@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import structlog
@@ -19,6 +20,17 @@ from .models import Task, TaskType
 from .store import TaskStore
 
 logger = structlog.get_logger(__name__)
+
+
+class _LazyChatAgent:
+    def __init__(self, factory: Callable[[], ChatAgent]) -> None:
+        self._factory = factory
+        self._agent: ChatAgent | None = None
+
+    def reply(self, message: str, context: list[str] | None = None) -> str:
+        if self._agent is None:
+            self._agent = self._factory()
+        return self._agent.reply(message, context=context)
 
 
 class OperationWorker:
@@ -165,7 +177,7 @@ class OperationWorker:
         if task.type == TaskType.WATCH_CHATS:
             return watch_chats_messages(
                 api=self.api,
-                agent=self._chat_agent(),
+                agent=_LazyChatAgent(self._chat_agent),
                 friends=_payload_friends(payload),
                 duration=str(payload.get("duration") or "30s"),
                 real=not bool(payload.get("dry_run", True)),
