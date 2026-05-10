@@ -352,7 +352,6 @@ class MainWindow(QMainWindow):
         self.watch_auto_reply = QCheckBox("监听到新消息后自动调用 Agent 回复")
         self.watch_auto_reply.setChecked(True)
         self.watch_reply_all = QCheckBox("回复本轮监听到的所有新消息")
-        self.watch_select_sender = QCheckBox("尝试读取群成员发送人")
         self.watch_start = QPushButton("启动监听")
         self.watch_start.setObjectName("primaryButton")
         self.watch_start.clicked.connect(self.toggle_watch_timer)
@@ -361,7 +360,6 @@ class MainWindow(QMainWindow):
         form.addRow("监听对象", self.watch_targets)
         form.addRow("", self.watch_auto_reply)
         form.addRow("", self.watch_reply_all)
-        form.addRow("", self.watch_select_sender)
         form.addRow("", self.watch_start)
         page.layout().addWidget(  # type: ignore[union-attr]
             self._tasks_panel("消息监听任务", {"watch_chats"})
@@ -551,7 +549,7 @@ class MainWindow(QMainWindow):
             duration=duration,
             auto_reply=self.watch_auto_reply.isChecked(),
             reply_all=self.watch_reply_all.isChecked(),
-            select_sender=self.watch_select_sender.isChecked(),
+            select_sender=False,
             real=True,
         )
         self._task_created(task.id, task.type.value)

@@ -204,6 +204,7 @@ def watch_chats_messages(
     targets = _dedupe_chat_names(friends)
     if not targets:
         raise ValueError("至少需要一个监听对象")
+    effective_select_sender = False
 
     chat_results: list[dict[str, Any]] = []
     replies: list[dict[str, Any]] = []
@@ -226,7 +227,7 @@ def watch_chats_messages(
                     duration=duration,
                     real=real,
                     reply_all=reply_all,
-                    select_sender=select_sender,
+                    select_sender=effective_select_sender,
                     source="new",
                     context_message_limit=context_message_limit,
                     separate_window=False,
@@ -241,7 +242,7 @@ def watch_chats_messages(
                 scan_result = api.scan_messages(
                     friend=chat_name,
                     duration=duration,
-                    select_sender=select_sender,
+                    select_sender=effective_select_sender,
                     separate_window=False,
                     dry_run=not real,
                 )
@@ -291,7 +292,7 @@ def watch_chats_messages(
         "duration": duration,
         "auto_reply": auto_reply,
         "reply_all": reply_all,
-        "select_sender": select_sender,
+        "select_sender": effective_select_sender,
         "chat_count": len(targets),
         "message_count": message_count,
         "new_message_count": message_count,

@@ -183,7 +183,6 @@ def listen_chats(
         help="Use the configured agent to reply to detected messages",
     ),
     reply_all: bool = typer.Option(False, help="Reply to every new message instead of only the last"),
-    select_sender: bool = typer.Option(False, help="Try to identify group message senders"),
     real: bool = typer.Option(False, help="Execute real WeChat action"),
     config: Path | None = typer.Option(None, help="Path to JSON config file"),
 ) -> None:
@@ -195,7 +194,7 @@ def listen_chats(
             "duration": duration,
             "auto_reply": auto_reply,
             "reply_all": reply_all,
-            "select_sender": select_sender,
+            "select_sender": False,
             "dry_run": not real,
         },
         settings.default_account_id,

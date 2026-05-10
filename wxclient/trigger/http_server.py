@@ -128,7 +128,7 @@ def create_app(settings: Settings, store: TaskStore) -> FastAPI:
                 "duration": payload.duration,
                 "auto_reply": payload.auto_reply,
                 "reply_all": payload.reply_all,
-                "select_sender": payload.select_sender,
+                "select_sender": False,
                 "dry_run": _default_dry_run(payload.dry_run, settings),
             },
             payload.account_id or settings.default_account_id,
@@ -176,7 +176,6 @@ class ListenChatsRequest(BaseTaskRequest):
     duration: str = "30s"
     auto_reply: bool = True
     reply_all: bool = False
-    select_sender: bool = False
 
 
 def _default_dry_run(value: bool | None, settings: Settings) -> bool:

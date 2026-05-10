@@ -182,7 +182,7 @@ class WeChatApi:
             )
             window_mode = "separate"
         else:
-            dialog_window = self._open_main_dialog_window(friend=friend, select=select_sender)
+            dialog_window = self._open_main_dialog_window(friend=friend, select=False)
             reused_window = True
             window_mode = "main"
         result = self._poll_visible_messages(
@@ -811,9 +811,22 @@ def _infer_message_is_self(rect: Any, container_rect: Any) -> bool | None:
     try:
         width = float(rect.width())
         container_width = float(container_rect.width())
-        if container_width <= 0 or width >= container_width * 0.9:
+        if container_width <= 0 or width >= container_width * 0.98:
             return None
-        return rect.mid_point().x > container_rect.mid_point().x
+        left_gap = float(rect.left - container_rect.left)
+        right_gap = float(container_rect.right - rect.right)
+        if left_gap < 0 or right_gap < 0:
+            return None
+        gap_delta = abs(left_gap - right_gap)
+        if gap_delta >= max(container_width * 0.08, 24.0):
+            return left_gap > right_gap
+
+        center_ratio = float(rect.mid_point().x - container_rect.left) / container_width
+        if center_ratio >= 0.58:
+            return True
+        if center_ratio <= 0.42:
+            return False
+        return None
     except Exception:
         return None
 

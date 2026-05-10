@@ -26,7 +26,11 @@ from wxclient.trigger.http_server import create_app
 from wxclient.ui.config import load_gui_settings, save_gui_settings
 from wxclient.ui.task_actions import enqueue_reply_unread, enqueue_watch_chats
 from wxclient.wechat_api import WeChatApi
-from wxclient.wechat_api.service import _resolve_control_by_criteria, _tail_messages
+from wxclient.wechat_api.service import (
+    _infer_message_is_self,
+    _resolve_control_by_criteria,
+    _tail_messages,
+)
 
 
 class FakeAgent:
@@ -69,6 +73,7 @@ class FakeChatApi:
         self.current_sent: list[dict[str, object]] = []
         self.scanned: list[str] = []
         self.scan_separate_windows: list[bool] = []
+        self.scan_select_senders: list[bool] = []
         self.read_separate_windows: list[bool] = []
 
     def check_unread_messages(self, dry_run: bool | None = None) -> dict[str, object]:
@@ -90,6 +95,7 @@ class FakeChatApi:
     ) -> dict[str, object]:
         self.scanned.append(friend)
         self.scan_separate_windows.append(separate_window)
+        self.scan_select_senders.append(select_sender)
         return {
             "dry_run": dry_run,
             "action": "scan_messages",
@@ -575,6 +581,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["reply_count"], 2)
         self.assertEqual(api.scanned, ["Mzxx", "测试群"])
         self.assertEqual(api.scan_separate_windows, [False, False])
+        self.assertEqual(api.scan_select_senders, [False, False])
         self.assertEqual(api.read_separate_windows, [False, False])
         self.assertEqual([item["friend"] for item in api.sent], ["Mzxx", "测试群"])
 
@@ -593,6 +600,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["message_count"], 1)
         self.assertEqual(result["reply_count"], 0)
         self.assertEqual(api.scan_separate_windows, [False])
+        self.assertEqual(api.scan_select_senders, [False])
         self.assertEqual(api.sent, [])
 
     def test_reply_chat_skips_self_messages(self) -> None:
@@ -1007,6 +1015,19 @@ class CoreTests(unittest.TestCase):
         rows = api._collect_visible_message_nodes(window)
 
         self.assertEqual([row["text"] for row in rows], ["top", "bottom"])
+
+    def test_message_side_detection_marks_left_and_right_bubbles(self) -> None:
+        container = FakeRect(300, 0, 1000, 900)
+
+        self.assertFalse(_infer_message_is_self(FakeRect(360, 100, 560, 150), container))
+        self.assertTrue(_infer_message_is_self(FakeRect(740, 200, 940, 250), container))
+
+    def test_message_side_detection_handles_wide_bubbles_by_gap(self) -> None:
+        container = FakeRect(300, 0, 1000, 900)
+
+        self.assertFalse(_infer_message_is_self(FakeRect(330, 100, 870, 150), container))
+        self.assertTrue(_infer_message_is_self(FakeRect(430, 200, 970, 250), container))
+        self.assertIsNone(_infer_message_is_self(FakeRect(300, 300, 1000, 350), container))
 
     def test_read_current_chat_uses_fallback_name_when_title_missing(self) -> None:
         window = FakeUiaWindow(
