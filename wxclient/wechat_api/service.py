@@ -228,7 +228,7 @@ class WeChatApi:
             dialog_window = self._open_main_dialog_window(friend=friend, select=False)
             reused_window = True
             window_mode = "main"
-        messages = self._collect_visible_message_nodes(dialog_window)
+        messages = self._collect_visible_message_nodes(dialog_window, chat_name=friend)
         return {
             "dry_run": False,
             "action": "read_visible_messages",
@@ -549,7 +549,11 @@ class WeChatApi:
             "initial_visible_count": len(baseline),
         }
 
-    def _collect_visible_message_nodes(self, dialog_window: Any) -> list[dict[str, Any]]:
+    def _collect_visible_message_nodes(
+        self,
+        dialog_window: Any,
+        chat_name: str | None = None,
+    ) -> list[dict[str, Any]]:
         message_classes = {
             "mmui::ChatTextItemView",
             "mmui::ChatBubbleItemView",
@@ -597,12 +601,26 @@ class WeChatApi:
                 }
             )
         messages = _attach_message_timestamps(_sort_message_rows(rows))
-        self._annotate_latest_message_sender(dialog_window, messages)
+        self._annotate_message_senders(dialog_window, messages, chat_name=chat_name)
         return messages
 
-    def _annotate_latest_message_sender(self, window: Any, messages: list[dict[str, Any]]) -> None:
-        latest = _last_replyable_message(messages)
-        if latest is None or latest.get("is_self") is not None:
+    def _annotate_message_senders(
+        self,
+        window: Any,
+        messages: list[dict[str, Any]],
+        chat_name: str | None = None,
+    ) -> None:
+        for message in messages:
+            if _is_self_activity_row(message):
+                message["is_self"] = True
+                message["sender"] = "\u6211"
+
+        unknown_messages = [
+            message
+            for message in messages
+            if _message_needs_sender_annotation(message)
+        ]
+        if not unknown_messages:
             return
         try:
             Tools = self._pyweixin_class("Tools")
@@ -610,14 +628,24 @@ class WeChatApi:
             edit_area = self._resolve_chat_edit(window)
             if chat_list is None or edit_area is None:
                 return
-            item = _matching_list_item_for_message(chat_list, latest)
-            if item is None:
-                return
-            latest["is_self"] = bool(Tools.is_my_bubble(window, item, edit_area))
-            if latest["is_self"]:
-                latest["sender"] = "\u6211"
+            container_rect = _safe_call(getattr(chat_list, "rectangle", None))
         except Exception:
             return
+        for message in unknown_messages:
+            if not _message_inside_container(message, container_rect):
+                continue
+            item = _matching_list_item_for_message(chat_list, message)
+            if item is None:
+                continue
+            try:
+                is_self = bool(Tools.is_my_bubble(window, item, edit_area))
+            except Exception:
+                continue
+            message["is_self"] = is_self
+            if is_self:
+                message["sender"] = "\u6211"
+            else:
+                message["sender"] = chat_name or "\u5bf9\u65b9"
 
     def _resolve_chat_list(self, window: Any) -> Any | None:
         try:
@@ -812,6 +840,30 @@ def _session_preview_is_self_message(preview: Any, message_text: str) -> bool:
         if preview_text.startswith(prefix) and preview_text[len(prefix) :].strip() == message:
             return True
     return False
+
+
+def _message_needs_sender_annotation(message: dict[str, Any]) -> bool:
+    if message.get("is_self") is not None:
+        return False
+    if message.get("is_timestamp"):
+        return False
+    if not str(message.get("text") or "").strip():
+        return False
+    class_name = str(message.get("class_name") or "")
+    return class_name.startswith("mmui::Chat")
+
+
+def _message_inside_container(message: dict[str, Any], container_rect: Any) -> bool:
+    if container_rect is None:
+        return True
+    top = message.get("top")
+    bottom = message.get("bottom")
+    if top is None or bottom is None:
+        return True
+    try:
+        return int(top) >= int(container_rect.top) and int(bottom) <= int(container_rect.bottom)
+    except Exception:
+        return True
 
 
 def _safe_runtime_id(node: Any) -> str | None:
