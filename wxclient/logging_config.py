@@ -115,12 +115,30 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"上下文 {payload.get('context_count', 0)} 条"
         )
     if event == "reply.chat_messages.read":
+        reused = payload.get("window_reused")
+        window_mode = payload.get("window_mode")
+        if window_mode == "main":
+            reused_text = "，使用微信主窗口会话"
+        elif reused is True:
+            reused_text = "，已复用现有独立聊天窗口"
+        elif reused is False:
+            reused_text = "，已新打开独立聊天窗口"
+        else:
+            reused_text = ""
         return (
             f"读取监听会话「{payload.get('chat') or '-'}」："
             f"方式 {payload.get('message_source') or '-'}，"
             f"新消息 {payload.get('message_count', 0)} 条，"
             f"可回复 {payload.get('replyable_count', 0)} 条，"
-            f"最后一条「{payload.get('latest_message') or ''}」"
+            f"最后一条「{payload.get('latest_message') or ''}」{reused_text}"
+        )
+    if event == "reply.chat_messages.message":
+        return (
+            f"监听会话「{payload.get('chat') or '-'}」读到第 "
+            f"{payload.get('index', '-')}/{payload.get('total', '-')} 条："
+            f"{payload.get('sender') or '未知'}：{payload.get('text') or ''}"
+            f"（自己发送={_yes_no(payload.get('is_self'))}，"
+            f"时间={payload.get('timestamp_text') or '-'}）"
         )
     if event == "reply.chat_messages.skipped":
         return (
@@ -146,6 +164,14 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"读取新消息 {payload.get('message_count', 0)} 条，"
             f"已回复 {payload.get('reply_count', 0)} 条，"
             f"最后一条「{payload.get('latest_message') or ''}」"
+        )
+    if event == "watch.chats.message":
+        return (
+            f"消息监听「{payload.get('chat') or '-'}」本轮读到第 "
+            f"{payload.get('index', '-')}/{payload.get('total', '-')} 条："
+            f"{payload.get('sender') or '未知'}：{payload.get('text') or ''}"
+            f"（自己发送={_yes_no(payload.get('is_self'))}，"
+            f"时间={payload.get('timestamp_text') or '-'}）"
         )
     if event == "watch.chats.replied":
         return (

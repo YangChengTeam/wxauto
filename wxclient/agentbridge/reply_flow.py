@@ -22,6 +22,7 @@ class ChatAutomationApi(Protocol):
         select_sender: bool = False,
         save_file: bool = False,
         save_media: bool = False,
+        separate_window: bool = True,
         dry_run: bool | None = None,
     ) -> dict[str, Any]:
         ...
@@ -44,6 +45,7 @@ class ChatAutomationApi(Protocol):
     def read_visible_messages(
         self,
         friend: str,
+        separate_window: bool = True,
         dry_run: bool | None = None,
     ) -> dict[str, Any]:
         ...
@@ -81,6 +83,7 @@ def reply_to_chat_messages(
     select_sender: bool = False,
     source: str = "new",
     context_message_limit: int = DEFAULT_CONTEXT_MESSAGE_LIMIT,
+    separate_window: bool = True,
 ) -> dict[str, Any]:
     source_result = _read_source_messages(
         api=api,
@@ -89,6 +92,7 @@ def reply_to_chat_messages(
         real=real,
         select_sender=select_sender,
         source=source,
+        separate_window=separate_window,
     )
     messages = source_result["messages"]
     context_messages = source_result["context_messages"]
@@ -100,6 +104,13 @@ def reply_to_chat_messages(
         message_count=len(messages),
         replyable_count=len(replyable_messages),
         latest_message=_message_log_text(messages[-1] if messages else None),
+        window_reused=source_result["raw_result"].get("window_reused"),
+        window_mode=source_result["raw_result"].get("window_mode"),
+    )
+    _log_chat_messages(
+        event="reply.chat_messages.message",
+        chat_name=friend,
+        messages=messages,
     )
     if messages and not replyable_messages:
         logger.info(
@@ -164,6 +175,7 @@ def reply_to_new_chat_messages(
     real: bool,
     reply_all: bool = False,
     select_sender: bool = False,
+    separate_window: bool = True,
 ) -> dict[str, Any]:
     return reply_to_chat_messages(
         api=api,
@@ -174,6 +186,7 @@ def reply_to_new_chat_messages(
         reply_all=reply_all,
         select_sender=select_sender,
         source="new",
+        separate_window=separate_window,
     )
 
 
@@ -216,6 +229,7 @@ def watch_chats_messages(
                     select_sender=select_sender,
                     source="new",
                     context_message_limit=context_message_limit,
+                    separate_window=False,
                 )
                 scan_messages = _extract_scan_messages(result.get("source_result", {}))
                 chat_replies = [
@@ -228,6 +242,7 @@ def watch_chats_messages(
                     friend=chat_name,
                     duration=duration,
                     select_sender=select_sender,
+                    separate_window=False,
                     dry_run=not real,
                 )
                 scan_messages = _extract_scan_messages(scan_result)
@@ -250,6 +265,11 @@ def watch_chats_messages(
                 message_count=len(scan_messages),
                 reply_count=int(result.get("reply_count") or 0),
                 latest_message=_message_log_text(scan_messages[-1] if scan_messages else None),
+            )
+            _log_chat_messages(
+                event="watch.chats.message",
+                chat_name=chat_name,
+                messages=scan_messages,
             )
             for reply in result.get("replies", []) if isinstance(result, dict) else []:
                 if not isinstance(reply, dict):
@@ -291,22 +311,28 @@ def _read_source_messages(
     real: bool,
     select_sender: bool,
     source: str,
+    separate_window: bool,
 ) -> dict[str, Any]:
     if source == "new":
         scan_result = api.scan_messages(
             friend=friend,
             duration=duration,
             select_sender=select_sender,
+            separate_window=separate_window,
             dry_run=not real,
         )
         return {
             "messages": _extract_scan_messages(scan_result),
-            "context_messages": _try_read_visible_messages(api, friend, real),
+            "context_messages": _try_read_visible_messages(api, friend, real, separate_window),
             "raw_result": scan_result,
         }
 
     if source == "visible":
-        read_result = api.read_visible_messages(friend=friend, dry_run=not real)
+        read_result = api.read_visible_messages(
+            friend=friend,
+            separate_window=separate_window,
+            dry_run=not real,
+        )
         visible_messages = _extract_visible_messages(read_result)
         return {
             "messages": visible_messages,
@@ -315,6 +341,29 @@ def _read_source_messages(
         }
 
     raise ValueError(f"Unsupported reply source: {source}")
+
+
+def _log_chat_messages(
+    event: str,
+    chat_name: str,
+    messages: list[dict[str, Any]],
+    limit: int = 20,
+) -> None:
+    if not messages:
+        return
+    start_index = max(0, len(messages) - limit)
+    for offset, message in enumerate(messages[start_index:], start=start_index + 1):
+        logger.info(
+            event,
+            chat=chat_name,
+            index=offset,
+            total=len(messages),
+            sender=_display_sender(message, chat_name),
+            text=_truncate_text(_message_text(message)),
+            is_self=message.get("is_self"),
+            timestamp_text=message.get("timestamp_text"),
+            timestamp_is_today=message.get("timestamp_is_today"),
+        )
 
 
 def reply_to_unread_messages(
@@ -855,9 +904,14 @@ def _try_read_visible_messages(
     api: ChatAutomationApi,
     friend: str,
     real: bool,
+    separate_window: bool = True,
 ) -> list[dict[str, Any]]:
     try:
-        read_result = api.read_visible_messages(friend=friend, dry_run=not real)
+        read_result = api.read_visible_messages(
+            friend=friend,
+            separate_window=separate_window,
+            dry_run=not real,
+        )
     except Exception:
         return []
     return _extract_visible_messages(read_result)

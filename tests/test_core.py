@@ -68,6 +68,8 @@ class FakeChatApi:
         self.sent: list[dict[str, object]] = []
         self.current_sent: list[dict[str, object]] = []
         self.scanned: list[str] = []
+        self.scan_separate_windows: list[bool] = []
+        self.read_separate_windows: list[bool] = []
 
     def check_unread_messages(self, dry_run: bool | None = None) -> dict[str, object]:
         return {
@@ -83,14 +85,18 @@ class FakeChatApi:
         select_sender: bool = False,
         save_file: bool = False,
         save_media: bool = False,
+        separate_window: bool = True,
         dry_run: bool | None = None,
     ) -> dict[str, object]:
         self.scanned.append(friend)
+        self.scan_separate_windows.append(separate_window)
         return {
             "dry_run": dry_run,
             "action": "scan_messages",
             "friend": friend,
             "duration": duration,
+            "separate_window": separate_window,
+            "window_mode": "separate" if separate_window else "main",
             "result": {"messages": self.messages},
         }
 
@@ -125,12 +131,16 @@ class FakeChatApi:
     def read_visible_messages(
         self,
         friend: str,
+        separate_window: bool = True,
         dry_run: bool | None = None,
     ) -> dict[str, object]:
+        self.read_separate_windows.append(separate_window)
         return {
             "dry_run": dry_run,
             "action": "read_visible_messages",
             "friend": friend,
+            "separate_window": separate_window,
+            "window_mode": "separate" if separate_window else "main",
             "messages": self.messages,
         }
 
@@ -238,6 +248,22 @@ class FakeUiaWindow:
         return self.nodes
 
 
+class FakeDialogWindow(FakeUiaWindow):
+    def __init__(self, title: str, nodes: list[FakeUiaNode] | None = None) -> None:
+        super().__init__(nodes or [])
+        self.title = title
+        self.closed = False
+
+    def class_name(self) -> str:
+        return "mmui::ChatSingleWindow"
+
+    def window_text(self) -> str:
+        return self.title
+
+    def close(self) -> None:
+        self.closed = True
+
+
 class TestableWeChatApi(WeChatApi):
     def _resolve_chat_list(self, window):  # type: ignore[no-untyped-def]
         return None
@@ -308,6 +334,45 @@ class FakeUnreadWeChatApi(WeChatApi):
         ]
 
 
+class FakeNavigator:
+    def __init__(self, dialog: FakeDialogWindow) -> None:
+        self.dialog = dialog
+        self.open_count = 0
+
+    def open_seperate_dialog_window(self, **kwargs):  # type: ignore[no-untyped-def]
+        self.open_count += 1
+        return self.dialog
+
+
+class ReuseDialogWeChatApi(WeChatApi):
+    def __init__(self, existing_dialog: FakeDialogWindow | None) -> None:
+        super().__init__(dry_run=False)
+        self.existing_dialog = existing_dialog
+        self.opened_dialog = FakeDialogWindow("Mzxx")
+        self.navigator = FakeNavigator(self.opened_dialog)
+
+    def _ensure_ready(self) -> None:
+        return None
+
+    def _find_separate_dialog_window(self, friend: str):  # type: ignore[no-untyped-def]
+        return self.existing_dialog
+
+    def _try_minimize_window(self, dialog_window):  # type: ignore[no-untyped-def]
+        return None
+
+    def _pyweixin_class(self, name: str):  # type: ignore[no-untyped-def]
+        if name == "Navigator":
+            return self.navigator
+        return super()._pyweixin_class(name)
+
+    def _poll_visible_messages(self, dialog_window, duration: str):  # type: ignore[no-untyped-def]
+        return {
+            "new_message_count": 1,
+            "messages": [{"sender": "Mzxx", "text": "hello", "is_self": False}],
+            "initial_visible_count": 0,
+        }
+
+
 class CoreTests(unittest.TestCase):
     def test_store_creates_and_lists_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -338,6 +403,17 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(loaded.status, TaskStatus.SUCCEEDED)
             self.assertEqual(loaded.result["action"], "send_message")
             self.assertTrue(loaded.result["dry_run"])
+
+    def test_scan_messages_reuses_existing_separate_window(self) -> None:
+        existing = FakeDialogWindow("Mzxx")
+        api = ReuseDialogWeChatApi(existing)
+
+        result = api.scan_messages(friend="Mzxx", duration="1s", dry_run=False)
+
+        self.assertTrue(result["window_reused"])
+        self.assertEqual(api.navigator.open_count, 0)
+        self.assertFalse(existing.closed)
+        self.assertEqual(result["result"]["new_message_count"], 1)
 
     def test_worker_can_restart_after_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -498,6 +574,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["chat_count"], 2)
         self.assertEqual(result["reply_count"], 2)
         self.assertEqual(api.scanned, ["Mzxx", "测试群"])
+        self.assertEqual(api.scan_separate_windows, [False, False])
+        self.assertEqual(api.read_separate_windows, [False, False])
         self.assertEqual([item["friend"] for item in api.sent], ["Mzxx", "测试群"])
 
     def test_watch_chats_can_listen_without_reply(self) -> None:
@@ -514,6 +592,7 @@ class CoreTests(unittest.TestCase):
 
         self.assertEqual(result["message_count"], 1)
         self.assertEqual(result["reply_count"], 0)
+        self.assertEqual(api.scan_separate_windows, [False])
         self.assertEqual(api.sent, [])
 
     def test_reply_chat_skips_self_messages(self) -> None:

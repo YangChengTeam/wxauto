@@ -160,6 +160,7 @@ class WeChatApi:
         select_sender: bool = False,
         save_file: bool = False,
         save_media: bool = False,
+        separate_window: bool = True,
         dry_run: bool | None = None,
     ) -> dict[str, Any]:
         if self._is_dry_run(dry_run):
@@ -169,29 +170,33 @@ class WeChatApi:
                 "friend": friend,
                 "duration": duration,
                 "select_sender": select_sender,
+                "separate_window": separate_window,
                 "events": [],
             }
         self._ensure_ready()
-        Navigator = self._pyweixin_class("Navigator")
-        dialog_window = Navigator.open_seperate_dialog_window(
-            friend=friend,
-            select=select_sender,
-            window_minimize=True,
-            close_weixin=False,
-        )
+        if separate_window:
+            dialog_window, reused_window = self._open_or_reuse_separate_dialog_window(
+                friend=friend,
+                select=select_sender,
+                window_minimize=True,
+            )
+            window_mode = "separate"
+        else:
+            dialog_window = self._open_main_dialog_window(friend=friend, select=select_sender)
+            reused_window = True
+            window_mode = "main"
         result = self._poll_visible_messages(
             dialog_window=dialog_window,
             duration=duration,
         )
-        try:
-            dialog_window.close()
-        except Exception:
-            pass
         return {
             "dry_run": False,
             "action": "scan_messages",
             "friend": friend,
             "duration": duration,
+            "window_reused": reused_window,
+            "window_mode": window_mode,
+            "separate_window": separate_window,
             "save_file": save_file,
             "save_media": save_media,
             "result": result,
@@ -200,6 +205,7 @@ class WeChatApi:
     def read_visible_messages(
         self,
         friend: str,
+        separate_window: bool = True,
         dry_run: bool | None = None,
     ) -> dict[str, Any]:
         if self._is_dry_run(dry_run):
@@ -207,25 +213,29 @@ class WeChatApi:
                 "dry_run": True,
                 "action": "read_visible_messages",
                 "friend": friend,
+                "separate_window": separate_window,
                 "messages": [],
             }
         self._ensure_ready()
-        Navigator = self._pyweixin_class("Navigator")
-        dialog_window = Navigator.open_seperate_dialog_window(
-            friend=friend,
-            select=False,
-            window_minimize=False,
-            close_weixin=False,
-        )
+        if separate_window:
+            dialog_window, reused_window = self._open_or_reuse_separate_dialog_window(
+                friend=friend,
+                select=False,
+                window_minimize=False,
+            )
+            window_mode = "separate"
+        else:
+            dialog_window = self._open_main_dialog_window(friend=friend, select=False)
+            reused_window = True
+            window_mode = "main"
         messages = self._collect_visible_message_nodes(dialog_window)
-        try:
-            dialog_window.close()
-        except Exception:
-            pass
         return {
             "dry_run": False,
             "action": "read_visible_messages",
             "friend": friend,
+            "window_reused": reused_window,
+            "window_mode": window_mode,
+            "separate_window": separate_window,
             "messages": messages,
         }
 
@@ -409,6 +419,77 @@ class WeChatApi:
                     "is_selected": bool(selected),
                 }
         return {}
+
+    def _open_or_reuse_separate_dialog_window(
+        self,
+        friend: str,
+        select: bool,
+        window_minimize: bool,
+    ) -> tuple[Any, bool]:
+        dialog_window = self._find_separate_dialog_window(friend)
+        if dialog_window is not None:
+            if select:
+                self._try_select_chat_list(dialog_window)
+            if window_minimize:
+                self._try_minimize_window(dialog_window)
+            return dialog_window, True
+
+        Navigator = self._pyweixin_class("Navigator")
+        dialog_window = Navigator.open_seperate_dialog_window(
+            friend=friend,
+            select=select,
+            window_minimize=window_minimize,
+            close_weixin=False,
+        )
+        return dialog_window, False
+
+    def _open_main_dialog_window(self, friend: str, select: bool) -> Any:
+        Navigator = self._pyweixin_class("Navigator")
+        try:
+            return Navigator.open_dialog_window(
+                friend=friend,
+                select=select,
+                is_maximize=False,
+                search_pages=5,
+            )
+        except Exception as exc:
+            raise WeChatApiError(f"打开主窗口会话「{friend}」失败：{exc}") from exc
+
+    def _find_separate_dialog_window(self, friend: str) -> Any | None:
+        try:
+            Desktop = __import__("pywinauto", fromlist=["Desktop"]).Desktop
+            desktop = Desktop(backend="uia")
+            exact_matches = []
+            fuzzy_matches = []
+            for window in desktop.windows():
+                if _safe_call(window.class_name) != "mmui::ChatSingleWindow":
+                    continue
+                title = str(_safe_call(window.window_text) or "").strip()
+                if title == friend:
+                    exact_matches.append(window)
+                elif friend and (friend in title or title in friend):
+                    fuzzy_matches.append(window)
+            matches = exact_matches or fuzzy_matches
+            return matches[0] if matches else None
+        except Exception:
+            return None
+
+    def _try_select_chat_list(self, dialog_window: Any) -> None:
+        try:
+            Tools = self._pyweixin_class("Tools")
+            Tools.select_chatList(dialog_window)
+        except Exception:
+            pass
+
+    def _try_minimize_window(self, dialog_window: Any) -> None:
+        try:
+            win32gui = __import__("win32gui")
+            win32con = __import__("win32con")
+            handle = getattr(dialog_window, "handle", None)
+            if handle:
+                win32gui.SendMessage(handle, win32con.WM_SYSCOMMAND, win32con.SC_MINIMIZE, 0)
+        except Exception:
+            pass
 
     def _check_unread_messages_without_select(self) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
         utils = self._pyweixin_submodule("utils")

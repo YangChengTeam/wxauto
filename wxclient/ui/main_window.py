@@ -811,8 +811,10 @@ def _event_label(event: str) -> str:
         "task.failed": "任务执行失败",
         "watch.chats.start": "消息监听开始",
         "watch.chats.read": "消息监听完成",
+        "watch.chats.message": "消息监听读到消息",
         "watch.chats.replied": "消息监听已回复",
         "watch.chats.failed": "消息监听失败",
+        "reply.chat_messages.message": "监听会话读到消息",
     }
     return labels.get(event, event or "日志")
 
