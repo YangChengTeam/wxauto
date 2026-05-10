@@ -852,7 +852,8 @@ def _reply_to_chat_batch(
     context_message_limit: int,
 ) -> list[dict[str, Any]]:
     replies: list[dict[str, Any]] = []
-    target_messages = messages if reply_all else messages[-1:]
+    replyable_messages = [message for message in messages if message.get("is_self") is not True]
+    target_messages = replyable_messages if reply_all else replyable_messages[-1:]
     for message in target_messages:
         inbound_text = _message_text(message)
         if not inbound_text:

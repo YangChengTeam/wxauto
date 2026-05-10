@@ -641,6 +641,35 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(second["reply_count"], 1)
         self.assertIn("second", str(api.sent[0]["text"]))
 
+    def test_watch_chats_skips_new_self_messages(self) -> None:
+        api = FakeChatApi([{"sender": "Mzxx", "text": "hello", "is_self": False}])
+        cursors = InMemoryCursorStore()
+
+        watch_chats_messages(
+            api=api,
+            agent=EchoAgent(),
+            friends=["Mzxx"],
+            duration="1s",
+            real=True,
+            auto_reply=True,
+            cursor_store=cursors,
+        )
+        api.messages.append({"sender": "me", "text": "mine", "is_self": True})
+
+        result = watch_chats_messages(
+            api=api,
+            agent=EchoAgent(),
+            friends=["Mzxx"],
+            duration="1s",
+            real=True,
+            auto_reply=True,
+            cursor_store=cursors,
+        )
+
+        self.assertEqual(result["message_count"], 1)
+        self.assertEqual(result["reply_count"], 0)
+        self.assertEqual(api.sent, [])
+
     def test_reply_chat_skips_self_messages(self) -> None:
         api = FakeChatApi([{"sender": "我", "text": "mine", "is_self": True}])
 

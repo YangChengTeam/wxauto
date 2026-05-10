@@ -596,7 +596,28 @@ class WeChatApi:
                     **metrics,
                 }
             )
-        return _attach_message_timestamps(_sort_message_rows(rows))
+        messages = _attach_message_timestamps(_sort_message_rows(rows))
+        self._annotate_latest_message_sender(dialog_window, messages)
+        return messages
+
+    def _annotate_latest_message_sender(self, window: Any, messages: list[dict[str, Any]]) -> None:
+        latest = _last_replyable_message(messages)
+        if latest is None or latest.get("is_self") is not None:
+            return
+        try:
+            Tools = self._pyweixin_class("Tools")
+            chat_list = self._resolve_chat_list(window)
+            edit_area = self._resolve_chat_edit(window)
+            if chat_list is None or edit_area is None:
+                return
+            item = _matching_list_item_for_message(chat_list, latest)
+            if item is None:
+                return
+            latest["is_self"] = bool(Tools.is_my_bubble(window, item, edit_area))
+            if latest["is_self"]:
+                latest["sender"] = "\u6211"
+        except Exception:
+            return
 
     def _resolve_chat_list(self, window: Any) -> Any | None:
         try:
@@ -803,6 +824,39 @@ def _safe_runtime_id(node: Any) -> str | None:
     if isinstance(value, (list, tuple)):
         return ".".join(str(item) for item in value)
     return str(value)
+
+
+def _matching_list_item_for_message(chat_list: Any, message: dict[str, Any]) -> Any | None:
+    try:
+        items = chat_list.children(control_type="ListItem")
+    except Exception:
+        return None
+    if not items:
+        return None
+
+    runtime_id = str(message.get("runtime_id") or "").strip()
+    if runtime_id:
+        for item in items:
+            if _safe_runtime_id(item) == runtime_id:
+                return item
+
+    text = str(message.get("text") or "").strip()
+    order = _safe_int(message.get("order"))
+    if 0 <= order < len(items):
+        candidate = items[order]
+        candidate_text = str(_safe_call(candidate.window_text) or "").strip()
+        if not text or candidate_text == text:
+            return candidate
+
+    if text:
+        matches = [
+            item
+            for item in items
+            if str(_safe_call(item.window_text) or "").strip() == text
+        ]
+        if matches:
+            return matches[-1]
+    return None
 
 
 def _infer_message_is_self(rect: Any, container_rect: Any) -> bool | None:
