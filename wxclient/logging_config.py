@@ -161,9 +161,15 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "watch.chats.read":
         return (
             f"监听完成「{payload.get('chat') or '-'}」："
-            f"读取新消息 {payload.get('message_count', 0)} 条，"
+            f"可见消息 {payload.get('visible_message_count', 0)} 条，"
+            f"游标后新消息 {payload.get('message_count', 0)} 条，"
             f"已回复 {payload.get('reply_count', 0)} 条，"
             f"最后一条「{payload.get('latest_message') or ''}」"
+        )
+    if event == "watch.chats.skipped":
+        return (
+            f"消息监听「{payload.get('chat') or '-'}」建立首轮基线："
+            f"已读取可见消息 {payload.get('visible_message_count', 0)} 条，本轮不回复旧消息。"
         )
     if event == "watch.chats.message":
         return (

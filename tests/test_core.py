@@ -72,6 +72,7 @@ class FakeChatApi:
         self.sent: list[dict[str, object]] = []
         self.current_sent: list[dict[str, object]] = []
         self.scanned: list[str] = []
+        self.visible_reads: list[str] = []
         self.scan_separate_windows: list[bool] = []
         self.scan_select_senders: list[bool] = []
         self.read_separate_windows: list[bool] = []
@@ -140,6 +141,7 @@ class FakeChatApi:
         separate_window: bool = True,
         dry_run: bool | None = None,
     ) -> dict[str, object]:
+        self.visible_reads.append(friend)
         self.read_separate_windows.append(separate_window)
         return {
             "dry_run": dry_run,
@@ -579,9 +581,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["action"], "watch_chats")
         self.assertEqual(result["chat_count"], 2)
         self.assertEqual(result["reply_count"], 2)
-        self.assertEqual(api.scanned, ["Mzxx", "测试群"])
-        self.assertEqual(api.scan_separate_windows, [False, False])
-        self.assertEqual(api.scan_select_senders, [False, False])
+        self.assertEqual(api.scanned, [])
+        self.assertEqual(api.visible_reads, ["Mzxx", "测试群"])
         self.assertEqual(api.read_separate_windows, [False, False])
         self.assertEqual([item["friend"] for item in api.sent], ["Mzxx", "测试群"])
 
@@ -598,10 +599,47 @@ class CoreTests(unittest.TestCase):
         )
 
         self.assertEqual(result["message_count"], 1)
+        self.assertEqual(result["visible_message_count"], 1)
         self.assertEqual(result["reply_count"], 0)
-        self.assertEqual(api.scan_separate_windows, [False])
-        self.assertEqual(api.scan_select_senders, [False])
+        self.assertEqual(api.scanned, [])
+        self.assertEqual(api.visible_reads, ["Mzxx"])
+        self.assertEqual(api.read_separate_windows, [False])
         self.assertEqual(api.sent, [])
+
+    def test_watch_chats_seeds_cursor_before_replying_visible_history(self) -> None:
+        api = FakeChatApi([{"sender": "Mzxx", "text": "hello", "is_self": False}])
+        cursors = InMemoryCursorStore()
+
+        first = watch_chats_messages(
+            api=api,
+            agent=EchoAgent(),
+            friends=["Mzxx"],
+            duration="1s",
+            real=True,
+            auto_reply=True,
+            cursor_store=cursors,
+        )
+
+        self.assertEqual(first["visible_message_count"], 1)
+        self.assertEqual(first["message_count"], 0)
+        self.assertEqual(first["cursor_seed_count"], 1)
+        self.assertEqual(first["reply_count"], 0)
+        self.assertEqual(api.sent, [])
+
+        api.messages.append({"sender": "Mzxx", "text": "second", "is_self": False})
+        second = watch_chats_messages(
+            api=api,
+            agent=EchoAgent(),
+            friends=["Mzxx"],
+            duration="1s",
+            real=True,
+            auto_reply=True,
+            cursor_store=cursors,
+        )
+
+        self.assertEqual(second["message_count"], 1)
+        self.assertEqual(second["reply_count"], 1)
+        self.assertIn("second", str(api.sent[0]["text"]))
 
     def test_reply_chat_skips_self_messages(self) -> None:
         api = FakeChatApi([{"sender": "我", "text": "mine", "is_self": True}])

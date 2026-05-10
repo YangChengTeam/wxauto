@@ -200,6 +200,8 @@ def watch_chats_messages(
     reply_all: bool = False,
     select_sender: bool = False,
     context_message_limit: int = DEFAULT_CONTEXT_MESSAGE_LIMIT,
+    cursor_store: MessageCursorStore | None = None,
+    account_id: str = "default",
 ) -> dict[str, Any]:
     targets = _dedupe_chat_names(friends)
     if not targets:
@@ -210,6 +212,8 @@ def watch_chats_messages(
     replies: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     message_count = 0
+    visible_message_count = 0
+    cursor_seed_count = 0
 
     for chat_name in targets:
         logger.info(
@@ -219,60 +223,89 @@ def watch_chats_messages(
             auto_reply=auto_reply,
         )
         try:
-            if auto_reply:
-                result = reply_to_chat_messages(
+            read_result = api.read_visible_messages(
+                friend=chat_name,
+                separate_window=False,
+                dry_run=not real,
+            )
+            visible_messages = _extract_visible_messages(read_result)
+            visible_message_count += len(visible_messages)
+
+            cursor = None
+            if cursor_store is not None:
+                cursor = cursor_store.get_message_cursor(account_id, chat_name, "watch")
+                _mark_recent_outbound_messages(visible_messages, _cursor_outbound_texts(cursor))
+                new_messages, seeded = _messages_after_cursor(visible_messages, cursor)
+            else:
+                new_messages = visible_messages
+                seeded = False
+
+            if seeded:
+                cursor_seed_count += 1
+                logger.info(
+                    "watch.chats.skipped",
+                    chat=chat_name,
+                    reason="cursor_seeded",
+                    visible_message_count=len(visible_messages),
+                )
+
+            chat_replies: list[dict[str, Any]] = []
+            if auto_reply and not seeded:
+                chat_replies = _reply_to_chat_batch(
                     api=api,
                     agent=agent,
-                    friend=chat_name,
-                    duration=duration,
-                    real=real,
+                    chat_name=chat_name,
+                    messages=new_messages,
+                    context_messages=visible_messages,
                     reply_all=reply_all,
-                    select_sender=effective_select_sender,
-                    source="new",
+                    real=real,
+                    source="watch",
                     context_message_limit=context_message_limit,
-                    separate_window=False,
                 )
-                scan_messages = _extract_scan_messages(result.get("source_result", {}))
-                chat_replies = [
-                    item for item in result.get("replies", []) if isinstance(item, dict)
-                ]
                 replies.extend(chat_replies)
-                chat_results.append(result)
-            else:
-                scan_result = api.scan_messages(
-                    friend=chat_name,
-                    duration=duration,
-                    select_sender=effective_select_sender,
-                    separate_window=False,
-                    dry_run=not real,
-                )
-                scan_messages = _extract_scan_messages(scan_result)
-                result = {
-                    "action": "watch_chat",
-                    "friend": chat_name,
-                    "duration": duration,
-                    "dry_run": not real,
-                    "auto_reply": False,
-                    "new_message_count": len(scan_messages),
-                    "reply_count": 0,
-                    "source_result": scan_result,
-                }
-                chat_results.append(result)
 
-            message_count += len(scan_messages)
+            if cursor_store is not None:
+                next_cursor = _cursor_from_messages(visible_messages, previous_cursor=cursor)
+                _append_outbound_texts(
+                    next_cursor,
+                    [str(reply.get("reply_text") or "") for reply in chat_replies],
+                )
+                cursor_store.set_message_cursor(
+                    account_id,
+                    chat_name,
+                    next_cursor,
+                    "watch",
+                )
+
+            result = {
+                "action": "watch_chat",
+                "friend": chat_name,
+                "duration": duration,
+                "dry_run": not real,
+                "auto_reply": auto_reply,
+                "visible_message_count": len(visible_messages),
+                "new_message_count": len(new_messages) if not seeded else 0,
+                "reply_count": len(chat_replies),
+                "cursor_seeded": seeded,
+                "source_result": read_result,
+            }
+            chat_results.append(result)
+
+            message_count += 0 if seeded else len(new_messages)
             logger.info(
                 "watch.chats.read",
                 chat=chat_name,
-                message_count=len(scan_messages),
+                message_count=0 if seeded else len(new_messages),
+                visible_message_count=len(visible_messages),
                 reply_count=int(result.get("reply_count") or 0),
-                latest_message=_message_log_text(scan_messages[-1] if scan_messages else None),
+                latest_message=_message_log_text(visible_messages[-1] if visible_messages else None),
             )
             _log_chat_messages(
                 event="watch.chats.message",
                 chat_name=chat_name,
-                messages=scan_messages,
+                messages=visible_messages,
             )
-            for reply in result.get("replies", []) if isinstance(result, dict) else []:
+            for reply in chat_replies:
                 if not isinstance(reply, dict):
                     continue
                 logger.info(
@@ -296,6 +329,8 @@ def watch_chats_messages(
         "chat_count": len(targets),
         "message_count": message_count,
         "new_message_count": message_count,
+        "visible_message_count": visible_message_count,
+        "cursor_seed_count": cursor_seed_count,
         "reply_count": len(replies),
         "error_count": len(errors),
         "friends": targets,
@@ -1067,6 +1102,13 @@ def _cursor_from_messages(
     if outbound_texts:
         cursor["outbound_texts"] = list(dict.fromkeys(outbound_texts))[-20:]
     return cursor
+
+
+def _append_outbound_texts(cursor: dict[str, Any], texts: list[str]) -> None:
+    outbound_texts = _cursor_outbound_texts(cursor)
+    outbound_texts.extend(str(text or "").strip() for text in texts if str(text or "").strip())
+    if outbound_texts:
+        cursor["outbound_texts"] = list(dict.fromkeys(outbound_texts))[-20:]
 
 
 def _cursor_contains_message(cursor: dict[str, Any] | None, message: dict[str, Any]) -> bool:

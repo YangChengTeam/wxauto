@@ -809,6 +809,7 @@ def _event_label(event: str) -> str:
         "task.failed": "任务执行失败",
         "watch.chats.start": "消息监听开始",
         "watch.chats.read": "消息监听完成",
+        "watch.chats.skipped": "消息监听跳过回复",
         "watch.chats.message": "消息监听读到消息",
         "watch.chats.replied": "消息监听已回复",
         "watch.chats.failed": "消息监听失败",

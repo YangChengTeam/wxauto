@@ -173,6 +173,8 @@ class OperationWorker:
                 reply_all=bool(payload.get("reply_all", False)),
                 select_sender=bool(payload.get("select_sender", False)),
                 context_message_limit=self.settings.agent_context_message_count,
+                cursor_store=self.store,
+                account_id=task.account_id,
             )
         raise ValueError(f"Unsupported task type: {task.type}")
 
@@ -208,6 +210,8 @@ class OperationWorker:
             "chat_count",
             "message_count",
             "new_message_count",
+            "visible_message_count",
+            "cursor_seed_count",
             "error_count",
         ):
             if key in result:
