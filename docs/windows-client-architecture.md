@@ -8,7 +8,7 @@
 2. 检查新的好友申请，并按策略自动同意。
 3. 监听或发起微信聊天，把新消息交给大模型生成回复；后续可替换为正式智能体。
 
-所有能力都必须经由一个统一的 UIA/pyweixin 操作队列执行。不要让定时器、Webhook、UI 按钮、智能体线程直接操作微信窗口。
+所有能力都必须经由一个统一的 UIA/pyweixin 操作队列执行。不要让定时器、HTTP API、UI 按钮、智能体线程直接操作微信窗口。
 
 ## 推荐模块
 
@@ -18,7 +18,7 @@ wxclient/
   config/                      # 账号、触发器、白名单、限频、LLM 配置
   uia_unlock/                  # ensure_wechat_uia/probe_wechat_uia
   wechat_api/                  # pyweixin 二次封装
-  trigger/                     # 定时任务、Webhook、本地事件
+  trigger/                     # 定时任务、HTTP API、本地事件
   queue/                       # 单消费者任务队列、去重、重试、状态机
   agents/                      # 大模型或后续智能体
   agentbridge/                 # WeChat 事件 <-> Agent 请求/响应协议
@@ -70,7 +70,7 @@ ensure_wechat_uia(restart_if_needed=False)
 
 好友申请自动同意适合定时检查，因为 pyweixin 的 `Contacts.check_new_friends(verify=True)` 本质是 UI 自动化动作。
 
-2. Webhook
+2. HTTP API
 
 用于外部系统发指令：
 
@@ -79,7 +79,7 @@ ensure_wechat_uia(restart_if_needed=False)
 - `POST /tasks/agent-reply`
 - `POST /tasks/check-new-friends`
 
-Webhook 不直接碰微信，只写入 SQLite 和内存队列，返回 `task_id`。客户端后台 worker 再串行执行。
+HTTP API 不直接碰微信，只写入 SQLite 和内存队列，返回 `task_id`。客户端后台 worker 再串行执行。
 
 3. 本地 UI 操作
 
@@ -95,7 +95,7 @@ Webhook 不直接碰微信，只写入 SQLite 和内存队列，返回 `task_id`
 必须是单消费者 UI 操作队列：
 
 ```text
-Webhook / Scheduler / UI
+HTTP API / Scheduler / UI
         |
         v
   Task Store + Queue
@@ -114,7 +114,7 @@ Webhook / Scheduler / UI
 ### 主动加好友
 
 ```text
-Webhook/UI 提交 add_friend
+HTTP API/UI 提交 add_friend
   -> 校验手机号/微信号、白名单、频率限制
   -> 入队
   -> ensure_wechat_uia
@@ -207,7 +207,7 @@ uia_status
 - 任务页：待执行、执行中、失败、已完成。
 - 好友申请页：申请列表、自动通过规则、手动通过按钮。
 - 聊天页：最近消息、模型回复草稿、发送状态。
-- 设置页：微信路径、解锁策略、Webhook token、LLM 配置、限频策略。
+- 设置页：微信路径、解锁策略、HTTP token、LLM 配置、限频策略。
 - 诊断页：运行 `probe_wechat_uia`、导出控件树、查看最近错误。
 
 ## 最小落地顺序
@@ -215,9 +215,8 @@ uia_status
 1. 封装 `uia_unlock.ensure_wechat_uia()` 和 `probe_wechat_uia()`。
 2. 封装 `wechat_api.send_message()`，先打通文件传输助手。
 3. 加单消费者任务队列和 SQLite 任务表。
-4. 加 Webhook：`send-message`、`add-friend`。
+4. 加 HTTP API：`send-message`、`add-friend`。
 5. 加定时 `check_new_friends(verify=False)`，先只展示申请。
 6. 加策略化自动通过，默认 dry-run。
 7. 加消息轮询 -> agentbridge -> LLM -> send_message。
 8. 最后再做多实例管理。
-

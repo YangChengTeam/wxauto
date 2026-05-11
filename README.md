@@ -10,7 +10,7 @@ Windows 微信自动化客户端，基于 `third_party/pywechat/pyweixin` 和 UI
 - 监听聊天消息并交给大模型回复
 - 读取可见消息 / 未读消息
 - 发送朋友圈
-- 提供本地 Webhook、CLI、GUI 三种入口
+- 提供本地 HTTP API、CLI、GUI 三种入口
 
 ## 运行要求
 
@@ -74,7 +74,7 @@ wxclient send-message 文件传输助手 "真实发送测试" --real
 wxclient add-friend 13800138000 --greetings "你好" --real
 ```
 
-## Webhook
+## 本地 HTTP API
 
 默认监听 `http://127.0.0.1:8765`，常用接口：
 
@@ -87,7 +87,7 @@ wxclient add-friend 13800138000 --greetings "你好" --real
 - `POST /tasks/listen-chat`
 - `POST /tasks/listen-chats`
 
-如果配置了 `webhook_token`，请求头需要：
+如果配置了 `webhook_token`（兼容保留字段），请求头需要：
 
 ```text
 Authorization: Bearer <token>
@@ -109,7 +109,7 @@ Authorization: Bearer <token>
 - `port`
 - `wechat_path`
 - `dry_run`
-- `webhook_token`
+- `webhook_token`（HTTP 鉴权 token）
 - `llm_api_key`
 
 ## GUI
@@ -127,7 +127,7 @@ GUI 包含这些页面：
 ## 架构约束
 
 - 所有真实微信动作都必须先进入队列，再由单消费者 worker 串行执行
-- Webhook、定时器、UI 只负责投递任务，不能直接碰微信窗口
+- HTTP API、定时器、UI 只负责投递任务，不能直接碰微信窗口
 - 业务层只通过 `wxclient/wechat_api/` 封装调用 `pyweixin`
 - UIA 解锁只走 `ensure_wechat_uia()`
 - 真实加好友、同意好友、发消息、发朋友圈都应保留 `dry_run` 或确认机制
@@ -137,4 +137,3 @@ GUI 包含这些页面：
 - [`docs/windows-client-architecture.md`](docs/windows-client-architecture.md)
 - [`docs/pyweixin-uia-integration.md`](docs/pyweixin-uia-integration.md)
 - [`docs/first-version-usage.md`](docs/first-version-usage.md)
-

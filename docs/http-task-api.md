@@ -1,10 +1,10 @@
-# Webhook / HTTP 服务器说明
+# 本地 HTTP 任务接口说明
 
 ## 结论
 
 已实现。
 
-当前仓库里的 Webhook 不是占位设计，而是已经落地的本地 HTTP 服务，技术栈是：
+当前仓库里的本地 HTTP 任务接口不是占位设计，而是已经落地的本地 HTTP 服务，技术栈是：
 
 - `FastAPI`
 - `uvicorn`
@@ -30,7 +30,7 @@ HTTP 服务器只负责两件事：
 这符合当前项目的核心约束：
 
 - 微信 UI 自动化动作必须串行执行
-- Webhook、定时器、UI、Agent 只能投递任务，不能直接操作微信窗口
+- HTTP API、定时器、UI、Agent 只能投递任务，不能直接操作微信窗口
 
 ## 启动方式
 
@@ -107,7 +107,7 @@ http://127.0.0.1:8765
 
 - HTTP 请求返回很快，因为只负责入队
 - 真正执行是否成功，要看后续任务状态
-- 多个 Webhook 并发到达时，微信动作仍然会被 worker 串行处理
+- 多个 HTTP 请求并发到达时，微信动作仍然会被 worker 串行处理
 
 ## 当前已实现的 HTTP 接口
 
@@ -397,6 +397,8 @@ GET /tasks
 
 当前实现使用可选的 Bearer Token。
 
+配置项名仍然叫 `webhook_token`，这是兼容保留的旧命名；它现在实际承担的是本地 HTTP API 的鉴权 token。
+
 配置：
 
 ```json
@@ -496,7 +498,7 @@ worker 已开始处理
 - 请求来源字段
 - 失败分类和报警
 
-## Scheduler 和 Webhook 的关系
+## Scheduler 和 HTTP API 的关系
 
 启动 `serve` 时，除了 HTTP 服务还会一起启动 `Scheduler`。
 
@@ -505,7 +507,7 @@ worker 已开始处理
 - 立即入队一次 `check_new_friends`
 - 然后按 `friend_check_interval_seconds` 周期继续入队
 
-所以你在 `GET /tasks` 里看到的任务，不一定都是外部 Webhook 触发的，也可能是定时器生成的。
+所以你在 `GET /tasks` 里看到的任务，不一定都是外部 HTTP API 触发的，也可能是定时器生成的。
 
 ## 当前未暴露成 HTTP 的能力
 
@@ -520,7 +522,7 @@ worker 已开始处理
 也就是说：
 
 - CLI 和 GUI 能做的事
-- 不一定都能直接通过当前 Webhook 调用
+- 不一定都能直接通过当前 HTTP API 调用
 
 如果后续要补接口，最直接的地方就是：
 
@@ -613,7 +615,7 @@ Invoke-RestMethod -Method Get `
 
 说明：
 
-- 服务端配置了 `webhook_token`
+- 服务端配置了 `webhook_token`（兼容保留字段）
 - 你的请求头没有带 `Authorization: Bearer <token>`
 - 或 token 不匹配
 
@@ -633,4 +635,3 @@ Invoke-RestMethod -Method Get `
 - `wxclient/queue/store.py`
 - `wxclient/queue/worker.py`
 - `docs/first-version-usage.md`
-
