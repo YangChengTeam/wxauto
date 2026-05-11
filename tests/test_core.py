@@ -645,7 +645,13 @@ class CoreTests(unittest.TestCase):
         api = FakeChatApi(
             [{"sender": "Other", "text": "hello", "is_self": False}],
             session_summaries=[
-                {"name": "Mzxx", "preview": "Me: already answered", "is_selected": True},
+                {
+                    "name": "Mzxx",
+                    "preview": "Me: already answered",
+                    "timestamp_text": "10:32",
+                    "timestamp_is_today": True,
+                    "is_selected": True,
+                },
             ],
         )
 
@@ -664,6 +670,39 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["fallback_window_opened"], False)
         self.assertEqual(result["results"][0]["latest_message_source"], "session_preview")
         self.assertEqual(result["results"][0]["decision_reason"], "latest_is_self_preview")
+        self.assertTrue(result["results"][0]["latest_is_today"])
+        self.assertEqual(result["results"][0]["timestamp_text"], "10:32")
+
+    def test_watch_chats_skips_separate_window_when_session_summary_is_not_today(self) -> None:
+        api = FakeChatApi(
+            [{"sender": "Other", "text": "hello", "is_self": False}],
+            session_summaries=[
+                {
+                    "name": "Mzxx",
+                    "preview": "Other: old message",
+                    "timestamp_text": "昨天 10:32",
+                    "timestamp_is_today": False,
+                    "is_selected": True,
+                },
+            ],
+        )
+
+        result = watch_chats_messages(
+            api=api,
+            agent=EchoAgent(),
+            friends=["Mzxx"],
+            duration="1s",
+            real=True,
+            auto_reply=True,
+        )
+
+        self.assertEqual(result["reply_count"], 0)
+        self.assertEqual(api.scanned, [])
+        self.assertEqual(api.visible_reads, [])
+        self.assertFalse(result["results"][0]["fallback_window_opened"])
+        self.assertEqual(result["results"][0]["decision_reason"], "not_today")
+        self.assertFalse(result["results"][0]["latest_is_today"])
+        self.assertEqual(result["results"][0]["timestamp_text"], "昨天 10:32")
 
     def test_watch_chats_uses_scan_result_instead_of_seeding_visible_history(self) -> None:
         api = FakeChatApi([{"sender": "Mzxx", "text": "hello", "is_self": False}])

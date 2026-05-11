@@ -156,10 +156,27 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         return (
             f"Agent 请求「{payload.get('chat') or '-'}」："
             f"来源={payload.get('source') or '-'}，"
+            f"消息「{payload.get('input_message') or ''}」，"
+            f"上下文 {payload.get('context_count', 0)} 条，"
+            f"自己消息={_yes_no(payload.get('latest_is_self'))}，"
+            f"今天={_yes_no(payload.get('latest_is_today'))}"
+        )
+        return (
+            f"Agent 请求「{payload.get('chat') or '-'}」："
+            f"来源={payload.get('source') or '-'}，"
             f"输入「{payload.get('input_message') or ''}」，"
             f"上下文 {payload.get('context_count', 0)} 条"
         )
     if event == "reply.agent.response":
+        return (
+            f"Agent 响应「{payload.get('chat') or '-'}」："
+            f"来源={payload.get('source') or '-'}，"
+            f"回复「{payload.get('reply_message') or ''}」，"
+            f"上下文 {payload.get('context_count', 0)} 条，"
+            f"自己消息={_yes_no(payload.get('latest_is_self'))}，"
+            f"今天={_yes_no(payload.get('latest_is_today'))}，"
+            f"耗时 {payload.get('elapsed_ms', 0)}ms"
+        )
         return (
             f"Agent 返回「{payload.get('chat') or '-'}」："
             f"来源={payload.get('source') or '-'}，"
@@ -179,10 +196,32 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"监听到新消息 {payload.get('message_count', 0)} 条，"
             f"已回复 {payload.get('reply_count', 0)} 条，"
             f"最后一条「{payload.get('latest_message') or ''}」，"
+            f"依据={payload.get('latest_message_source') or '-'}，"
+            f"自己消息判定={payload.get('latest_is_self_source') or '-'}，"
+            f"今天={_yes_no(payload.get('latest_is_today'))}，"
+            f"时间={payload.get('timestamp_text') or '-'}，"
+            f"判定={_decision_reason_label(payload.get('decision_reason'))}，"
+            f"开窗={_yes_no(payload.get('fallback_window_opened'))}"
+        )
+        return (
+            f"监听完成「{payload.get('chat') or '-'}」："
+            f"可见消息 {payload.get('visible_message_count', 0)} 条，"
+            f"监听到新消息 {payload.get('message_count', 0)} 条，"
+            f"已回复 {payload.get('reply_count', 0)} 条，"
+            f"最后一条「{payload.get('latest_message') or ''}」，"
             f"最新消息依据={payload.get('latest_message_source') or '-'}，"
             f"判定={payload.get('decision_reason') or '-'}"
         )
     if event == "watch.chats.skip_summary":
+        return (
+            f"监听跳过「{payload.get('chat') or '-'}」："
+            f"{_skip_reason_label(payload.get('reason'))}，"
+            f"最后一条「{payload.get('latest_message') or ''}」，"
+            f"依据={payload.get('latest_message_source') or '-'}，"
+            f"自己消息判定={payload.get('latest_is_self_source') or '-'}，"
+            f"今天={_yes_no(payload.get('latest_is_today'))}，"
+            f"时间={payload.get('timestamp_text') or '-'}"
+        )
         return (
             f"监听跳过「{payload.get('chat') or '-'}」："
             f"{_skip_reason_label(payload.get('reason'))}，"
@@ -389,6 +428,8 @@ def _yes_no(value: Any) -> str:
 
 
 def _skip_reason_label(value: Any) -> str:
+    if str(value or "") == "latest_is_self_preview":
+        return "会话列表最后一条是自己发送的"
     labels = {
         "friend_filter": "不符合目标会话过滤",
         "not_new_after_cursor": "游标之后没有新消息",
@@ -401,6 +442,18 @@ def _skip_reason_label(value: Any) -> str:
         "no_replyable_message": "没有可回复的消息",
     }
     return labels.get(str(value or ""), str(value or "未说明原因"))
+
+def _decision_reason_label(value: Any) -> str:
+    labels = {
+        "replied": "已回复",
+        "auto_reply_disabled": "仅监听未自动回复",
+        "not_today": "最后一条不是今天的消息",
+        "latest_is_self_preview": "会话列表最后一条是自己发送的",
+        "latest_is_self": "最后一条是自己发送的",
+        "empty_latest_message": "最后一条消息为空",
+        "no_replyable_message": "没有可回复消息",
+    }
+    return labels.get(str(value or ""), str(value or "未说明"))
 
 
 def _format_timestamp(value: str) -> str:

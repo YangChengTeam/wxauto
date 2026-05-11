@@ -143,6 +143,7 @@ def reply_to_chat_messages(
             input_message=_truncate_text(inbound_text),
             context_count=len(context),
             latest_is_self=message.get("is_self"),
+            latest_is_today=message.get("timestamp_is_today"),
         )
         reply_text = agent.reply(inbound_text, context=context).strip()
         elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -152,6 +153,8 @@ def reply_to_chat_messages(
             source=source,
             reply_message=_truncate_text(reply_text),
             context_count=len(context),
+            latest_is_self=message.get("is_self"),
+            latest_is_today=message.get("timestamp_is_today"),
             elapsed_ms=elapsed_ms,
         )
         if not reply_text:
@@ -248,8 +251,46 @@ def watch_chats_messages(
         outbound_texts = _cursor_outbound_texts(cursor)
         session_summary = _find_chat_session(session_summaries, chat_name)
         session_preview = _session_summary_preview(session_summary)
+        session_timestamp_text = _session_summary_timestamp_text(session_summary)
+        session_is_today = _session_summary_is_today(session_summary)
         preview_self_source = _session_preview_self_reason(session_preview, outbound_texts)
-        if preview_self_source is not None:
+        if session_is_today is False:
+            result = {
+                "action": "watch_chat",
+                "friend": chat_name,
+                "duration": duration,
+                "dry_run": not real,
+                "auto_reply": auto_reply,
+                "visible_message_count": 0,
+                "new_message_count": 0,
+                "reply_count": 0,
+                "cursor_seeded": False,
+                "source_result": None,
+                "latest_message": _truncate_text(session_preview),
+                "latest_message_source": "session_preview",
+                "latest_is_self_source": preview_self_source,
+                "decision_reason": "not_today",
+                "fallback_window_opened": False,
+                "reply_message_source": None,
+                "session_preview": session_preview,
+                "timestamp_text": session_timestamp_text,
+                "latest_is_today": False,
+            }
+            chat_results.append(result)
+            logger.info(
+                "watch.chats.skip_summary",
+                chat=chat_name,
+                reason="not_today",
+                visible_message_count=0,
+                latest_message=result["latest_message"],
+                latest_message_source="session_preview",
+                latest_is_self_source=preview_self_source,
+                timestamp_text=session_timestamp_text,
+                latest_is_today=False,
+                decision_reason="not_today",
+            )
+            continue
+        if preview_self_source is not None and session_is_today is True:
             result = {
                 "action": "watch_chat",
                 "friend": chat_name,
@@ -268,6 +309,8 @@ def watch_chats_messages(
                 "fallback_window_opened": False,
                 "reply_message_source": None,
                 "session_preview": session_preview,
+                "timestamp_text": session_timestamp_text,
+                "latest_is_today": True,
             }
             chat_results.append(result)
             logger.info(
@@ -278,6 +321,8 @@ def watch_chats_messages(
                 latest_message=result["latest_message"],
                 latest_message_source="session_preview",
                 latest_is_self_source=preview_self_source,
+                timestamp_text=session_timestamp_text,
+                latest_is_today=True,
                 decision_reason="latest_is_self_preview",
             )
             continue
@@ -380,6 +425,8 @@ def watch_chats_messages(
                 "fallback_window_opened": True,
                 "reply_message_source": reply_message_source,
                 "session_preview": session_preview,
+                "timestamp_text": latest_message_row.get("timestamp_text") if isinstance(latest_message_row, dict) else session_timestamp_text,
+                "latest_is_today": latest_message_row.get("timestamp_is_today") if isinstance(latest_message_row, dict) else session_is_today,
             }
             chat_results.append(result)
 
@@ -393,6 +440,8 @@ def watch_chats_messages(
                 latest_message=latest_message,
                 latest_message_source=latest_message_source,
                 latest_is_self_source=latest_is_self_source,
+                timestamp_text=result["timestamp_text"],
+                latest_is_today=result["latest_is_today"],
                 decision_reason=decision_reason,
                 fallback_window_opened=True,
                 reply_message_source=reply_message_source,
@@ -411,6 +460,8 @@ def watch_chats_messages(
                     latest_message=latest_message,
                     latest_message_source=latest_message_source,
                     latest_is_self_source=latest_is_self_source,
+                    timestamp_text=result["timestamp_text"],
+                    latest_is_today=result["latest_is_today"],
                     decision_reason=decision_reason,
                 )
             for reply in chat_replies:
@@ -485,6 +536,22 @@ def _session_summary_preview(session: dict[str, Any] | None) -> str | None:
     preview = session.get("preview")
     preview_text = str(preview or "").strip()
     return preview_text or None
+
+
+def _session_summary_timestamp_text(session: dict[str, Any] | None) -> str | None:
+    if not session:
+        return None
+    value = str(session.get("timestamp_text") or "").strip()
+    return value or None
+
+
+def _session_summary_is_today(session: dict[str, Any] | None) -> bool | None:
+    if not session:
+        return None
+    value = session.get("timestamp_is_today")
+    if value is None:
+        return None
+    return bool(value)
 
 
 def _session_preview_self_reason(preview: str | None, outbound_texts: list[str]) -> str | None:
@@ -919,6 +986,8 @@ def _reply_to_current_chat_latest(
         input_message=_truncate_text(inbound_text),
         context_count=len(context),
         sender=sender,
+        latest_is_self=latest.get("is_self"),
+        latest_is_today=latest.get("timestamp_is_today"),
     )
     reply_text = agent.reply(prompt, context=context).strip()
     elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -928,6 +997,8 @@ def _reply_to_current_chat_latest(
         source="unread",
         reply_message=_truncate_text(reply_text),
         context_count=len(context),
+        latest_is_self=latest.get("is_self"),
+        latest_is_today=latest.get("timestamp_is_today"),
         elapsed_ms=elapsed_ms,
     )
     if not reply_text:
@@ -1112,6 +1183,8 @@ def _reply_to_chat_batch(
             input_message=_truncate_text(inbound_text),
             context_count=len(context),
             sender=sender,
+            latest_is_self=message.get("is_self"),
+            latest_is_today=message.get("timestamp_is_today"),
         )
         reply_text = agent.reply(prompt, context=context).strip()
         elapsed_ms = int((time.perf_counter() - started) * 1000)
@@ -1121,6 +1194,8 @@ def _reply_to_chat_batch(
             source=source,
             reply_message=_truncate_text(reply_text),
             context_count=len(context),
+            latest_is_self=message.get("is_self"),
+            latest_is_today=message.get("timestamp_is_today"),
             elapsed_ms=elapsed_ms,
         )
         if not reply_text:

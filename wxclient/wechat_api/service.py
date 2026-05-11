@@ -755,6 +755,8 @@ class WeChatApi:
                     "name": name,
                     "text": text,
                     "preview": _session_preview_from_text(text),
+                    "timestamp_text": _session_timestamp_from_text(text),
+                    "timestamp_is_today": _session_timestamp_is_today(_session_timestamp_from_text(text)),
                     "automation_id": automation_id or None,
                     "is_selected": bool(
                         _truthy_safe_call(getattr(item, "is_selected", None))
@@ -1347,6 +1349,64 @@ def _session_preview_from_text(text: str) -> str | None:
     if len(lines) < 2:
         return None
     return lines[1] or None
+
+
+def _session_timestamp_from_text(text: str) -> str | None:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if len(lines) < 2:
+        return None
+    for line in reversed(lines):
+        if _session_timestamp_is_today(line) is not None:
+            return line
+    return None
+
+
+def _session_timestamp_is_today(text: str) -> bool | None:
+    value = " ".join(str(text or "").strip().split())
+    if not value:
+        return None
+    if re.fullmatch(r"\d{1,2}:\d{2}", value):
+        return True
+    lowered = value.lower()
+    if "昨天" in value or "yesterday" in lowered:
+        return False
+
+    today = date.today()
+    chinese_date = re.search(r"(?:(?P<year>\d{4})年)?(?P<month>\d{1,2})月(?P<day>\d{1,2})日", value)
+    if chinese_date:
+        try:
+            year = int(chinese_date.group("year") or today.year)
+            month = int(chinese_date.group("month"))
+            day = int(chinese_date.group("day"))
+            return date(year, month, day) == today
+        except ValueError:
+            return None
+
+    slash_date = re.search(r"(?:(?P<year>\d{4})/)?(?P<month>\d{1,2})/(?P<day>\d{1,2})", value)
+    if slash_date:
+        try:
+            year = int(slash_date.group("year") or today.year)
+            month = int(slash_date.group("month"))
+            day = int(slash_date.group("day"))
+            return date(year, month, day) == today
+        except ValueError:
+            return None
+
+    dash_date = re.search(r"(?P<year>\d{4})-(?P<month>\d{1,2})-(?P<day>\d{1,2})", value)
+    if dash_date:
+        try:
+            return (
+                date(
+                    int(dash_date.group("year")),
+                    int(dash_date.group("month")),
+                    int(dash_date.group("day")),
+                )
+                == today
+            )
+        except ValueError:
+            return None
+
+    return None
 
 
 def _session_preview_is_self_message(preview: Any, message_text: str) -> bool:
