@@ -9,8 +9,21 @@ from pathlib import Path
 from typing import Any
 
 
-MAIN_WINDOW_CLASS = "mmui::MainWindow"
-LOGIN_WINDOW_CLASS = "mmui::LoginWindow"
+WECHAT_WINDOW_TITLE = "微信"
+WECHAT_PROCESS_NAMES = {"wechat.exe", "weixin.exe"}
+WECHAT_MAIN_CLASSES = {"WeChatMainWndForPC", "WeChatLoginWndForPC"}
+WECHAT_UTILITY_CLASSES = {
+    "Base_PowerMessageWindow",
+    "Chrome_SystemMessageWindow",
+    "DisplayICC_SystemMessageWindow",
+    "IME",
+    "MSCTFIME UI",
+    "Qt51514WxTrayIconMessageWindowClass",
+    "Sogou_TSF_UI",
+    "SoWB_Status",
+    "SoWB_UI",
+    "libusb-1.0-windows-hotplug",
+}
 SPI_GETSCREENREADER = 0x0046
 SPI_SETSCREENREADER = 0x0047
 SPIF_SENDCHANGE = 0x0002
@@ -38,18 +51,15 @@ def probe_wechat_uia(max_depth: int = 10, max_nodes: int = 5000) -> dict[str, An
             "reason": f"probe failed: {exc}",
         }
 
-    main_windows = [item for item in windows if item["class_name"] == MAIN_WINDOW_CLASS]
-    login_windows = [item for item in windows if item["class_name"] == LOGIN_WINDOW_CLASS]
-    selected = main_windows[0] if main_windows else None
+    selected = windows[0] if windows else None
     exposed = bool(selected and selected["descendant_count"] > 10)
 
     return {
         "platform": "Windows",
-        "logged_in": bool(main_windows),
-        "login_window": bool(login_windows) and not main_windows,
+        "logged_in": bool(windows),
+        "login_window": False,
         "uia_exposed": exposed,
-        "main_window_count": len(main_windows),
-        "login_window_count": len(login_windows),
+        "window_count": len(windows),
         "selected_window": selected,
         "windows": windows,
         "max_depth": max_depth,
@@ -58,25 +68,63 @@ def probe_wechat_uia(max_depth: int = 10, max_nodes: int = 5000) -> dict[str, An
     }
 
 
+def bootstrap_wechat_uia(
+    wechat_path: str | Path | None = None,
+    *,
+    restart_if_needed: bool = False,
+    startup_wait: float = 35.0,
+    quick_timeout: float = 5.0,
+    probe_max_depth: int = 4,
+    probe_max_nodes: int = 120,
+) -> dict[str, Any]:
+    """Try a fast unlock first, then optionally fall back to Narrator + restart."""
+    probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+    if probe.get("uia_exposed") is True:
+        return {"success": True, "mode": "already", "probe": probe}
+    if probe.get("platform") != "Windows":
+        return {"success": False, "mode": "unsupported", "probe": probe}
+
+    if try_unlock_without_restart(
+        wechat_path=wechat_path,
+        timeout=quick_timeout,
+        probe_max_depth=probe_max_depth,
+        probe_max_nodes=probe_max_nodes,
+    ):
+        probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+        return {"success": bool(probe.get("uia_exposed")), "mode": "quick", "probe": probe}
+
+    probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+    if probe.get("uia_exposed") is True:
+        return {"success": True, "mode": "quick", "probe": probe}
+    if not restart_if_needed:
+        return {"success": False, "mode": "quick_failed", "probe": probe}
+
+    success = unlock_with_narrator(
+        wechat_path=wechat_path,
+        restart_wechat=True,
+        startup_wait=startup_wait,
+        probe_max_depth=probe_max_depth,
+        probe_max_nodes=probe_max_nodes,
+    )
+    probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+    return {
+        "success": bool(success and probe.get("uia_exposed")),
+        "mode": "restart" if success and probe.get("uia_exposed") else "restart_failed",
+        "probe": probe,
+    }
+
+
 def ensure_wechat_uia(
     restart_if_needed: bool = False,
     wechat_path: str | Path | None = None,
     startup_wait: float = 35.0,
 ) -> bool:
-    probe = probe_wechat_uia()
-    if probe.get("uia_exposed") is True:
-        return True
-    if probe.get("platform") != "Windows":
-        return False
-
-    if not restart_if_needed:
-        return False
-
-    return unlock_with_narrator(
+    result = bootstrap_wechat_uia(
         wechat_path=wechat_path,
-        restart_wechat=True,
+        restart_if_needed=restart_if_needed,
         startup_wait=startup_wait,
     )
+    return bool(result.get("success"))
 
 
 def get_screen_reader_active() -> bool | None:
@@ -100,7 +148,7 @@ def get_screen_reader_active() -> bool | None:
 
 
 def set_screen_reader_active(active: bool) -> bool:
-    """Set the Windows screen reader flag used by WeChat to expose UIA nodes."""
+    """Set the Windows screen reader flag and broadcast the change to all windows."""
     if platform.system() != "Windows":
         return False
 
@@ -113,7 +161,57 @@ def set_screen_reader_active(active: bool) -> bool:
         )
     except Exception:
         return False
-    return bool(result)
+    if not result:
+        return False
+    notify_screen_reader_change()
+    return True
+
+
+def notify_screen_reader_change() -> bool:
+    """Broadcast WM_SETTINGCHANGE so running apps re-check accessibility settings."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        SMTO_ABORTIFHUNG = 0x0002
+        SMTO_BLOCK = 0x0020
+        result = ctypes.c_ulong_PTR(0)
+        user32.SendMessageTimeoutW.restype = ctypes.c_ulong_PTR
+        user32.SendMessageTimeoutW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
+            ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_uint,
+            ctypes.POINTER(ctypes.c_ulong_PTR),
+        ]
+        ret = user32.SendMessageTimeoutW(
+            0xFFFF, 0x001A, 0, "Accessibility",
+            SMTO_ABORTIFHUNG | SMTO_BLOCK, 5000, result,
+        )
+        return bool(ret)
+    except Exception:
+        return False
+
+
+def try_unlock_without_restart(
+    wechat_path: str | Path | None = None,
+    timeout: float = 5.0,
+    *,
+    probe_max_depth: int = 4,
+    probe_max_nodes: int = 120,
+) -> bool:
+    """Try to unlock UIA by setting the screen reader flag + broadcast, without restarting WeChat."""
+    if platform.system() != "Windows":
+        return False
+    probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+    if probe.get("uia_exposed"):
+        return True
+    if not set_screen_reader_active(True):
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(1)
+        if probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes).get("uia_exposed"):
+            return True
+    return False
 
 
 def unlock_with_narrator(
@@ -121,6 +219,9 @@ def unlock_with_narrator(
     restart_wechat: bool = True,
     startup_wait: float = 35.0,
     stop_narrator_after_wechat: bool = True,
+    *,
+    probe_max_depth: int = 4,
+    probe_max_nodes: int = 120,
 ) -> bool:
     if platform.system() != "Windows":
         return False
@@ -134,7 +235,7 @@ def unlock_with_narrator(
     deadline = time.monotonic() + startup_wait
     exposed = False
     while time.monotonic() < deadline:
-        probe = probe_wechat_uia()
+        probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
         if probe.get("uia_exposed") is True:
             exposed = True
             break
@@ -143,7 +244,11 @@ def unlock_with_narrator(
     if stop_narrator_after_wechat:
         stop_narrator()
         time.sleep(1)
-        exposed = bool(probe_wechat_uia().get("uia_exposed"))
+        exposed = bool(
+            probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes).get(
+                "uia_exposed"
+            )
+        )
     return exposed
 
 
@@ -179,24 +284,26 @@ def start_wechat(wechat_path: str | Path | None = None) -> None:
 
 
 def close_wechat_windows() -> None:
-    for window in _desktop().windows():
-        class_name = _safe_call(window.class_name)
-        if class_name in {MAIN_WINDOW_CLASS, LOGIN_WINDOW_CLASS}:
-            try:
-                window.close()
-            except Exception:
-                continue
+    for candidate in _find_wechat_window_candidates():
+        window = candidate.get("_window")
+        if window is None:
+            continue
+        try:
+            window.close()
+        except Exception:
+            continue
 
 
 def _find_wechat_windows(max_depth: int, max_nodes: int) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    for window in _desktop().windows():
-        class_name = _safe_call(window.class_name)
-        if class_name not in {MAIN_WINDOW_CLASS, LOGIN_WINDOW_CLASS}:
+    for candidate in _find_wechat_window_candidates():
+        handle = candidate.get("handle")
+        if not handle:
             continue
-        handle = _safe_call(lambda: window.handle)
-        text = _safe_call(window.window_text)
-        process_id = _safe_call(window.process_id)
+        try:
+            window = _desktop("uia").window(handle=handle)
+        except Exception:
+            window = candidate.get("_window")
         descendant_count = _count_descendants(
             window,
             max_depth=max_depth,
@@ -205,14 +312,88 @@ def _find_wechat_windows(max_depth: int, max_nodes: int) -> list[dict[str, Any]]
         items.append(
             {
                 "handle": handle,
-                "process_id": process_id,
-                "class_name": class_name,
-                "title": text,
+                "process_id": candidate.get("process_id"),
+                "process_name": candidate.get("process_name"),
+                "process_path": candidate.get("process_path"),
+                "class_name": candidate.get("class_name"),
+                "title": candidate.get("title"),
                 "descendant_count": descendant_count,
+                "candidate_score": candidate.get("score", 0),
             }
         )
-    items.sort(key=lambda item: 0 if item["class_name"] == MAIN_WINDOW_CLASS else 1)
+    items.sort(key=lambda item: (-item["descendant_count"], -item["candidate_score"]))
     return items
+
+
+def _find_wechat_window_candidates() -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    seen_handles: set[int] = set()
+    for window in _desktop("win32").windows():
+        title = str(_safe_call(window.window_text) or "").strip()
+        class_name = str(_safe_call(window.class_name) or "").strip()
+        handle = _safe_call(lambda: window.handle)
+        if not isinstance(handle, int) or handle in seen_handles:
+            continue
+        process_id = _safe_call(window.process_id)
+        process_info = _process_info(process_id)
+        process_name = str(process_info.get("name") or "").strip()
+        if not _is_wechat_window_candidate(title, class_name, process_name):
+            continue
+        seen_handles.add(handle)
+        candidates.append(
+            {
+                "_window": window,
+                "handle": handle,
+                "process_id": process_id,
+                "process_name": process_name,
+                "process_path": process_info.get("path"),
+                "class_name": class_name,
+                "title": title,
+                "score": _wechat_candidate_score(title, class_name),
+            }
+        )
+    candidates.sort(key=lambda item: -int(item.get("score") or 0))
+    return candidates
+
+
+def _is_wechat_window_candidate(title: str, class_name: str, process_name: str) -> bool:
+    if process_name.lower() not in WECHAT_PROCESS_NAMES:
+        return False
+    if title != WECHAT_WINDOW_TITLE:
+        return False
+    if class_name in WECHAT_UTILITY_CLASSES:
+        return False
+    if title == "WxTrayIconMessageWindow" or "TrayIcon" in class_name:
+        return False
+    if class_name in WECHAT_MAIN_CLASSES:
+        return True
+    return "QWindowIcon" in class_name and class_name.startswith("Qt")
+
+
+def _wechat_candidate_score(title: str, class_name: str) -> int:
+    score = 0
+    if title == WECHAT_WINDOW_TITLE:
+        score += 30
+    if class_name in WECHAT_MAIN_CLASSES:
+        score += 10
+    if "QWindowIcon" in class_name:
+        score += 5
+    return score
+
+
+def _process_info(process_id: Any) -> dict[str, str]:
+    if not isinstance(process_id, int):
+        return {}
+    try:
+        import psutil
+
+        process = psutil.Process(process_id)
+        return {
+            "name": process.name(),
+            "path": process.exe(),
+        }
+    except Exception:
+        return {}
 
 
 def _count_descendants(window: Any, max_depth: int, max_nodes: int) -> int:
@@ -233,10 +414,10 @@ def _count_descendants(window: Any, max_depth: int, max_nodes: int) -> int:
     return count
 
 
-def _desktop() -> Any:
+def _desktop(backend: str = "uia") -> Any:
     from pywinauto import Desktop
 
-    return Desktop(backend="uia")
+    return Desktop(backend=backend)
 
 
 def _system_parameters_info(

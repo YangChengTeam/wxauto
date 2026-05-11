@@ -13,6 +13,7 @@ from PySide6.QtGui import QFont, QFontDatabase, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGridLayout,
@@ -41,16 +42,20 @@ from wxclient.config import Settings
 from wxclient.logging_config import configure_logging
 from wxclient.queue import OperationWorker, TaskStore
 from wxclient.uia_unlock import (
+    bootstrap_wechat_uia,
     get_screen_reader_active,
     probe_wechat_uia,
     set_screen_reader_active,
+    try_unlock_without_restart,
+    unlock_with_narrator,
 )
 from wxclient.wechat_api import WeChatApi
 
-from .config import save_gui_settings
+from .config import load_form_state, save_gui_settings
 from .task_actions import (
     enqueue_add_friend,
     enqueue_check_new_friends,
+    enqueue_post_moments,
     enqueue_reply_unread,
     enqueue_watch_chats,
 )
@@ -60,6 +65,9 @@ APP_NAME = "AI微信自动化"
 
 class MainWindow(QMainWindow):
     uia_probe_finished = Signal(dict)
+    uia_unlock_finished = Signal(bool, str)
+    uia_bootstrap_finished = Signal(dict)
+    worker_start_finished = Signal(dict)
 
     def __init__(self, settings: Settings, config_path: Path) -> None:
         super().__init__()
@@ -68,12 +76,19 @@ class MainWindow(QMainWindow):
         self._uia_probe_running = False
         self._closing = False
         self._last_operation_state: str | None = None
+        self._worker_starting = False
         self.uia_probe_finished.connect(self._handle_uia_probe_result)
+        self.uia_unlock_finished.connect(self._handle_uia_unlock_result)
+        self.uia_bootstrap_finished.connect(self._handle_uia_bootstrap_result)
+        self.worker_start_finished.connect(self._handle_worker_start_result)
+        self._uia_unlock_running = False
+        self._startup_uia_bootstrap_running = False
         self._append_log("正在启动 AI微信自动化。")
         _load_ui_font()
         self._append_log("界面字体已加载，准备初始化配置。")
         self.settings = settings
         self.config_path = config_path
+        self._form_state = load_form_state(config_path)
         self._append_log(f"配置文件位置：{config_path}")
         self._append_log(f"数据目录：{settings.data_dir}")
         self.store = TaskStore(settings.resolved_database_path)
@@ -86,7 +101,7 @@ class MainWindow(QMainWindow):
         self.worker = OperationWorker(self.store, self.api, settings=settings)
         self._append_log("串行任务服务已准备，微信动作会按队列逐个执行。")
         self.worker_running = False
-        self.log_path = settings.data_dir / "logs" / "worker.log"
+        self.log_path = settings.data_dir / "logs" / "ui.log"
         self.task_tables: list[tuple[QTableWidget, set[str] | None]] = []
         self._previous_screen_reader_state = get_screen_reader_active()
         if self._previous_screen_reader_state is None:
@@ -118,6 +133,7 @@ class MainWindow(QMainWindow):
             self._append_log("未找到应用图标，使用系统默认图标。")
         self.setWindowTitle(APP_NAME)
         self._build_ui()
+        self._show_logs()
         self._append_log("主界面已创建。")
         self.refresh_timer.start(2000)
         self.uia_timer.start(10000)
@@ -126,9 +142,13 @@ class MainWindow(QMainWindow):
         self.refresh_all()
         self.refresh_uia_status()
         self.refresh_operation_state()
+        self._bootstrap_uia_on_startup()
 
     def closeEvent(self, event: Any) -> None:  # type: ignore[override]
         self._closing = True
+        self._worker_starting = False
+        self._startup_uia_bootstrap_running = False
+        self._persist_form_state()
         self.refresh_timer.stop()
         self.uia_timer.stop()
         self.worker_state_timer.stop()
@@ -163,13 +183,20 @@ class MainWindow(QMainWindow):
 
         sidebar_layout.addWidget(self._brand_panel())
         sidebar_layout.addWidget(self._operation_status_panel())
+        sidebar_layout.addWidget(self._uia_status_panel())
+        sidebar_layout.addWidget(self._section_label("日志"))
+
+        self.logs_button = QPushButton("运行日志")
+        self.logs_button.setObjectName("navButton")
+        self.logs_button.clicked.connect(self._show_logs)
+        sidebar_layout.addWidget(self.logs_button)
+
         sidebar_layout.addWidget(self._section_label("自动化"))
 
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
-        for text in ("总览", "好友检测", "未读回复", "消息监听", "添加好友"):
+        for text in ("好友检测", "未读回复", "消息监听", "添加好友", "朋友圈"):
             self.nav.addItem(QListWidgetItem(text))
-        self.nav.setCurrentRow(0)
         self.nav.currentRowChanged.connect(self._switch_page)
         sidebar_layout.addWidget(self.nav, 1)
 
@@ -184,6 +211,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._unread_automation_page())
         self.pages.addWidget(self._watch_automation_page())
         self.pages.addWidget(self._add_friend_page())
+        self.pages.addWidget(self._moments_page())
         self.pages.addWidget(self._settings_page())
 
         shell_layout.addWidget(sidebar)
@@ -260,6 +288,37 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.operation_status_detail)
         return panel
 
+    def _uia_status_panel(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("uiaStatus")
+        panel.setProperty("state", "unknown")
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(2)
+
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        self.uia_panel_dot = QLabel()
+        self.uia_panel_dot.setObjectName("uiaPanelDot")
+        self.uia_panel_dot.setFixedSize(8, 8)
+        self.uia_state_label = QLabel("正在检测...")
+        self.uia_state_label.setObjectName("uiaStateLabel")
+        header.addWidget(self.uia_panel_dot)
+        header.addWidget(self.uia_state_label, 1)
+        layout.addLayout(header)
+
+        self.uia_detail_label = QLabel("微信 UIA 状态待检测")
+        self.uia_detail_label.setObjectName("uiaDetailLabel")
+        self.uia_detail_label.setWordWrap(True)
+        layout.addWidget(self.uia_detail_label)
+
+        self.uia_unlock_button = QPushButton("解锁 UIA")
+        self.uia_unlock_button.setObjectName("uiaUnlockButton")
+        self.uia_unlock_button.clicked.connect(self._try_unlock_uia)
+        self.uia_unlock_button.setVisible(False)
+        layout.addWidget(self.uia_unlock_button)
+        return panel
+
     def _overview_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -297,8 +356,14 @@ class MainWindow(QMainWindow):
         return box
 
     def _logs_panel(self) -> QWidget:
-        box = QGroupBox("服务日志")
+        box = QGroupBox("运行日志")
         layout = QVBoxLayout(box)
+        actions = QHBoxLayout()
+        actions.addStretch(1)
+        clear_button = QPushButton("清除日志")
+        clear_button.clicked.connect(self._clear_logs)
+        actions.addWidget(clear_button)
+        layout.addLayout(actions)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         layout.addWidget(self.log_view)
@@ -307,9 +372,10 @@ class MainWindow(QMainWindow):
     def _friend_automation_page(self) -> QWidget:
         page = self._page("定时检测好友")
         form = self._form(page)
-        self.friend_interval = _spin(10, 86400, self.settings.friend_check_interval_seconds)
-        self.friend_limit = _spin(1, 100, 8)
+        self.friend_interval = _spin(10, 86400, self._form_state.get("friend_interval", self.settings.friend_check_interval_seconds))
+        self.friend_limit = _spin(1, 100, self._form_state.get("friend_limit", 8))
         self.friend_verify = QCheckBox("检测到好友申请后自动同意")
+        self.friend_verify.setChecked(self._form_state.get("friend_verify", False))
         self.friend_start = QPushButton("启动自动任务")
         self.friend_start.setObjectName("primaryButton")
         self.friend_start.clicked.connect(self.toggle_friend_timer)
@@ -325,17 +391,22 @@ class MainWindow(QMainWindow):
     def _unread_automation_page(self) -> QWidget:
         page = self._page("定时检测未读并回复")
         form = self._form(page)
-        self.unread_interval = _spin(10, 86400, self.settings.message_scan_interval_seconds)
+        self.unread_interval = _spin(10, 86400, self._form_state.get("unread_interval", self.settings.message_scan_interval_seconds))
         self.unread_friend = QLineEdit()
         self.unread_friend.setPlaceholderText("留空表示所有会话")
+        self.unread_friend.setText(self._form_state.get("unread_friend", ""))
         self.unread_reply_all = QCheckBox("回复所有未读消息")
+        self.unread_reply_all.setChecked(self._form_state.get("unread_reply_all", False))
         self.unread_start = QPushButton("启动自动任务")
         self.unread_start.setObjectName("primaryButton")
         self.unread_start.clicked.connect(self.toggle_unread_timer)
+        add_watch_button = QPushButton("将当前会话加入监听")
+        add_watch_button.clicked.connect(self._add_current_chat_to_watch)
         form.addRow("间隔秒数", self.unread_interval)
         form.addRow("目标会话", self.unread_friend)
         form.addRow("", self.unread_reply_all)
         form.addRow("", self.unread_start)
+        form.addRow("", add_watch_button)
         page.layout().addWidget(  # type: ignore[union-attr]
             self._tasks_panel("未读回复任务", {"check_unread_messages", "reply_unread"})
         )
@@ -344,14 +415,18 @@ class MainWindow(QMainWindow):
     def _watch_automation_page(self) -> QWidget:
         page = self._page("指定好友/群消息监听")
         form = self._form(page)
-        self.watch_interval = _spin(10, 86400, self.settings.message_scan_interval_seconds)
-        self.watch_duration = QLineEdit("30s")
+        self.watch_interval = _spin(10, 86400, self._form_state.get("watch_interval", self.settings.message_scan_interval_seconds))
+        self.watch_duration = QLineEdit(self._form_state.get("watch_duration", "30s"))
         self.watch_targets = QTextEdit()
         self.watch_targets.setPlaceholderText("一行一个好友或群名，也可以用逗号分隔")
         self.watch_targets.setFixedHeight(92)
+        saved_targets = self._form_state.get("watch_targets", "")
+        if saved_targets:
+            self.watch_targets.setPlainText(saved_targets)
         self.watch_auto_reply = QCheckBox("监听到新消息后自动调用 Agent 回复")
-        self.watch_auto_reply.setChecked(True)
+        self.watch_auto_reply.setChecked(self._form_state.get("watch_auto_reply", True))
         self.watch_reply_all = QCheckBox("回复本轮监听到的所有新消息")
+        self.watch_reply_all.setChecked(self._form_state.get("watch_reply_all", False))
         self.watch_start = QPushButton("启动监听")
         self.watch_start.setObjectName("primaryButton")
         self.watch_start.clicked.connect(self.toggle_watch_timer)
@@ -370,8 +445,10 @@ class MainWindow(QMainWindow):
         page = self._page("添加好友")
         form = self._form(page)
         self.add_number = QLineEdit()
-        self.add_greetings = QLineEdit("你好")
+        self.add_number.setText(self._form_state.get("add_number", ""))
+        self.add_greetings = QLineEdit(self._form_state.get("add_greetings", "你好"))
         self.add_remark = QLineEdit()
+        self.add_remark.setText(self._form_state.get("add_remark", ""))
         button = QPushButton("提交添加好友")
         button.clicked.connect(self.enqueue_add_friend)
         form.addRow("手机号", self.add_number)
@@ -380,6 +457,79 @@ class MainWindow(QMainWindow):
         form.addRow("", button)
         page.layout().addWidget(self._tasks_panel("添加好友任务", {"add_friend"}))  # type: ignore[union-attr]
         return page
+
+    def _moments_page(self) -> QWidget:
+        page = self._page("发送朋友圈")
+        form = self._form(page)
+
+        self.moments_text = QTextEdit()
+        self.moments_text.setPlaceholderText("输入朋友圈文字内容…")
+        self.moments_text.setMaximumHeight(120)
+        self.moments_text.setPlainText(self._form_state.get("moments_text", ""))
+
+        self.moments_medias = QTextEdit()
+        self.moments_medias.setPlaceholderText("每行一个图片或视频路径")
+        self.moments_medias.setMaximumHeight(100)
+        self.moments_medias.setPlainText(self._form_state.get("moments_medias", ""))
+
+        browse_button = QPushButton("选择图片/视频")
+        browse_button.clicked.connect(self._browse_moments_media)
+
+        buttons = QHBoxLayout()
+        dry_run_button = QPushButton("模拟发送")
+        dry_run_button.clicked.connect(lambda: self.enqueue_post_moments(dry_run=True))
+        send_button = QPushButton("发送朋友圈")
+        send_button.setObjectName("primaryButton")
+        send_button.clicked.connect(lambda: self.enqueue_post_moments(dry_run=False))
+        buttons.addWidget(dry_run_button)
+        buttons.addWidget(send_button)
+
+        form.addRow("内容", self.moments_text)
+        form.addRow("图片/视频", self.moments_medias)
+        form.addRow("", browse_button)
+        form.addRow("", buttons)
+        page.layout().addWidget(self._tasks_panel("朋友圈任务", {"post_moments"}))  # type: ignore[union-attr]
+        return page
+
+    def _browse_moments_media(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择图片或视频",
+            "",
+            "媒体文件 (*.png *.jpg *.jpeg *.bmp *.mp4 *.mov);;所有文件 (*)",
+        )
+        if files:
+            existing = self.moments_medias.toPlainText().strip()
+            new_lines = "\n".join(files)
+            self.moments_medias.setPlainText(
+                f"{existing}\n{new_lines}".strip() if existing else new_lines
+            )
+
+    def enqueue_post_moments(self, dry_run: bool = True) -> None:
+        text = self.moments_text.toPlainText().strip()
+        raw = self.moments_medias.toPlainText().strip()
+        medias = [line.strip() for line in raw.splitlines() if line.strip()] if raw else []
+        if not text and not medias:
+            QMessageBox.warning(self, "缺少内容", "请输入文字或选择图片/视频")
+            return
+        if not dry_run:
+            confirm = QMessageBox.question(
+                self,
+                "确认发送",
+                f"即将发送朋友圈：\n文字：{text[:50] or '（无）'}\n图片/视频：{len(medias)} 个\n\n确认发送？",
+            )
+            if confirm != QMessageBox.Yes:
+                return
+        mode = "模拟" if dry_run else "正式"
+        self._append_log(f"创建朋友圈任务（{mode}）：文字 {len(text)} 字，图片/视频 {len(medias)} 个。")
+        task = enqueue_post_moments(
+            self.store,
+            self.settings.default_account_id,
+            text=text,
+            medias=medias,
+            real=not dry_run,
+        )
+        self._task_created(task.id, task.type.value)
 
     def _settings_page(self) -> QWidget:
         page = self._page("Agent 设置")
@@ -415,6 +565,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(label)
         return page
 
+    def _set_sidebar_button_active(self, button: QPushButton, active: bool) -> None:
+        button.setProperty("active", active)
+        button.style().unpolish(button)
+        button.style().polish(button)
+
     def _form(self, page: QWidget) -> QFormLayout:
         panel = QFrame()
         panel.setObjectName("panel")
@@ -426,19 +581,30 @@ class MainWindow(QMainWindow):
         return form
 
     def _switch_page(self, row: int) -> None:
-        self.settings_button.setProperty("active", False)
-        self.settings_button.style().unpolish(self.settings_button)
-        self.settings_button.style().polish(self.settings_button)
-        self.pages.setCurrentIndex(max(0, row))
+        if row < 0:
+            return
+        self._set_sidebar_button_active(self.logs_button, False)
+        self._set_sidebar_button_active(self.settings_button, False)
+        self.pages.setCurrentIndex(row + 1)
+
+    def _show_logs(self) -> None:
+        self.nav.clearSelection()
+        self.nav.setCurrentRow(-1)
+        self.pages.setCurrentIndex(0)
+        self._set_sidebar_button_active(self.logs_button, True)
+        self._set_sidebar_button_active(self.settings_button, False)
 
     def _show_settings(self) -> None:
         self.nav.clearSelection()
-        self.settings_button.setProperty("active", True)
-        self.settings_button.style().unpolish(self.settings_button)
-        self.settings_button.style().polish(self.settings_button)
-        self.pages.setCurrentIndex(5)
+        self.nav.setCurrentRow(-1)
+        self._set_sidebar_button_active(self.logs_button, False)
+        self._set_sidebar_button_active(self.settings_button, True)
+        self.pages.setCurrentIndex(6)
 
     def toggle_worker(self) -> None:
+        if self._worker_starting:
+            self._append_log("服务正在启动中，请稍等。")
+            return
         if self.worker_running:
             self._append_log("正在停止服务，请等待当前任务收尾。")
             self.worker.stop(wait=False)
@@ -447,14 +613,90 @@ class MainWindow(QMainWindow):
             self._append_log("停止信号已发送。若当前正在操作微信，会在本次动作结束后停止。")
             self.refresh_operation_state(force=True)
             return
-        self._append_log(f"正在启动服务，日志文件：{self.log_path}")
-        configure_logging(level="INFO", log_file=self.log_path)
-        self._append_log("日志系统已就绪。")
-        self.worker.start()
-        self.worker_running = True
-        self.worker_button.setText("停止服务")
-        self._append_log("服务线程已启动，开始轮询任务队列。")
-        self.refresh_operation_state(force=True)
+        self._begin_worker_start()
+
+    def _begin_worker_start(self) -> None:
+        self._worker_starting = True
+        self.worker_button.setEnabled(False)
+        self.worker_button.setText("启动中...")
+        self._append_log("正在后台检查 UIA、自动解锁并启动服务，请稍等。")
+        thread = threading.Thread(
+            target=self._start_worker_in_background,
+            name="wx-ui-worker-start",
+            daemon=True,
+        )
+        thread.start()
+
+    def _start_worker_in_background(self) -> None:
+        try:
+            bootstrap = bootstrap_wechat_uia(
+                wechat_path=self.settings.wechat_path,
+                restart_if_needed=True,
+            )
+            probe = bootstrap.get("probe") if isinstance(bootstrap.get("probe"), dict) else {}
+            if not bootstrap.get("success"):
+                self.worker_start_finished.emit(
+                    {
+                        "success": False,
+                        "reason": "uia_not_ready",
+                        "probe": probe,
+                        "bootstrap": bootstrap,
+                    }
+                )
+                return
+            if self._closing:
+                self.worker_start_finished.emit(
+                    {"success": False, "reason": "closed", "probe": probe}
+                )
+                return
+            configure_logging(level="INFO", log_file=self.log_path)
+            self.worker.start()
+        except Exception as exc:
+            self.worker_start_finished.emit(
+                {"success": False, "reason": "error", "error": str(exc)}
+            )
+            return
+        self.worker_start_finished.emit({"success": True, "probe": probe, "bootstrap": bootstrap})
+
+    def _handle_worker_start_result(self, result: dict[str, Any]) -> None:
+        self._worker_starting = False
+        if self._closing:
+            self.worker.stop(wait=False)
+            return
+        self.worker_button.setEnabled(True)
+        if result.get("success"):
+            bootstrap = result.get("bootstrap") if isinstance(result.get("bootstrap"), dict) else {}
+            mode = str(bootstrap.get("mode") or "")
+            if mode == "already":
+                self._append_log("启动服务前 UIA 已可用。")
+            if mode == "quick":
+                self._append_log("启动服务前已自动解锁 UIA（无需重启微信）。")
+            elif mode == "restart":
+                self._append_log("启动服务前已自动解锁 UIA（已重启微信）。")
+            self.worker_running = True
+            self.worker_button.setText("停止服务")
+            self._append_log(f"服务已启动，日志文件：{self.log_path}")
+            self._append_log("服务线程已启动，开始轮询任务队列。")
+            self.refresh_uia_status()
+            self.refresh_operation_state(force=True)
+            return
+
+        self.worker_running = False
+        self.worker_button.setText("启动服务")
+        if result.get("reason") == "uia_not_ready":
+            probe = result.get("probe") if isinstance(result.get("probe"), dict) else {}
+            detail = str(probe.get("reason") or "自动解锁失败")
+            self._append_log(f"UIA 自动解锁失败，服务未启动：{detail}")
+            QMessageBox.warning(
+                self,
+                "UIA 未就绪",
+                f"微信 UIA 节点仍未暴露，服务未启动。\n原因：{detail}",
+            )
+            self.refresh_uia_status()
+            return
+        detail = result.get("error") or "未知错误"
+        self._append_log(f"服务启动失败：{detail}")
+        QMessageBox.warning(self, "服务启动失败", str(detail))
 
     def toggle_friend_timer(self) -> None:
         if self.friend_timer.isActive():
@@ -530,6 +772,29 @@ class MainWindow(QMainWindow):
         )
         self._task_created(task.id, task.type.value)
 
+    def _add_current_chat_to_watch(self) -> None:
+        try:
+            current = self.api.read_current_chat(dry_run=True)
+        except Exception as exc:
+            self._append_log(f"读取当前会话失败：{exc}")
+            return
+        chat_name = str(current.get("chat") or "").strip()
+        if not chat_name or chat_name == "当前会话":
+            self._append_log("未检测到主窗口中选中的会话，请在微信中点击左侧会话列表。")
+            return
+        existing = _parse_chat_targets(self.watch_targets.toPlainText())
+        if chat_name in existing:
+            self._append_log(f"「{chat_name}」已在监听列表中。")
+            return
+        current_text = self.watch_targets.toPlainText().strip()
+        new_text = f"{current_text}\n{chat_name}".strip() if current_text else chat_name
+        self.watch_targets.setPlainText(new_text)
+        self._persist_form_state()
+        if self.watch_timer.isActive():
+            self._append_log(f"已将「{chat_name}」加入监听列表。下一轮监听将包含该会话。")
+        else:
+            self._append_log(f"已将「{chat_name}」加入监听列表。请到「消息监听」页面启动监听。")
+
     def enqueue_watch_chats(self) -> None:
         if self._skip_auto_task_when_busy("消息监听"):
             return
@@ -589,11 +854,42 @@ class MainWindow(QMainWindow):
             self.config_path,
             self.settings,
             api_key=self.api_key_input.text().strip(),
+            form_state=self._collect_form_state(),
         )
         self.worker.settings = self.settings
         self.worker._agent = None
         self._append_log(f"Agent 设置已保存：模型 {self.settings.llm_model}，地址 {self.settings.llm_base_url}。")
         QMessageBox.information(self, "已保存", f"设置已保存到 {self.config_path}")
+
+    def _collect_form_state(self) -> dict[str, Any]:
+        """Collect current values of all form fields for persistence."""
+        return {
+            "friend_interval": self.friend_interval.value(),
+            "friend_limit": self.friend_limit.value(),
+            "friend_verify": self.friend_verify.isChecked(),
+            "unread_interval": self.unread_interval.value(),
+            "unread_friend": self.unread_friend.text().strip(),
+            "unread_reply_all": self.unread_reply_all.isChecked(),
+            "watch_interval": self.watch_interval.value(),
+            "watch_duration": self.watch_duration.text().strip(),
+            "watch_targets": self.watch_targets.toPlainText().strip(),
+            "watch_auto_reply": self.watch_auto_reply.isChecked(),
+            "watch_reply_all": self.watch_reply_all.isChecked(),
+            "add_number": self.add_number.text().strip(),
+            "add_greetings": self.add_greetings.text().strip(),
+            "add_remark": self.add_remark.text().strip(),
+            "moments_text": self.moments_text.toPlainText().strip(),
+            "moments_medias": self.moments_medias.toPlainText().strip(),
+        }
+
+    def _persist_form_state(self) -> None:
+        """Save current form values to the settings file."""
+        save_gui_settings(
+            self.config_path,
+            self.settings,
+            api_key=self.settings.llm_api_key.get_secret_value(),
+            form_state=self._collect_form_state(),
+        )
 
     def _task_created(self, task_id: str, task_type: str | None = None) -> None:
         self.statusBar().showMessage(f"任务已创建: {task_id}", 5000)
@@ -643,7 +939,7 @@ class MainWindow(QMainWindow):
     def refresh_uia_status(self) -> None:
         if self.worker_running and self.worker.busy:
             return
-        if self._closing or self._uia_probe_running:
+        if self._closing or self._worker_starting or self._uia_probe_running:
             return
         self._uia_probe_running = True
         self.uia_status_dot.setProperty("state", "unknown")
@@ -676,15 +972,23 @@ class MainWindow(QMainWindow):
         if probe.get("uia_exposed") is True:
             state = "ok"
             title = "UIA 正常"
+            panel_title = "UIA 已解锁"
+            panel_detail = "微信 UIA 节点已正常暴露"
         elif probe.get("login_window"):
             state = "bad"
             title = "微信未登录"
+            panel_title = "微信未登录"
+            panel_detail = "请先登录微信"
         elif probe.get("logged_in"):
             state = "warn"
             title = "UIA 未解锁"
+            panel_title = "UIA 未解锁"
+            panel_detail = "微信已运行但 UIA 节点未暴露"
         else:
             state = "bad"
             title = "未找到微信主窗口"
+            panel_title = "未找到微信"
+            panel_detail = "请先启动并登录微信"
 
         reader_state = "屏幕阅读器标志已开启" if self.screen_reader_enabled else "屏幕阅读器标志未开启"
         reason = _uia_reason_label(str(probe.get("reason") or ""))
@@ -692,10 +996,150 @@ class MainWindow(QMainWindow):
         self.uia_status_dot.setToolTip(f"{title}\n{reader_state}\n{reason}")
         self.uia_status_dot.style().unpolish(self.uia_status_dot)
         self.uia_status_dot.style().polish(self.uia_status_dot)
+
+        panel = self.uia_state_label.parentWidget()
+        if panel is not None:
+            panel.setProperty("state", state)
+            panel.style().unpolish(panel)
+            panel.style().polish(panel)
+        self.uia_panel_dot.setProperty("state", state)
+        self.uia_panel_dot.style().unpolish(self.uia_panel_dot)
+        self.uia_panel_dot.style().polish(self.uia_panel_dot)
+        self.uia_state_label.setText(panel_title)
+        self.uia_detail_label.setText(panel_detail)
+        self.uia_unlock_button.setVisible(
+            state != "ok"
+            and not self._uia_unlock_running
+            and not self._startup_uia_bootstrap_running
+        )
+
         signature = (state, reason)
         if signature != self._last_uia_signature:
             self._last_uia_signature = signature
             self._append_log(f"UIA 检测完成：{title}。{reader_state}。{reason}")
+
+    def _try_unlock_uia(self) -> None:
+        if self._uia_unlock_running or self._closing:
+            return
+        self._uia_unlock_running = True
+        self.uia_unlock_button.setEnabled(False)
+        self.uia_unlock_button.setText("正在解锁...")
+        self.uia_state_label.setText("正在解锁 UIA")
+        self.uia_detail_label.setText("设置屏幕阅读器标志并广播通知...")
+        self._append_log("正在解锁微信 UIA...")
+        threading.Thread(
+            target=self._run_unlock_in_background,
+            name="wx-ui-uia-unlock",
+            daemon=True,
+        ).start()
+
+    def _run_unlock_in_background(self) -> None:
+        wechat_path = self.settings.wechat_path
+        try:
+            success = try_unlock_without_restart(wechat_path=wechat_path)
+        except Exception as exc:
+            self.uia_unlock_finished.emit(False, str(exc))
+            return
+        if success:
+            self.uia_unlock_finished.emit(True, "quick")
+            return
+        self.uia_unlock_finished.emit(False, "need_restart")
+
+    def _handle_uia_unlock_result(self, success: bool, detail: str) -> None:
+        self._uia_unlock_running = False
+        self.uia_unlock_button.setEnabled(True)
+        self.uia_unlock_button.setText("解锁 UIA")
+        if success:
+            if detail == "restart":
+                self._append_log("UIA 解锁成功（已重启微信）。")
+            else:
+                self._append_log("UIA 解锁成功（无需重启微信）。")
+            self.refresh_uia_status()
+            return
+        if detail == "need_restart":
+            self._append_log("广播后 UIA 未解锁，需要重启微信。")
+            answer = QMessageBox.question(
+                self,
+                "UIA 未解锁",
+                "广播后微信未响应，需要重启微信才能解锁 UIA。\n\n是否重启微信？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer == QMessageBox.Yes:
+                self._start_restart_unlock()
+            return
+        self._append_log(f"UIA 解锁失败：{detail}")
+
+    def _bootstrap_uia_on_startup(self) -> None:
+        if self._closing or self._startup_uia_bootstrap_running:
+            return
+        self._startup_uia_bootstrap_running = True
+        self._append_log("程序启动时自动尝试解锁 UIA。")
+        threading.Thread(
+            target=self._run_startup_uia_bootstrap_in_background,
+            name="wx-ui-uia-bootstrap",
+            daemon=True,
+        ).start()
+
+    def _run_startup_uia_bootstrap_in_background(self) -> None:
+        try:
+            result = bootstrap_wechat_uia(
+                wechat_path=self.settings.wechat_path,
+                restart_if_needed=False,
+            )
+        except Exception as exc:
+            self.uia_bootstrap_finished.emit(
+                {"success": False, "mode": "error", "error": str(exc)}
+            )
+            return
+        self.uia_bootstrap_finished.emit(result)
+
+    def _handle_uia_bootstrap_result(self, result: dict[str, Any]) -> None:
+        self._startup_uia_bootstrap_running = False
+        if self._closing:
+            return
+        probe = result.get("probe") if isinstance(result.get("probe"), dict) else {}
+        if result.get("success"):
+            mode = str(result.get("mode") or "")
+            if mode == "already":
+                self._append_log("程序启动时 UIA 已可用。")
+            elif mode == "quick":
+                self._append_log("程序启动时已自动解锁 UIA（无需重启微信）。")
+            else:
+                self._append_log("程序启动时 UIA 已就绪。")
+        else:
+            detail = str(result.get("error") or probe.get("reason") or "未能自动解锁 UIA")
+            self._append_log(f"程序启动时自动解锁 UIA 失败：{detail}")
+        self.refresh_uia_status()
+
+    def _start_restart_unlock(self) -> None:
+        self._uia_unlock_running = True
+        self.uia_unlock_button.setEnabled(False)
+        self.uia_unlock_button.setText("重启微信中...")
+        self.uia_state_label.setText("正在重启微信解锁")
+        self.uia_detail_label.setText("关闭并重新启动微信，请稍候...")
+        self._append_log("正在重启微信以解锁 UIA...")
+        threading.Thread(
+            target=self._run_restart_unlock_in_background,
+            name="wx-ui-uia-restart",
+            daemon=True,
+        ).start()
+
+    def _run_restart_unlock_in_background(self) -> None:
+        try:
+            success = unlock_with_narrator(
+                wechat_path=self.settings.wechat_path,
+                restart_wechat=True,
+                startup_wait=35.0,
+                stop_narrator_after_wechat=True,
+            )
+        except Exception as exc:
+            self.uia_unlock_finished.emit(False, str(exc))
+            return
+        if success:
+            self.uia_unlock_finished.emit(True, "restart")
+        else:
+            self.uia_unlock_finished.emit(False, "重启微信后 UIA 仍未解锁")
 
     def refresh_tasks(self) -> None:
         tasks = self.store.list_tasks(80)
@@ -722,6 +1166,25 @@ class MainWindow(QMainWindow):
 
     def refresh_logs(self) -> None:
         self._render_logs()
+
+    def _clear_logs(self) -> None:
+        confirm = QMessageBox.question(
+            self,
+            "清除日志",
+            "确认清空当前运行日志文件？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        self.ui_log_lines.clear()
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self.log_path.write_text("", encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "清除失败", f"无法清空运行日志：{exc}")
+        self._render_logs()
+        self.statusBar().showMessage("日志已清除。", 3000)
 
     def _render_logs(self) -> None:
         if not hasattr(self, "log_view"):
@@ -1067,6 +1530,70 @@ QMainWindow, QWidget {
 #operationStatus[state="busy"] #operationStatusDetail {
     color: #7a4d00;
 }
+#uiaStatus {
+    background: #ffffff;
+    border: 1px solid #dedbd3;
+    border-radius: 8px;
+}
+#uiaStatus[state="ok"] {
+    background: #f6fbf7;
+    border: 1px solid #bdddc7;
+}
+#uiaStatus[state="warn"] {
+    background: #fff7f5;
+    border: 1px solid #e8b4b4;
+}
+#uiaStatus[state="bad"] {
+    background: #fff7f5;
+    border: 1px solid #e8b4b4;
+}
+#uiaPanelDot {
+    background: #8a8a8a;
+    border: none;
+    border-radius: 4px;
+}
+#uiaPanelDot[state="ok"] {
+    background: #1f9d55;
+}
+#uiaPanelDot[state="warn"] {
+    background: #d64545;
+}
+#uiaPanelDot[state="bad"] {
+    background: #d64545;
+}
+#uiaPanelDot[state="unknown"] {
+    background: #8a8a8a;
+}
+#uiaStateLabel {
+    background: transparent;
+    color: #111111;
+    font-size: 12px;
+    font-weight: 700;
+}
+#uiaDetailLabel {
+    background: transparent;
+    color: #5f5f5f;
+    font-size: 11px;
+}
+#uiaUnlockButton {
+    background: #ffffff;
+    color: #242424;
+    border: 1px solid #c2bdb3;
+    border-radius: 5px;
+    padding: 4px 12px;
+    font-size: 11px;
+}
+#uiaUnlockButton:hover {
+    background: #f0efeb;
+    border-color: #8a8a8a;
+}
+#uiaUnlockButton:pressed {
+    background: #e0dfdb;
+}
+#uiaUnlockButton:disabled {
+    color: #aaa;
+    border-color: #ddd;
+}
 #nav {
     background: transparent;
     border: none;
@@ -1096,6 +1623,20 @@ QMainWindow, QWidget {
     background: #ffffff;
 }
 #settingsButton[active="true"] {
+    background: #111111;
+    color: #ffffff;
+}
+#navButton {
+    background: transparent;
+    color: #242424;
+    border: 1px solid #dedbd3;
+    border-radius: 7px;
+    text-align: left;
+}
+#navButton:hover {
+    background: #ffffff;
+}
+#navButton[active="true"] {
     background: #111111;
     color: #ffffff;
 }

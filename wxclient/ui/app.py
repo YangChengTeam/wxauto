@@ -14,7 +14,7 @@ from .main_window import APP_NAME, MainWindow
 
 def run_gui(config: Path | None = None) -> int:
     settings, config_path = load_gui_settings(config)
-    configure_logging(level="INFO", log_file=settings.data_dir / "logs" / "worker.log")
+    configure_logging(level="INFO", log_file=settings.data_dir / "logs" / "ui.log")
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

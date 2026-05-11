@@ -10,7 +10,7 @@ from wxclient.config import Settings, load_settings
 from wxclient.logging_config import configure_logging
 from wxclient.queue import OperationWorker, Task, TaskStore, TaskType
 from wxclient.trigger import Scheduler, run_http_server
-from wxclient.uia_unlock import probe_wechat_uia, unlock_with_narrator
+from wxclient.uia_unlock import bootstrap_wechat_uia, probe_wechat_uia, unlock_with_narrator
 from wxclient.wechat_api import WeChatApi
 
 app = typer.Typer(help="Windows WeChat automation client")
@@ -38,6 +38,25 @@ def callback(log_level: str = typer.Option("INFO", help="Python logging level"))
 def serve(config: Path | None = typer.Option(None, help="Path to JSON config file")) -> None:
     settings, store, api = _runtime(config)
     configure_logging(level=_LOG_LEVEL, log_file=settings.data_dir / "logs" / "serve.log")
+    try:
+        bootstrap = bootstrap_wechat_uia(
+            wechat_path=settings.wechat_path,
+            restart_if_needed=True,
+        )
+    except Exception as exc:
+        bootstrap = {"success": False, "mode": "error", "error": str(exc), "probe": {}}
+    if not bootstrap.get("success"):
+        typer.echo(
+            json.dumps(
+                {
+                    "uia_exposed": False,
+                    "mode": bootstrap.get("mode"),
+                    "reason": bootstrap.get("error") or (bootstrap.get("probe") or {}).get("reason"),
+                },
+                ensure_ascii=False,
+            )
+        )
+        raise typer.Exit(code=1)
     worker = OperationWorker(store, api, settings=settings)
     scheduler = Scheduler(settings, store)
     worker.start()
@@ -54,6 +73,25 @@ def serve(config: Path | None = typer.Option(None, help="Path to JSON config fil
 def worker(config: Path | None = typer.Option(None, help="Path to JSON config file")) -> None:
     settings, store, api = _runtime(config)
     configure_logging(level=_LOG_LEVEL, log_file=settings.data_dir / "logs" / "worker.log")
+    try:
+        bootstrap = bootstrap_wechat_uia(
+            wechat_path=settings.wechat_path,
+            restart_if_needed=True,
+        )
+    except Exception as exc:
+        bootstrap = {"success": False, "mode": "error", "error": str(exc), "probe": {}}
+    if not bootstrap.get("success"):
+        typer.echo(
+            json.dumps(
+                {
+                    "uia_exposed": False,
+                    "mode": bootstrap.get("mode"),
+                    "reason": bootstrap.get("error") or (bootstrap.get("probe") or {}).get("reason"),
+                },
+                ensure_ascii=False,
+            )
+        )
+        raise typer.Exit(code=1)
     operation_worker = OperationWorker(store, api, settings=settings)
     try:
         operation_worker.run_forever()
