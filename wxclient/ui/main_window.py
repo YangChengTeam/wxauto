@@ -264,13 +264,6 @@ class MainWindow(QMainWindow):
             )
         logo_layout.addWidget(logo, 0, 0, Qt.AlignCenter)
 
-        self.uia_status_dot = QLabel()
-        self.uia_status_dot.setObjectName("uiaStatusDot")
-        self.uia_status_dot.setFixedSize(12, 12)
-        self.uia_status_dot.setProperty("state", "unknown")
-        self.uia_status_dot.setToolTip("正在检测 UIA 状态")
-        logo_layout.addWidget(self.uia_status_dot, 0, 0, Qt.AlignRight | Qt.AlignBottom)
-
         header.addWidget(logo_box)
 
         copy = QVBoxLayout()
@@ -991,10 +984,6 @@ class MainWindow(QMainWindow):
         if self._closing or self._worker_starting or self._uia_probe_running:
             return
         self._uia_probe_running = True
-        self.uia_status_dot.setProperty("state", "unknown")
-        self.uia_status_dot.setToolTip("正在后台检测 UIA 状态")
-        self.uia_status_dot.style().unpolish(self.uia_status_dot)
-        self.uia_status_dot.style().polish(self.uia_status_dot)
         thread = threading.Thread(
             target=self._probe_uia_in_background,
             name="wx-ui-uia-probe",
@@ -1041,11 +1030,6 @@ class MainWindow(QMainWindow):
 
         reader_state = "屏幕阅读器标志已开启" if self.screen_reader_enabled else "屏幕阅读器标志未开启"
         reason = _uia_reason_label(str(probe.get("reason") or ""))
-        self.uia_status_dot.setProperty("state", state)
-        self.uia_status_dot.setToolTip(f"{title}\n{reader_state}\n{reason}")
-        self.uia_status_dot.style().unpolish(self.uia_status_dot)
-        self.uia_status_dot.style().polish(self.uia_status_dot)
-
         panel = self.uia_state_label.parentWidget()
         if panel is not None:
             panel.setProperty("state", state)
@@ -1744,23 +1728,6 @@ QMainWindow, QWidget {
 #logoBox {
     background: transparent;
     border: none;
-}
-#uiaStatusDot {
-    background: #8a8a8a;
-    border: 2px solid #ffffff;
-    border-radius: 6px;
-}
-#uiaStatusDot[state="ok"] {
-    background: #1f9d55;
-}
-#uiaStatusDot[state="warn"] {
-    background: #d79600;
-}
-#uiaStatusDot[state="bad"] {
-    background: #d64545;
-}
-#uiaStatusDot[state="unknown"] {
-    background: #8a8a8a;
 }
 #brandTitle {
     color: #111111;
