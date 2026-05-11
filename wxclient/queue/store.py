@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import structlog
 from sqlalchemy import (
     Column,
     Index,
@@ -23,6 +24,8 @@ from sqlalchemy.engine import Engine, RowMapping
 from sqlalchemy.pool import NullPool
 
 from .models import Task, TaskStatus, TaskType, utcnow
+
+logger = structlog.get_logger(__name__)
 
 
 class TaskStore:
@@ -64,8 +67,33 @@ class TaskStore:
         self.metadata.create_all(self.engine)
 
     def create_task(self, task_type: TaskType, payload: dict[str, Any], account_id: str) -> Task:
-        task = Task.new(task_type, payload, account_id=account_id)
         with self.engine.begin() as conn:
+            active_row = conn.execute(
+                select(self.tasks)
+                .where(
+                    and_(
+                        self.tasks.c.account_id == account_id,
+                        self.tasks.c.type == task_type.value,
+                        self.tasks.c.status.in_(
+                            [TaskStatus.PENDING.value, TaskStatus.RUNNING.value]
+                        ),
+                    )
+                )
+                .order_by(self.tasks.c.created_at.asc())
+                .limit(1)
+            ).mappings().fetchone()
+            if active_row:
+                active_task = self._from_row(active_row)
+                logger.info(
+                    "task.duplicate_skipped",
+                    task_type=task_type.value,
+                    account_id=account_id,
+                    active_task_id=active_task.id,
+                    active_task_status=active_task.status.value,
+                )
+                return active_task
+
+            task = Task.new(task_type, payload, account_id=account_id)
             conn.execute(insert(self.tasks).values(self._to_row(task)))
         return task
 

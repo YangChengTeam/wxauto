@@ -454,6 +454,45 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(removed, 1)
             self.assertIsNone(store.get(blocked.id))
 
+    def test_store_skips_duplicate_active_task_types(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "test.db")
+            first = store.create_task(
+                TaskType.SEND_MESSAGE,
+                {"friend": "filehelper", "text": "hello", "dry_run": True},
+                "default",
+            )
+
+            duplicate_pending = store.create_task(
+                TaskType.SEND_MESSAGE,
+                {"friend": "filehelper", "text": "world", "dry_run": True},
+                "default",
+            )
+            self.assertEqual(duplicate_pending.id, first.id)
+            self.assertEqual(len(store.list_tasks(task_types={TaskType.SEND_MESSAGE})), 1)
+
+            running = store.next_pending()
+            self.assertIsNotNone(running)
+            self.assertEqual(running.id, first.id)
+            self.assertEqual(running.status, TaskStatus.RUNNING)
+
+            duplicate_running = store.create_task(
+                TaskType.SEND_MESSAGE,
+                {"friend": "filehelper", "text": "again", "dry_run": True},
+                "default",
+            )
+            self.assertEqual(duplicate_running.id, first.id)
+            self.assertEqual(len(store.list_tasks(task_types={TaskType.SEND_MESSAGE})), 1)
+
+            store.complete(first.id, {"action": "send_message"})
+            second = store.create_task(
+                TaskType.SEND_MESSAGE,
+                {"friend": "filehelper", "text": "after", "dry_run": True},
+                "default",
+            )
+            self.assertNotEqual(second.id, first.id)
+            self.assertEqual(len(store.list_tasks(task_types={TaskType.SEND_MESSAGE})), 2)
+
     def test_worker_executes_dry_run_send_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TaskStore(Path(tmp) / "test.db")
