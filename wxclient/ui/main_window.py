@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -73,10 +74,12 @@ _UNFINISHED_STATUSES = {
 @dataclass(frozen=True)
 class TaskPanelBinding:
     title: str
-    table: QTableWidget
     task_types: set[str] | None
     summary_label: QLabel
+    toggle_button: QToolButton
+    content_widget: QWidget
     empty_label: QLabel
+    table: QTableWidget
 
 
 class MainWindow(QMainWindow):
@@ -351,12 +354,40 @@ class MainWindow(QMainWindow):
         return page
 
     def _tasks_panel(self, title: str = "任务列表", task_types: set[str] | None = None) -> QWidget:
-        box = QGroupBox(title)
+        box = QFrame()
+        box.setObjectName("panel")
         layout = QVBoxLayout(box)
-        actions = QHBoxLayout()
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(10)
+
+        toggle_button = QToolButton()
+        toggle_button.setObjectName("taskToggleButton")
+        toggle_button.setCheckable(True)
+        toggle_button.setChecked(False)
+        toggle_button.setAutoRaise(True)
+        toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        toggle_button.setArrowType(Qt.RightArrow)
+        toggle_button.setText(title)
+
         summary_label = QLabel("当前没有未完成任务")
         summary_label.setObjectName("taskSummary")
         summary_label.setWordWrap(True)
+
+        header.addWidget(toggle_button)
+        header.addWidget(summary_label, 1)
+        layout.addLayout(header)
+
+        content_widget = QWidget()
+        content_widget.setVisible(False)
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
+
+        actions = QHBoxLayout()
         clear_button = QPushButton("清除未完成任务")
         clear_button.setObjectName("secondaryButton")
         clear_button.clicked.connect(
@@ -365,14 +396,14 @@ class MainWindow(QMainWindow):
                 panel_types,
             )
         )
-        actions.addWidget(summary_label, 1)
+        actions.addStretch(1)
         actions.addWidget(clear_button)
-        layout.addLayout(actions)
+        content_layout.addLayout(actions)
 
         empty_label = QLabel("当前没有未完成任务。")
         empty_label.setObjectName("taskEmptyState")
         empty_label.setWordWrap(True)
-        layout.addWidget(empty_label)
+        content_layout.addWidget(empty_label)
 
         table = QTableWidget(0, 4)
         table.setHorizontalHeaderLabels(
@@ -389,14 +420,27 @@ class MainWindow(QMainWindow):
         table.setColumnWidth(1, 96)
         table.setColumnWidth(2, 420)
         table.setColumnWidth(3, 150)
-        layout.addWidget(table)
+        content_layout.addWidget(table)
+        layout.addWidget(content_widget)
+
+        def _toggle_content(
+            expanded: bool,
+            widget: QWidget = content_widget,
+            button: QToolButton = toggle_button,
+        ) -> None:
+            widget.setVisible(expanded)
+            button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+
+        toggle_button.toggled.connect(_toggle_content)
         self.task_tables.append(
             TaskPanelBinding(
                 title=title,
-                table=table,
                 task_types=task_types,
                 summary_label=summary_label,
+                toggle_button=toggle_button,
+                content_widget=content_widget,
                 empty_label=empty_label,
+                table=table,
             )
         )
         return box
@@ -1163,7 +1207,7 @@ class MainWindow(QMainWindow):
                 if (panel.task_types is None or task.type.value in panel.task_types)
                 and task.status in _UNFINISHED_STATUSES
             ]
-            visible_tasks.sort(key=_task_sort_key)
+            visible_tasks.sort(key=_task_sort_key, reverse=True)
             panel.summary_label.setText(_task_panel_summary(visible_tasks))
             panel.empty_label.setVisible(not visible_tasks)
             panel.table.setVisible(bool(visible_tasks))
@@ -1351,14 +1395,8 @@ def _task_status_label(status: TaskStatus | str | None) -> str:
     return labels.get(key, key or "未知")
 
 
-def _task_sort_key(task: Any) -> tuple[int, str, str]:
-    priority = {
-        TaskStatus.RUNNING.value: 0,
-        TaskStatus.PENDING.value: 1,
-        TaskStatus.BLOCKED.value: 2,
-        TaskStatus.FAILED.value: 3,
-    }.get(task.status.value if isinstance(task.status, TaskStatus) else str(task.status), 9)
-    return (priority, str(task.updated_at or ""), str(task.created_at or ""))
+def _task_sort_key(task: Any) -> tuple[str, str]:
+    return (str(task.updated_at or ""), str(task.created_at or ""))
 
 
 def _task_panel_summary(tasks: list[Any]) -> str:
@@ -1867,6 +1905,18 @@ QMainWindow, QWidget {
 #taskSummary {
     color: #5f5f5f;
     font-size: 11px;
+}
+#taskToggleButton {
+    background: transparent;
+    color: #111111;
+    border: none;
+    padding: 0;
+    font-size: 12px;
+    font-weight: 600;
+    text-align: left;
+}
+#taskToggleButton:hover {
+    color: #000000;
 }
 #taskEmptyState {
     color: #7a7a7a;
