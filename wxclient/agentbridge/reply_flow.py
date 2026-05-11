@@ -236,6 +236,7 @@ def watch_chats_messages(
     replies: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     message_count = 0
+    new_message_count = 0
     visible_message_count = 0
     cursor_seed_count = 0
     session_summaries = _try_read_chat_sessions(api, real)
@@ -254,116 +255,32 @@ def watch_chats_messages(
         session_timestamp_text = _session_summary_timestamp_text(session_summary)
         session_is_today = _session_summary_is_today(session_summary)
         preview_self_source = _session_preview_self_reason(session_preview, outbound_texts)
-        if session_is_today is False:
-            result = {
-                "action": "watch_chat",
-                "friend": chat_name,
-                "duration": duration,
-                "dry_run": not real,
-                "auto_reply": auto_reply,
-                "visible_message_count": 0,
-                "new_message_count": 0,
-                "reply_count": 0,
-                "cursor_seeded": False,
-                "source_result": None,
-                "latest_message": _truncate_text(session_preview),
-                "latest_message_source": "session_preview",
-                "latest_is_self_source": preview_self_source,
-                "decision_reason": "not_today",
-                "fallback_window_opened": False,
-                "reply_message_source": None,
-                "session_preview": session_preview,
-                "timestamp_text": session_timestamp_text,
-                "latest_is_today": False,
-            }
-            chat_results.append(result)
-            logger.info(
-                "watch.chats.skip_summary",
-                chat=chat_name,
-                reason="not_today",
-                visible_message_count=0,
-                latest_message=result["latest_message"],
-                latest_message_source="session_preview",
-                latest_is_self_source=preview_self_source,
-                timestamp_text=session_timestamp_text,
-                latest_is_today=False,
-                decision_reason="not_today",
-            )
-            continue
-        if preview_self_source is not None and session_is_today is True:
-            result = {
-                "action": "watch_chat",
-                "friend": chat_name,
-                "duration": duration,
-                "dry_run": not real,
-                "auto_reply": auto_reply,
-                "visible_message_count": 0,
-                "new_message_count": 0,
-                "reply_count": 0,
-                "cursor_seeded": False,
-                "source_result": None,
-                "latest_message": _truncate_text(session_preview),
-                "latest_message_source": "session_preview",
-                "latest_is_self_source": preview_self_source,
-                "decision_reason": "latest_is_self_preview",
-                "fallback_window_opened": False,
-                "reply_message_source": None,
-                "session_preview": session_preview,
-                "timestamp_text": session_timestamp_text,
-                "latest_is_today": True,
-            }
-            chat_results.append(result)
-            logger.info(
-                "watch.chats.skip_summary",
-                chat=chat_name,
-                reason="latest_is_self",
-                visible_message_count=0,
-                latest_message=result["latest_message"],
-                latest_message_source="session_preview",
-                latest_is_self_source=preview_self_source,
-                timestamp_text=session_timestamp_text,
-                latest_is_today=True,
-                decision_reason="latest_is_self_preview",
-            )
-            continue
         try:
-            scan_result = api.scan_messages(
+            source_result = _read_source_messages(
+                api=api,
                 friend=chat_name,
                 duration=duration,
-                select_sender=effective_select_sender,
-                separate_window=True,
-                dry_run=not real,
+                real=real,
+                select_sender=False,
+                source="visible",
+                separate_window=False,
             )
-            new_messages = _extract_scan_messages(scan_result)
-            baseline_messages = _extract_baseline_messages(scan_result)
-            visible_messages = baseline_messages
-            if not visible_messages:
-                visible_messages = _try_read_visible_messages(
-                    api,
-                    chat_name,
-                    real,
-                    separate_window=True,
-                )
-            if not visible_messages:
-                visible_messages = new_messages
+            visible_messages = source_result["messages"]
             visible_message_count += len(visible_messages)
 
             if cursor_store is not None:
                 _mark_recent_outbound_messages(visible_messages, outbound_texts)
-                _mark_recent_outbound_messages(new_messages, outbound_texts)
             cursor_new_messages, seeded = _watch_messages_after_cursor(
                 visible_messages,
                 cursor,
             )
             if seeded:
                 cursor_seed_count += 1
-            reply_messages = new_messages or cursor_new_messages
-            reply_message_source = "scan_messages" if new_messages else "cursor_visible"
-            if not reply_messages and not seeded:
-                reply_messages = _latest_visible_watch_message(visible_messages, cursor)
-                reply_message_source = "visible_latest"
+            reply_messages = cursor_new_messages
+            reply_message_source = "cursor_visible" if reply_messages else None
             if not reply_messages:
-                reply_message_source = None
+                reply_messages = _latest_visible_watch_message(visible_messages, cursor)
+                reply_message_source = "visible_latest" if reply_messages else None
 
             chat_replies: list[dict[str, Any]] = []
             if auto_reply:
@@ -393,14 +310,14 @@ def watch_chats_messages(
                     "watch",
                 )
 
-            latest_message_row = _latest_activity_message(new_messages) or _latest_activity_message(visible_messages)
+            latest_message_row = _latest_activity_message(visible_messages)
             latest_message = _message_log_text(latest_message_row) or _truncate_text(session_preview)
             latest_message_source = _watch_latest_message_source(
                 session_preview=session_preview,
-                new_messages=new_messages,
+                new_messages=[],
                 visible_messages=visible_messages,
             )
-            latest_is_self_source = _message_self_source(latest_message_row, outbound_texts)
+            latest_is_self_source = _message_self_source(latest_message_row, outbound_texts) or preview_self_source
             decision_reason = _watch_decision_reason(
                 auto_reply=auto_reply,
                 reply_messages=reply_messages,
@@ -414,15 +331,15 @@ def watch_chats_messages(
                 "dry_run": not real,
                 "auto_reply": auto_reply,
                 "visible_message_count": len(visible_messages),
-                "new_message_count": len(new_messages),
+                "new_message_count": len(cursor_new_messages),
                 "reply_count": len(chat_replies),
                 "cursor_seeded": seeded,
-                "source_result": scan_result,
+                "source_result": source_result["raw_result"],
                 "latest_message": latest_message,
                 "latest_message_source": latest_message_source,
                 "latest_is_self_source": latest_is_self_source,
                 "decision_reason": decision_reason,
-                "fallback_window_opened": True,
+                "fallback_window_opened": False,
                 "reply_message_source": reply_message_source,
                 "session_preview": session_preview,
                 "timestamp_text": latest_message_row.get("timestamp_text") if isinstance(latest_message_row, dict) else session_timestamp_text,
@@ -430,11 +347,12 @@ def watch_chats_messages(
             }
             chat_results.append(result)
 
-            message_count += len(new_messages)
+            message_count += len(reply_messages)
+            new_message_count += len(cursor_new_messages)
             logger.info(
                 "watch.chats.summary",
                 chat=chat_name,
-                message_count=len(new_messages),
+                message_count=len(reply_messages),
                 visible_message_count=len(visible_messages),
                 reply_count=int(result.get("reply_count") or 0),
                 latest_message=latest_message,
@@ -443,7 +361,7 @@ def watch_chats_messages(
                 timestamp_text=result["timestamp_text"],
                 latest_is_today=result["latest_is_today"],
                 decision_reason=decision_reason,
-                fallback_window_opened=True,
+                fallback_window_opened=False,
                 reply_message_source=reply_message_source,
             )
             _log_chat_messages(
@@ -487,7 +405,7 @@ def watch_chats_messages(
         "select_sender": effective_select_sender,
         "chat_count": len(targets),
         "message_count": message_count,
-        "new_message_count": message_count,
+        "new_message_count": new_message_count,
         "visible_message_count": visible_message_count,
         "cursor_seed_count": cursor_seed_count,
         "reply_count": len(replies),

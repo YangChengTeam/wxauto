@@ -191,9 +191,9 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         )
     if event == "watch.chats.summary":
         return (
-            f"监听完成「{payload.get('chat') or '-'}」："
+            f"读取聊天「{payload.get('chat') or '-'}」："
             f"可见消息 {payload.get('visible_message_count', 0)} 条，"
-            f"监听到新消息 {payload.get('message_count', 0)} 条，"
+            f"本轮候选 {payload.get('message_count', 0)} 条，"
             f"已回复 {payload.get('reply_count', 0)} 条，"
             f"最后一条「{payload.get('latest_message') or ''}」，"
             f"依据={payload.get('latest_message_source') or '-'}，"
@@ -214,7 +214,7 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         )
     if event == "watch.chats.skip_summary":
         return (
-            f"监听跳过「{payload.get('chat') or '-'}」："
+            f"跳过聊天「{payload.get('chat') or '-'}」："
             f"{_skip_reason_label(payload.get('reason'))}，"
             f"最后一条「{payload.get('latest_message') or ''}」，"
             f"依据={payload.get('latest_message_source') or '-'}，"
@@ -232,8 +232,7 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "watch.chats.start":
         mode = "自动回复" if payload.get("auto_reply") else "只监听"
         return (
-            f"开始监听「{payload.get('chat') or '-'}」，"
-            f"时长 {payload.get('duration') or '-'}，模式：{mode}。"
+            f"打开聊天「{payload.get('chat') or '-'}」，模式：{mode}。"
         )
     if event == "watch.chats.read":
         return (
