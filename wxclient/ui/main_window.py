@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QStackedWidget,
     QTableWidget,
@@ -377,8 +378,8 @@ class MainWindow(QMainWindow):
         summary_label.setObjectName("taskSummary")
         summary_label.setWordWrap(True)
 
-        header.addWidget(toggle_button)
-        header.addWidget(summary_label, 1)
+        header.addWidget(toggle_button, 0, Qt.AlignTop)
+        header.addWidget(summary_label, 1, Qt.AlignTop)
         layout.addLayout(header)
 
         content_widget = QWidget()
@@ -472,7 +473,7 @@ class MainWindow(QMainWindow):
         form.addRow("间隔秒数", self.friend_interval)
         form.addRow("处理数量", self.friend_limit)
         form.addRow("", self.friend_verify)
-        page.layout().addLayout(self._right_aligned_actions(self.friend_start))
+        form.addRow("", self._right_aligned_actions(self.friend_start))
         page.layout().addWidget(  # type: ignore[union-attr]
             self._tasks_panel("好友检测任务", {"check_new_friends", "accept_new_friends"})
         )
@@ -539,7 +540,7 @@ class MainWindow(QMainWindow):
         form.addRow("手机号", self.add_number)
         form.addRow("招呼语", self.add_greetings)
         form.addRow("备注", self.add_remark)
-        page.layout().addLayout(self._right_aligned_actions(button))
+        form.addRow("", self._right_aligned_actions(button))
         page.layout().addWidget(self._tasks_panel("添加好友任务", {"add_friend"}))  # type: ignore[union-attr]
         return page
 
@@ -643,6 +644,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(16)
         label = QLabel(title)
         label.setObjectName("title")
+        label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         layout.addWidget(label)
         return page
 
