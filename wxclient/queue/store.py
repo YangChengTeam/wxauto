@@ -74,9 +74,7 @@ class TaskStore:
                     and_(
                         self.tasks.c.account_id == account_id,
                         self.tasks.c.type == task_type.value,
-                        self.tasks.c.status.in_(
-                            [TaskStatus.PENDING.value, TaskStatus.RUNNING.value]
-                        ),
+                        self.tasks.c.status == TaskStatus.PENDING.value,
                     )
                 )
                 .order_by(self.tasks.c.created_at.asc())
