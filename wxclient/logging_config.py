@@ -152,6 +152,44 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"回复「{payload.get('reply_message') or ''}」，"
             f"上下文 {payload.get('context_count', 0)} 条"
         )
+    if event == "reply.agent.request":
+        return (
+            f"Agent 请求「{payload.get('chat') or '-'}」："
+            f"来源={payload.get('source') or '-'}，"
+            f"输入「{payload.get('input_message') or ''}」，"
+            f"上下文 {payload.get('context_count', 0)} 条"
+        )
+    if event == "reply.agent.response":
+        return (
+            f"Agent 返回「{payload.get('chat') or '-'}」："
+            f"来源={payload.get('source') or '-'}，"
+            f"回复「{payload.get('reply_message') or ''}」，"
+            f"上下文 {payload.get('context_count', 0)} 条，"
+            f"耗时 {payload.get('elapsed_ms', 0)}ms"
+        )
+    if event == "chat.sessions.read":
+        return (
+            f"会话摘要读取：可见会话 {payload.get('session_count', 0)} 个，"
+            f"当前选中「{payload.get('selected_session') or '-'}」"
+        )
+    if event == "watch.chats.summary":
+        return (
+            f"监听完成「{payload.get('chat') or '-'}」："
+            f"可见消息 {payload.get('visible_message_count', 0)} 条，"
+            f"监听到新消息 {payload.get('message_count', 0)} 条，"
+            f"已回复 {payload.get('reply_count', 0)} 条，"
+            f"最后一条「{payload.get('latest_message') or ''}」，"
+            f"最新消息依据={payload.get('latest_message_source') or '-'}，"
+            f"判定={payload.get('decision_reason') or '-'}"
+        )
+    if event == "watch.chats.skip_summary":
+        return (
+            f"监听跳过「{payload.get('chat') or '-'}」："
+            f"{_skip_reason_label(payload.get('reason'))}，"
+            f"最后一条「{payload.get('latest_message') or ''}」，"
+            f"依据={payload.get('latest_message_source') or '-'}，"
+            f"自己消息判定={payload.get('latest_is_self_source') or '-'}"
+        )
     if event == "watch.chats.start":
         mode = "自动回复" if payload.get("auto_reply") else "只监听"
         return (
@@ -162,7 +200,7 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         return (
             f"监听完成「{payload.get('chat') or '-'}」："
             f"可见消息 {payload.get('visible_message_count', 0)} 条，"
-            f"游标后新消息 {payload.get('message_count', 0)} 条，"
+            f"监听到新消息 {payload.get('message_count', 0)} 条，"
             f"已回复 {payload.get('reply_count', 0)} 条，"
             f"最后一条「{payload.get('latest_message') or ''}」"
         )
@@ -188,6 +226,76 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         )
     if event == "watch.chats.failed":
         return f"监听「{payload.get('chat') or '-'}」失败：{payload.get('error', '')}"
+
+    # Friend check logs
+    if event == "friend.check.start":
+        mode = "检测并自动同意" if payload.get("auto_accept") else "仅检测"
+        return f"开始检测新好友：{mode}，上限 {payload.get('limit', '-')} 人"
+    if event == "friend.check.empty":
+        return "好友检测完成：没有新的好友申请"
+    if event == "friend.check.found":
+        samples = payload.get("samples") or []
+        sample_text = "、".join(str(s)[:20] for s in samples[:3])
+        suffix = f"，示例「{sample_text}」" if sample_text else ""
+        auto = "，已自动同意" if payload.get("auto_accept") else ""
+        return f"好友检测完成：发现 {payload.get('count', 0)} 位新好友{auto}{suffix}"
+    if event == "friend.check.failed":
+        return f"好友检测失败：{payload.get('error', '')}"
+    if event == "friend.add.start":
+        return f"开始添加好友：{payload.get('number', '-')}，招呼「{payload.get('greetings', '')}」"
+    if event == "friend.add.done":
+        return f"添加好友请求已发送：{payload.get('number', '-')}"
+    if event == "friend.add.failed":
+        return f"添加好友失败：{payload.get('number', '-')}，{payload.get('error', '')}"
+
+    # Moments logs
+    if event == "moments.post.start":
+        return (
+            f"开始发送朋友圈：文字 {payload.get('text_length', 0)} 字，"
+            f"图片/视频 {payload.get('media_count', 0)} 个"
+        )
+    if event == "moments.post.done":
+        return f"朋友圈发送完成：图片/视频 {payload.get('media_count', 0)} 个"
+    if event == "moments.post.failed":
+        return f"朋友圈发送失败：{payload.get('error', '')}"
+
+    # Diagnostic logs from wechat_api
+    if event == "collect_visible_messages.collected":
+        return (
+            f"消息收集：原始节点 {payload.get('raw_node_count', 0)} 个，"
+            f"消息 {payload.get('message_count', 0)} 条"
+        )
+    if event == "collect_visible_messages.group_detect":
+        return f"群聊检测：{payload.get('chat_name', '-')}，is_group={payload.get('is_group', False)}"
+    if event == "annotate_group_senders.right_click":
+        return (
+            f"群聊发送者检测：右键点击文本「{payload.get('text', '')[:30]}」，"
+            f"区域={payload.get('rect', '-')}，位置={payload.get('pos', '-')}"
+        )
+    if event == "annotate_group_senders.select_chatList_failed":
+        return f"群聊发送者检测：select_chatList失败：{payload.get('error', '')}"
+    if event == "annotate_group_senders.menu_search_error":
+        return f"群聊发送者检测：菜单搜索异常：{payload.get('error', '')}"
+    if event == "annotate_group_senders.check_mode":
+        return f"群聊发送者检测：已在多选模式={payload.get('already_selected', False)}，CheckBox={payload.get('checkbox_count', 0)}"
+    if event == "annotate_group_senders.select_result":
+        return f"群聊发送者检测：select_chatList={'成功' if payload.get('selected') else '失败'}"
+    if event == "annotate_group_senders.texts_with_name":
+        samples = payload.get("samples") or []
+        sample_text = "、".join(str(s)[:30] for s in samples[:3])
+        return f"群聊发送者检测：带名文本 {payload.get('count', 0)} 条，示例「{sample_text}」"
+    if event == "annotate_group_senders.texts_without_name":
+        samples = payload.get("samples") or []
+        sample_text = "、".join(str(s)[:30] for s in samples[:3])
+        return f"群聊发送者检测：纯文本 {payload.get('count', 0)} 条，示例「{sample_text}」"
+    if event == "annotate_group_senders.sender_map":
+        return f"群聊发送者检测：提取到 {payload.get('map_size', 0)} 个发送者"
+    if event == "annotate_group_senders.applied":
+        return f"群聊发送者检测：已应用 {payload.get('applied_count', 0)} 条消息的发送者"
+    if event == "annotate_group_senders.failed":
+        return f"群聊发送者检测失败：{payload.get('error', '')}"
+    if event == "annotate_group_senders.no_chat_list":
+        return "群聊发送者检测：未找到 chat_list 控件"
     if event == "reply.unread_messages.summary":
         return (
             f"未读检测完成：会话 {payload.get('chat_count', 0)} 个，"
@@ -203,6 +311,19 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"跳过未读会话「{payload.get('chat') or '-'}」："
             f"{_skip_reason_label(payload.get('reason'))}"
         )
+
+    if event == "uia.unlock.start":
+        return "正在解锁微信 UIA..."
+    if event == "uia.unlock.broadcast":
+        return "已广播屏幕阅读器变更通知。"
+    if event == "uia.unlock.quick_success":
+        return "UIA 解锁成功（无需重启微信）。"
+    if event == "uia.unlock.restart_needed":
+        return "广播后 UIA 未解锁，需要重启微信。"
+    if event == "uia.unlock.restart_success":
+        return "UIA 解锁成功（已重启微信）。"
+    if event == "uia.unlock.failed":
+        return f"UIA 解锁失败：{payload.get('error', '')}"
 
     if event == "worker.started":
         return f"服务已启动，轮询间隔 {payload.get('poll_interval', '-')} 秒。"
@@ -233,6 +354,7 @@ def _task_type_label(task_type: str) -> str:
         "reply_chat": "聊天回复任务",
         "reply_unread": "未读回复任务",
         "watch_chats": "消息监听任务",
+        "post_moments": "朋友圈发送任务",
     }
     return labels.get(task_type, task_type or "任务")
 
@@ -276,6 +398,7 @@ def _skip_reason_label(value: Any) -> str:
         "empty_agent_reply": "Agent 返回空回复",
         "already_processed_current_chat": "当前会话已处理过",
         "unknown_sender": "无法确认最后一条消息是谁发送的",
+        "no_replyable_message": "没有可回复的消息",
     }
     return labels.get(str(value or ""), str(value or "未说明原因"))
 

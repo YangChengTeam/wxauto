@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Protocol
 
 import structlog
@@ -13,6 +14,9 @@ logger = structlog.get_logger(__name__)
 
 class ChatAutomationApi(Protocol):
     def check_unread_messages(self, dry_run: bool | None = None) -> dict[str, Any]:
+        ...
+
+    def read_chat_sessions(self, dry_run: bool | None = None) -> dict[str, Any]:
         ...
 
     def scan_messages(
@@ -96,13 +100,13 @@ def reply_to_chat_messages(
     )
     messages = source_result["messages"]
     context_messages = source_result["context_messages"]
-    replyable_messages = [message for message in messages if message.get("is_self") is not True]
+    target_messages = _reply_target_messages(messages, reply_all=reply_all)
     logger.info(
         "reply.chat_messages.read",
         chat=friend,
         message_source=source,
         message_count=len(messages),
-        replyable_count=len(replyable_messages),
+        replyable_count=len(_reply_target_messages(messages, reply_all=True)),
         latest_message=_message_log_text(messages[-1] if messages else None),
         window_reused=source_result["raw_result"].get("window_reused"),
         window_mode=source_result["raw_result"].get("window_mode"),
@@ -112,14 +116,13 @@ def reply_to_chat_messages(
         chat_name=friend,
         messages=messages,
     )
-    if messages and not replyable_messages:
+    if messages and not target_messages:
         logger.info(
             "reply.chat_messages.skipped",
             chat=friend,
-            reason="latest_is_self",
+            reason=_reply_skip_reason(messages[-1]),
             latest_message=_message_log_text(messages[-1]),
         )
-    target_messages = replyable_messages if reply_all else replyable_messages[-1:]
     replies: list[dict[str, Any]] = []
 
     for message in target_messages:
@@ -132,7 +135,25 @@ def reply_to_chat_messages(
             latest_message=message,
             limit=context_message_limit,
         )
+        started = time.perf_counter()
+        logger.info(
+            "reply.agent.request",
+            chat=friend,
+            source=source,
+            input_message=_truncate_text(inbound_text),
+            context_count=len(context),
+            latest_is_self=message.get("is_self"),
+        )
         reply_text = agent.reply(inbound_text, context=context).strip()
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.info(
+            "reply.agent.response",
+            chat=friend,
+            source=source,
+            reply_message=_truncate_text(reply_text),
+            context_count=len(context),
+            elapsed_ms=elapsed_ms,
+        )
         if not reply_text:
             continue
         send_result = api.send_message(friend=friend, text=reply_text, dry_run=not real)
@@ -206,7 +227,7 @@ def watch_chats_messages(
     targets = _dedupe_chat_names(friends)
     if not targets:
         raise ValueError("至少需要一个监听对象")
-    effective_select_sender = False
+    effective_select_sender = bool(select_sender)
 
     chat_results: list[dict[str, Any]] = []
     replies: list[dict[str, Any]] = []
@@ -214,6 +235,7 @@ def watch_chats_messages(
     message_count = 0
     visible_message_count = 0
     cursor_seed_count = 0
+    session_summaries = _try_read_chat_sessions(api, real)
 
     for chat_name in targets:
         logger.info(
@@ -222,40 +244,89 @@ def watch_chats_messages(
             duration=duration,
             auto_reply=auto_reply,
         )
+        cursor = cursor_store.get_message_cursor(account_id, chat_name, "watch") if cursor_store is not None else None
+        outbound_texts = _cursor_outbound_texts(cursor)
+        session_summary = _find_chat_session(session_summaries, chat_name)
+        session_preview = _session_summary_preview(session_summary)
+        preview_self_source = _session_preview_self_reason(session_preview, outbound_texts)
+        if preview_self_source is not None:
+            result = {
+                "action": "watch_chat",
+                "friend": chat_name,
+                "duration": duration,
+                "dry_run": not real,
+                "auto_reply": auto_reply,
+                "visible_message_count": 0,
+                "new_message_count": 0,
+                "reply_count": 0,
+                "cursor_seeded": False,
+                "source_result": None,
+                "latest_message": _truncate_text(session_preview),
+                "latest_message_source": "session_preview",
+                "latest_is_self_source": preview_self_source,
+                "decision_reason": "latest_is_self_preview",
+                "fallback_window_opened": False,
+                "reply_message_source": None,
+                "session_preview": session_preview,
+            }
+            chat_results.append(result)
+            logger.info(
+                "watch.chats.skip_summary",
+                chat=chat_name,
+                reason="latest_is_self",
+                visible_message_count=0,
+                latest_message=result["latest_message"],
+                latest_message_source="session_preview",
+                latest_is_self_source=preview_self_source,
+                decision_reason="latest_is_self_preview",
+            )
+            continue
         try:
-            read_result = api.read_visible_messages(
+            scan_result = api.scan_messages(
                 friend=chat_name,
-                separate_window=False,
+                duration=duration,
+                select_sender=effective_select_sender,
+                separate_window=True,
                 dry_run=not real,
             )
-            visible_messages = _extract_visible_messages(read_result)
+            new_messages = _extract_scan_messages(scan_result)
+            baseline_messages = _extract_baseline_messages(scan_result)
+            visible_messages = baseline_messages
+            if not visible_messages:
+                visible_messages = _try_read_visible_messages(
+                    api,
+                    chat_name,
+                    real,
+                    separate_window=True,
+                )
+            if not visible_messages:
+                visible_messages = new_messages
             visible_message_count += len(visible_messages)
 
-            cursor = None
             if cursor_store is not None:
-                cursor = cursor_store.get_message_cursor(account_id, chat_name, "watch")
-                _mark_recent_outbound_messages(visible_messages, _cursor_outbound_texts(cursor))
-                new_messages, seeded = _messages_after_cursor(visible_messages, cursor)
-            else:
-                new_messages = visible_messages
-                seeded = False
-
+                _mark_recent_outbound_messages(visible_messages, outbound_texts)
+                _mark_recent_outbound_messages(new_messages, outbound_texts)
+            cursor_new_messages, seeded = _watch_messages_after_cursor(
+                visible_messages,
+                cursor,
+            )
             if seeded:
                 cursor_seed_count += 1
-                logger.info(
-                    "watch.chats.skipped",
-                    chat=chat_name,
-                    reason="cursor_seeded",
-                    visible_message_count=len(visible_messages),
-                )
+            reply_messages = new_messages or cursor_new_messages
+            reply_message_source = "scan_messages" if new_messages else "cursor_visible"
+            if not reply_messages and not seeded:
+                reply_messages = _latest_visible_watch_message(visible_messages, cursor)
+                reply_message_source = "visible_latest"
+            if not reply_messages:
+                reply_message_source = None
 
             chat_replies: list[dict[str, Any]] = []
-            if auto_reply and not seeded:
+            if auto_reply:
                 chat_replies = _reply_to_chat_batch(
                     api=api,
                     agent=agent,
                     chat_name=chat_name,
-                    messages=new_messages,
+                    messages=reply_messages,
                     context_messages=visible_messages,
                     reply_all=reply_all,
                     real=real,
@@ -277,6 +348,20 @@ def watch_chats_messages(
                     "watch",
                 )
 
+            latest_message_row = _latest_activity_message(new_messages) or _latest_activity_message(visible_messages)
+            latest_message = _message_log_text(latest_message_row) or _truncate_text(session_preview)
+            latest_message_source = _watch_latest_message_source(
+                session_preview=session_preview,
+                new_messages=new_messages,
+                visible_messages=visible_messages,
+            )
+            latest_is_self_source = _message_self_source(latest_message_row, outbound_texts)
+            decision_reason = _watch_decision_reason(
+                auto_reply=auto_reply,
+                reply_messages=reply_messages,
+                replies=chat_replies,
+            )
+
             result = {
                 "action": "watch_chat",
                 "friend": chat_name,
@@ -284,27 +369,50 @@ def watch_chats_messages(
                 "dry_run": not real,
                 "auto_reply": auto_reply,
                 "visible_message_count": len(visible_messages),
-                "new_message_count": len(new_messages) if not seeded else 0,
+                "new_message_count": len(new_messages),
                 "reply_count": len(chat_replies),
                 "cursor_seeded": seeded,
-                "source_result": read_result,
+                "source_result": scan_result,
+                "latest_message": latest_message,
+                "latest_message_source": latest_message_source,
+                "latest_is_self_source": latest_is_self_source,
+                "decision_reason": decision_reason,
+                "fallback_window_opened": True,
+                "reply_message_source": reply_message_source,
+                "session_preview": session_preview,
             }
             chat_results.append(result)
 
-            message_count += 0 if seeded else len(new_messages)
+            message_count += len(new_messages)
             logger.info(
-                "watch.chats.read",
+                "watch.chats.summary",
                 chat=chat_name,
-                message_count=0 if seeded else len(new_messages),
+                message_count=len(new_messages),
                 visible_message_count=len(visible_messages),
                 reply_count=int(result.get("reply_count") or 0),
-                latest_message=_message_log_text(visible_messages[-1] if visible_messages else None),
+                latest_message=latest_message,
+                latest_message_source=latest_message_source,
+                latest_is_self_source=latest_is_self_source,
+                decision_reason=decision_reason,
+                fallback_window_opened=True,
+                reply_message_source=reply_message_source,
             )
             _log_chat_messages(
                 event="watch.chats.message",
                 chat_name=chat_name,
                 messages=visible_messages,
             )
+            if auto_reply and not chat_replies:
+                logger.info(
+                    "watch.chats.skip_summary",
+                    chat=chat_name,
+                    reason=decision_reason,
+                    visible_message_count=len(visible_messages),
+                    latest_message=latest_message,
+                    latest_message_source=latest_message_source,
+                    latest_is_self_source=latest_is_self_source,
+                    decision_reason=decision_reason,
+                )
             for reply in chat_replies:
                 if not isinstance(reply, dict):
                     continue
@@ -338,6 +446,112 @@ def watch_chats_messages(
         "errors": errors,
         "results": chat_results,
     }
+
+
+def _try_read_chat_sessions(api: ChatAutomationApi, real: bool) -> list[dict[str, Any]]:
+    read_sessions = getattr(api, "read_chat_sessions", None)
+    if read_sessions is None:
+        return []
+    try:
+        result = read_sessions(dry_run=not real)
+    except Exception:
+        return []
+    return _extract_chat_sessions(result)
+
+
+def _extract_chat_sessions(result: dict[str, Any]) -> list[dict[str, Any]]:
+    sessions = result.get("sessions")
+    if not isinstance(sessions, list):
+        return []
+    return [item for item in sessions if isinstance(item, dict)]
+
+
+def _find_chat_session(sessions: list[dict[str, Any]], chat_name: str) -> dict[str, Any] | None:
+    if not sessions:
+        return None
+    matches = [
+        session
+        for session in sessions
+        if _chat_matches_filter(str(session.get("name") or ""), chat_name)
+    ]
+    if not matches:
+        return None
+    return matches[0]
+
+
+def _session_summary_preview(session: dict[str, Any] | None) -> str | None:
+    if not session:
+        return None
+    preview = session.get("preview")
+    preview_text = str(preview or "").strip()
+    return preview_text or None
+
+
+def _session_preview_self_reason(preview: str | None, outbound_texts: list[str]) -> str | None:
+    preview_text = str(preview or "").strip()
+    if not preview_text:
+        return None
+    self_prefixes = (
+        "你:",
+        "你：",
+        "我:",
+        "我：",
+        "You:",
+        "Me:",
+    )
+    outbound = {str(text or "").strip() for text in outbound_texts if str(text or "").strip()}
+    for prefix in self_prefixes:
+        if preview_text.startswith(prefix):
+            tail = preview_text[len(prefix) :].strip()
+            if not outbound or not tail or tail in outbound or preview_text in outbound:
+                return f"preview_prefix:{prefix}"
+    if outbound and preview_text in outbound:
+        return "preview_matches_outbound"
+    return None
+
+
+def _message_self_source(message: dict[str, Any] | None, outbound_texts: list[str]) -> str | None:
+    if message is None:
+        return None
+    if message.get("is_self") is True:
+        text = _message_text(message)
+        if text and text in set(outbound_texts):
+            return "recent_outbound_cache"
+        return "message_annotation"
+    if message.get("is_self") is False:
+        return "message_annotation"
+    return None
+
+
+def _watch_latest_message_source(
+    session_preview: str | None,
+    new_messages: list[dict[str, Any]],
+    visible_messages: list[dict[str, Any]],
+) -> str:
+    if new_messages:
+        return "scan_messages"
+    if visible_messages:
+        return "visible_messages"
+    if session_preview:
+        return "session_preview"
+    return "unknown"
+
+
+def _watch_decision_reason(
+    *,
+    auto_reply: bool,
+    reply_messages: list[dict[str, Any]],
+    replies: list[dict[str, Any]],
+) -> str:
+    if not auto_reply:
+        return "auto_reply_disabled"
+    if replies:
+        return "replied"
+    if reply_messages:
+        latest = _latest_activity_message(reply_messages)
+        if latest is not None:
+            return _reply_skip_reason(latest)
+    return "no_replyable_message"
 
 
 def _read_source_messages(
@@ -387,13 +601,17 @@ def _log_chat_messages(
 ) -> None:
     if not messages:
         return
-    start_index = max(0, len(messages) - limit)
-    for offset, message in enumerate(messages[start_index:], start=start_index + 1):
+    display_messages = [message for message in messages if not message.get("is_timestamp")]
+    if not display_messages:
+        return
+    start_index = max(0, len(display_messages) - limit)
+    total = len(display_messages)
+    for offset, message in enumerate(display_messages[start_index:], start=start_index + 1):
         logger.info(
             event,
             chat=chat_name,
             index=offset,
-            total=len(messages),
+            total=total,
             sender=_display_sender(message, chat_name),
             text=_truncate_text(_message_text(message)),
             is_self=message.get("is_self"),
@@ -413,7 +631,7 @@ def reply_to_unread_messages(
     visible_chats: list[str] | None = None,
     context_message_limit: int = DEFAULT_CONTEXT_MESSAGE_LIMIT,
 ) -> dict[str, Any]:
-    current_results = _reply_to_current_chat_latest(
+    current_result = _reply_to_current_chat_latest(
         api=api,
         agent=agent,
         cursor_store=cursor_store,
@@ -422,9 +640,6 @@ def reply_to_unread_messages(
         friend=friend,
         context_message_limit=context_message_limit,
     )
-    replies: list[dict[str, Any]] = list(current_results["replies"])
-    processed_chats: set[str] = set(current_results["processed_chats"])
-
     check_result = api.check_unread_messages(dry_run=not real)
     unread_messages = _extract_unread_messages(check_result, friend=friend)
     logger.info(
@@ -432,6 +647,9 @@ def reply_to_unread_messages(
         chat_count=len(unread_messages),
         message_count=sum(len(messages) for messages in unread_messages.values()),
     )
+
+    replies: list[dict[str, Any]] = list(current_result.get("replies") or [])
+    processed_chats: set[str] = set(current_result.get("processed_chats") or [])
 
     for chat_name, messages in unread_messages.items():
         logger.info(
@@ -470,7 +688,7 @@ def reply_to_unread_messages(
                 "visible",
             )
 
-    visible_results = _reply_to_visible_watch_chats(
+    visible_result = _reply_to_visible_watch_chats(
         api=api,
         agent=agent,
         cursor_store=cursor_store,
@@ -482,7 +700,7 @@ def reply_to_unread_messages(
         friend=friend,
         context_message_limit=context_message_limit,
     )
-    replies.extend(visible_results["replies"])
+    replies.extend(visible_result.get("replies") or [])
 
     return {
         "action": "reply_unread",
@@ -491,14 +709,13 @@ def reply_to_unread_messages(
         "chat_count": len(unread_messages),
         "message_count": sum(len(messages) for messages in unread_messages.values()),
         "matched_chat_count": len(unread_messages),
-        "current_chat": current_results["chat"],
-        "current_chat_checked": current_results["checked"],
-        "current_chat_replied": current_results["replied"],
-        "current_chat_latest_is_today": current_results["latest_is_today"],
-        "visible_chat_count": visible_results["visible_chat_count"],
-        "visible_message_count": visible_results["visible_message_count"],
-        "cursor_seed_count": visible_results["cursor_seed_count"],
-        "processed_chats": sorted(processed_chats | set(visible_results["processed_chats"])),
+        "current_chat_checked": bool(current_result.get("checked")),
+        "current_chat_replied": bool(current_result.get("replied")),
+        "current_chat": current_result.get("chat"),
+        "current_chat_latest_is_today": current_result.get("latest_is_today"),
+        "visible_chat_count": visible_result.get("visible_chat_count", 0),
+        "visible_message_count": visible_result.get("visible_message_count", 0),
+        "cursor_seed_count": visible_result.get("cursor_seed_count", 0),
         "reply_count": len(replies),
         "replies": replies,
         "check_result": check_result,
@@ -694,7 +911,25 @@ def _reply_to_current_chat_latest(
         sender=sender,
         inbound_text=inbound_text,
     )
+    started = time.perf_counter()
+    logger.info(
+        "reply.agent.request",
+        chat=chat_name,
+        source="unread",
+        input_message=_truncate_text(inbound_text),
+        context_count=len(context),
+        sender=sender,
+    )
     reply_text = agent.reply(prompt, context=context).strip()
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    logger.info(
+        "reply.agent.response",
+        chat=chat_name,
+        source="unread",
+        reply_message=_truncate_text(reply_text),
+        context_count=len(context),
+        elapsed_ms=elapsed_ms,
+    )
     if not reply_text:
         logger.info(
             "reply.current_chat.skipped",
@@ -852,8 +1087,7 @@ def _reply_to_chat_batch(
     context_message_limit: int,
 ) -> list[dict[str, Any]]:
     replies: list[dict[str, Any]] = []
-    replyable_messages = [message for message in messages if message.get("is_self") is not True]
-    target_messages = replyable_messages if reply_all else replyable_messages[-1:]
+    target_messages = _reply_target_messages(messages, reply_all=reply_all)
     for message in target_messages:
         inbound_text = _message_text(message)
         if not inbound_text:
@@ -870,7 +1104,25 @@ def _reply_to_chat_batch(
             sender=sender,
             inbound_text=inbound_text,
         )
+        started = time.perf_counter()
+        logger.info(
+            "reply.agent.request",
+            chat=chat_name,
+            source=source,
+            input_message=_truncate_text(inbound_text),
+            context_count=len(context),
+            sender=sender,
+        )
         reply_text = agent.reply(prompt, context=context).strip()
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.info(
+            "reply.agent.response",
+            chat=chat_name,
+            source=source,
+            reply_message=_truncate_text(reply_text),
+            context_count=len(context),
+            elapsed_ms=elapsed_ms,
+        )
         if not reply_text:
             continue
         send_result = api.send_message(
@@ -890,6 +1142,71 @@ def _reply_to_chat_batch(
             }
         )
     return replies
+
+
+def _watch_messages_after_cursor(
+    messages: list[dict[str, Any]],
+    cursor: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], bool]:
+    if cursor is None:
+        return [], False
+    return _messages_after_cursor(messages, cursor)
+
+
+def _latest_visible_watch_message(
+    messages: list[dict[str, Any]],
+    cursor: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    latest = _latest_activity_message(messages)
+    if latest is None:
+        return []
+    if _cursor_contains_message(cursor, latest):
+        return []
+    return [latest]
+
+
+def _reply_target_messages(
+    messages: list[dict[str, Any]],
+    *,
+    reply_all: bool,
+) -> list[dict[str, Any]]:
+    if reply_all:
+        return [message for message in messages if _message_can_trigger_reply(message)]
+    latest = _latest_activity_message(messages)
+    if latest is None or not _message_can_trigger_reply(latest):
+        return []
+    return [latest]
+
+
+def _latest_activity_message(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for message in reversed(messages):
+        if message.get("is_timestamp"):
+            continue
+        if _message_text(message):
+            return message
+    return None
+
+
+def _message_can_trigger_reply(message: dict[str, Any]) -> bool:
+    if message.get("is_timestamp"):
+        return False
+    if not _message_text(message):
+        return False
+    if message.get("is_self") is True:
+        return False
+    if message.get("timestamp_is_today") is False:
+        return False
+    return True
+
+
+def _reply_skip_reason(latest: dict[str, Any]) -> str:
+    if latest.get("is_self") is True:
+        return "latest_is_self"
+    if latest.get("timestamp_is_today") is False:
+        return "not_today"
+    if not _message_text(latest):
+        return "empty_latest_message"
+    return "no_replyable_message"
 
 
 def _refresh_visible_cursor(
@@ -927,6 +1244,15 @@ def _extract_scan_messages(scan_result: dict[str, Any]) -> list[dict[str, Any]]:
     if isinstance(messages, list):
         return [item for item in messages if isinstance(item, dict)]
 
+    return []
+
+
+def _extract_baseline_messages(scan_result: dict[str, Any]) -> list[dict[str, Any]]:
+    nested_result = scan_result.get("result")
+    if isinstance(nested_result, dict):
+        messages = nested_result.get("baseline_messages")
+        if isinstance(messages, list):
+            return [item for item in messages if isinstance(item, dict)]
     return []
 
 
@@ -1038,7 +1364,11 @@ def _display_sender(message: dict[str, Any], chat_name: str) -> str:
     if sender:
         return sender
     if message.get("is_self") is False:
+        if message.get("is_group"):
+            return "\u5176\u4ed6\u4eba"
         return chat_name
+    if message.get("is_group"):
+        return "\u672a\u77e5"
     return chat_name or "\u5bf9\u65b9"
 
 

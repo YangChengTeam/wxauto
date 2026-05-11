@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from PIL import Image, ImageDraw
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from wxclient.agentbridge import AgentBridge
 from wxclient.agentbridge.reply_flow import (
+    _display_sender,
+    _log_chat_messages,
+    _message_fingerprint,
     reply_to_chat_messages,
     reply_to_new_chat_messages,
     reply_to_unread_messages,
@@ -25,10 +31,15 @@ from wxclient.queue import OperationWorker, TaskStatus, TaskStore, TaskType
 from wxclient.trigger.http_server import create_app
 from wxclient.ui.config import load_gui_settings, save_gui_settings
 from wxclient.ui.task_actions import enqueue_reply_unread, enqueue_watch_chats
+from wxclient.uia_unlock.service import _is_wechat_window_candidate
 from wxclient.wechat_api import WeChatApi
 from wxclient.wechat_api.service import (
+    WeChatApiError,
+    _control_matches_criteria,
     _infer_message_is_self,
+    _infer_message_is_self_from_row_image,
     _resolve_control_by_criteria,
+    _split_selected_group_message_text,
     _tail_messages,
 )
 
@@ -63,12 +74,16 @@ class FakeChatApi:
         append_sent_to_messages: bool = False,
         current_chat: str | None = None,
         current_messages: list[dict[str, str]] | None = None,
+        visible_messages: list[dict[str, str]] | None = None,
+        session_summaries: list[dict[str, object]] | None = None,
     ) -> None:
         self.messages = messages
+        self.visible_messages = visible_messages if visible_messages is not None else messages
         self.unread_messages = unread_messages or {}
         self.append_sent_to_messages = append_sent_to_messages
         self.current_chat = current_chat
         self.current_messages = current_messages if current_messages is not None else messages
+        self.session_summaries = session_summaries or []
         self.sent: list[dict[str, object]] = []
         self.current_sent: list[dict[str, object]] = []
         self.scanned: list[str] = []
@@ -82,6 +97,14 @@ class FakeChatApi:
             "dry_run": dry_run,
             "action": "check_unread_messages",
             "messages_by_chat": self.unread_messages,
+        }
+
+    def read_chat_sessions(self, dry_run: bool | None = None) -> dict[str, object]:
+        return {
+            "dry_run": dry_run,
+            "action": "read_chat_sessions",
+            "sessions": self.session_summaries,
+            "selected_session": self.session_summaries[0] if self.session_summaries else None,
         }
 
     def scan_messages(
@@ -149,7 +172,7 @@ class FakeChatApi:
             "friend": friend,
             "separate_window": separate_window,
             "window_mode": "separate" if separate_window else "main",
-            "messages": self.messages,
+            "messages": self.visible_messages,
         }
 
     def read_current_chat(self, dry_run: bool | None = None) -> dict[str, object]:
@@ -207,9 +230,15 @@ class FakeRect:
 
 
 class FakeElementInfo:
-    def __init__(self, automation_id: str = "", framework_id: str = "Qt") -> None:
+    def __init__(
+        self,
+        automation_id: str = "",
+        framework_id: str = "Qt",
+        control_type: str = "",
+    ) -> None:
         self.automation_id = automation_id
         self.framework_id = framework_id
+        self.control_type = control_type
 
 
 class FakeUiaNode:
@@ -225,7 +254,7 @@ class FakeUiaNode:
         self._control_type = control_type
         self._text = text
         self._rect = rect
-        self.element_info = FakeElementInfo(automation_id=automation_id)
+        self.element_info = FakeElementInfo(automation_id=automation_id, control_type=control_type)
 
     def class_name(self) -> str:
         return self._class_name
@@ -309,6 +338,10 @@ class FakeUnreadNavigator:
         self.opened_with_select.append(select)
         return friend
 
+    def open_seperate_dialog_window(self, friend: str, select: bool, **kwargs):  # type: ignore[no-untyped-def]
+        self.opened_with_select.append(select)
+        return friend
+
 
 class FakeUnreadUtils:
     def scan_for_new_messages(self, **kwargs):  # type: ignore[no-untyped-def]
@@ -334,7 +367,7 @@ class FakeUnreadWeChatApi(WeChatApi):
             return self.utils
         return super()._pyweixin_submodule(name)
 
-    def _collect_visible_message_nodes(self, dialog_window):  # type: ignore[no-untyped-def]
+    def _collect_visible_message_nodes(self, dialog_window, *args, **kwargs):  # type: ignore[no-untyped-def]
         return [
             {"text": "old", "class_name": "mmui::ChatTextItemView"},
             {"text": "first unread", "class_name": "mmui::ChatTextItemView"},
@@ -373,7 +406,7 @@ class ReuseDialogWeChatApi(WeChatApi):
             return self.navigator
         return super()._pyweixin_class(name)
 
-    def _poll_visible_messages(self, dialog_window, duration: str):  # type: ignore[no-untyped-def]
+    def _poll_visible_messages(self, dialog_window, duration: str, *args, **kwargs):  # type: ignore[no-untyped-def]
         return {
             "new_message_count": 1,
             "messages": [{"sender": "Mzxx", "text": "hello", "is_self": False}],
@@ -581,9 +614,10 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["action"], "watch_chats")
         self.assertEqual(result["chat_count"], 2)
         self.assertEqual(result["reply_count"], 2)
-        self.assertEqual(api.scanned, [])
+        self.assertEqual(api.scanned, ["Mzxx", "测试群"])
         self.assertEqual(api.visible_reads, ["Mzxx", "测试群"])
-        self.assertEqual(api.read_separate_windows, [False, False])
+        self.assertEqual(api.scan_separate_windows, [True, True])
+        self.assertEqual(api.read_separate_windows, [True, True])
         self.assertEqual([item["friend"] for item in api.sent], ["Mzxx", "测试群"])
 
     def test_watch_chats_can_listen_without_reply(self) -> None:
@@ -601,16 +635,41 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["message_count"], 1)
         self.assertEqual(result["visible_message_count"], 1)
         self.assertEqual(result["reply_count"], 0)
-        self.assertEqual(api.scanned, [])
+        self.assertEqual(api.scanned, ["Mzxx"])
         self.assertEqual(api.visible_reads, ["Mzxx"])
-        self.assertEqual(api.read_separate_windows, [False])
+        self.assertEqual(api.scan_separate_windows, [True])
+        self.assertEqual(api.read_separate_windows, [True])
         self.assertEqual(api.sent, [])
 
-    def test_watch_chats_seeds_cursor_before_replying_visible_history(self) -> None:
+    def test_watch_chats_skips_separate_window_when_session_preview_marks_self(self) -> None:
+        api = FakeChatApi(
+            [{"sender": "Other", "text": "hello", "is_self": False}],
+            session_summaries=[
+                {"name": "Mzxx", "preview": "Me: already answered", "is_selected": True},
+            ],
+        )
+
+        result = watch_chats_messages(
+            api=api,
+            agent=EchoAgent(),
+            friends=["Mzxx"],
+            duration="1s",
+            real=True,
+            auto_reply=True,
+        )
+
+        self.assertEqual(result["reply_count"], 0)
+        self.assertEqual(api.scanned, [])
+        self.assertEqual(api.visible_reads, [])
+        self.assertEqual(result["results"][0]["fallback_window_opened"], False)
+        self.assertEqual(result["results"][0]["latest_message_source"], "session_preview")
+        self.assertEqual(result["results"][0]["decision_reason"], "latest_is_self_preview")
+
+    def test_watch_chats_uses_scan_result_instead_of_seeding_visible_history(self) -> None:
         api = FakeChatApi([{"sender": "Mzxx", "text": "hello", "is_self": False}])
         cursors = InMemoryCursorStore()
 
-        first = watch_chats_messages(
+        result = watch_chats_messages(
             api=api,
             agent=EchoAgent(),
             friends=["Mzxx"],
@@ -620,26 +679,59 @@ class CoreTests(unittest.TestCase):
             cursor_store=cursors,
         )
 
-        self.assertEqual(first["visible_message_count"], 1)
-        self.assertEqual(first["message_count"], 0)
-        self.assertEqual(first["cursor_seed_count"], 1)
-        self.assertEqual(first["reply_count"], 0)
+        self.assertEqual(result["visible_message_count"], 1)
+        self.assertEqual(result["message_count"], 1)
+        self.assertEqual(result["cursor_seed_count"], 0)
+        self.assertEqual(result["reply_count"], 1)
+        self.assertIn("hello", str(api.sent[0]["text"]))
+
+    def test_watch_chats_replies_to_latest_visible_when_scan_has_no_new_nodes(self) -> None:
+        api = FakeChatApi(
+            [],
+            visible_messages=[
+                {"sender": "Mzxx", "text": "old", "is_self": False},
+                {"sender": "Mzxx", "text": "visible-last", "is_self": False},
+            ],
+        )
+        cursors = InMemoryCursorStore()
+
+        result = watch_chats_messages(
+            api=api,
+            agent=EchoAgent(),
+            friends=["Mzxx"],
+            duration="1s",
+            real=True,
+            auto_reply=True,
+            cursor_store=cursors,
+        )
+
+        self.assertEqual(result["message_count"], 0)
+        self.assertEqual(result["reply_count"], 1)
+        self.assertIn("visible-last", str(api.sent[0]["text"]))
+
+    def test_watch_chats_skips_latest_visible_when_already_processed(self) -> None:
+        latest = {"sender": "Mzxx", "text": "visible-last", "is_self": False}
+        api = FakeChatApi([], visible_messages=[latest])
+        cursors = InMemoryCursorStore()
+        cursors.set_message_cursor(
+            "default",
+            "Mzxx",
+            {"tail": [_message_fingerprint(latest)]},
+            "watch",
+        )
+
+        result = watch_chats_messages(
+            api=api,
+            agent=EchoAgent(),
+            friends=["Mzxx"],
+            duration="1s",
+            real=True,
+            auto_reply=True,
+            cursor_store=cursors,
+        )
+
+        self.assertEqual(result["reply_count"], 0)
         self.assertEqual(api.sent, [])
-
-        api.messages.append({"sender": "Mzxx", "text": "second", "is_self": False})
-        second = watch_chats_messages(
-            api=api,
-            agent=EchoAgent(),
-            friends=["Mzxx"],
-            duration="1s",
-            real=True,
-            auto_reply=True,
-            cursor_store=cursors,
-        )
-
-        self.assertEqual(second["message_count"], 1)
-        self.assertEqual(second["reply_count"], 1)
-        self.assertIn("second", str(api.sent[0]["text"]))
 
     def test_watch_chats_skips_new_self_messages(self) -> None:
         api = FakeChatApi([{"sender": "Mzxx", "text": "hello", "is_self": False}])
@@ -654,7 +746,8 @@ class CoreTests(unittest.TestCase):
             auto_reply=True,
             cursor_store=cursors,
         )
-        api.messages.append({"sender": "me", "text": "mine", "is_self": True})
+        api.messages = [{"sender": "me", "text": "mine", "is_self": True}]
+        api.sent.clear()
 
         result = watch_chats_messages(
             api=api,
@@ -667,6 +760,26 @@ class CoreTests(unittest.TestCase):
         )
 
         self.assertEqual(result["message_count"], 1)
+        self.assertEqual(result["reply_count"], 0)
+        self.assertEqual(api.sent, [])
+
+    def test_reply_chat_skips_when_latest_message_is_self_even_with_prior_inbound(self) -> None:
+        api = FakeChatApi(
+            [
+                {"sender": "Mzxx", "text": "question", "is_self": False},
+                {"sender": "我", "text": "already answered", "is_self": True},
+            ]
+        )
+
+        result = reply_to_chat_messages(
+            api=api,
+            agent=EchoAgent(),
+            friend="Mzxx",
+            duration="1s",
+            real=True,
+        )
+
+        self.assertEqual(result["new_message_count"], 2)
         self.assertEqual(result["reply_count"], 0)
         self.assertEqual(api.sent, [])
 
@@ -1007,6 +1120,74 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(result["dry_run"])
         self.assertEqual(result["messages_by_chat"], {})
 
+    def test_moments_file_dialog_value_uses_raw_single_path(self) -> None:
+        path = r"D:\tmp\file with space.png"
+
+        self.assertEqual(WeChatApi._build_native_file_dialog_value([path]), path)
+
+    def test_moments_file_dialog_value_quotes_multiple_paths_without_trailing_space(self) -> None:
+        value = WeChatApi._build_native_file_dialog_value(
+            [r"D:\tmp\a one.png", r"D:\tmp\b two.png"]
+        )
+
+        self.assertEqual(value, r'"D:\tmp\a one.png" "D:\tmp\b two.png"')
+
+    def test_moments_media_paths_are_normalized_from_quoted_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            media = Path(tmp) / "a file.png"
+            media.write_bytes(b"png")
+            api = WeChatApi(project_root=Path(tmp), dry_run=True)
+
+            self.assertEqual(
+                api._normalize_moments_media_paths([f'"{media}"']),
+                [str(media.resolve())],
+            )
+
+    def test_moments_media_paths_reject_missing_files(self) -> None:
+        with self.assertRaises(WeChatApiError):
+            WeChatApi(dry_run=True)._normalize_moments_media_paths([r"D:\tmp\missing.png"])
+
+    def test_moments_file_dialog_fallback_picks_bottom_edit(self) -> None:
+        search_edit = FakeUiaNode("Edit", "Edit", "", rect=FakeRect(20, 40, 220, 64))
+        file_name_edit = FakeUiaNode("Edit", "Edit", "", rect=FakeRect(20, 360, 420, 384))
+        dialog = FakeUiaWindow([search_edit, file_name_edit])
+
+        self.assertIs(
+            WeChatApi(dry_run=True)._find_native_file_name_edit(dialog),
+            file_name_edit,
+        )
+
+    def test_moments_file_dialog_open_button_ignores_dropdown(self) -> None:
+        dropdown = FakeUiaNode("Button", "Button", "打开", automation_id="DropDown")
+        open_button = FakeUiaNode("Button", "Button", "打开(O)", automation_id="1")
+        dialog = FakeUiaWindow([dropdown, open_button])
+
+        self.assertIs(WeChatApi(dry_run=True)._find_native_open_button(dialog), open_button)
+
+    def test_uia_unlock_rejects_explorer_weixin_window(self) -> None:
+        self.assertFalse(
+            _is_wechat_window_candidate("Weixin", "CabinetWClass", "explorer.exe")
+        )
+
+    def test_uia_unlock_rejects_real_weixin_non_chinese_title(self) -> None:
+        self.assertFalse(
+            _is_wechat_window_candidate("Weixin", "Qt51514QWindowIcon", "Weixin.exe")
+        )
+
+    def test_uia_unlock_accepts_real_weixin_qt_window(self) -> None:
+        self.assertTrue(
+            _is_wechat_window_candidate("微信", "Qt51514QWindowIcon", "Weixin.exe")
+        )
+
+    def test_uia_unlock_rejects_wechat_tray_window(self) -> None:
+        self.assertFalse(
+            _is_wechat_window_candidate(
+                "WxTrayIconMessageWindow",
+                "Qt51514WxTrayIconMessageWindowClass",
+                "Weixin.exe",
+            )
+        )
+
     def test_wechat_api_check_unread_messages_does_not_use_multiselect(self) -> None:
         api = FakeUnreadWeChatApi()
 
@@ -1031,6 +1212,75 @@ class CoreTests(unittest.TestCase):
         rows = api._collect_visible_message_nodes(window)
 
         self.assertEqual([row["text"] for row in rows], ["hello", "world"])
+
+    def test_visible_message_reader_keeps_collection_diagnostics_out_of_info_logs(self) -> None:
+        api = TestableWeChatApi(dry_run=True)
+        window = FakeUiaWindow([FakeUiaNode("mmui::ChatTextItemView", "Text", "hello")])
+
+        with patch("wxclient.wechat_api.service.logger") as fake_logger:
+            rows = api._collect_visible_message_nodes(window)
+
+        self.assertEqual([row["text"] for row in rows], ["hello"])
+        info_events = [call.args[0] for call in fake_logger.info.call_args_list]
+        debug_events = [call.args[0] for call in fake_logger.debug.call_args_list]
+        self.assertNotIn("collect_visible_messages.collected", info_events)
+        self.assertNotIn("collect_visible_messages.group_detect", info_events)
+        self.assertIn("collect_visible_messages.collected", debug_events)
+        self.assertIn("collect_visible_messages.group_detect", debug_events)
+
+    def test_control_type_matching_accepts_uia_control_type_alias(self) -> None:
+        node = FakeUiaNode("mmui::RecyclerListView", "ListBox", "消息")
+        node.element_info.control_type = "List"
+
+        self.assertTrue(_control_matches_criteria(node, {"control_type": "List"}))
+
+    def test_visible_message_reader_marks_group_from_count_label(self) -> None:
+        api = TestableWeChatApi(dry_run=True)
+        count_label = FakeUiaNode("mmui::XTextView", "Text", "(3)")
+        count_label.element_info.automation_id = (
+            "content_view.top_content_view.title_h_view.left_v_view.left_content_v_view."
+            "left_ui_.big_title_line_h_view.current_chat_count_label"
+        )
+        window = FakeUiaWindow(
+            [
+                count_label,
+                FakeUiaNode("mmui::ChatTextItemView", "Text", "hello"),
+            ]
+        )
+
+        rows = api._collect_visible_message_nodes(window, chat_name="Mzxx")
+
+        self.assertTrue(rows[0]["is_group"])
+        self.assertEqual(_display_sender(rows[0], "Mzxx"), "未知")
+
+    def test_selected_group_message_text_extracts_sender_and_content(self) -> None:
+        sender, content = _split_selected_group_message_text("Kk 凯哥\n@面面xx 早")
+
+        self.assertEqual(sender, "Kk 凯哥")
+        self.assertEqual(content, "@面面xx 早")
+
+    def test_group_message_without_sender_displays_other_person_when_not_self(self) -> None:
+        sender = _display_sender({"is_group": True, "is_self": False}, "Mzxx")
+
+        self.assertEqual(sender, "其他人")
+
+    def test_chat_message_logging_skips_timestamp_rows(self) -> None:
+        messages = [
+            {"text": "08:56", "is_timestamp": True, "timestamp_text": "08:56"},
+            {"text": "hello", "is_group": True, "is_self": False},
+            {"text": "mine", "is_group": True, "is_self": True},
+        ]
+
+        with patch("wxclient.agentbridge.reply_flow.logger") as fake_logger:
+            _log_chat_messages("watch.chats.message", "Mzxx", messages)
+
+        self.assertEqual(fake_logger.info.call_count, 2)
+        first = fake_logger.info.call_args_list[0].kwargs
+        second = fake_logger.info.call_args_list[1].kwargs
+        self.assertEqual(first["index"], 1)
+        self.assertEqual(first["total"], 2)
+        self.assertEqual(first["sender"], "其他人")
+        self.assertEqual(second["sender"], "我")
 
     def test_visible_message_reader_marks_today_timestamp_for_following_message(self) -> None:
         api = TestableWeChatApi(dry_run=True)
@@ -1095,6 +1345,21 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(_infer_message_is_self(FakeRect(330, 100, 870, 150), container))
         self.assertTrue(_infer_message_is_self(FakeRect(430, 200, 970, 250), container))
         self.assertIsNone(_infer_message_is_self(FakeRect(300, 300, 1000, 350), container))
+
+    def test_message_screenshot_side_detection_marks_left_and_right_rows(self) -> None:
+        left_row = Image.new("RGB", (120, 36), (245, 245, 245))
+        right_row = Image.new("RGB", (120, 36), (245, 245, 245))
+        ImageDraw.Draw(left_row).rectangle((8, 8, 42, 28), fill=(255, 255, 255))
+        ImageDraw.Draw(right_row).rectangle((78, 8, 112, 28), fill=(149, 236, 105))
+
+        self.assertFalse(_infer_message_is_self_from_row_image(left_row))
+        self.assertTrue(_infer_message_is_self_from_row_image(right_row))
+
+    def test_message_screenshot_side_detection_ignores_centered_rows(self) -> None:
+        row = Image.new("RGB", (120, 36), (245, 245, 245))
+        ImageDraw.Draw(row).rectangle((46, 8, 74, 28), fill=(220, 220, 220))
+
+        self.assertIsNone(_infer_message_is_self_from_row_image(row))
 
     def test_read_current_chat_uses_fallback_name_when_title_missing(self) -> None:
         window = FakeUiaWindow(
@@ -1378,8 +1643,9 @@ class CoreTests(unittest.TestCase):
             self.assertFalse(task.payload["dry_run"])
 
     def test_openai_agent_config_requires_api_key(self) -> None:
-        with self.assertRaises(AgentConfigError):
-            build_chat_agent(Settings())
+        with patch.dict(os.environ, {"WXCLIENT_LLM_API_KEY": ""}, clear=False):
+            with self.assertRaises(AgentConfigError):
+                build_chat_agent(Settings())
 
     def test_openai_agent_defaults_to_internal_model_endpoint(self) -> None:
         settings = Settings()
