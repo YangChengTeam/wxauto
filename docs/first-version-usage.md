@@ -102,8 +102,16 @@ POST /tasks/add-friend
 POST /tasks/send-message
 POST /tasks/check-new-friends
 POST /tasks/accept-new-friends
+POST /tasks/listen-chat
+POST /tasks/listen-chats
 GET  /tasks
 GET  /health
+```
+
+详细说明见：
+
+```text
+docs/webhook-http-server.md
 ```
 
 示例：
