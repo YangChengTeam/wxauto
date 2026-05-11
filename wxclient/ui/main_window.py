@@ -1021,7 +1021,7 @@ class MainWindow(QMainWindow):
         if probe.get("uia_exposed") is True:
             state = "ok"
             title = "UIA 正常"
-            panel_title = "UIA 已解锁"
+            panel_title = "已解锁"
             panel_detail = "微信 UIA 节点已正常暴露"
         elif probe.get("login_window"):
             state = "bad"
@@ -1764,7 +1764,7 @@ QMainWindow, QWidget {
 }
 #brandTitle {
     color: #111111;
-    font-size: 15px;
+    font-size: 14px;
     font-weight: 700;
 }
 #sectionLabel {
@@ -1844,13 +1844,13 @@ QMainWindow, QWidget {
 #uiaStateLabel {
     background: transparent;
     color: #111111;
-    font-size: 12px;
+    font-size: 11px;
     font-weight: 700;
 }
 #uiaDetailLabel {
     background: transparent;
     color: #5f5f5f;
-    font-size: 11px;
+    font-size: 10px;
 }
 #uiaUnlockButton {
     background: #ffffff;
@@ -1858,7 +1858,7 @@ QMainWindow, QWidget {
     border: 1px solid #c2bdb3;
     border-radius: 5px;
     padding: 4px 12px;
-    font-size: 11px;
+    font-size: 10px;
 }
 #uiaUnlockButton:hover {
     background: #f0efeb;
