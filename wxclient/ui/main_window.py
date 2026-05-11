@@ -650,7 +650,7 @@ class MainWindow(QMainWindow):
         form.addRow("数据库路径", self.database_path_input)
         form.addRow("Host", self.host_input)
         form.addRow("Port", self.port_input)
-        form.addRow("Webhook Token", self.webhook_token_input)
+        form.addRow("Token", self.webhook_token_input)
         form.addRow("默认账号", self.default_account_input)
         form.addRow("微信路径", self.wechat_path_input)
         form.addRow("", self.dry_run_input)
