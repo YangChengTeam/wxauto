@@ -476,12 +476,10 @@ class MainWindow(QMainWindow):
         browse_button.clicked.connect(self._browse_moments_media)
 
         buttons = QHBoxLayout()
-        dry_run_button = QPushButton("模拟发送")
-        dry_run_button.clicked.connect(lambda: self.enqueue_post_moments(dry_run=True))
         send_button = QPushButton("发送朋友圈")
         send_button.setObjectName("primaryButton")
-        send_button.clicked.connect(lambda: self.enqueue_post_moments(dry_run=False))
-        buttons.addWidget(dry_run_button)
+        send_button.clicked.connect(self.enqueue_post_moments)
+        buttons.addStretch(1)
         buttons.addWidget(send_button)
 
         form.addRow("内容", self.moments_text)
@@ -505,29 +503,27 @@ class MainWindow(QMainWindow):
                 f"{existing}\n{new_lines}".strip() if existing else new_lines
             )
 
-    def enqueue_post_moments(self, dry_run: bool = True) -> None:
+    def enqueue_post_moments(self) -> None:
         text = self.moments_text.toPlainText().strip()
         raw = self.moments_medias.toPlainText().strip()
         medias = [line.strip() for line in raw.splitlines() if line.strip()] if raw else []
         if not text and not medias:
             QMessageBox.warning(self, "缺少内容", "请输入文字或选择图片/视频")
             return
-        if not dry_run:
-            confirm = QMessageBox.question(
-                self,
-                "确认发送",
-                f"即将发送朋友圈：\n文字：{text[:50] or '（无）'}\n图片/视频：{len(medias)} 个\n\n确认发送？",
-            )
-            if confirm != QMessageBox.Yes:
-                return
-        mode = "模拟" if dry_run else "正式"
-        self._append_log(f"创建朋友圈任务（{mode}）：文字 {len(text)} 字，图片/视频 {len(medias)} 个。")
+        confirm = QMessageBox.question(
+            self,
+            "确认发送",
+            f"即将发送朋友圈：\n文字：{text[:50] or '（无）'}\n图片/视频：{len(medias)} 个\n\n确认发送？",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        self._append_log(f"创建朋友圈任务：文字 {len(text)} 字，图片/视频 {len(medias)} 个。")
         task = enqueue_post_moments(
             self.store,
             self.settings.default_account_id,
             text=text,
             medias=medias,
-            real=not dry_run,
+            real=True,
         )
         self._task_created(task.id, task.type.value)
 
@@ -1679,8 +1675,8 @@ QPushButton {
     color: #171717;
     border: 1px solid #d6d2c9;
     border-radius: 7px;
-    padding: 8px 14px;
-    min-height: 28px;
+    padding: 6px 12px;
+    min-height: 24px;
 }
 QPushButton:hover {
     background: #f1f0ec;
