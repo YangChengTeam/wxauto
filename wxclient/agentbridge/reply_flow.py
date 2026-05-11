@@ -46,6 +46,9 @@ class ChatAutomationApi(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    def open_chat(self, friend: str, dry_run: bool | None = None) -> dict[str, Any]:
+        ...
+
     def read_visible_messages(
         self,
         friend: str,
@@ -714,6 +717,7 @@ def reply_to_unread_messages(
         context_message_limit=context_message_limit,
     )
     replies.extend(visible_result.get("replies") or [])
+    _return_to_file_transfer_assistant(api, real)
 
     return {
         "action": "reply_unread",
@@ -733,6 +737,15 @@ def reply_to_unread_messages(
         "replies": replies,
         "check_result": check_result,
     }
+
+
+def _return_to_file_transfer_assistant(api: ChatAutomationApi, real: bool) -> None:
+    if not real:
+        return
+    try:
+        api.open_chat("文件传输助手", dry_run=False)
+    except Exception as exc:
+        logger.warning("reply.unread_messages.return_to_file_transfer_failed", error=str(exc))
 
 
 def _reply_to_current_chat_latest(

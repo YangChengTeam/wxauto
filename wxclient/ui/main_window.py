@@ -446,13 +446,10 @@ class MainWindow(QMainWindow):
         self.unread_start = QPushButton("启动自动任务")
         self.unread_start.setObjectName("primaryButton")
         self.unread_start.clicked.connect(self.toggle_unread_timer)
-        add_watch_button = QPushButton("将当前会话加入监听")
-        add_watch_button.clicked.connect(self._add_current_chat_to_watch)
         form.addRow("间隔秒数", self.unread_interval)
         form.addRow("目标会话", self.unread_friend)
         form.addRow("", self.unread_reply_all)
         form.addRow("", self.unread_start)
-        form.addRow("", add_watch_button)
         page.layout().addWidget(  # type: ignore[union-attr]
             self._tasks_panel("未读回复任务", {"check_unread_messages", "reply_unread"})
         )
@@ -820,29 +817,6 @@ class MainWindow(QMainWindow):
             real=True,
         )
         self._task_created(task.id, task.type.value)
-
-    def _add_current_chat_to_watch(self) -> None:
-        try:
-            current = self.api.read_current_chat(dry_run=True)
-        except Exception as exc:
-            self._append_log(f"读取当前会话失败：{exc}")
-            return
-        chat_name = str(current.get("chat") or "").strip()
-        if not chat_name or chat_name == "当前会话":
-            self._append_log("未检测到主窗口中选中的会话，请在微信中点击左侧会话列表。")
-            return
-        existing = _parse_chat_targets(self.watch_targets.toPlainText())
-        if chat_name in existing:
-            self._append_log(f"「{chat_name}」已在监听列表中。")
-            return
-        current_text = self.watch_targets.toPlainText().strip()
-        new_text = f"{current_text}\n{chat_name}".strip() if current_text else chat_name
-        self.watch_targets.setPlainText(new_text)
-        self._persist_form_state()
-        if self.watch_timer.isActive():
-            self._append_log(f"已将「{chat_name}」加入监听列表。下一轮监听将包含该会话。")
-        else:
-            self._append_log(f"已将「{chat_name}」加入监听列表。请到「消息监听」页面启动监听。")
 
     def enqueue_watch_chats(self) -> None:
         if self._skip_auto_task_when_busy("消息监听"):

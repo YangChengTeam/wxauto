@@ -129,6 +129,17 @@ class WeChatApi:
         )
         return {"dry_run": False, "action": "send_message", "friend": friend}
 
+    def open_chat(
+        self,
+        friend: str,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        if self._is_dry_run(dry_run):
+            return {"dry_run": True, "action": "open_chat", "friend": friend}
+        self._ensure_ready()
+        self._open_main_dialog_window(friend=friend, select=False)
+        return {"dry_run": False, "action": "open_chat", "friend": friend}
+
     def post_moments(
         self,
         text: str = "",
