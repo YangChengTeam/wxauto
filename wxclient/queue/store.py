@@ -14,6 +14,7 @@ from sqlalchemy import (
     Text,
     and_,
     create_engine,
+    delete,
     insert,
     select,
     update,
@@ -115,12 +116,43 @@ class TaskStore:
     def block(self, task_id: str, error: str) -> None:
         self._set_terminal(task_id, TaskStatus.BLOCKED, error=error)
 
-    def list_tasks(self, limit: int = 50) -> list[Task]:
+    def list_tasks(
+        self,
+        limit: int = 50,
+        task_types: set[TaskType | str] | None = None,
+        statuses: set[TaskStatus | str] | None = None,
+    ) -> list[Task]:
+        query = select(self.tasks)
+        type_values = _task_type_values(task_types)
+        if type_values:
+            query = query.where(self.tasks.c.type.in_(type_values))
+        status_values = _task_status_values(statuses)
+        if status_values:
+            query = query.where(self.tasks.c.status.in_(status_values))
         with self.engine.connect() as conn:
             rows = conn.execute(
-                select(self.tasks).order_by(self.tasks.c.created_at.desc()).limit(limit)
+                query.order_by(self.tasks.c.updated_at.desc()).limit(limit)
             ).mappings().fetchall()
         return [self._from_row(row) for row in rows]
+
+    def delete_tasks(
+        self,
+        task_types: set[TaskType | str] | None = None,
+        statuses: set[TaskStatus | str] | None = None,
+    ) -> int:
+        query = delete(self.tasks)
+        clauses: list[Any] = []
+        type_values = _task_type_values(task_types)
+        if type_values:
+            clauses.append(self.tasks.c.type.in_(type_values))
+        status_values = _task_status_values(statuses)
+        if status_values:
+            clauses.append(self.tasks.c.status.in_(status_values))
+        if clauses:
+            query = query.where(and_(*clauses))
+        with self.engine.begin() as conn:
+            result = conn.execute(query)
+        return int(result.rowcount or 0)
 
     def get(self, task_id: str) -> Task | None:
         with self.engine.connect() as conn:
@@ -265,3 +297,21 @@ class TaskStore:
             last_error=row["last_error"],
             result=json.loads(row["result"]) if row["result"] else None,
         )
+
+
+def _task_type_values(values: set[TaskType | str] | None) -> list[str]:
+    if not values:
+        return []
+    return [
+        value.value if isinstance(value, TaskType) else str(value)
+        for value in values
+    ]
+
+
+def _task_status_values(values: set[TaskStatus | str] | None) -> list[str]:
+    if not values:
+        return []
+    return [
+        value.value if isinstance(value, TaskStatus) else str(value)
+        for value in values
+    ]

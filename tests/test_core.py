@@ -431,6 +431,29 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(loaded.type, TaskType.SEND_MESSAGE)
             self.assertEqual(store.list_tasks()[0].id, task.id)
 
+    def test_store_filters_and_clears_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "test.db")
+            pending = store.create_task(
+                TaskType.SEND_MESSAGE,
+                {"friend": "filehelper", "text": "hello", "dry_run": True},
+                "default",
+            )
+            blocked = store.create_task(
+                TaskType.ADD_FRIEND,
+                {"number": "13800138000", "greetings": "你好", "dry_run": True},
+                "default",
+            )
+            store.complete(pending.id, {"action": "send_message"})
+            store.block(blocked.id, "UIA not ready")
+
+            visible = store.list_tasks(statuses={TaskStatus.PENDING, TaskStatus.BLOCKED})
+            self.assertEqual([task.id for task in visible], [blocked.id])
+
+            removed = store.delete_tasks(statuses={TaskStatus.BLOCKED})
+            self.assertEqual(removed, 1)
+            self.assertIsNone(store.get(blocked.id))
+
     def test_worker_executes_dry_run_send_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TaskStore(Path(tmp) / "test.db")

@@ -4,6 +4,7 @@ import ast
 import json
 import re
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -40,7 +41,7 @@ from pydantic import SecretStr
 
 from wxclient.config import Settings
 from wxclient.logging_config import configure_logging
-from wxclient.queue import OperationWorker, TaskStore
+from wxclient.queue import OperationWorker, TaskStatus, TaskStore, TaskType
 from wxclient.uia_unlock import (
     bootstrap_wechat_uia,
     get_screen_reader_active,
@@ -61,6 +62,21 @@ from .task_actions import (
 )
 
 APP_NAME = "AI微信自动化"
+_UNFINISHED_STATUSES = {
+    TaskStatus.PENDING,
+    TaskStatus.RUNNING,
+    TaskStatus.FAILED,
+    TaskStatus.BLOCKED,
+}
+
+
+@dataclass(frozen=True)
+class TaskPanelBinding:
+    title: str
+    table: QTableWidget
+    task_types: set[str] | None
+    summary_label: QLabel
+    empty_label: QLabel
 
 
 class MainWindow(QMainWindow):
@@ -102,7 +118,7 @@ class MainWindow(QMainWindow):
         self._append_log("串行任务服务已准备，微信动作会按队列逐个执行。")
         self.worker_running = False
         self.log_path = settings.data_dir / "logs" / "ui.log"
-        self.task_tables: list[tuple[QTableWidget, set[str] | None]] = []
+        self.task_tables: list[TaskPanelBinding] = []
         self._previous_screen_reader_state = get_screen_reader_active()
         if self._previous_screen_reader_state is None:
             self._append_log("未能读取系统屏幕阅读器标志，继续尝试开启。")
@@ -342,17 +358,52 @@ class MainWindow(QMainWindow):
     def _tasks_panel(self, title: str = "任务列表", task_types: set[str] | None = None) -> QWidget:
         box = QGroupBox(title)
         layout = QVBoxLayout(box)
-        table = QTableWidget(0, 7)
+        actions = QHBoxLayout()
+        summary_label = QLabel("当前没有未完成任务")
+        summary_label.setObjectName("taskSummary")
+        summary_label.setWordWrap(True)
+        clear_button = QPushButton("清除未完成任务")
+        clear_button.setObjectName("secondaryButton")
+        clear_button.clicked.connect(
+            lambda _=False, panel_title=title, panel_types=task_types: self._clear_tasks_for_panel(
+                panel_title,
+                panel_types,
+            )
+        )
+        actions.addWidget(summary_label, 1)
+        actions.addWidget(clear_button)
+        layout.addLayout(actions)
+
+        empty_label = QLabel("当前没有未完成任务。")
+        empty_label.setObjectName("taskEmptyState")
+        empty_label.setWordWrap(True)
+        layout.addWidget(empty_label)
+
+        table = QTableWidget(0, 4)
         table.setHorizontalHeaderLabels(
-            ["任务 ID", "类型", "状态", "账号", "尝试", "更新时间", "错误"]
+            ["任务", "状态", "说明", "更新时间"]
         )
         table.setAlternatingRowColors(True)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.verticalHeader().setVisible(False)
+        table.setWordWrap(True)
+        table.setVisible(False)
         table.horizontalHeader().setStretchLastSection(True)
+        table.setColumnWidth(0, 220)
+        table.setColumnWidth(1, 96)
+        table.setColumnWidth(2, 420)
+        table.setColumnWidth(3, 150)
         layout.addWidget(table)
-        self.task_tables.append((table, task_types))
+        self.task_tables.append(
+            TaskPanelBinding(
+                title=title,
+                table=table,
+                task_types=task_types,
+                summary_label=summary_label,
+                empty_label=empty_label,
+            )
+        )
         return box
 
     def _logs_panel(self) -> QWidget:
@@ -1138,27 +1189,90 @@ class MainWindow(QMainWindow):
             self.uia_unlock_finished.emit(False, "重启微信后 UIA 仍未解锁")
 
     def refresh_tasks(self) -> None:
-        tasks = self.store.list_tasks(80)
-        for table, task_types in self.task_tables:
+        tasks = self.store.list_tasks(200, statuses=_UNFINISHED_STATUSES)
+        for panel in self.task_tables:
             visible_tasks = [
-                task for task in tasks if task_types is None or task.type.value in task_types
+                task
+                for task in tasks
+                if (panel.task_types is None or task.type.value in panel.task_types)
+                and task.status in _UNFINISHED_STATUSES
             ]
-            table.setRowCount(len(visible_tasks))
+            visible_tasks.sort(key=_task_sort_key)
+            panel.summary_label.setText(_task_panel_summary(visible_tasks))
+            panel.empty_label.setVisible(not visible_tasks)
+            panel.table.setVisible(bool(visible_tasks))
+            panel.table.setRowCount(len(visible_tasks))
             for row, task in enumerate(visible_tasks):
                 values = [
-                    task.id,
-                    task.type.value,
-                    task.status.value,
-                    task.account_id,
-                    str(task.attempts),
-                    task.updated_at,
-                    task.last_error or "",
+                    _task_display_name(task),
+                    _task_status_label(task.status),
+                    _task_display_detail(task),
+                    _format_log_timestamp(task.updated_at),
                 ]
                 for col, value in enumerate(values):
                     item = QTableWidgetItem(value)
-                    item.setToolTip(value)
-                    table.setItem(row, col, item)
-            table.resizeColumnsToContents()
+                    item.setToolTip(_task_tooltip(task))
+                    if col == 1:
+                        item.setTextAlignment(Qt.AlignCenter)
+                    panel.table.setItem(row, col, item)
+            panel.table.resizeRowsToContents()
+            panel.table.resizeColumnsToContents()
+            panel.table.setColumnWidth(0, 220)
+            panel.table.setColumnWidth(1, 96)
+            panel.table.setColumnWidth(2, max(panel.table.columnWidth(2), 420))
+            panel.table.setColumnWidth(3, 150)
+
+    def _clear_tasks_for_panel(
+        self,
+        title: str,
+        task_types: set[str] | None,
+    ) -> None:
+        deletable_statuses = {
+            TaskStatus.PENDING,
+            TaskStatus.FAILED,
+            TaskStatus.BLOCKED,
+        }
+        tasks = self.store.list_tasks(200, task_types=task_types, statuses=_UNFINISHED_STATUSES)
+        visible = [
+            task
+            for task in tasks
+            if (task_types is None or task.type.value in task_types)
+            and task.status in _UNFINISHED_STATUSES
+        ]
+        deletable = [task for task in visible if task.status in deletable_statuses]
+        running_count = sum(1 for task in visible if task.status == TaskStatus.RUNNING)
+        if not visible:
+            QMessageBox.information(self, "没有可清除的任务", f"「{title}」当前没有未完成任务。")
+            return
+        if not deletable:
+            QMessageBox.information(
+                self,
+                "没有可清除的任务",
+                f"「{title}」当前只有执行中的任务，暂时不能清除。",
+            )
+            return
+        message = [
+            f"确认清除「{title}」中的未完成任务吗？",
+            "",
+            f"将清除：{len(deletable)} 个任务",
+        ]
+        if running_count:
+            message.append(f"正在执行：{running_count} 个任务（不会被清除）")
+        confirm = QMessageBox.question(
+            self,
+            "清除任务",
+            "\n".join(message),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        removed = self.store.delete_tasks(
+            task_types=task_types,
+            statuses=deletable_statuses,
+        )
+        self._append_log(f"已清除「{title}」中的 {removed} 个未完成任务。")
+        self.refresh_tasks()
 
     def refresh_logs(self) -> None:
         self._render_logs()
@@ -1256,6 +1370,175 @@ def _task_type_label(task_type: str | None) -> str:
         "watch_chats": "消息监听任务",
     }
     return labels.get(task_type or "", task_type or "任务")
+
+
+def _task_status_label(status: TaskStatus | str | None) -> str:
+    labels = {
+        TaskStatus.PENDING.value: "待执行",
+        TaskStatus.RUNNING.value: "执行中",
+        TaskStatus.SUCCEEDED.value: "已完成",
+        TaskStatus.FAILED.value: "失败",
+        TaskStatus.BLOCKED.value: "阻塞",
+        TaskStatus.CANCELLED.value: "已取消",
+    }
+    key = status.value if isinstance(status, TaskStatus) else str(status or "")
+    return labels.get(key, key or "未知")
+
+
+def _task_sort_key(task: Any) -> tuple[int, str, str]:
+    priority = {
+        TaskStatus.RUNNING.value: 0,
+        TaskStatus.PENDING.value: 1,
+        TaskStatus.BLOCKED.value: 2,
+        TaskStatus.FAILED.value: 3,
+    }.get(task.status.value if isinstance(task.status, TaskStatus) else str(task.status), 9)
+    return (priority, str(task.updated_at or ""), str(task.created_at or ""))
+
+
+def _task_panel_summary(tasks: list[Any]) -> str:
+    if not tasks:
+        return "当前没有未完成任务"
+    counts = {
+        TaskStatus.PENDING.value: 0,
+        TaskStatus.RUNNING.value: 0,
+        TaskStatus.FAILED.value: 0,
+        TaskStatus.BLOCKED.value: 0,
+    }
+    for task in tasks:
+        key = task.status.value if isinstance(task.status, TaskStatus) else str(task.status)
+        if key in counts:
+            counts[key] += 1
+    parts = []
+    if counts[TaskStatus.PENDING.value]:
+        parts.append(f"待执行 {counts[TaskStatus.PENDING.value]}")
+    if counts[TaskStatus.RUNNING.value]:
+        parts.append(f"执行中 {counts[TaskStatus.RUNNING.value]}")
+    if counts[TaskStatus.BLOCKED.value]:
+        parts.append(f"阻塞 {counts[TaskStatus.BLOCKED.value]}")
+    if counts[TaskStatus.FAILED.value]:
+        parts.append(f"失败 {counts[TaskStatus.FAILED.value]}")
+    return "未完成任务：" + "，".join(parts)
+
+
+def _task_display_name(task: Any) -> str:
+    payload = task.payload if isinstance(task.payload, dict) else {}
+    task_type = task.type.value if isinstance(task.type, TaskType) else str(task.type)
+    if task_type == TaskType.ADD_FRIEND.value:
+        return f"添加好友：{payload.get('number') or '未知号码'}"
+    if task_type == TaskType.CHECK_NEW_FRIENDS.value:
+        if payload.get("verify"):
+            return "检查并同意好友申请"
+        return "检查好友申请"
+    if task_type == TaskType.ACCEPT_NEW_FRIENDS.value:
+        return "同意好友申请"
+    if task_type == TaskType.SEND_MESSAGE.value:
+        return f"发送消息：{payload.get('friend') or '未知会话'}"
+    if task_type == TaskType.SCAN_MESSAGES.value:
+        return f"监听会话：{payload.get('friend') or '未知会话'}"
+    if task_type == TaskType.READ_VISIBLE_MESSAGES.value:
+        return f"读取可见消息：{payload.get('friend') or '未知会话'}"
+    if task_type == TaskType.CHECK_UNREAD_MESSAGES.value:
+        return "检查未读消息"
+    if task_type == TaskType.REPLY_CHAT.value:
+        return f"回复会话：{payload.get('friend') or '未知会话'}"
+    if task_type == TaskType.REPLY_UNREAD.value:
+        friend = payload.get("friend")
+        return f"回复未读消息：{friend or '所有会话'}"
+    if task_type == TaskType.WATCH_CHATS.value:
+        friends = payload.get("friends") if isinstance(payload.get("friends"), list) else []
+        if len(friends) == 1:
+            return f"监听会话：{friends[0]}"
+        if len(friends) > 1:
+            return f"监听会话：{len(friends)} 个"
+        return "消息监听"
+    if task_type == TaskType.POST_MOMENTS.value:
+        return "发送朋友圈"
+    return _task_type_label(task_type)
+
+
+def _task_display_detail(task: Any) -> str:
+    payload = task.payload if isinstance(task.payload, dict) else {}
+    task_type = task.type.value if isinstance(task.type, TaskType) else str(task.type)
+    parts: list[str] = []
+
+    if task_type == TaskType.ADD_FRIEND.value:
+        pieces = [f"招呼语：{_truncate_text(str(payload.get('greetings') or '你好'), 24)}"]
+        remark = str(payload.get("remark") or "").strip()
+        if remark:
+            pieces.append(f"备注：{_truncate_text(remark, 20)}")
+        parts.extend(pieces)
+    elif task_type == TaskType.CHECK_NEW_FRIENDS.value:
+        if payload.get("verify"):
+            parts.append(f"自动同意，最多处理 {payload.get('limit', 8)} 条")
+        else:
+            parts.append(f"仅检查，最多处理 {payload.get('limit', 8)} 条")
+    elif task_type == TaskType.ACCEPT_NEW_FRIENDS.value:
+        parts.append(f"最多处理 {payload.get('limit', 8)} 条")
+    elif task_type == TaskType.SEND_MESSAGE.value:
+        parts.append(f"内容：{_truncate_text(str(payload.get('text') or ''), 40)}")
+    elif task_type == TaskType.SCAN_MESSAGES.value:
+        parts.append(f"时长：{payload.get('duration') or '30s'}")
+        if payload.get("select_sender"):
+            parts.append("识别发送者")
+    elif task_type == TaskType.READ_VISIBLE_MESSAGES.value:
+        parts.append("读取当前可见聊天内容")
+    elif task_type == TaskType.CHECK_UNREAD_MESSAGES.value:
+        parts.append("读取当前未读消息")
+    elif task_type == TaskType.REPLY_CHAT.value:
+        parts.append(f"来源：{payload.get('source') or 'new'}")
+        parts.append(f"时长：{payload.get('duration') or '30s'}")
+    elif task_type == TaskType.REPLY_UNREAD.value:
+        friend = str(payload.get("friend") or "").strip()
+        if friend:
+            parts.append(f"目标：{friend}")
+        parts.append("回复未读消息")
+    elif task_type == TaskType.WATCH_CHATS.value:
+        friends = payload.get("friends") if isinstance(payload.get("friends"), list) else []
+        if friends:
+            parts.append(f"会话：{_truncate_text('、'.join(str(item) for item in friends), 36)}")
+        parts.append(f"每轮：{payload.get('duration') or '30s'}")
+        parts.append("自动回复" if payload.get("auto_reply", True) else "仅监听")
+    elif task_type == TaskType.POST_MOMENTS.value:
+        text = str(payload.get("text") or "").strip()
+        medias = payload.get("medias") if isinstance(payload.get("medias"), list) else []
+        parts.append(f"文字 {len(text)} 字，媒体 {len(medias)} 个")
+
+    if task.status == TaskStatus.PENDING:
+        parts.append("等待队列处理")
+    elif task.status == TaskStatus.RUNNING:
+        parts.append(f"执行中，第 {task.attempts} 次尝试")
+    elif task.status == TaskStatus.BLOCKED:
+        parts.append(_truncate_text(f"需要处理：{task.last_error or '阻塞中'}", 60))
+    elif task.status == TaskStatus.FAILED:
+        parts.append(_truncate_text(f"执行失败：{task.last_error or '未知错误'}", 60))
+
+    if task.attempts > 0:
+        parts.append(f"尝试 {task.attempts}/{task.max_attempts}")
+
+    return "；".join(part for part in parts if part)
+
+
+def _task_tooltip(task: Any) -> str:
+    payload = task.payload if isinstance(task.payload, dict) else {}
+    return "\n".join(
+        [
+            f"任务 ID: {task.id}",
+            f"类型: {_task_type_label(task.type.value if isinstance(task.type, TaskType) else str(task.type))}",
+            f"状态: {_task_status_label(task.status)}",
+            f"账号: {task.account_id}",
+            f"更新时间: {_format_log_timestamp(task.updated_at)}",
+            f"说明: {_task_display_detail(task)}",
+            f"错误: {task.last_error or '无'}",
+            f"参数: {json.dumps(payload, ensure_ascii=False)}",
+        ]
+    )
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 1)]}…"
 
 
 def _event_label(event: str) -> str:
@@ -1597,8 +1880,8 @@ QMainWindow, QWidget {
     outline: 0;
 }
 #nav::item {
-    min-height: 34px;
-    padding: 7px 10px;
+    min-height: 28px;
+    padding: 5px 10px;
     border-radius: 7px;
 }
 #nav::item:hover {
@@ -1635,6 +1918,15 @@ QMainWindow, QWidget {
 #navButton[active="true"] {
     background: #111111;
     color: #ffffff;
+}
+#taskSummary {
+    color: #5f5f5f;
+    font-size: 11px;
+}
+#taskEmptyState {
+    color: #7a7a7a;
+    font-style: italic;
+    padding: 2px 0;
 }
 #title {
     color: #111111;
