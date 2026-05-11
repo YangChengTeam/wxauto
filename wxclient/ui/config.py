@@ -9,6 +9,25 @@ from wxclient.config import Settings, load_settings
 
 DEFAULT_GUI_CONFIG_PATH = Path(".wxclient") / "settings.json"
 
+# Keys for form fields that should be persisted across sessions
+_FORM_STATE_KEYS = (
+    "friend_interval",
+    "friend_limit",
+    "friend_verify",
+    "unread_interval",
+    "unread_friend",
+    "unread_reply_all",
+    "watch_interval",
+    "watch_duration",
+    "watch_targets",
+    "watch_auto_reply",
+    "watch_reply_all",
+    "add_number",
+    "add_greetings",
+    "add_remark",
+    "show_automation_tasks",
+)
+
 
 def resolve_config_path(path: Path | None = None) -> Path:
     return path or DEFAULT_GUI_CONFIG_PATH
@@ -21,7 +40,23 @@ def load_gui_settings(path: Path | None = None) -> tuple[Settings, Path]:
     return load_settings(config_path), config_path
 
 
-def save_gui_settings(path: Path, settings: Settings, api_key: str | None = None) -> None:
+def load_form_state(path: Path) -> dict[str, Any]:
+    """Load persisted form field values from the settings file."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data.get("gui_form_state", {})
+    except Exception:
+        return {}
+
+
+def save_gui_settings(
+    path: Path,
+    settings: Settings,
+    api_key: str | None = None,
+    form_state: dict[str, Any] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data: dict[str, Any] = {
         "data_dir": str(settings.data_dir),
@@ -43,4 +78,6 @@ def save_gui_settings(path: Path, settings: Settings, api_key: str | None = None
     }
     if api_key:
         data["llm_api_key"] = api_key
+    if form_state:
+        data["gui_form_state"] = form_state
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

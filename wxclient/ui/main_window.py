@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -70,12 +71,14 @@ _UNFINISHED_STATUSES = {
     TaskStatus.FAILED,
     TaskStatus.BLOCKED,
 }
+_AUTOMATION_BUTTON_WIDTH = 168
 
 
 @dataclass(frozen=True)
 class TaskPanelBinding:
     title: str
     task_types: set[str] | None
+    panel: QWidget
     summary_label: QLabel
     toggle_button: QToolButton
     content_widget: QWidget
@@ -109,6 +112,7 @@ class MainWindow(QMainWindow):
         self.settings = settings
         self.config_path = config_path
         self._form_state = load_form_state(config_path)
+        self.show_automation_tasks = bool(self._form_state.get("show_automation_tasks", False))
         self._append_log(f"配置文件位置：{config_path}")
         self._append_log(f"数据目录：{settings.data_dir}")
         self.store = TaskStore(settings.resolved_database_path)
@@ -437,6 +441,7 @@ class MainWindow(QMainWindow):
             TaskPanelBinding(
                 title=title,
                 task_types=task_types,
+                panel=box,
                 summary_label=summary_label,
                 toggle_button=toggle_button,
                 content_widget=content_widget,
@@ -444,6 +449,7 @@ class MainWindow(QMainWindow):
                 table=table,
             )
         )
+        box.setVisible(self.show_automation_tasks)
         return box
 
     def _logs_panel(self) -> QWidget:
@@ -467,13 +473,12 @@ class MainWindow(QMainWindow):
         self.friend_limit = _spin(1, 100, self._form_state.get("friend_limit", 8))
         self.friend_verify = QCheckBox("检测到好友申请后自动同意")
         self.friend_verify.setChecked(self._form_state.get("friend_verify", False))
-        self.friend_start = QPushButton("启动好友检测")
-        self.friend_start.setObjectName("primaryButton")
+        self.friend_start = self._automation_action_button(QPushButton("启动好友检测"))
         self.friend_start.clicked.connect(self.toggle_friend_timer)
         form.addRow("间隔秒数", self.friend_interval)
         form.addRow("处理数量", self.friend_limit)
         form.addRow("", self.friend_verify)
-        form.addRow("", self._right_aligned_actions(self.friend_start))
+        form.addRow("", self.friend_start)
         page.layout().addWidget(  # type: ignore[union-attr]
             self._tasks_panel("好友检测任务", {"check_new_friends", "accept_new_friends"})
         )
@@ -488,8 +493,7 @@ class MainWindow(QMainWindow):
         self.unread_friend.setText(self._form_state.get("unread_friend", ""))
         self.unread_reply_all = QCheckBox("回复所有未读消息")
         self.unread_reply_all.setChecked(self._form_state.get("unread_reply_all", False))
-        self.unread_start = QPushButton("启动自动任务")
-        self.unread_start.setObjectName("primaryButton")
+        self.unread_start = self._automation_action_button(QPushButton("启动自动任务"))
         self.unread_start.clicked.connect(self.toggle_unread_timer)
         form.addRow("间隔秒数", self.unread_interval)
         form.addRow("目标会话", self.unread_friend)
@@ -507,14 +511,13 @@ class MainWindow(QMainWindow):
         self.watch_duration = QLineEdit(self._form_state.get("watch_duration", "30s"))
         self.watch_targets = QTextEdit()
         self.watch_targets.setPlaceholderText("一行一个好友或群名，也可以用逗号分隔")
-        self.watch_targets.setFixedHeight(92)
+        self.watch_targets.setFixedHeight(72)
         saved_targets = self._form_state.get("watch_targets", "")
         if saved_targets:
             self.watch_targets.setPlainText(saved_targets)
         self.watch_auto_reply = QCheckBox("监听到新消息后自动调用 Agent 回复")
         self.watch_auto_reply.setChecked(self._form_state.get("watch_auto_reply", True))
-        self.watch_start = QPushButton("启动监听")
-        self.watch_start.setObjectName("primaryButton")
+        self.watch_start = self._automation_action_button(QPushButton("启动监听"))
         self.watch_start.clicked.connect(self.toggle_watch_timer)
         form.addRow("间隔秒数", self.watch_interval)
         form.addRow("每次监听时长", self.watch_duration)
@@ -534,13 +537,12 @@ class MainWindow(QMainWindow):
         self.add_greetings = QLineEdit(self._form_state.get("add_greetings", "你好"))
         self.add_remark = QLineEdit()
         self.add_remark.setText(self._form_state.get("add_remark", ""))
-        button = QPushButton("提交添加好友")
-        button.setObjectName("primaryButton")
+        button = self._automation_action_button(QPushButton("提交添加好友"))
         button.clicked.connect(self.enqueue_add_friend)
         form.addRow("手机号", self.add_number)
         form.addRow("招呼语", self.add_greetings)
         form.addRow("备注", self.add_remark)
-        form.addRow("", self._right_aligned_actions(button))
+        form.addRow("", button)
         page.layout().addWidget(self._tasks_panel("添加好友任务", {"add_friend"}))  # type: ignore[union-attr]
         return page
 
@@ -561,17 +563,13 @@ class MainWindow(QMainWindow):
         browse_button = QPushButton("选择图片/视频")
         browse_button.clicked.connect(self._browse_moments_media)
 
-        buttons = QHBoxLayout()
-        send_button = QPushButton("发送朋友圈")
-        send_button.setObjectName("primaryButton")
+        send_button = self._automation_action_button(QPushButton("发送朋友圈"))
         send_button.clicked.connect(self.enqueue_post_moments)
-        buttons.addStretch(1)
-        buttons.addWidget(send_button)
 
         form.addRow("内容", self.moments_text)
         form.addRow("图片/视频", self.moments_medias)
         form.addRow("", browse_button)
-        form.addRow("", buttons)
+        form.addRow("", send_button)
         page.layout().addWidget(self._tasks_panel("朋友圈任务", {"post_moments"}))  # type: ignore[union-attr]
         return page
 
@@ -614,8 +612,56 @@ class MainWindow(QMainWindow):
         self._task_created(task.id, task.type.value)
 
     def _settings_page(self) -> QWidget:
-        page = self._page("Agent 设置")
-        form = self._form(page)
+        page = self._page("设置")
+        tabs = QTabWidget()
+        tabs.addTab(self._base_settings_tab(), "基础设备")
+        tabs.addTab(self._agent_settings_tab(), "Agent 设置")
+        page.layout().addWidget(tabs)  # type: ignore[union-attr]
+
+        save_button = QPushButton("保存设置")
+        save_button.setObjectName("primaryButton")
+        save_button.clicked.connect(self.save_settings)
+        page.layout().addLayout(self._right_aligned_actions(save_button))  # type: ignore[union-attr]
+        return page
+
+    def _base_settings_tab(self) -> QWidget:
+        tab = QWidget()
+        QVBoxLayout(tab)
+        form = self._form(tab)
+
+        self.data_dir_input = QLineEdit(str(self.settings.data_dir))
+        self.database_path_input = QLineEdit(
+            str(self.settings.database_path) if self.settings.database_path else ""
+        )
+        self.host_input = QLineEdit(self.settings.host)
+        self.port_input = _spin(1, 65535, self.settings.port)
+        self.webhook_token_input = QLineEdit(self.settings.webhook_token or "")
+        self.default_account_input = QLineEdit(self.settings.default_account_id)
+        self.wechat_path_input = QLineEdit(
+            str(self.settings.wechat_path) if self.settings.wechat_path else ""
+        )
+        self.dry_run_input = QCheckBox("仅模拟运行，不直接操作微信")
+        self.dry_run_input.setChecked(self.settings.dry_run)
+        self.show_tasks_checkbox = QCheckBox("显示自动化任务列表")
+        self.show_tasks_checkbox.setChecked(self.show_automation_tasks)
+        self.show_tasks_checkbox.toggled.connect(self._set_automation_task_visibility)
+
+        form.addRow("数据目录", self.data_dir_input)
+        form.addRow("数据库路径", self.database_path_input)
+        form.addRow("Host", self.host_input)
+        form.addRow("Port", self.port_input)
+        form.addRow("Webhook Token", self.webhook_token_input)
+        form.addRow("默认账号", self.default_account_input)
+        form.addRow("微信路径", self.wechat_path_input)
+        form.addRow("", self.dry_run_input)
+        form.addRow("", self.show_tasks_checkbox)
+        return tab
+
+    def _agent_settings_tab(self) -> QWidget:
+        tab = QWidget()
+        QVBoxLayout(tab)
+        form = self._form(tab)
+
         self.provider_input = QLineEdit(self.settings.agent_provider)
         self.base_url_input = QLineEdit(self.settings.llm_base_url)
         self.model_input = QLineEdit(self.settings.llm_model)
@@ -624,9 +670,7 @@ class MainWindow(QMainWindow):
         self.timeout_input = _spin(1, 300, int(self.settings.agent_timeout_seconds))
         self.context_count_input = _spin(0, 50, int(self.settings.agent_context_message_count))
         self.prompt_input = QTextEdit(self.settings.agent_system_prompt)
-        save_button = QPushButton("保存设置")
-        save_button.setObjectName("primaryButton")
-        save_button.clicked.connect(self.save_settings)
+
         form.addRow("Provider", self.provider_input)
         form.addRow("Base URL", self.base_url_input)
         form.addRow("Model", self.model_input)
@@ -634,8 +678,7 @@ class MainWindow(QMainWindow):
         form.addRow("Timeout", self.timeout_input)
         form.addRow("上下文消息数", self.context_count_input)
         form.addRow("System Prompt", self.prompt_input)
-        form.addRow("", save_button)
-        return page
+        return tab
 
     def _page(self, title: str) -> QWidget:
         page = QWidget()
@@ -656,6 +699,17 @@ class MainWindow(QMainWindow):
         for widget in widgets:
             layout.addWidget(widget)
         return layout
+
+    def _automation_action_button(self, button: QPushButton) -> QPushButton:
+        button.setObjectName("primaryButton")
+        button.setFixedWidth(_AUTOMATION_BUTTON_WIDTH)
+        button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        return button
+
+    def _set_automation_task_visibility(self, visible: bool) -> None:
+        self.show_automation_tasks = visible
+        for panel in self.task_tables:
+            panel.panel.setVisible(visible)
 
     def _set_sidebar_button_active(self, button: QPushButton, active: bool) -> None:
         button.setProperty("active", active)
@@ -912,6 +966,16 @@ class MainWindow(QMainWindow):
         self._task_created(task.id, task.type.value)
 
     def save_settings(self) -> None:
+        self.settings.data_dir = Path(self.data_dir_input.text().strip() or self.settings.data_dir)
+        database_path_text = self.database_path_input.text().strip()
+        self.settings.database_path = Path(database_path_text) if database_path_text else None
+        self.settings.host = self.host_input.text().strip() or self.settings.host
+        self.settings.port = int(self.port_input.value())
+        self.settings.webhook_token = self.webhook_token_input.text().strip() or None
+        self.settings.default_account_id = self.default_account_input.text().strip() or "default"
+        wechat_path_text = self.wechat_path_input.text().strip()
+        self.settings.wechat_path = Path(wechat_path_text) if wechat_path_text else None
+        self.settings.dry_run = self.dry_run_input.isChecked()
         self.settings.agent_provider = self.provider_input.text().strip() or "openai_agents"
         self.settings.llm_base_url = self.base_url_input.text().strip()
         self.settings.llm_model = self.model_input.text().strip()
@@ -919,6 +983,8 @@ class MainWindow(QMainWindow):
         self.settings.agent_timeout_seconds = float(self.timeout_input.value())
         self.settings.agent_context_message_count = int(self.context_count_input.value())
         self.settings.agent_system_prompt = self.prompt_input.toPlainText().strip()
+        self.api.dry_run = self.settings.dry_run
+        self.api.wechat_path = self.settings.wechat_path
         save_gui_settings(
             self.config_path,
             self.settings,
@@ -927,7 +993,7 @@ class MainWindow(QMainWindow):
         )
         self.worker.settings = self.settings
         self.worker._agent = None
-        self._append_log(f"Agent 设置已保存：模型 {self.settings.llm_model}，地址 {self.settings.llm_base_url}。")
+        self._append_log(f"设置已保存：模型 {self.settings.llm_model}，地址 {self.settings.llm_base_url}。")
         QMessageBox.information(self, "已保存", f"设置已保存到 {self.config_path}")
 
     def _collect_form_state(self) -> dict[str, Any]:
@@ -948,6 +1014,7 @@ class MainWindow(QMainWindow):
             "add_remark": self.add_remark.text().strip(),
             "moments_text": self.moments_text.toPlainText().strip(),
             "moments_medias": self.moments_medias.toPlainText().strip(),
+            "show_automation_tasks": self.show_automation_tasks,
         }
 
     def _persist_form_state(self) -> None:
