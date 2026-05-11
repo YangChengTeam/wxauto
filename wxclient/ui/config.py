@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,19 @@ _FORM_STATE_KEYS = (
 
 
 def resolve_config_path(path: Path | None = None) -> Path:
-    return path or DEFAULT_GUI_CONFIG_PATH
+    if path is not None:
+        return path
+
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        frozen_parent_path = exe_dir.parent / ".wxclient" / "settings.json"
+        frozen_local_path = exe_dir / ".wxclient" / "settings.json"
+        for candidate in (frozen_parent_path, DEFAULT_GUI_CONFIG_PATH, frozen_local_path):
+            if candidate.exists():
+                return candidate
+        return frozen_local_path
+
+    return DEFAULT_GUI_CONFIG_PATH
 
 
 def load_gui_settings(path: Path | None = None) -> tuple[Settings, Path]:
@@ -45,7 +58,7 @@ def load_form_state(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         return data.get("gui_form_state", {})
     except Exception:
         return {}
