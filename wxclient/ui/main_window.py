@@ -199,7 +199,6 @@ class MainWindow(QMainWindow):
 
         sidebar_layout.addWidget(self._brand_panel())
         sidebar_layout.addWidget(self._operation_status_panel())
-        sidebar_layout.addWidget(self._uia_status_panel())
         sidebar_layout.addWidget(self._section_label("日志"))
 
         self.logs_button = QPushButton("运行日志")
@@ -239,9 +238,15 @@ class MainWindow(QMainWindow):
     def _brand_panel(self) -> QWidget:
         panel = QFrame()
         panel.setObjectName("brandPanel")
-        layout = QHBoxLayout(panel)
+        layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
+
+        layout.addWidget(self._uia_status_panel())
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(10)
 
         logo_box = QFrame()
         logo_box.setObjectName("logoBox")
@@ -268,7 +273,7 @@ class MainWindow(QMainWindow):
         self.uia_status_dot.setToolTip("正在检测 UIA 状态")
         logo_layout.addWidget(self.uia_status_dot, 0, 0, Qt.AlignRight | Qt.AlignBottom)
 
-        layout.addWidget(logo_box)
+        header.addWidget(logo_box)
 
         copy = QVBoxLayout()
         copy.setContentsMargins(0, 0, 0, 0)
@@ -279,7 +284,8 @@ class MainWindow(QMainWindow):
         subtitle.setObjectName("brandSubtitle")
         copy.addWidget(title)
         copy.addWidget(subtitle)
-        layout.addLayout(copy, 1)
+        header.addLayout(copy, 1)
+        layout.addLayout(header)
         return panel
 
     def _section_label(self, text: str) -> QLabel:
