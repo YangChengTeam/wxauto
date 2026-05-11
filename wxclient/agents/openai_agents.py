@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
 from pydantic import SecretStr
 
 from .errors import AgentConfigError, AgentExecutionError
@@ -46,6 +47,7 @@ class OpenAIAgentsChatAgent:
         client = AsyncOpenAI(
             base_url=normalize_openai_base_url(config.base_url),
             api_key=config.api_key.get_secret_value(),
+            http_client=_build_http_client(),
         )
         model = OpenAIChatCompletionsModel(
             model=config.model,
@@ -116,3 +118,7 @@ def _stringify_output(value: Any) -> str:
     if isinstance(value, str):
         return value
     return str(value)
+
+
+def _build_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(trust_env=False)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from wxclient.agentbridge.reply_flow import (
 from wxclient.agents import AgentConfigError
 from wxclient.agents.factory import build_chat_agent
 from wxclient.agents.openai_agents import normalize_openai_base_url
+from wxclient.agents.openai_agents import _build_http_client
 from wxclient.app.cli import app
 from wxclient.config import Settings
 from wxclient.queue import OperationWorker, TaskStatus, TaskStore, TaskType
@@ -1701,6 +1703,11 @@ class CoreTests(unittest.TestCase):
             normalize_openai_base_url("http://172.16.6.23:3000/v1"),
             "http://172.16.6.23:3000/v1",
         )
+
+    def test_openai_http_client_ignores_environment_proxy(self) -> None:
+        client = _build_http_client()
+        self.assertFalse(client._trust_env)
+        asyncio.run(client.aclose())
 
     def test_fastapi_send_message_endpoint_enqueues_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
