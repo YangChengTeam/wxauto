@@ -422,13 +422,13 @@ class MainWindow(QMainWindow):
         self.friend_limit = _spin(1, 100, self._form_state.get("friend_limit", 8))
         self.friend_verify = QCheckBox("检测到好友申请后自动同意")
         self.friend_verify.setChecked(self._form_state.get("friend_verify", False))
-        self.friend_start = QPushButton("启动自动任务")
+        self.friend_start = QPushButton("启动好友检测")
         self.friend_start.setObjectName("primaryButton")
         self.friend_start.clicked.connect(self.toggle_friend_timer)
         form.addRow("间隔秒数", self.friend_interval)
         form.addRow("处理数量", self.friend_limit)
         form.addRow("", self.friend_verify)
-        form.addRow("", self.friend_start)
+        page.layout().addLayout(self._right_aligned_actions(self.friend_start))
         page.layout().addWidget(  # type: ignore[union-attr]
             self._tasks_panel("好友检测任务", {"check_new_friends", "accept_new_friends"})
         )
@@ -496,11 +496,12 @@ class MainWindow(QMainWindow):
         self.add_remark = QLineEdit()
         self.add_remark.setText(self._form_state.get("add_remark", ""))
         button = QPushButton("提交添加好友")
+        button.setObjectName("primaryButton")
         button.clicked.connect(self.enqueue_add_friend)
         form.addRow("手机号", self.add_number)
         form.addRow("招呼语", self.add_greetings)
         form.addRow("备注", self.add_remark)
-        form.addRow("", button)
+        page.layout().addLayout(self._right_aligned_actions(button))
         page.layout().addWidget(self._tasks_panel("添加好友任务", {"add_friend"}))  # type: ignore[union-attr]
         return page
 
@@ -606,6 +607,15 @@ class MainWindow(QMainWindow):
         label.setObjectName("title")
         layout.addWidget(label)
         return page
+
+    def _right_aligned_actions(self, *widgets: QWidget) -> QHBoxLayout:
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addStretch(1)
+        for widget in widgets:
+            layout.addWidget(widget)
+        return layout
 
     def _set_sidebar_button_active(self, button: QPushButton, active: bool) -> None:
         button.setProperty("active", active)
@@ -743,11 +753,11 @@ class MainWindow(QMainWindow):
     def toggle_friend_timer(self) -> None:
         if self.friend_timer.isActive():
             self.friend_timer.stop()
-            self.friend_start.setText("启动自动任务")
+            self.friend_start.setText("启动好友检测")
             self._append_log("好友检测自动任务已停止。")
             return
         self.friend_timer.start(self.friend_interval.value() * 1000)
-        self.friend_start.setText("停止自动任务")
+        self.friend_start.setText("停止好友检测")
         self._append_log(
             f"好友检测自动任务已启动，每 {self.friend_interval.value()} 秒执行一次。"
         )
