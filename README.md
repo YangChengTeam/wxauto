@@ -87,7 +87,7 @@ wxclient add-friend 13800138000 --greetings "你好" --real
 - `POST /tasks/listen-chat`
 - `POST /tasks/listen-chats`
 
-如果配置了 `webhook_token`（兼容保留字段），请求头需要：
+如果启用了 `webhook_token`（历史命名，当前作为 HTTP API 的鉴权 token），请求头需要：
 
 ```text
 Authorization: Bearer <token>
