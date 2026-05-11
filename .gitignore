@@ -37,3 +37,6 @@ third_party/pywechat/.git-vendor-backup/
 Thumbs.db
 .idea/
 .vscode/
+.claude/
+.codex/
+CLAUDE.md

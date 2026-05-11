@@ -47,6 +47,8 @@ python -m wxclient.app.cli serve
 wxclient gui
 ```
 
+GUI 打开后会自动拉起本地 HTTP 服务 `http://127.0.0.1:8765`，但任务真正执行仍然要在首页点击“启动服务”。如果只是看日志或改配置，不启动 worker 也没关系。
+
 ## 常用命令
 
 UIA 探测与解锁：
@@ -123,6 +125,30 @@ GUI 包含这些页面：
 - 添加好友
 - 朋友圈
 - 设置
+
+GUI 里常用的自动化入口都在左侧，先在首页点“启动服务”，再去好友检测、未读回复、消息监听、添加好友、朋友圈这些页面触发任务。
+
+## 打包成单体 EXE
+
+先安装打包依赖：
+
+```powershell
+pip install -e ".[build]"
+```
+
+然后执行：
+
+```powershell
+python scripts/build_gui_onefile.py
+```
+
+产物会输出到 `dist/wxclient-gui.exe`，并带有程序图标和启动图。打包脚本会把 `third_party/pywechat/pyweixin`、`third_party/pywechat/pywechat` 和 `logger/logging.conf` 一并带入 onefile 包里。如果只想先看命令，不真正构建，可以加 `--dry-run`。
+
+注意：
+
+- onefile 模式会先解压到临时目录，首次启动比 `onedir` 慢一些
+- 如果旧版 exe 报 `pyweixin is unavailable` 或 `logger/logging.conf doesn't exist`，请重新用当前脚本打包
+- 打包后的 GUI 仍然默认 `dry_run`，需要在设置或命令里显式开启真实执行
 
 ## 架构约束
 
