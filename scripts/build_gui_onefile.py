@@ -16,6 +16,43 @@ def _find_logger_conf() -> Path | None:
     return conf_path if conf_path.exists() else None
 
 
+def _vendor_package_modules(vendor_dir: Path, package_names: tuple[str, ...]) -> list[str]:
+    modules: list[str] = []
+    seen: set[str] = set()
+    for package_name in package_names:
+        package_dir = vendor_dir / package_name
+        if not package_dir.exists():
+            continue
+        for py_file in sorted(package_dir.rglob("*.py")):
+            if "__pycache__" in py_file.parts:
+                continue
+            relative = py_file.relative_to(vendor_dir).with_suffix("")
+            parts = list(relative.parts)
+            if parts[-1] == "__init__":
+                parts = parts[:-1]
+            module_name = ".".join(parts)
+            if not module_name or module_name in seen:
+                continue
+            seen.add(module_name)
+            modules.append(module_name)
+    return modules
+
+
+def _vendor_package_data(vendor_dir: Path, package_names: tuple[str, ...]) -> list[str]:
+    data_args: list[str] = []
+    for package_name in package_names:
+        package_dir = vendor_dir / package_name
+        if not package_dir.exists():
+            continue
+        data_args.extend(
+            [
+                "--add-data",
+                f"{package_dir}{os.pathsep}third_party/pywechat/{package_name}",
+            ]
+        )
+    return data_args
+
+
 def _build_args(repo_root: Path, name: str, console: bool) -> list[str]:
     launcher = repo_root / "scripts" / "wxclient_gui.py"
     assets_dir = repo_root / "wxclient" / "ui" / "assets"
@@ -23,6 +60,7 @@ def _build_args(repo_root: Path, name: str, console: bool) -> list[str]:
     splash_file = assets_dir / "app-logo-256.png"
     logger_conf = _find_logger_conf()
     vendor_dir = repo_root / "third_party" / "pywechat"
+    vendor_packages = ("pyweixin", "pywechat")
     build_dir = repo_root / "build" / "pyinstaller"
     dist_dir = repo_root / "dist"
     add_data = f"{assets_dir}{os.pathsep}wxclient/ui/assets"
@@ -55,8 +93,6 @@ def _build_args(repo_root: Path, name: str, console: bool) -> list[str]:
             str(splash_file),
             "--collect-all",
             "PySide6",
-            "--collect-submodules",
-            "pyweixin",
             "--hidden-import",
             "pyautogui",
             "--hidden-import",
@@ -115,6 +151,9 @@ def _build_args(repo_root: Path, name: str, console: bool) -> list[str]:
             "notebook",
         ]
     )
+    args.extend(_vendor_package_data(vendor_dir, vendor_packages))
+    for module_name in _vendor_package_modules(vendor_dir, vendor_packages):
+        args.extend(["--hidden-import", module_name])
     if logger_conf is not None:
         args.extend(["--add-data", f"{logger_conf}{os.pathsep}logger"])
     args.append("--console" if console else "--windowed")
