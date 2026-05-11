@@ -598,7 +598,7 @@ class CoreTests(unittest.TestCase):
 
         self.assertEqual(result["reply_count"], 1)
         self.assertEqual(agent.calls[0][0], "latest")
-        self.assertEqual(agent.calls[0][1], ["Mzxx: old-1", "self: old-2"])
+        self.assertEqual(agent.calls[0][1], ["对方: old-1", "我: old-2"])
         self.assertEqual(result["replies"][0]["context_count"], 2)
 
     def test_watch_chats_auto_replies_to_multiple_targets(self) -> None:
@@ -750,7 +750,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["reply_count"], 1)
         self.assertIn("visible-last", str(api.sent[0]["text"]))
 
-    def test_watch_chats_skips_latest_visible_when_already_processed(self) -> None:
+    def test_watch_chats_replies_to_latest_visible_when_cursor_already_has_it(self) -> None:
         latest = {"sender": "Mzxx", "text": "visible-last", "is_self": False}
         api = FakeChatApi([], visible_messages=[latest])
         cursors = InMemoryCursorStore()
@@ -771,8 +771,11 @@ class CoreTests(unittest.TestCase):
             cursor_store=cursors,
         )
 
-        self.assertEqual(result["reply_count"], 0)
-        self.assertEqual(api.sent, [])
+        self.assertEqual(result["message_count"], 1)
+        self.assertEqual(result["new_message_count"], 1)
+        self.assertEqual(result["reply_count"], 1)
+        self.assertEqual(api.visible_reads, ["Mzxx"])
+        self.assertIn("visible-last", str(api.sent[0]["text"]))
 
     def test_watch_chats_skips_new_self_messages(self) -> None:
         api = FakeChatApi([{"sender": "Mzxx", "text": "hello", "is_self": False}])
@@ -788,6 +791,7 @@ class CoreTests(unittest.TestCase):
             cursor_store=cursors,
         )
         api.messages = [{"sender": "me", "text": "mine", "is_self": True}]
+        api.visible_messages = [{"sender": "me", "text": "mine", "is_self": True}]
         api.sent.clear()
 
         result = watch_chats_messages(
@@ -886,7 +890,7 @@ class CoreTests(unittest.TestCase):
 
         self.assertEqual(result["reply_count"], 1)
         self.assertIn("latest", agent.calls[0][0])
-        self.assertEqual(agent.calls[0][1], ["Mzxx: old"])
+        self.assertEqual(agent.calls[0][1], ["对方: old"])
         self.assertEqual(result["replies"][0]["context_count"], 1)
 
     def test_reply_unread_replies_current_chat_before_unread_scan(self) -> None:
@@ -1884,7 +1888,7 @@ class CoreTests(unittest.TestCase):
 
         self.assertEqual(result["visible_message_count"], 1)
         self.assertEqual(result["message_count"], 1)
-        self.assertEqual(result["new_message_count"], 0)
+        self.assertEqual(result["new_message_count"], 1)
         self.assertEqual(result["cursor_seed_count"], 0)
         self.assertEqual(result["reply_count"], 1)
         self.assertEqual(api.scanned, [])
@@ -1913,7 +1917,7 @@ class CoreTests(unittest.TestCase):
         )
 
         self.assertEqual(result["message_count"], 1)
-        self.assertEqual(result["new_message_count"], 0)
+        self.assertEqual(result["new_message_count"], 1)
         self.assertEqual(result["reply_count"], 1)
         self.assertEqual(api.scanned, [])
         self.assertEqual(api.visible_reads, ["Mzxx"])
@@ -1934,6 +1938,7 @@ class CoreTests(unittest.TestCase):
             cursor_store=cursors,
         )
         api.messages = [{"sender": "me", "text": "mine", "is_self": True}]
+        api.visible_messages = [{"sender": "me", "text": "mine", "is_self": True}]
         api.sent.clear()
 
         result = watch_chats_messages(
@@ -1947,8 +1952,54 @@ class CoreTests(unittest.TestCase):
         )
 
         self.assertEqual(result["message_count"], 0)
+        self.assertEqual(result["new_message_count"], 0)
         self.assertEqual(result["reply_count"], 0)
         self.assertEqual(api.sent, [])
+
+    def test_watch_chats_marks_empty_agent_reply_when_latest_visible_is_not_self(self) -> None:
+        api = FakeChatApi([{"sender": "Mzxx", "text": "图片", "is_self": False}])
+
+        result = watch_chats_messages(
+            api=api,
+            agent=FakeAgent("  "),
+            friends=["Mzxx"],
+            duration="1s",
+            real=True,
+            auto_reply=True,
+        )
+
+        self.assertEqual(result["message_count"], 1)
+        self.assertEqual(result["new_message_count"], 1)
+        self.assertEqual(result["reply_count"], 0)
+        self.assertEqual(result["results"][0]["decision_reason"], "empty_agent_reply")
+        self.assertEqual(api.sent, [])
+
+    def test_watch_chats_replies_to_latest_image_message_even_if_cursor_seen(self) -> None:
+        latest = {"sender": "Mzxx", "text": "图片", "is_self": False}
+        api = FakeChatApi([], visible_messages=[latest])
+        cursors = InMemoryCursorStore()
+        cursors.set_message_cursor(
+            "default",
+            "Mzxx",
+            {"tail": [_message_fingerprint(latest)]},
+            "watch",
+        )
+
+        result = watch_chats_messages(
+            api=api,
+            agent=EchoAgent(),
+            friends=["Mzxx"],
+            duration="1s",
+            real=True,
+            auto_reply=True,
+            cursor_store=cursors,
+        )
+
+        self.assertEqual(result["message_count"], 1)
+        self.assertEqual(result["new_message_count"], 1)
+        self.assertEqual(result["reply_count"], 1)
+        self.assertEqual(api.visible_reads, ["Mzxx"])
+        self.assertIn("图片", str(api.sent[0]["text"]))
 
 
 def _write_config(tmp: Path, store_path: Path) -> Path:

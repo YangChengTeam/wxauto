@@ -129,6 +129,7 @@ def reply_to_chat_messages(
         inbound_text = str(message.get("text") or "").strip()
         if not inbound_text:
             continue
+        sender = _context_sender_label(message, friend)
         context = _build_context_lines(
             chat_name=friend,
             messages=context_messages,
@@ -142,6 +143,7 @@ def reply_to_chat_messages(
             source=source,
             input_message=_truncate_text(inbound_text),
             context_count=len(context),
+            sender=sender,
             latest_is_self=message.get("is_self"),
             latest_is_today=message.get("timestamp_is_today"),
         )
@@ -153,6 +155,7 @@ def reply_to_chat_messages(
             source=source,
             reply_message=_truncate_text(reply_text),
             context_count=len(context),
+            sender=sender,
             latest_is_self=message.get("is_self"),
             latest_is_today=message.get("timestamp_is_today"),
             elapsed_ms=elapsed_ms,
@@ -270,17 +273,18 @@ def watch_chats_messages(
 
             if cursor_store is not None:
                 _mark_recent_outbound_messages(visible_messages, outbound_texts)
-            cursor_new_messages, seeded = _watch_messages_after_cursor(
-                visible_messages,
-                cursor,
-            )
-            if seeded:
-                cursor_seed_count += 1
-            reply_messages = cursor_new_messages
-            reply_message_source = "cursor_visible" if reply_messages else None
-            if not reply_messages:
-                reply_messages = _latest_visible_watch_message(visible_messages, cursor)
-                reply_message_source = "visible_latest" if reply_messages else None
+            latest_message_row = _latest_activity_message(visible_messages)
+            if (
+                session_preview is not None
+                and isinstance(latest_message_row, dict)
+                and latest_message_row.get("is_self") is None
+                and _session_preview_is_self_message(session_preview, _message_text(latest_message_row))
+            ):
+                latest_message_row["is_self"] = True
+                latest_message_row["sender"] = "\u6211"
+            seeded = False
+            reply_messages = _watch_latest_reply_messages(latest_message_row)
+            reply_message_source = "visible_latest" if reply_messages else None
 
             chat_replies: list[dict[str, Any]] = []
             if auto_reply:
@@ -310,16 +314,17 @@ def watch_chats_messages(
                     "watch",
                 )
 
-            latest_message_row = _latest_activity_message(visible_messages)
             latest_message = _message_log_text(latest_message_row) or _truncate_text(session_preview)
             latest_message_source = _watch_latest_message_source(
                 session_preview=session_preview,
                 new_messages=[],
                 visible_messages=visible_messages,
             )
+            latest_is_self = latest_message_row.get("is_self") if isinstance(latest_message_row, dict) else None
             latest_is_self_source = _message_self_source(latest_message_row, outbound_texts) or preview_self_source
             decision_reason = _watch_decision_reason(
                 auto_reply=auto_reply,
+                latest_message=latest_message_row,
                 reply_messages=reply_messages,
                 replies=chat_replies,
             )
@@ -331,12 +336,13 @@ def watch_chats_messages(
                 "dry_run": not real,
                 "auto_reply": auto_reply,
                 "visible_message_count": len(visible_messages),
-                "new_message_count": len(cursor_new_messages),
+                "new_message_count": len(reply_messages),
                 "reply_count": len(chat_replies),
                 "cursor_seeded": seeded,
                 "source_result": source_result["raw_result"],
                 "latest_message": latest_message,
                 "latest_message_source": latest_message_source,
+                "latest_is_self": latest_is_self,
                 "latest_is_self_source": latest_is_self_source,
                 "decision_reason": decision_reason,
                 "fallback_window_opened": False,
@@ -348,7 +354,7 @@ def watch_chats_messages(
             chat_results.append(result)
 
             message_count += len(reply_messages)
-            new_message_count += len(cursor_new_messages)
+            new_message_count += len(reply_messages)
             logger.info(
                 "watch.chats.summary",
                 chat=chat_name,
@@ -357,6 +363,7 @@ def watch_chats_messages(
                 reply_count=int(result.get("reply_count") or 0),
                 latest_message=latest_message,
                 latest_message_source=latest_message_source,
+                latest_is_self=latest_is_self,
                 latest_is_self_source=latest_is_self_source,
                 timestamp_text=result["timestamp_text"],
                 latest_is_today=result["latest_is_today"],
@@ -377,6 +384,7 @@ def watch_chats_messages(
                     visible_message_count=len(visible_messages),
                     latest_message=latest_message,
                     latest_message_source=latest_message_source,
+                    latest_is_self=latest_is_self,
                     latest_is_self_source=latest_is_self_source,
                     timestamp_text=result["timestamp_text"],
                     latest_is_today=result["latest_is_today"],
@@ -495,6 +503,25 @@ def _session_preview_self_reason(preview: str | None, outbound_texts: list[str])
     return None
 
 
+def _session_preview_is_self_message(preview: str | None, message_text: str) -> bool:
+    preview_text = str(preview or "").strip()
+    message = str(message_text or "").strip()
+    if not preview_text or not message:
+        return False
+    self_prefixes = (
+        "\u4f60:",
+        "\u4f60\uff1a",
+        "\u6211:",
+        "\u6211\uff1a",
+        "You:",
+        "Me:",
+    )
+    for prefix in self_prefixes:
+        if preview_text.startswith(prefix) and preview_text[len(prefix) :].strip() == message:
+            return True
+    return False
+
+
 def _message_self_source(message: dict[str, Any] | None, outbound_texts: list[str]) -> str | None:
     if message is None:
         return None
@@ -525,6 +552,7 @@ def _watch_latest_message_source(
 def _watch_decision_reason(
     *,
     auto_reply: bool,
+    latest_message: dict[str, Any] | None,
     reply_messages: list[dict[str, Any]],
     replies: list[dict[str, Any]],
 ) -> str:
@@ -532,11 +560,11 @@ def _watch_decision_reason(
         return "auto_reply_disabled"
     if replies:
         return "replied"
-    if reply_messages:
-        latest = _latest_activity_message(reply_messages)
-        if latest is not None:
-            return _reply_skip_reason(latest)
-    return "no_replyable_message"
+    if latest_message is None:
+        return "no_visible_message"
+    if not reply_messages:
+        return _watch_reply_skip_reason(latest_message)
+    return "empty_agent_reply"
 
 
 def _read_source_messages(
@@ -890,7 +918,7 @@ def _reply_to_current_chat_latest(
         latest_message=latest,
         limit=context_message_limit,
     )
-    sender = _display_sender(latest, chat_name)
+    sender = _context_sender_label(latest, chat_name)
     prompt = _build_unread_reply_prompt(
         chat_name=chat_name,
         sender=sender,
@@ -915,6 +943,7 @@ def _reply_to_current_chat_latest(
         source="unread",
         reply_message=_truncate_text(reply_text),
         context_count=len(context),
+        sender=sender,
         latest_is_self=latest.get("is_self"),
         latest_is_today=latest.get("timestamp_is_today"),
         elapsed_ms=elapsed_ms,
@@ -1081,7 +1110,7 @@ def _reply_to_chat_batch(
         inbound_text = _message_text(message)
         if not inbound_text:
             continue
-        sender = _message_sender(message)
+        sender = _context_sender_label(message, chat_name)
         context = _build_context_lines(
             chat_name=chat_name,
             messages=context_messages,
@@ -1112,6 +1141,7 @@ def _reply_to_chat_batch(
             source=source,
             reply_message=_truncate_text(reply_text),
             context_count=len(context),
+            sender=sender,
             latest_is_self=message.get("is_self"),
             latest_is_today=message.get("timestamp_is_today"),
             elapsed_ms=elapsed_ms,
@@ -1137,23 +1167,10 @@ def _reply_to_chat_batch(
     return replies
 
 
-def _watch_messages_after_cursor(
-    messages: list[dict[str, Any]],
-    cursor: dict[str, Any] | None,
-) -> tuple[list[dict[str, Any]], bool]:
-    if cursor is None:
-        return [], False
-    return _messages_after_cursor(messages, cursor)
-
-
-def _latest_visible_watch_message(
-    messages: list[dict[str, Any]],
-    cursor: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    latest = _latest_activity_message(messages)
+def _watch_latest_reply_messages(latest: dict[str, Any] | None) -> list[dict[str, Any]]:
     if latest is None:
         return []
-    if _cursor_contains_message(cursor, latest):
+    if not _watch_message_can_reply(latest):
         return []
     return [latest]
 
@@ -1169,6 +1186,24 @@ def _reply_target_messages(
     if latest is None or not _message_can_trigger_reply(latest):
         return []
     return [latest]
+
+
+def _watch_message_can_reply(message: dict[str, Any]) -> bool:
+    if message.get("is_timestamp"):
+        return False
+    if not _message_text(message):
+        return False
+    if message.get("is_self") is True:
+        return False
+    return True
+
+
+def _watch_reply_skip_reason(latest: dict[str, Any]) -> str:
+    if latest.get("is_self") is True:
+        return "latest_is_self"
+    if not _message_text(latest):
+        return "empty_latest_message"
+    return "no_replyable_message"
 
 
 def _latest_activity_message(messages: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1365,6 +1400,16 @@ def _display_sender(message: dict[str, Any], chat_name: str) -> str:
     return chat_name or "\u5bf9\u65b9"
 
 
+def _context_sender_label(message: dict[str, Any], chat_name: str) -> str:
+    sender = _message_sender(message)
+    normalized_sender = str(sender or "").strip().lower()
+    if message.get("is_self") is True or normalized_sender in {"self", "me"} or sender == "\u6211":
+        return "\u6211"
+    if message.get("is_group"):
+        return sender or "\u5176\u4ed6\u4eba"
+    return "\u5bf9\u65b9"
+
+
 def _message_is_self(current: dict[str, Any], latest: dict[str, Any] | None) -> bool | None:
     if latest is not None and latest.get("is_self") is not None:
         return bool(latest.get("is_self"))
@@ -1405,7 +1450,7 @@ def _build_context_lines(
             continue
         if _message_fingerprint(message) == latest_fingerprint:
             continue
-        sender = _display_sender(message, chat_name)
+        sender = _context_sender_label(message, chat_name)
         rows.append(f"{sender}: {text}")
     return rows[-limit:]
 
@@ -1512,12 +1557,19 @@ def _build_unread_reply_prompt(
     sender: str | None,
     inbound_text: str,
 ) -> str:
+    prefix = f"Incoming WeChat message in chat '{chat_name}'"
     if sender:
         return (
-            f"Incoming WeChat message in chat '{chat_name}' from '{sender}':\n"
-            f"{inbound_text}\n\nReply naturally and concisely."
+            f"{prefix} from '{sender}':\n"
+            f"{inbound_text}\n\n"
+            "Reply naturally and concisely.\n"
+            "Use the attached context, where lines are labeled 我 / 对方 / 群成员, "
+            "to distinguish who said what."
         )
     return (
-        f"Incoming WeChat message in chat '{chat_name}':\n"
-        f"{inbound_text}\n\nReply naturally and concisely."
+        f"{prefix}:\n"
+        f"{inbound_text}\n\n"
+        "Reply naturally and concisely.\n"
+        "Use the attached context, where lines are labeled 我 / 对方 / 群成员, "
+        "to distinguish who said what."
     )

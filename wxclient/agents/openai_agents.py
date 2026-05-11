@@ -102,7 +102,12 @@ class OpenAIAgentsChatAgent:
         if not context:
             return message
         history = "\n".join(context)
-        return f"Conversation context:\n{history}\n\nLatest message:\n{message}"
+        return (
+            "Conversation context:\n"
+            "The history lines are role-labeled: 我 = messages I sent, 对方 = the other side, "
+            "群成员 = another member in the group chat.\n"
+            f"{history}\n\nLatest message:\n{message}"
+        )
 
 
 def normalize_openai_base_url(value: str) -> str:
