@@ -240,9 +240,7 @@ class MainWindow(QMainWindow):
         panel.setObjectName("brandPanel")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
-
-        layout.addWidget(self._uia_status_panel())
+        layout.setSpacing(8)
 
         header = QHBoxLayout()
         header.setContentsMargins(0, 0, 0, 0)
@@ -277,13 +275,11 @@ class MainWindow(QMainWindow):
 
         copy = QVBoxLayout()
         copy.setContentsMargins(0, 0, 0, 0)
-        copy.setSpacing(2)
+        copy.setSpacing(6)
         title = QLabel(APP_NAME)
         title.setObjectName("brandTitle")
-        subtitle = QLabel("微信 UIA 工作台")
-        subtitle.setObjectName("brandSubtitle")
         copy.addWidget(title)
-        copy.addWidget(subtitle)
+        copy.addWidget(self._uia_status_panel())
         header.addLayout(copy, 1)
         layout.addLayout(header)
         return panel
@@ -1770,10 +1766,6 @@ QMainWindow, QWidget {
     color: #111111;
     font-size: 15px;
     font-weight: 700;
-}
-#brandSubtitle {
-    color: #6b6b6b;
-    font-size: 11px;
 }
 #sectionLabel {
     color: #77736b;
