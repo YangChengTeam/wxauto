@@ -27,6 +27,8 @@ WECHAT_UTILITY_CLASSES = {
 SPI_GETSCREENREADER = 0x0046
 SPI_SETSCREENREADER = 0x0047
 SPIF_SENDCHANGE = 0x0002
+SW_SHOW = 5
+SW_RESTORE = 9
 
 
 def probe_wechat_uia(max_depth: int = 10, max_nodes: int = 5000) -> dict[str, Any]:
@@ -78,6 +80,7 @@ def bootstrap_wechat_uia(
     probe_max_nodes: int = 120,
 ) -> dict[str, Any]:
     """Try a fast unlock first, then optionally fall back to Narrator + restart."""
+    bring_wechat_to_front(timeout=2.0)
     probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
     if probe.get("uia_exposed") is True:
         return {"success": True, "mode": "already", "probe": probe}
@@ -201,6 +204,7 @@ def try_unlock_without_restart(
     """Try to unlock UIA by setting the screen reader flag + broadcast, without restarting WeChat."""
     if platform.system() != "Windows":
         return False
+    bring_wechat_to_front(timeout=2.0)
     probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
     if probe.get("uia_exposed"):
         return True
@@ -226,11 +230,14 @@ def unlock_with_narrator(
     if platform.system() != "Windows":
         return False
 
+    if not restart_wechat:
+        bring_wechat_to_front(timeout=2.0)
     start_narrator()
     if restart_wechat:
         close_wechat_windows()
         time.sleep(2)
         start_wechat(wechat_path)
+        bring_wechat_to_front(timeout=min(8.0, startup_wait))
 
     deadline = time.monotonic() + startup_wait
     exposed = False
@@ -294,6 +301,21 @@ def close_wechat_windows() -> None:
             continue
 
 
+def bring_wechat_to_front(timeout: float = 3.0) -> bool:
+    """Best-effort foreground activation before UIA unlock attempts."""
+    if platform.system() != "Windows":
+        return False
+
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        for candidate in _find_wechat_window_candidates():
+            if _focus_wechat_candidate(candidate):
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
 def _find_wechat_windows(max_depth: int, max_nodes: int) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     for candidate in _find_wechat_window_candidates():
@@ -323,6 +345,44 @@ def _find_wechat_windows(max_depth: int, max_nodes: int) -> list[dict[str, Any]]
         )
     items.sort(key=lambda item: (-item["descendant_count"], -item["candidate_score"]))
     return items
+
+
+def _focus_wechat_candidate(candidate: dict[str, Any]) -> bool:
+    handle = candidate.get("handle")
+    if isinstance(handle, int) and handle > 0:
+        if _restore_and_foreground_window(handle):
+            return True
+
+    window = candidate.get("_window")
+    if window is None:
+        return False
+    try:
+        window.restore()
+    except Exception:
+        pass
+    try:
+        window.set_focus()
+        return True
+    except Exception:
+        return False
+
+
+def _restore_and_foreground_window(handle: int) -> bool:
+    try:
+        user32 = ctypes.windll.user32
+        user32.IsWindow.argtypes = [wintypes.HWND]
+        user32.IsWindow.restype = wintypes.BOOL
+        if not user32.IsWindow(handle):
+            return False
+
+        user32.IsIconic.argtypes = [wintypes.HWND]
+        user32.IsIconic.restype = wintypes.BOOL
+        show_command = SW_RESTORE if user32.IsIconic(handle) else SW_SHOW
+        user32.ShowWindow(handle, show_command)
+        user32.BringWindowToTop(handle)
+        return bool(user32.SetForegroundWindow(handle))
+    except Exception:
+        return False
 
 
 def _find_wechat_window_candidates() -> list[dict[str, Any]]:

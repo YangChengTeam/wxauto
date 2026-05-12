@@ -1,5 +1,6 @@
 from .service import (
     bootstrap_wechat_uia,
+    bring_wechat_to_front,
     ensure_wechat_uia,
     get_screen_reader_active,
     notify_screen_reader_change,
@@ -11,6 +12,7 @@ from .service import (
 
 __all__ = [
     "bootstrap_wechat_uia",
+    "bring_wechat_to_front",
     "ensure_wechat_uia",
     "get_screen_reader_active",
     "notify_screen_reader_change",
