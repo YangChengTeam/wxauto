@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="draw.io" version="26.0.0">
+  <diagram name="wxclient &#26550;&#26500;&#27169;&#22359;&#22270;">
+    <mxGraphModel>
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="sw1" value="&#35302;&#21457;&#23618; / Triggers" style="swimlane;startSize=30;fillColor=#E8E8E8;strokeColor=#999999;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="80" y="30" width="960" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="ui" value="UI&#xa;wxclient/ui" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="sw1">
+          <mxGeometry x="40" y="45" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="cli" value="CLI&#xa;wxclient/app/cli" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="sw1">
+          <mxGeometry x="370" y="45" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="trigger" value="Trigger / Scheduler&#xa;wxclient/trigger" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="sw1">
+          <mxGeometry x="700" y="45" width="220" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="sw2" value="&#35843;&#24230;&#23618; / Dispatch" style="swimlane;startSize=30;fillColor=#E8E8E8;strokeColor=#999999;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="80" y="240" width="960" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="queue" value="Task Queue&#xa;&#21435;&#37325; / &#37325;&#35797; / &#29366;&#24577;&#26426;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="sw2">
+          <mxGeometry x="170" y="45" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="worker" value="WeChatOperationWorker&#xa;&#20018;&#34892;&#25191;&#34892;&#24494;&#20449;&#25805;&#20316;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" vertex="1" parent="sw2">
+          <mxGeometry x="540" y="45" width="280" height="60" as="geometry" />
+        </mxCell>
+        <mxCell id="sw3" value="&#19994;&#21153;&#23618; / Business" style="swimlane;startSize=30;fillColor=#E8E8E8;strokeColor=#999999;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="80" y="450" width="960" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="wechat_api" value="wechat_api&#xa;pyweixin &#20108;&#27425;&#23553;&#35013;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="sw3">
+          <mxGeometry x="30" y="45" width="260" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="agentbridge" value="agentbridge&#xa;&#20107;&#20214; &#8596; Agent &#21327;&#35758;&#36716;&#25442;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="sw3">
+          <mxGeometry x="350" y="45" width="260" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="agents" value="agents / LLM&#xa;&#22823;&#27169;&#22411;&#26234;&#33021;&#20307;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="sw3">
+          <mxGeometry x="670" y="45" width="260" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="sw4" value="&#22522;&#30784;&#23618; / Infrastructure" style="swimlane;startSize=30;fillColor=#E8E8E8;strokeColor=#999999;fontStyle=1;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="80" y="680" width="960" height="150" as="geometry" />
+        </mxCell>
+        <mxCell id="uia_unlock" value="uia_unlock&#xa;UIA &#35299;&#38145;&#32534;&#25490;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="sw4">
+          <mxGeometry x="30" y="45" width="260" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="config" value="config&#xa;&#36134;&#21495;/&#30333;&#21517;&#21333;/&#38480;&#39057;/LLM" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;" vertex="1" parent="sw4">
+          <mxGeometry x="350" y="45" width="260" height="80" as="geometry" />
+        </mxCell>
+        <mxCell id="storage" value="Storage (SQLite)&#xa;&#20219;&#21153;/&#28216;&#26631;/&#22909;&#21451;/&#23457;&#35745;" style="shape=cylinder3;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;size=15;" vertex="1" parent="sw4">
+          <mxGeometry x="670" y="40" width="260" height="90" as="geometry" />
+        </mxCell>
+        <mxCell id="pyweixin" value="pyweixin&#xa;(third_party vendor)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;dashPattern=8 8;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="910" width="300" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="wechat_pc" value="WeChat PC&#xa;&#24494;&#20449;&#23458;&#25143;&#31471;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="620" y="910" width="300" height="70" as="geometry" />
+        </mxCell>
+        <mxCell id="ext_label" value="&#22806;&#37096;&#20381;&#36182; / External" style="text;html=1;align=left;verticalAlign=middle;resizable=0;points=[];autosize=1;fontStyle=1;fontSize=13;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="80" y="890" width="170" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="ui" target="queue">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="cli" target="queue">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="trigger" target="queue">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" value="&#28040;&#36153;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="queue" target="worker">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e5" value="&#35843;&#29992;API" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="worker" target="wechat_api">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" value="&#28040;&#24687;&#22788;&#29702;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="worker" target="agentbridge">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" value="LLM&#35831;&#27714;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="agentbridge" target="agents">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" value="&#22238;&#22797;&#20219;&#21153;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;dashed=1;dashPattern=8 4;" edge="1" parent="1" source="agents" target="queue">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1080" y="535" />
+              <mxPoint x="1080" y="315" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e9" value="ensure UIA" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="wechat_api" target="uia_unlock">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e10" value="&#23553;&#35013;&#35843;&#29992;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="wechat_api" target="pyweixin">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="40" y="575" />
+              <mxPoint x="40" y="945" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e11" value="&#35299;&#38145;UIA" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.25;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="uia_unlock" target="wechat_pc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e12" value="UI&#33258;&#21160;&#21270;" style="edgeStyle=orthogonalEdgeStyle;rounded=1;orthogonalLoop=1;jettySize=auto;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="pyweixin" target="wechat_pc">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

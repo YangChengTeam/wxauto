@@ -53,6 +53,23 @@ def _vendor_package_data(vendor_dir: Path, package_names: tuple[str, ...]) -> li
     return data_args
 
 
+def _omni_visual_vendor_data(repo_root: Path) -> list[str]:
+    vendor_dir = repo_root / "third_party" / "omni-bot-sdk-oss"
+    if not vendor_dir.exists():
+        return []
+    data_items = [
+        (vendor_dir / "src" / "omni_bot_sdk", "third_party/omni-bot-sdk-oss/src/omni_bot_sdk"),
+        (vendor_dir / "LICENSE", "third_party/omni-bot-sdk-oss"),
+        (vendor_dir / "README.md", "third_party/omni-bot-sdk-oss"),
+        (vendor_dir / "pyproject.toml", "third_party/omni-bot-sdk-oss"),
+    ]
+    data_args: list[str] = []
+    for source, target in data_items:
+        if source.exists():
+            data_args.extend(["--add-data", f"{source}{os.pathsep}{target}"])
+    return data_args
+
+
 def _build_args(repo_root: Path, name: str, console: bool) -> list[str]:
     launcher = repo_root / "scripts" / "wxclient_gui.py"
     assets_dir = repo_root / "wxclient" / "ui" / "assets"
@@ -152,10 +169,12 @@ def _build_args(repo_root: Path, name: str, console: bool) -> list[str]:
         ]
     )
     args.extend(_vendor_package_data(vendor_dir, vendor_packages))
+    args.extend(_omni_visual_vendor_data(repo_root))
     for module_name in _vendor_package_modules(vendor_dir, vendor_packages):
         args.extend(["--hidden-import", module_name])
     if logger_conf is not None:
         args.extend(["--add-data", f"{logger_conf}{os.pathsep}logger"])
+    args.append("--uac-admin")
     args.append("--console" if console else "--windowed")
     return args
 

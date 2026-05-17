@@ -802,22 +802,29 @@ class Navigator():
             window_size:微信主界面大小,默认(1000,100),可GlobalConfig.window_size=(width,height)全局控制
         '''
         def move_window_to_center(window:WindowSpecification,is_maximize:bool):
-            #将微信主界面移动到窗口正中间,并调整全屏
-            window.restore()
-            win32gui.SetWindowPos(window.handle,win32con.HWND_TOPMOST, 
-            0, 0,window_size[0],window_size[1],win32con.SWP_NOMOVE)
-            window_width,window_height=window_size[0],window_size[1]
-            screen_width,screen_height=win32api.GetSystemMetrics(win32con.SM_CXSCREEN),win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
-            new_left=(screen_width-window_width)//2
-            new_top=(screen_height-window_height)//2
-            if screen_width!=window_width:
-                #移动窗口到屏幕中央
-                win32gui.MoveWindow(window.handle,new_left,new_top,window_width,window_height,True)
-            ###############################
+            # 温和激活微信主窗口：不强制置顶、不改尺寸，避免 Qt 主窗口被重排后白屏/灰屏。
+            handle=window.handle
+            try:
+                show_cmd=win32con.SW_RESTORE if win32gui.IsIconic(handle) else win32con.SW_SHOW
+                win32gui.ShowWindow(handle,show_cmd)
+            except Exception:
+                try:
+                    window.restore()
+                except Exception:
+                    pass
+            try:
+                win32gui.SetWindowPos(handle,win32con.HWND_TOP,
+                0, 0,0,0,win32con.SWP_NOMOVE|win32con.SWP_NOSIZE|win32con.SWP_SHOWWINDOW|win32con.SWP_NOOWNERZORDER)
+                win32gui.BringWindowToTop(handle)
+                win32gui.SetForegroundWindow(handle)
+            except Exception:
+                try:
+                    window.set_focus()
+                except Exception:
+                    pass
+            time.sleep(0.15)
             if is_maximize:
                 win32gui.SendMessage(window.handle, win32con.WM_SYSCOMMAND, win32con.SC_MAXIMIZE,0)
-            if not is_maximize:
-                win32gui.SendMessage(window.handle, win32con.WM_SYSCOMMAND, win32con.SC_RESTORE,0)
             return window
         if is_maximize is None:
             is_maximize=GlobalConfig.is_maximize

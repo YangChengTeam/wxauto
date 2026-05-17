@@ -14,12 +14,10 @@ DEFAULT_GUI_CONFIG_PATH = Path(".wxclient") / "settings.json"
 _FORM_STATE_KEYS = (
     "friend_interval",
     "friend_limit",
-    "friend_verify",
     "unread_interval",
     "unread_friend",
     "unread_reply_all",
     "watch_interval",
-    "watch_duration",
     "watch_targets",
     "watch_auto_reply",
     "watch_reply_all",
@@ -49,8 +47,12 @@ def resolve_config_path(path: Path | None = None) -> Path:
 def load_gui_settings(path: Path | None = None) -> tuple[Settings, Path]:
     config_path = resolve_config_path(path)
     if path is None and not config_path.exists():
-        return Settings(), config_path
-    return load_settings(config_path), config_path
+        settings = Settings()
+    else:
+        settings = load_settings(config_path)
+    # GUI 默认固定为真实操作微信，旧配置里的 dry_run 不再生效。
+    settings.dry_run = False
+    return settings, config_path
 
 
 def load_form_state(path: Path) -> dict[str, Any]:
@@ -74,12 +76,10 @@ def save_gui_settings(
     data: dict[str, Any] = {
         "data_dir": str(settings.data_dir),
         "database_path": str(settings.database_path) if settings.database_path else None,
-        "host": settings.host,
-        "port": settings.port,
-        "webhook_token": settings.webhook_token,
         "default_account_id": settings.default_account_id,
         "wechat_path": str(settings.wechat_path) if settings.wechat_path else None,
-        "dry_run": settings.dry_run,
+        "wechat_driver_order": settings.wechat_driver_order,
+        "omni_visual_rpa_config": settings.omni_visual_rpa_config,
         "friend_check_interval_seconds": settings.friend_check_interval_seconds,
         "message_scan_interval_seconds": settings.message_scan_interval_seconds,
         "agent_provider": settings.agent_provider,

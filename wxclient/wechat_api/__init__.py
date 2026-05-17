@@ -1,3 +1,19 @@
-from .service import WeChatApi, WeChatApiError
+from .service import (
+    CompositeWeChatDriver,
+    OmniVisualDriver,
+    UiaWeChatDriver,
+    WeChatActionUnsupported,
+    WeChatApi,
+    WeChatApiError,
+    WeChatApiUnavailableError,
+)
 
-__all__ = ["WeChatApi", "WeChatApiError"]
+__all__ = [
+    "CompositeWeChatDriver",
+    "OmniVisualDriver",
+    "UiaWeChatDriver",
+    "WeChatActionUnsupported",
+    "WeChatApi",
+    "WeChatApiError",
+    "WeChatApiUnavailableError",
+]

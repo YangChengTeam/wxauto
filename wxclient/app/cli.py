@@ -9,9 +9,12 @@ from wxclient.agents import AgentError, build_chat_agent
 from wxclient.config import Settings, load_settings
 from wxclient.logging_config import configure_logging
 from wxclient.queue import OperationWorker, Task, TaskStore, TaskType
-from wxclient.trigger import Scheduler, run_http_server
-from wxclient.uia_unlock import bootstrap_wechat_uia, probe_wechat_uia, unlock_with_narrator
-from wxclient.wechat_api import WeChatApi
+from wxclient.uia_unlock import (
+    bootstrap_wechat_uia,
+    probe_wechat_uia,
+    probe_wechat_uia_native,
+)
+from wxclient.wechat_api import OmniVisualDriver, WeChatApi, WeChatApiError
 
 app = typer.Typer(help="Windows WeChat automation client")
 _LOG_LEVEL = "INFO"
@@ -23,6 +26,8 @@ def _runtime(config: Path | None) -> tuple[Settings, TaskStore, WeChatApi]:
     api = WeChatApi(
         dry_run=settings.dry_run,
         wechat_path=settings.wechat_path,
+        wechat_driver_order=settings.wechat_driver_order,
+        omni_visual_rpa_config=settings.omni_visual_rpa_config,
     )
     return settings, store, api
 
@@ -32,41 +37,6 @@ def callback(log_level: str = typer.Option("INFO", help="Python logging level"))
     global _LOG_LEVEL
     _LOG_LEVEL = log_level
     configure_logging(level=log_level)
-
-
-@app.command()
-def serve(config: Path | None = typer.Option(None, help="Path to JSON config file")) -> None:
-    settings, store, api = _runtime(config)
-    configure_logging(level=_LOG_LEVEL, log_file=settings.data_dir / "logs" / "serve.log")
-    try:
-        bootstrap = bootstrap_wechat_uia(
-            wechat_path=settings.wechat_path,
-            restart_if_needed=True,
-        )
-    except Exception as exc:
-        bootstrap = {"success": False, "mode": "error", "error": str(exc), "probe": {}}
-    if not bootstrap.get("success"):
-        typer.echo(
-            json.dumps(
-                {
-                    "uia_exposed": False,
-                    "mode": bootstrap.get("mode"),
-                    "reason": bootstrap.get("error") or (bootstrap.get("probe") or {}).get("reason"),
-                },
-                ensure_ascii=False,
-            )
-        )
-        raise typer.Exit(code=1)
-    worker = OperationWorker(store, api, settings=settings)
-    scheduler = Scheduler(settings, store)
-    worker.start()
-    scheduler.start()
-    typer.echo(f"wxclient listening on http://{settings.host}:{settings.port}")
-    try:
-        run_http_server(settings, store)
-    finally:
-        scheduler.stop()
-        worker.stop()
 
 
 @app.command()
@@ -328,26 +298,103 @@ def reply_unread(
     typer.echo(task.id)
 
 
+@app.command("visual-send-message")
+def visual_send_message(
+    friend: str,
+    text: str,
+    real: bool = typer.Option(False, help="Execute real visual RPA action"),
+    config: Path | None = typer.Option(None, help="Path to JSON config file"),
+) -> None:
+    settings = load_settings(config)
+    driver = OmniVisualDriver(
+        dry_run=not real,
+        rpa_config=settings.omni_visual_rpa_config,
+    )
+    try:
+        result = driver.send_message(friend=friend, text=text, dry_run=not real)
+    except WeChatApiError as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "ok": False,
+                    "driver": "omni_visual",
+                    "action": "send_message",
+                    "error": str(exc),
+                },
+                ensure_ascii=False,
+            )
+        )
+        raise typer.Exit(code=1) from exc
+    result.setdefault("driver", "omni_visual")
+    result.setdefault("ok", True)
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+@app.command("visual-open-chat")
+def visual_open_chat(
+    friend: str,
+    real: bool = typer.Option(False, help="Execute real visual RPA action"),
+    config: Path | None = typer.Option(None, help="Path to JSON config file"),
+) -> None:
+    settings = load_settings(config)
+    driver = OmniVisualDriver(
+        dry_run=not real,
+        rpa_config=settings.omni_visual_rpa_config,
+    )
+    try:
+        result = driver.open_chat(friend=friend, dry_run=not real)
+    except WeChatApiError as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "ok": False,
+                    "driver": "omni_visual",
+                    "action": "open_chat",
+                    "error": str(exc),
+                },
+                ensure_ascii=False,
+            )
+        )
+        raise typer.Exit(code=1) from exc
+    result.setdefault("driver", "omni_visual")
+    result.setdefault("ok", True)
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 @app.command("probe-uia")
-def probe_uia() -> None:
-    typer.echo(json.dumps(probe_wechat_uia(), ensure_ascii=False, indent=2))
+def probe_uia(
+    native_com: bool = typer.Option(
+        False,
+        "--native-com",
+        help="Probe through native COM UIAutomation",
+    ),
+) -> None:
+    probe = probe_wechat_uia_native() if native_com else probe_wechat_uia()
+    typer.echo(json.dumps(probe, ensure_ascii=False, indent=2))
 
 
 @app.command("unlock-uia")
 def unlock_uia(
-    restart: bool = typer.Option(False, help="Close and restart WeChat after Narrator starts"),
-    stop_narrator: bool = typer.Option(True, help="Stop Narrator after UIA is exposed"),
+    restart: bool = typer.Option(False, help="Close and restart WeChat"),
     startup_wait: float = typer.Option(35.0, help="Seconds to wait for WeChat UIA"),
     config: Path | None = typer.Option(None, help="Path to JSON config file"),
 ) -> None:
     settings = load_settings(config)
-    ok = unlock_with_narrator(
+    result = bootstrap_wechat_uia(
         wechat_path=settings.wechat_path,
-        restart_wechat=restart,
+        restart_if_needed=restart,
         startup_wait=startup_wait,
-        stop_narrator_after_wechat=stop_narrator,
     )
-    typer.echo(json.dumps({"uia_exposed": ok}, ensure_ascii=False))
+    typer.echo(
+        json.dumps(
+            {
+                "success": result.get("success"),
+                "mode": result.get("mode"),
+                "foreground": result.get("foreground"),
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 def _task_to_dict(task: Task) -> dict:

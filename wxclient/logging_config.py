@@ -271,7 +271,7 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
 
     # Friend check logs
     if event == "friend.check.start":
-        mode = "检测并自动同意" if payload.get("auto_accept") else "仅检测"
+        mode = "仅检测" if payload.get("auto_accept") is False else "检测并自动同意"
         return f"开始检测新好友：{mode}，上限 {payload.get('limit', '-')} 人"
     if event == "friend.check.empty":
         return "好友检测完成：没有新的好友申请"
@@ -366,11 +366,16 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         return "UIA 解锁成功（已重启微信）。"
     if event == "uia.unlock.failed":
         return f"UIA 解锁失败：{payload.get('error', '')}"
+    if event == "uia.operation_unlock":
+        return str(payload.get("message") or "动作前 UIA 状态更新。")
 
     if event == "worker.started":
         return f"服务已启动，轮询间隔 {payload.get('poll_interval', '-')} 秒。"
     if event == "worker.stopped":
         return "服务已停止。"
+    if event == "task.duplicate_skipped":
+        active_id = str(payload.get("active_task_id") or "")[:8] or "-"
+        return f"已有待执行「{task_type}」任务，未重复入队：#{active_id}"
     if event == "task.running":
         return f"开始执行「{task_type}」#{short_id}，第 {attempts} 次尝试。"
     if event == "task.succeeded":
@@ -419,7 +424,35 @@ def _summarize_result(result: Any) -> str:
     for key, label in labels.items():
         if key in result and result[key] is not None:
             parts.append(f"{label} {result[key]}。")
+    chat_summaries = _summarize_chat_summaries(result.get("chat_summaries"))
+    if chat_summaries:
+        parts.append(chat_summaries)
     return " ".join(parts)
+
+
+def _summarize_chat_summaries(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    rows: list[str] = []
+    for item in value[:4]:
+        if not isinstance(item, dict):
+            continue
+        chat = str(item.get("chat") or "-")
+        latest = _truncate_text(str(item.get("latest_message") or ""), 36)
+        visible = item.get("visible_message_count", 0)
+        replies = item.get("reply_count", 0)
+        if latest:
+            rows.append(f"{chat}：可见 {visible} 条，回复 {replies} 条，最后「{latest}」")
+        else:
+            rows.append(f"{chat}：可见 {visible} 条，回复 {replies} 条")
+    return "；".join(rows)
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 1)]}…"
 
 
 def _yes_no(value: Any) -> str:

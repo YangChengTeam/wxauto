@@ -27,6 +27,7 @@ class TaskType(str, Enum):
     REPLY_CHAT = "reply_chat"
     REPLY_UNREAD = "reply_unread"
     WATCH_CHATS = "watch_chats"
+    POST_MOMENTS = "post_moments"
 
 
 def utcnow() -> str:

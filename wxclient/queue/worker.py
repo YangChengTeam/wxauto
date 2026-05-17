@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import threading
-import time
 from collections.abc import Callable
 from typing import Any
 
@@ -56,6 +55,10 @@ class OperationWorker:
     def busy(self) -> bool:
         return self._busy
 
+    @property
+    def running(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
@@ -64,7 +67,7 @@ class OperationWorker:
         self._thread.daemon = True
         self._thread.start()
 
-    def stop(self, wait: bool = True, timeout: float = 5.0) -> None:
+    def stop(self, wait: bool = True, timeout: float | None = 5.0) -> None:
         self._stop.set()
         if wait and self._thread:
             self._thread.join(timeout=timeout)
@@ -74,10 +77,12 @@ class OperationWorker:
         while not self._stop.is_set():
             did_work = self.run_once()
             if not did_work:
-                time.sleep(self.poll_interval)
+                self._stop.wait(self.poll_interval)
         logger.info("worker.stopped")
 
     def run_once(self) -> bool:
+        if self._stop.is_set():
+            return False
         task = self.store.next_pending()
         if task is None:
             return False
@@ -171,7 +176,6 @@ class OperationWorker:
                 friend=str(friend) if friend else None,
                 cursor_store=self.store,
                 account_id=task.account_id,
-                visible_chats=[],
                 context_message_limit=self.settings.agent_context_message_count,
             )
         if task.type == TaskType.WATCH_CHATS:
@@ -179,7 +183,7 @@ class OperationWorker:
                 api=self.api,
                 agent=_LazyChatAgent(self._chat_agent),
                 friends=_payload_friends(payload),
-                duration=str(payload.get("duration") or "30s"),
+                duration=str(payload.get("duration") or ""),
                 real=not bool(payload.get("dry_run", True)),
                 auto_reply=bool(payload.get("auto_reply", True)),
                 reply_all=bool(payload.get("reply_all", False)),
@@ -187,6 +191,12 @@ class OperationWorker:
                 context_message_limit=self.settings.agent_context_message_count,
                 cursor_store=self.store,
                 account_id=task.account_id,
+            )
+        if task.type == TaskType.POST_MOMENTS:
+            return self.api.post_moments(
+                text=str(payload.get("text") or ""),
+                medias=payload.get("medias") or [],
+                dry_run=payload.get("dry_run"),
             )
         raise ValueError(f"Unsupported task type: {task.type}")
 
@@ -236,7 +246,29 @@ class OperationWorker:
             summary["current_chat"] = result.get("current_chat")
             summary["current_chat_replied"] = result.get("current_chat_replied")
             summary["current_chat_latest_is_today"] = result.get("current_chat_latest_is_today")
+        if task_type == TaskType.WATCH_CHATS:
+            summary["chat_summaries"] = _watch_chat_summaries(result)
         return summary
+
+
+def _watch_chat_summaries(result: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = result.get("results")
+    if not isinstance(rows, list):
+        return []
+    summaries: list[dict[str, Any]] = []
+    for row in rows[:6]:
+        if not isinstance(row, dict):
+            continue
+        summaries.append(
+            {
+                "chat": row.get("friend"),
+                "visible_message_count": row.get("visible_message_count", 0),
+                "reply_count": row.get("reply_count", 0),
+                "latest_message": row.get("latest_message"),
+                "decision_reason": row.get("decision_reason"),
+            }
+        )
+    return summaries
 
 
 def _dedupe(values: list[str]) -> list[str]:

@@ -47,11 +47,13 @@ from wxclient.logging_config import configure_logging
 from wxclient.queue import OperationWorker, TaskStatus, TaskStore, TaskType
 from wxclient.uia_unlock import (
     bootstrap_wechat_uia,
-    get_screen_reader_active,
+    format_uia_diagnostics,
     probe_wechat_uia,
-    set_screen_reader_active,
-    try_unlock_without_restart,
-    unlock_with_narrator,
+    stop_uia_keepalive,
+)
+from wxclient.uia_unlock.constants import (
+    DEFAULT_UIA_PROBE_MAX_DEPTH,
+    DEFAULT_UIA_PROBE_MAX_NODES,
 )
 from wxclient.wechat_api import WeChatApi
 
@@ -65,11 +67,29 @@ from .task_actions import (
 )
 
 APP_NAME = "AI微信自动化"
+COMPACT_TEXT_EDIT_HEIGHT = 34
+
+_ICONS = {
+    "log": '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#555" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6"/><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/></svg>',
+    "settings": '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#555" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v2m0 18v2M4.22 4.22l1.42 1.42m12.72 12.72 1.42 1.42M1 12h2m18 0h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>',
+    "friend": '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#555" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+    "unread": '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#555" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>',
+    "listen": '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#555" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>',
+    "add": '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#555" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>',
+    "moments": '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#555" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>',
+}
+
 _UNFINISHED_STATUSES = {
     TaskStatus.PENDING,
     TaskStatus.RUNNING,
     TaskStatus.FAILED,
     TaskStatus.BLOCKED,
+}
+_TERMINAL_STATUSES = {
+    TaskStatus.SUCCEEDED,
+    TaskStatus.FAILED,
+    TaskStatus.BLOCKED,
+    TaskStatus.CANCELLED,
 }
 _AUTOMATION_BUTTON_WIDTH = 168
 
@@ -87,10 +107,11 @@ class TaskPanelBinding:
 
 
 class MainWindow(QMainWindow):
+    log_requested = Signal(str)
     uia_probe_finished = Signal(dict)
-    uia_unlock_finished = Signal(bool, str)
     uia_bootstrap_finished = Signal(dict)
     worker_start_finished = Signal(dict)
+    worker_stop_finished = Signal(dict)
 
     def __init__(self, settings: Settings, config_path: Path) -> None:
         super().__init__()
@@ -98,18 +119,20 @@ class MainWindow(QMainWindow):
         self._last_uia_signature: tuple[str, str] | None = None
         self._uia_probe_running = False
         self._closing = False
+        self._uia_bootstrapped = False
         self._last_operation_state: str | None = None
         self._worker_starting = False
+        self._worker_stopping = False
+        self.log_requested.connect(self._append_log)
         self.uia_probe_finished.connect(self._handle_uia_probe_result)
-        self.uia_unlock_finished.connect(self._handle_uia_unlock_result)
         self.uia_bootstrap_finished.connect(self._handle_uia_bootstrap_result)
         self.worker_start_finished.connect(self._handle_worker_start_result)
-        self._uia_unlock_running = False
-        self._startup_uia_bootstrap_running = False
+        self.worker_stop_finished.connect(self._handle_worker_stop_result)
         self._append_log("正在启动 AI微信自动化。")
         _load_ui_font()
         self._append_log("界面字体已加载，准备初始化配置。")
         self.settings = settings
+        self.settings.dry_run = False
         self.config_path = config_path
         self._form_state = load_form_state(config_path)
         self.show_automation_tasks = bool(self._form_state.get("show_automation_tasks", False))
@@ -117,9 +140,12 @@ class MainWindow(QMainWindow):
         self._append_log(f"数据目录：{settings.data_dir}")
         self.store = TaskStore(settings.resolved_database_path)
         self._append_log(f"本地任务库已连接：{settings.resolved_database_path}")
+        self._reported_terminal_task_ids = self._current_terminal_task_ids()
         self.api = WeChatApi(
             dry_run=settings.dry_run,
             wechat_path=settings.wechat_path,
+            wechat_driver_order=settings.wechat_driver_order,
+            omni_visual_rpa_config=settings.omni_visual_rpa_config,
         )
         self._append_log("微信自动化接口已初始化。")
         self.worker = OperationWorker(self.store, self.api, settings=settings)
@@ -127,27 +153,14 @@ class MainWindow(QMainWindow):
         self.worker_running = False
         self.log_path = settings.data_dir / "logs" / "ui.log"
         self.task_tables: list[TaskPanelBinding] = []
-        self._previous_screen_reader_state = get_screen_reader_active()
-        if self._previous_screen_reader_state is None:
-            self._append_log("未能读取系统屏幕阅读器标志，继续尝试开启。")
-        else:
-            state = "开启" if self._previous_screen_reader_state else "关闭"
-            self._append_log(f"启动前屏幕阅读器标志为：{state}。")
-        self.screen_reader_enabled = (
-            set_screen_reader_active(True) or self._previous_screen_reader_state is True
-        )
-        if self.screen_reader_enabled:
-            self._append_log("屏幕阅读器标志已开启，微信 UIA 节点检测可以开始。")
-        else:
-            self._append_log("屏幕阅读器标志开启失败，后续 UIA 检测可能不可用。")
 
         self.friend_timer = self._make_timer(self.enqueue_friend_check)
         self.unread_timer = self._make_timer(self.enqueue_unread_reply)
         self.watch_timer = self._make_timer(self.enqueue_watch_chats)
         self.refresh_timer = self._make_timer(self.refresh_all)
-        self.uia_timer = self._make_timer(self.refresh_uia_status)
         self.worker_state_timer = self._make_timer(self.refresh_operation_state)
-        self._append_log("定时器已注册：日志每 2 秒刷新，UIA 状态每 10 秒检测。")
+        self._last_pending_task_notice: dict[str, str] = {}
+        self._append_log("定时器已注册：日志每 2 秒刷新。")
 
         icon_path = _asset_path("app-icon.ico")
         if icon_path.exists():
@@ -160,29 +173,23 @@ class MainWindow(QMainWindow):
         self._show_logs()
         self._append_log("主界面已创建。")
         self.refresh_timer.start(2000)
-        self.uia_timer.start(10000)
         self.worker_state_timer.start(500)
         self._append_log("后台状态刷新已启动。")
         self.refresh_all()
-        self.refresh_uia_status()
         self.refresh_operation_state()
         self._bootstrap_uia_on_startup()
 
     def closeEvent(self, event: Any) -> None:  # type: ignore[override]
         self._closing = True
         self._worker_starting = False
-        self._startup_uia_bootstrap_running = False
+        self._worker_stopping = False
         self._persist_form_state()
         self.refresh_timer.stop()
-        self.uia_timer.stop()
         self.worker_state_timer.stop()
         self.watch_timer.stop()
         self._append_log("正在关闭应用，准备停止后台服务。")
         self.worker.stop(wait=False)
-        if self._previous_screen_reader_state is not None:
-            set_screen_reader_active(self._previous_screen_reader_state)
-            state = "开启" if self._previous_screen_reader_state else "关闭"
-            self._append_log(f"屏幕阅读器标志已恢复为启动前状态：{state}。")
+        stop_uia_keepalive(log=self._append_log)
         super().closeEvent(event)
 
     def _make_timer(self, callback: Any):
@@ -211,6 +218,7 @@ class MainWindow(QMainWindow):
 
         self.logs_button = QPushButton("运行日志")
         self.logs_button.setObjectName("navButton")
+        self.logs_button.setIcon(self._svg_icon(_ICONS["log"]))
         self.logs_button.clicked.connect(self._show_logs)
         sidebar_layout.addWidget(self.logs_button)
 
@@ -218,13 +226,22 @@ class MainWindow(QMainWindow):
 
         self.nav = QListWidget()
         self.nav.setObjectName("nav")
-        for text in ("好友检测", "未读回复", "消息监听", "添加好友", "朋友圈"):
-            self.nav.addItem(QListWidgetItem(text))
+        for text, key in (
+            ("好友检测", "friend"),
+            ("未读回复", "unread"),
+            ("消息监听", "listen"),
+            ("添加好友", "add"),
+            ("朋友圈", "moments"),
+        ):
+            item = QListWidgetItem(text)
+            item.setIcon(self._svg_icon(_ICONS[key]))
+            self.nav.addItem(item)
         self.nav.currentRowChanged.connect(self._switch_page)
         sidebar_layout.addWidget(self.nav, 1)
 
         self.settings_button = QPushButton("设置")
         self.settings_button.setObjectName("settingsButton")
+        self.settings_button.setIcon(self._svg_icon(_ICONS["settings"]))
         self.settings_button.clicked.connect(self._show_settings)
         sidebar_layout.addWidget(self.settings_button)
 
@@ -285,6 +302,15 @@ class MainWindow(QMainWindow):
         layout.addLayout(header)
         return panel
 
+    @staticmethod
+    def _svg_icon(svg: str, size: int = 16) -> QIcon:
+        from PySide6.QtCore import QByteArray
+        pixmap = QPixmap()
+        pixmap.loadFromData(QByteArray(svg.encode("utf-8")))
+        if pixmap.width() != size or pixmap.height() != size:
+            pixmap = pixmap.scaled(size, size, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+        return QIcon(pixmap)
+
     def _section_label(self, text: str) -> QLabel:
         label = QLabel(text)
         label.setObjectName("sectionLabel")
@@ -330,12 +356,6 @@ class MainWindow(QMainWindow):
         self.uia_detail_label.setObjectName("uiaDetailLabel")
         self.uia_detail_label.setWordWrap(True)
         layout.addWidget(self.uia_detail_label)
-
-        self.uia_unlock_button = QPushButton("解锁 UIA")
-        self.uia_unlock_button.setObjectName("uiaUnlockButton")
-        self.uia_unlock_button.clicked.connect(self._try_unlock_uia)
-        self.uia_unlock_button.setVisible(False)
-        layout.addWidget(self.uia_unlock_button)
         return panel
 
     def _overview_page(self) -> QWidget:
@@ -471,13 +491,10 @@ class MainWindow(QMainWindow):
         form = self._form(page)
         self.friend_interval = _spin(10, 86400, self._form_state.get("friend_interval", self.settings.friend_check_interval_seconds))
         self.friend_limit = _spin(1, 100, self._form_state.get("friend_limit", 8))
-        self.friend_verify = QCheckBox("检测到好友申请后自动同意")
-        self.friend_verify.setChecked(self._form_state.get("friend_verify", False))
         self.friend_start = self._automation_action_button(QPushButton("启动好友检测"))
         self.friend_start.clicked.connect(self.toggle_friend_timer)
         form.addRow("间隔秒数", self.friend_interval)
         form.addRow("处理数量", self.friend_limit)
-        form.addRow("", self.friend_verify)
         form.addRow("", self.friend_start)
         page.layout().addWidget(  # type: ignore[union-attr]
             self._tasks_panel("好友检测任务", {"check_new_friends", "accept_new_friends"})
@@ -508,10 +525,9 @@ class MainWindow(QMainWindow):
         page = self._page("指定好友/群消息监听")
         form = self._form(page)
         self.watch_interval = _spin(10, 86400, self._form_state.get("watch_interval", self.settings.message_scan_interval_seconds))
-        self.watch_duration = QLineEdit(self._form_state.get("watch_duration", "30s"))
         self.watch_targets = QTextEdit()
         self.watch_targets.setPlaceholderText("一行一个好友或群名，也可以用逗号分隔")
-        self.watch_targets.setFixedHeight(72)
+        self._compact_text_edit(self.watch_targets)
         saved_targets = self._form_state.get("watch_targets", "")
         if saved_targets:
             self.watch_targets.setPlainText(saved_targets)
@@ -520,7 +536,6 @@ class MainWindow(QMainWindow):
         self.watch_start = self._automation_action_button(QPushButton("启动监听"))
         self.watch_start.clicked.connect(self.toggle_watch_timer)
         form.addRow("间隔秒数", self.watch_interval)
-        form.addRow("每次监听时长", self.watch_duration)
         form.addRow("监听对象", self.watch_targets)
         form.addRow("", self.watch_auto_reply)
         form.addRow("", self.watch_start)
@@ -552,12 +567,12 @@ class MainWindow(QMainWindow):
 
         self.moments_text = QTextEdit()
         self.moments_text.setPlaceholderText("输入朋友圈文字内容…")
-        self.moments_text.setMaximumHeight(120)
+        self._compact_text_edit(self.moments_text)
         self.moments_text.setPlainText(self._form_state.get("moments_text", ""))
 
         self.moments_medias = QTextEdit()
         self.moments_medias.setPlaceholderText("每行一个图片或视频路径")
-        self.moments_medias.setMaximumHeight(100)
+        self._compact_text_edit(self.moments_medias)
         self.moments_medias.setPlainText(self._form_state.get("moments_medias", ""))
 
         browse_button = QPushButton("选择图片/视频")
@@ -633,27 +648,18 @@ class MainWindow(QMainWindow):
         self.database_path_input = QLineEdit(
             str(self.settings.database_path) if self.settings.database_path else ""
         )
-        self.host_input = QLineEdit(self.settings.host)
-        self.port_input = _spin(1, 65535, self.settings.port)
-        self.webhook_token_input = QLineEdit(self.settings.webhook_token or "")
         self.default_account_input = QLineEdit(self.settings.default_account_id)
         self.wechat_path_input = QLineEdit(
             str(self.settings.wechat_path) if self.settings.wechat_path else ""
         )
-        self.dry_run_input = QCheckBox("仅模拟运行，不直接操作微信")
-        self.dry_run_input.setChecked(self.settings.dry_run)
         self.show_tasks_checkbox = QCheckBox("显示自动化任务列表")
         self.show_tasks_checkbox.setChecked(self.show_automation_tasks)
         self.show_tasks_checkbox.toggled.connect(self._set_automation_task_visibility)
 
         form.addRow("数据目录", self.data_dir_input)
         form.addRow("数据库路径", self.database_path_input)
-        form.addRow("Host", self.host_input)
-        form.addRow("Port", self.port_input)
-        form.addRow("Token", self.webhook_token_input)
         form.addRow("默认账号", self.default_account_input)
         form.addRow("微信路径", self.wechat_path_input)
-        form.addRow("", self.dry_run_input)
         form.addRow("", self.show_tasks_checkbox)
         return tab
 
@@ -706,6 +712,12 @@ class MainWindow(QMainWindow):
         button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         return button
 
+    def _compact_text_edit(self, editor: QTextEdit) -> QTextEdit:
+        editor.setFixedHeight(COMPACT_TEXT_EDIT_HEIGHT)
+        editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        editor.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return editor
+
     def _set_automation_task_visibility(self, visible: bool) -> None:
         self.show_automation_tasks = visible
         for panel in self.task_tables:
@@ -721,8 +733,10 @@ class MainWindow(QMainWindow):
         panel.setObjectName("panel")
         form = QFormLayout(panel)
         form.setContentsMargins(22, 20, 22, 20)
-        form.setSpacing(14)
+        form.setSpacing(8)
         form.setLabelAlignment(Qt.AlignLeft)
+        form.setFormAlignment(Qt.AlignTop)
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         page.layout().addWidget(panel)  # type: ignore[union-attr]
         return form
 
@@ -751,15 +765,49 @@ class MainWindow(QMainWindow):
         if self._worker_starting:
             self._append_log("服务正在启动中，请稍等。")
             return
+        if self._worker_stopping:
+            self._append_log("服务正在停止中，请等待当前任务收尾。")
+            return
         if self.worker_running:
-            self._append_log("正在停止服务，请等待当前任务收尾。")
-            self.worker.stop(wait=False)
-            self.worker_running = False
-            self.worker_button.setText("启动服务")
-            self._append_log("停止信号已发送。若当前正在操作微信，会在本次动作结束后停止。")
-            self.refresh_operation_state(force=True)
+            self._begin_worker_stop()
             return
         self._begin_worker_start()
+
+    def _begin_worker_stop(self) -> None:
+        self._worker_stopping = True
+        self.worker_button.setEnabled(False)
+        self.worker_button.setText("停止中...")
+        self._append_log("正在停止服务，请等待当前任务收尾。")
+        thread = threading.Thread(
+            target=self._stop_worker_in_background,
+            name="wx-ui-worker-stop",
+            daemon=True,
+        )
+        thread.start()
+
+    def _stop_worker_in_background(self) -> None:
+        try:
+            self.worker.stop(wait=True, timeout=None)
+        except Exception as exc:
+            self.worker_stop_finished.emit({"success": False, "error": str(exc)})
+            return
+        self.worker_stop_finished.emit({"success": True})
+
+    def _handle_worker_stop_result(self, result: dict[str, Any]) -> None:
+        self._worker_stopping = False
+        if self._closing:
+            return
+        self.worker_button.setEnabled(True)
+        if result.get("success"):
+            self.worker_running = False
+            self.worker_button.setText("启动服务")
+            self._append_log("服务已停止，不会再处理新任务。")
+            self.refresh_operation_state(force=True)
+            return
+        self.worker_button.setText("停止服务" if self.worker_running else "启动服务")
+        detail = str(result.get("error") or "未知错误")
+        self._append_log(f"服务停止失败：{detail}")
+        QMessageBox.warning(self, "停止失败", detail)
 
     def _begin_worker_start(self) -> None:
         self._worker_starting = True
@@ -775,11 +823,24 @@ class MainWindow(QMainWindow):
 
     def _start_worker_in_background(self) -> None:
         try:
-            bootstrap = bootstrap_wechat_uia(
-                wechat_path=self.settings.wechat_path,
-                restart_if_needed=True,
+            current_probe = probe_wechat_uia(
+                max_depth=DEFAULT_UIA_PROBE_MAX_DEPTH,
+                max_nodes=DEFAULT_UIA_PROBE_MAX_NODES,
             )
+            if self._uia_bootstrapped and current_probe.get("uia_exposed") is True:
+                self.log_requested.emit("启动服务前复查 UIA 已可用，跳过解锁步骤。")
+                bootstrap = {"success": True, "mode": "already", "probe": current_probe}
+            else:
+                if self._uia_bootstrapped:
+                    self._uia_bootstrapped = False
+                    self.log_requested.emit("上次 UIA 状态已失效，重新执行解锁。")
+                bootstrap = bootstrap_wechat_uia(
+                    wechat_path=self.settings.wechat_path,
+                    restart_if_needed=False,
+                    log=lambda msg: self.log_requested.emit(msg),
+                )
             probe = bootstrap.get("probe") if isinstance(bootstrap.get("probe"), dict) else {}
+            self._uia_bootstrapped = bool(bootstrap.get("success") and probe.get("uia_exposed"))
             if not bootstrap.get("success"):
                 self.worker_start_finished.emit(
                     {
@@ -819,30 +880,41 @@ class MainWindow(QMainWindow):
                 self._append_log("启动服务前已自动解锁 UIA（无需重启微信）。")
             elif mode == "restart":
                 self._append_log("启动服务前已自动解锁 UIA（已重启微信）。")
+            if bootstrap.get("foreground") is False:
+                self._append_log("启动服务前 UIA 已解锁；微信当前未在前台，执行具体任务前会再次尝试切换。")
             self.worker_running = True
             self.worker_button.setText("停止服务")
             self._append_log(f"服务已启动，日志文件：{self.log_path}")
             self._append_log("服务线程已启动，开始轮询任务队列。")
-            self.refresh_uia_status()
+            self._append_uia_diagnostics(bootstrap, "启动服务前 UIA 诊断")
+            probe = bootstrap.get("probe") if isinstance(bootstrap.get("probe"), dict) else {}
+            if probe:
+                self._handle_uia_probe_result(probe)
             self.refresh_operation_state(force=True)
             return
 
         self.worker_running = False
         self.worker_button.setText("启动服务")
         if result.get("reason") == "uia_not_ready":
-            probe = result.get("probe") if isinstance(result.get("probe"), dict) else {}
-            detail = str(probe.get("reason") or "自动解锁失败")
-            self._append_log(f"UIA 自动解锁失败，服务未启动：{detail}")
+            bootstrap = result.get("bootstrap") if isinstance(result.get("bootstrap"), dict) else {}
+            probe = bootstrap.get("probe") if isinstance(bootstrap.get("probe"), dict) else {}
+            if bootstrap.get("mode") == "foreground_failed" and probe.get("uia_exposed"):
+                self._append_log("UIA 已解锁，但微信未在前台，服务未启动。请先手动打开微信主界面后重试。")
+            elif bootstrap.get("mode") == "account_shell_locked":
+                self._append_log("检测到微信账号空壳 UIA，服务未启动。请完全退出微信，再由本程序启动微信后登录该账号。")
+            else:
+                self._append_log("UIA 解锁失败，服务未启动。")
+            self._append_uia_diagnostics(bootstrap, "启动服务失败 UIA 诊断")
             QMessageBox.warning(
                 self,
-                "UIA 未就绪",
-                f"微信 UIA 节点仍未暴露，服务未启动。\n原因：{detail}",
+                "UIA 解锁失败",
+                "微信 UIA 未就绪，或微信未在前台。请先手动打开微信主界面后重试。",
             )
             self.refresh_uia_status()
             return
-        detail = result.get("error") or "未知错误"
-        self._append_log(f"服务启动失败：{detail}")
-        QMessageBox.warning(self, "服务启动失败", str(detail))
+            detail = str(result.get("error") or "未知错误")
+            self._append_log(f"服务启动失败：{detail}")
+            QMessageBox.warning(self, "启动失败", str(detail))
 
     def toggle_friend_timer(self) -> None:
         if self.friend_timer.isActive():
@@ -885,26 +957,31 @@ class MainWindow(QMainWindow):
         self.watch_start.setText("停止监听")
         self._append_log(
             f"消息监听已启动，每 {self.watch_interval.value()} 秒执行一次，"
-            f"每轮监听 {self.watch_duration.text().strip() or '30s'}，对象：{', '.join(targets)}。"
+            f"对象：{', '.join(targets)}。"
         )
         self.enqueue_watch_chats()
 
     def enqueue_friend_check(self) -> None:
-        if self._skip_auto_task_when_busy("好友检测"):
+        pending = self._pending_task_for_type(TaskType.CHECK_NEW_FRIENDS)
+        if pending is not None:
+            self._task_already_pending(pending, "好友检测任务")
             return
-        mode = "检测并自动同意好友申请" if self.friend_verify.isChecked() else "仅检测好友申请"
-        self._append_log(f"正在创建好友检测任务：{mode}，最多处理 {self.friend_limit.value()} 条。")
+        self._append_log(
+            f"正在创建好友检测任务：检测到好友申请后自动同意，最多处理 {self.friend_limit.value()} 条。"
+        )
         task = enqueue_check_new_friends(
             self.store,
             self.settings.default_account_id,
-            verify=self.friend_verify.isChecked(),
+            verify=True,
             limit=self.friend_limit.value(),
             real=True,
         )
         self._task_created(task.id, task.type.value)
 
     def enqueue_unread_reply(self) -> None:
-        if self._skip_auto_task_when_busy("未读回复"):
+        pending = self._pending_task_for_type(TaskType.REPLY_UNREAD)
+        if pending is not None:
+            self._task_already_pending(pending, "未读回复任务")
             return
         target = self.unread_friend.text().strip() or "所有会话"
         reply_mode = "回复全部未读消息" if self.unread_reply_all.isChecked() else "只回复每个会话最后一条未读消息"
@@ -919,35 +996,28 @@ class MainWindow(QMainWindow):
         self._task_created(task.id, task.type.value)
 
     def enqueue_watch_chats(self) -> None:
-        if self._skip_auto_task_when_busy("消息监听"):
+        pending = self._pending_task_for_type(TaskType.WATCH_CHATS)
+        if pending is not None:
+            self._task_already_pending(pending, "消息监听任务")
             return
         targets = _parse_chat_targets(self.watch_targets.toPlainText())
         if not targets:
             self._append_log("消息监听没有配置对象，本轮跳过。")
             return
-        duration = self.watch_duration.text().strip() or "30s"
         mode = "自动回复" if self.watch_auto_reply.isChecked() else "只监听不回复"
         self._append_log(
-            f"正在创建消息监听任务：{mode}，对象 {', '.join(targets)}，每个会话监听 {duration}。"
+            f"正在创建消息监听任务：{mode}，对象 {', '.join(targets)}。"
         )
         task = enqueue_watch_chats(
             self.store,
             self.settings.default_account_id,
             friends=targets,
-            duration=duration,
             auto_reply=self.watch_auto_reply.isChecked(),
             reply_all=False,
             select_sender=False,
             real=True,
         )
         self._task_created(task.id, task.type.value)
-
-    def _skip_auto_task_when_busy(self, task_name: str) -> bool:
-        if not (self.worker_running and self.worker.busy):
-            return False
-        self._append_log(f"服务正在操作微信，本轮{task_name}自动任务已跳过。")
-        self.refresh_operation_state(force=True)
-        return True
 
     def enqueue_add_friend(self) -> None:
         number = self.add_number.text().strip()
@@ -969,13 +1039,10 @@ class MainWindow(QMainWindow):
         self.settings.data_dir = Path(self.data_dir_input.text().strip() or self.settings.data_dir)
         database_path_text = self.database_path_input.text().strip()
         self.settings.database_path = Path(database_path_text) if database_path_text else None
-        self.settings.host = self.host_input.text().strip() or self.settings.host
-        self.settings.port = int(self.port_input.value())
-        self.settings.webhook_token = self.webhook_token_input.text().strip() or None
         self.settings.default_account_id = self.default_account_input.text().strip() or "default"
         wechat_path_text = self.wechat_path_input.text().strip()
         self.settings.wechat_path = Path(wechat_path_text) if wechat_path_text else None
-        self.settings.dry_run = self.dry_run_input.isChecked()
+        self.settings.dry_run = False
         self.settings.agent_provider = self.provider_input.text().strip() or "openai_agents"
         self.settings.llm_base_url = self.base_url_input.text().strip()
         self.settings.llm_model = self.model_input.text().strip()
@@ -1001,12 +1068,10 @@ class MainWindow(QMainWindow):
         return {
             "friend_interval": self.friend_interval.value(),
             "friend_limit": self.friend_limit.value(),
-            "friend_verify": self.friend_verify.isChecked(),
             "unread_interval": self.unread_interval.value(),
             "unread_friend": self.unread_friend.text().strip(),
             "unread_reply_all": self.unread_reply_all.isChecked(),
             "watch_interval": self.watch_interval.value(),
-            "watch_duration": self.watch_duration.text().strip(),
             "watch_targets": self.watch_targets.toPlainText().strip(),
             "watch_auto_reply": self.watch_auto_reply.isChecked(),
             "add_number": self.add_number.text().strip(),
@@ -1027,9 +1092,27 @@ class MainWindow(QMainWindow):
         )
 
     def _task_created(self, task_id: str, task_type: str | None = None) -> None:
+        if task_type:
+            self._last_pending_task_notice.pop(task_type, None)
+        self._reported_terminal_task_ids.discard(task_id)
         self.statusBar().showMessage(f"任务已创建: {task_id}", 5000)
         label = _task_type_label(task_type) if task_type else "任务"
         self._append_log(f"{label}已加入队列，任务编号：{task_id[:8]}。")
+        self.refresh_tasks()
+
+    def _pending_task_for_type(self, task_type: TaskType) -> Any | None:
+        tasks = self.store.list_tasks(
+            1,
+            task_types={task_type},
+            statuses={TaskStatus.PENDING},
+        )
+        return tasks[0] if tasks else None
+
+    def _task_already_pending(self, task: Any, label: str) -> None:
+        task_type = task.type.value if isinstance(task.type, TaskType) else str(task.type)
+        if self._last_pending_task_notice.get(task_type) != task.id:
+            self._last_pending_task_notice[task_type] = task.id
+            self._append_log(f"{label}已有待执行任务，暂不重复入队，任务编号：{task.id[:8]}。")
         self.refresh_tasks()
 
     def refresh_all(self) -> None:
@@ -1037,7 +1120,12 @@ class MainWindow(QMainWindow):
         self.refresh_logs()
 
     def refresh_operation_state(self, force: bool = False) -> None:
-        if self.worker.busy:
+        if self._worker_stopping:
+            state = "stopping"
+            title = "服务停止中"
+            detail = "等待当前任务收尾"
+            status = "服务停止中"
+        elif self.worker.busy:
             state = "busy"
             title = "正在操作微信"
             detail = "请暂时不要操作鼠标或键盘"
@@ -1086,7 +1174,10 @@ class MainWindow(QMainWindow):
 
     def _probe_uia_in_background(self) -> None:
         try:
-            probe = probe_wechat_uia(max_depth=4, max_nodes=120)
+            probe = probe_wechat_uia(
+                max_depth=DEFAULT_UIA_PROBE_MAX_DEPTH,
+                max_nodes=DEFAULT_UIA_PROBE_MAX_NODES,
+            )
         except Exception as exc:
             probe = {
                 "logged_in": False,
@@ -1101,27 +1192,40 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         if probe.get("uia_exposed") is True:
+            self._uia_bootstrapped = True
             state = "ok"
             title = "UIA 正常"
             panel_title = "已解锁"
             panel_detail = "微信 UIA 节点已正常暴露"
         elif probe.get("login_window"):
+            self._uia_bootstrapped = False
             state = "bad"
             title = "微信未登录"
             panel_title = "微信未登录"
             panel_detail = "请先登录微信"
         elif probe.get("logged_in"):
+            self._uia_bootstrapped = False
             state = "warn"
             title = "UIA 未解锁"
             panel_title = "UIA 未解锁"
             panel_detail = "微信已运行但 UIA 节点未暴露"
+        elif _probe_has_wechat_window(probe):
+            self._uia_bootstrapped = False
+            state = "warn"
+            title = "UIA 未解锁"
+            panel_title = "UIA 未解锁"
+            panel_detail = (
+                "已找到微信窗口，但当前只暴露 Qt 空壳"
+                if _probe_selected_qt_shell(probe)
+                else "已找到微信窗口，但 UIA 节点未暴露"
+            )
         else:
+            self._uia_bootstrapped = False
             state = "bad"
             title = "未找到微信主窗口"
             panel_title = "未找到微信"
             panel_detail = "请先启动并登录微信"
 
-        reader_state = "屏幕阅读器标志已开启" if self.screen_reader_enabled else "屏幕阅读器标志未开启"
         reason = _uia_reason_label(str(probe.get("reason") or ""))
         panel = self.uia_state_label.parentWidget()
         if panel is not None:
@@ -1133,74 +1237,16 @@ class MainWindow(QMainWindow):
         self.uia_panel_dot.style().polish(self.uia_panel_dot)
         self.uia_state_label.setText(panel_title)
         self.uia_detail_label.setText(panel_detail)
-        self.uia_unlock_button.setVisible(
-            state != "ok"
-            and not self._uia_unlock_running
-            and not self._startup_uia_bootstrap_running
-        )
 
         signature = (state, reason)
         if signature != self._last_uia_signature:
             self._last_uia_signature = signature
-            self._append_log(f"UIA 检测完成：{title}。{reader_state}。{reason}")
-
-    def _try_unlock_uia(self) -> None:
-        if self._uia_unlock_running or self._closing:
-            return
-        self._uia_unlock_running = True
-        self.uia_unlock_button.setEnabled(False)
-        self.uia_unlock_button.setText("正在解锁...")
-        self.uia_state_label.setText("正在解锁 UIA")
-        self.uia_detail_label.setText("设置屏幕阅读器标志并广播通知...")
-        self._append_log("正在解锁微信 UIA...")
-        threading.Thread(
-            target=self._run_unlock_in_background,
-            name="wx-ui-uia-unlock",
-            daemon=True,
-        ).start()
-
-    def _run_unlock_in_background(self) -> None:
-        wechat_path = self.settings.wechat_path
-        try:
-            success = try_unlock_without_restart(wechat_path=wechat_path)
-        except Exception as exc:
-            self.uia_unlock_finished.emit(False, str(exc))
-            return
-        if success:
-            self.uia_unlock_finished.emit(True, "quick")
-            return
-        self.uia_unlock_finished.emit(False, "need_restart")
-
-    def _handle_uia_unlock_result(self, success: bool, detail: str) -> None:
-        self._uia_unlock_running = False
-        self.uia_unlock_button.setEnabled(True)
-        self.uia_unlock_button.setText("解锁 UIA")
-        if success:
-            if detail == "restart":
-                self._append_log("UIA 解锁成功（已重启微信）。")
-            else:
-                self._append_log("UIA 解锁成功（无需重启微信）。")
-            self.refresh_uia_status()
-            return
-        if detail == "need_restart":
-            self._append_log("广播后 UIA 未解锁，需要重启微信。")
-            answer = QMessageBox.question(
-                self,
-                "UIA 未解锁",
-                "广播后微信未响应，需要重启微信才能解锁 UIA。\n\n是否重启微信？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer == QMessageBox.Yes:
-                self._start_restart_unlock()
-            return
-        self._append_log(f"UIA 解锁失败：{detail}")
+            self._append_log(f"UIA 检测完成：{title}。{reason}")
 
     def _bootstrap_uia_on_startup(self) -> None:
-        if self._closing or self._startup_uia_bootstrap_running:
+        if self._closing:
             return
-        self._startup_uia_bootstrap_running = True
-        self._append_log("程序启动时自动尝试解锁 UIA。")
+        self._append_log("程序启动时自动尝试解锁 UIA...")
         threading.Thread(
             target=self._run_startup_uia_bootstrap_in_background,
             name="wx-ui-uia-bootstrap",
@@ -1212,6 +1258,7 @@ class MainWindow(QMainWindow):
             result = bootstrap_wechat_uia(
                 wechat_path=self.settings.wechat_path,
                 restart_if_needed=False,
+                log=lambda msg: self.log_requested.emit(msg),
             )
         except Exception as exc:
             self.uia_bootstrap_finished.emit(
@@ -1221,51 +1268,43 @@ class MainWindow(QMainWindow):
         self.uia_bootstrap_finished.emit(result)
 
     def _handle_uia_bootstrap_result(self, result: dict[str, Any]) -> None:
-        self._startup_uia_bootstrap_running = False
         if self._closing:
             return
         probe = result.get("probe") if isinstance(result.get("probe"), dict) else {}
         if result.get("success"):
+            self._uia_bootstrapped = bool(probe.get("uia_exposed"))
             mode = str(result.get("mode") or "")
             if mode == "already":
                 self._append_log("程序启动时 UIA 已可用。")
             elif mode == "quick":
-                self._append_log("程序启动时已自动解锁 UIA（无需重启微信）。")
+                self._append_log("程序启动时已自动解锁 UIA。")
+            elif mode == "winevent":
+                self._append_log("程序启动时已自动解锁 UIA（已重启微信）。")
             else:
                 self._append_log("程序启动时 UIA 已就绪。")
+            if result.get("foreground") is False:
+                self._append_log("程序启动时 UIA 已解锁；微信当前未在前台，执行具体任务前会再次尝试切换。")
         else:
-            detail = str(result.get("error") or probe.get("reason") or "未能自动解锁 UIA")
-            self._append_log(f"程序启动时自动解锁 UIA 失败：{detail}")
-        self.refresh_uia_status()
+            if result.get("mode") == "foreground_failed" and probe.get("uia_exposed"):
+                self._append_log("程序启动时 UIA 已解锁，但微信未在前台；请手动打开微信主界面后再启动服务。")
+            elif result.get("mode") == "account_shell_locked":
+                self._append_log("程序启动时检测到微信账号空壳 UIA：请完全退出微信，再由本程序启动微信后登录该账号。")
+            else:
+                self._append_log("程序启动时 UIA 自动解锁失败。")
+        self._append_uia_diagnostics(result, "程序启动 UIA 诊断")
+        if isinstance(probe, dict) and probe:
+            self._handle_uia_probe_result(probe)
+        elif not result.get("success"):
+            self.refresh_uia_status()
 
-    def _start_restart_unlock(self) -> None:
-        self._uia_unlock_running = True
-        self.uia_unlock_button.setEnabled(False)
-        self.uia_unlock_button.setText("重启微信中...")
-        self.uia_state_label.setText("正在重启微信解锁")
-        self.uia_detail_label.setText("关闭并重新启动微信，请稍候...")
-        self._append_log("正在重启微信以解锁 UIA...")
-        threading.Thread(
-            target=self._run_restart_unlock_in_background,
-            name="wx-ui-uia-restart",
-            daemon=True,
-        ).start()
-
-    def _run_restart_unlock_in_background(self) -> None:
+    def _append_uia_diagnostics(self, result: dict[str, Any], context: str) -> None:
         try:
-            success = unlock_with_narrator(
-                wechat_path=self.settings.wechat_path,
-                restart_wechat=True,
-                startup_wait=35.0,
-                stop_narrator_after_wechat=True,
-            )
+            lines = format_uia_diagnostics(result, context=context)
         except Exception as exc:
-            self.uia_unlock_finished.emit(False, str(exc))
+            self._append_log(f"{context}：生成失败：{exc}")
             return
-        if success:
-            self.uia_unlock_finished.emit(True, "restart")
-        else:
-            self.uia_unlock_finished.emit(False, "重启微信后 UIA 仍未解锁")
+        for line in lines:
+            self._append_log(line)
 
     def refresh_tasks(self) -> None:
         tasks = self.store.list_tasks(200, statuses=_UNFINISHED_STATUSES)
@@ -1300,6 +1339,33 @@ class MainWindow(QMainWindow):
             panel.table.setColumnWidth(1, 96)
             panel.table.setColumnWidth(2, max(panel.table.columnWidth(2), 420))
             panel.table.setColumnWidth(3, 150)
+        self._append_new_terminal_task_logs()
+
+    def _current_terminal_task_ids(self) -> set[str]:
+        try:
+            tasks = self.store.list_tasks(300, statuses=_TERMINAL_STATUSES)
+        except Exception:
+            return set()
+        return {task.id for task in tasks}
+
+    def _append_new_terminal_task_logs(self) -> None:
+        try:
+            tasks = self.store.list_tasks(80, statuses=_TERMINAL_STATUSES)
+        except Exception as exc:
+            self._append_log(f"刷新任务结果失败：{exc}")
+            return
+        new_tasks = [
+            task
+            for task in tasks
+            if task.id not in self._reported_terminal_task_ids
+        ]
+        if not new_tasks:
+            return
+        new_tasks.sort(key=_task_sort_key)
+        for task in new_tasks:
+            self._reported_terminal_task_ids.add(task.id)
+            for line in _task_terminal_log_lines(task):
+                self._append_log(line)
 
     def _clear_tasks_for_panel(
         self,
@@ -1468,6 +1534,110 @@ def _task_sort_key(task: Any) -> tuple[str, str]:
     return (str(task.updated_at or ""), str(task.created_at or ""))
 
 
+def _task_terminal_log_lines(task: Any) -> list[str]:
+    task_type = task.type.value if isinstance(task.type, TaskType) else str(task.type)
+    label = _task_type_label(task_type)
+    short_id = str(task.id or "")[:8]
+    status = task.status.value if isinstance(task.status, TaskStatus) else str(task.status)
+    if status == TaskStatus.SUCCEEDED.value:
+        detail = _summarize_task_result(task.result)
+        suffix = f"：{detail}" if detail else "。"
+        lines = [f"{label}执行完成，任务编号：{short_id}{suffix}"]
+        if task_type == TaskType.WATCH_CHATS.value:
+            lines.extend(_watch_task_result_log_lines(task.result))
+        return lines
+    if status == TaskStatus.BLOCKED.value:
+        return [f"{label}被阻塞，任务编号：{short_id}，原因：{task.last_error or '未知'}。"]
+    if status == TaskStatus.FAILED.value:
+        return [f"{label}执行失败，任务编号：{short_id}，原因：{task.last_error or '未知'}。"]
+    if status == TaskStatus.CANCELLED.value:
+        return [f"{label}已取消，任务编号：{short_id}。"]
+    return []
+
+
+def _watch_task_result_log_lines(result: Any) -> list[str]:
+    if not isinstance(result, dict):
+        return []
+    rows = result.get("results")
+    if not isinstance(rows, list):
+        return []
+    lines: list[str] = []
+    for row in rows[:4]:
+        if not isinstance(row, dict):
+            continue
+        chat = str(row.get("friend") or row.get("chat") or "-")
+        messages = _watch_result_visible_messages(row)
+        display_messages = [
+            message
+            for message in messages
+            if isinstance(message, dict)
+            and not message.get("is_timestamp")
+            and _result_message_text(message)
+        ]
+        total = len(display_messages)
+        if total == 0:
+            continue
+        tail = display_messages[-5:]
+        start_index = total - len(tail) + 1
+        for offset, message in enumerate(tail, start=start_index):
+            sender = _result_message_sender(message, chat)
+            text = _truncate_text(_result_message_text(message), 80)
+            timestamp = str(message.get("timestamp_text") or "").strip()
+            time_suffix = f"，时间={timestamp}" if timestamp else ""
+            lines.append(
+                f"消息监听「{chat}」读到第 {offset}/{total} 条：{sender}：{text}{time_suffix}"
+            )
+    replies = result.get("replies")
+    if isinstance(replies, list):
+        for reply in replies[:4]:
+            if not isinstance(reply, dict):
+                continue
+            chat = str(reply.get("chat") or "-")
+            inbound = _truncate_text(str(reply.get("inbound_text") or ""), 60)
+            reply_text = _truncate_text(str(reply.get("reply_text") or ""), 60)
+            if inbound or reply_text:
+                lines.append(
+                    f"消息监听已发送回复「{chat}」：收到「{inbound}」，回复「{reply_text}」"
+                )
+    return lines
+
+
+def _watch_result_visible_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
+    source_result = row.get("source_result")
+    if not isinstance(source_result, dict):
+        return []
+    messages = source_result.get("messages")
+    if not isinstance(messages, list):
+        return []
+    return [message for message in messages if isinstance(message, dict)]
+
+
+def _result_message_text(message: dict[str, Any]) -> str:
+    value = (
+        message.get("text")
+        or message.get("message")
+        or message.get("content")
+        or message.get("消息内容")
+    )
+    return str(value or "").strip()
+
+
+def _result_message_sender(message: dict[str, Any], chat_name: str) -> str:
+    if message.get("is_self") is True:
+        return "我"
+    value = (
+        message.get("sender")
+        or message.get("from")
+        or message.get("消息发送人")
+    )
+    sender = str(value or "").strip()
+    if sender:
+        return sender
+    if message.get("is_group"):
+        return "其他人"
+    return chat_name or "对方"
+
+
 def _task_panel_summary(tasks: list[Any]) -> str:
     if not tasks:
         return "当前没有未完成任务"
@@ -1499,9 +1669,7 @@ def _task_display_name(task: Any) -> str:
     if task_type == TaskType.ADD_FRIEND.value:
         return f"添加好友：{payload.get('number') or '未知号码'}"
     if task_type == TaskType.CHECK_NEW_FRIENDS.value:
-        if payload.get("verify"):
-            return "检查并同意好友申请"
-        return "检查好友申请"
+        return "检查并同意好友申请"
     if task_type == TaskType.ACCEPT_NEW_FRIENDS.value:
         return "同意好友申请"
     if task_type == TaskType.SEND_MESSAGE.value:
@@ -1541,10 +1709,7 @@ def _task_display_detail(task: Any) -> str:
             pieces.append(f"备注：{_truncate_text(remark, 20)}")
         parts.extend(pieces)
     elif task_type == TaskType.CHECK_NEW_FRIENDS.value:
-        if payload.get("verify"):
-            parts.append(f"自动同意，最多处理 {payload.get('limit', 8)} 条")
-        else:
-            parts.append(f"仅检查，最多处理 {payload.get('limit', 8)} 条")
+        parts.append(f"自动同意，最多处理 {payload.get('limit', 8)} 条")
     elif task_type == TaskType.ACCEPT_NEW_FRIENDS.value:
         parts.append(f"最多处理 {payload.get('limit', 8)} 条")
     elif task_type == TaskType.SEND_MESSAGE.value:
@@ -1569,7 +1734,6 @@ def _task_display_detail(task: Any) -> str:
         friends = payload.get("friends") if isinstance(payload.get("friends"), list) else []
         if friends:
             parts.append(f"会话：{_truncate_text('、'.join(str(item) for item in friends), 36)}")
-        parts.append(f"每轮：{payload.get('duration') or '30s'}")
         parts.append("自动回复" if payload.get("auto_reply", True) else "仅监听")
     elif task_type == TaskType.POST_MOMENTS.value:
         text = str(payload.get("text") or "").strip()
@@ -1622,6 +1786,7 @@ def _event_label(event: str) -> str:
         "task.succeeded": "任务执行完成",
         "task.blocked": "任务被阻塞",
         "task.failed": "任务执行失败",
+        "uia.operation_unlock": "动作前 UIA 解锁",
         "watch.chats.start": "消息监听开始",
         "watch.chats.read": "消息监听完成",
         "watch.chats.skipped": "消息监听跳过回复",
@@ -1643,6 +1808,25 @@ def _uia_reason_label(reason: str) -> str:
     if reason.startswith("probe failed:"):
         return f"检测失败：{reason.removeprefix('probe failed:').strip()}"
     return reason
+
+
+def _probe_has_wechat_window(probe: dict[str, Any]) -> bool:
+    if int(probe.get("window_count") or 0) > 0:
+        return True
+    selected = probe.get("selected_window")
+    if isinstance(selected, dict) and selected.get("handle"):
+        return True
+    windows = probe.get("windows")
+    return isinstance(windows, list) and bool(windows)
+
+
+def _probe_selected_qt_shell(probe: dict[str, Any]) -> bool:
+    selected = probe.get("selected_window")
+    if not isinstance(selected, dict):
+        return False
+    class_name = str(selected.get("class_name") or "")
+    descendants = int(selected.get("descendant_count") or 0)
+    return class_name.startswith("Qt") and "QWindowIcon" in class_name and descendants == 0
 
 
 def _humanize_log_line(line: str) -> str | None:
@@ -1693,6 +1877,9 @@ def _humanize_log_line(line: str) -> str | None:
         return f"{timestamp}  服务已启动，轮询间隔 {payload.get('poll_interval', '-')} 秒"
     if event == "worker.stopped":
         return f"{timestamp}  服务已停止"
+    if event == "task.duplicate_skipped":
+        active_id = str(payload.get("active_task_id") or "")[:8] or "-"
+        return f"{timestamp}  已有待执行「{task_type}」任务，未重复入队：#{active_id}"
     if event == "task.running":
         return f"{timestamp}  开始执行「{task_type}」#{short_id}，第 {attempts} 次尝试"
     if event == "task.succeeded":
@@ -1726,7 +1913,51 @@ def _summarize_task_result(result: Any) -> str:
     for key, label in labels.items():
         if key in result and result[key] is not None:
             parts.append(f"{label} {result[key]}")
+    chat_summaries = _summarize_chat_summaries(_watch_chat_summaries(result))
+    if chat_summaries:
+        parts.append(chat_summaries)
     return "，".join(parts)
+
+
+def _watch_chat_summaries(result: dict[str, Any]) -> list[dict[str, Any]]:
+    existing = result.get("chat_summaries")
+    if isinstance(existing, list):
+        return [item for item in existing if isinstance(item, dict)]
+    rows = result.get("results")
+    if not isinstance(rows, list):
+        return []
+    summaries: list[dict[str, Any]] = []
+    for row in rows[:6]:
+        if not isinstance(row, dict):
+            continue
+        summaries.append(
+            {
+                "chat": row.get("friend") or row.get("chat"),
+                "visible_message_count": row.get("visible_message_count", 0),
+                "reply_count": row.get("reply_count", 0),
+                "latest_message": row.get("latest_message"),
+                "decision_reason": row.get("decision_reason"),
+            }
+        )
+    return summaries
+
+
+def _summarize_chat_summaries(value: Any) -> str:
+    if not isinstance(value, list):
+        return ""
+    rows: list[str] = []
+    for item in value[:4]:
+        if not isinstance(item, dict):
+            continue
+        chat = str(item.get("chat") or "-")
+        latest = _truncate_text(str(item.get("latest_message") or ""), 36)
+        visible = item.get("visible_message_count", 0)
+        replies = item.get("reply_count", 0)
+        if latest:
+            rows.append(f"{chat}：可见 {visible} 条，回复 {replies} 条，最后「{latest}」")
+        else:
+            rows.append(f"{chat}：可见 {visible} 条，回复 {replies} 条")
+    return "；".join(rows)
 
 
 def _summarize_payload(payload: dict[str, Any]) -> str:
@@ -1905,21 +2136,6 @@ QMainWindow, QWidget {
     background: transparent;
     color: #5f5f5f;
     font-size: 10px;
-}
-#uiaUnlockButton {
-    background: #ffffff;
-    color: #242424;
-    border: 1px solid #c2bdb3;
-    border-radius: 5px;
-    padding: 4px 12px;
-    font-size: 10px;
-}
-#uiaUnlockButton:hover {
-    background: #f0efeb;
-    border-color: #8a8a8a;
-}
-#uiaUnlockButton:pressed {
-    background: #e0dfdb;
 }
 #uiaUnlockButton:disabled {
     color: #aaa;

@@ -131,14 +131,14 @@ def probe_wechat_uia(
 
 实现流程：
 
-1. 先检测当前微信窗口状态，只检测，不改变进程。
-2. 如果存在 `mmui::MainWindow`，说明当前微信主窗口已登录或至少已进入主界面。
-3. 检查该窗口 UIA 节点数。如果 raw/control/content 明显大于 10，判定已经解锁，直接返回 `True`，绝不重启微信。
-4. 如果当前微信已经登录但 UIA 未解锁，才进入解锁流程。
-5. `strategy="auto"` 时，先启动自研无障碍客户端进程。
-6. 自研客户端启动后，如果需要触发微信重新初始化 UIA Provider，按 `restart_if_needed` 决定是否关闭/重启微信。
-7. 等待 `mmui::MainWindow` 出现，并检查 raw/control/content 节点数。
-8. 如果自研客户端成功，关闭自研客户端，再次确认 UIA 仍可读。
+1. 先确保微信在前台。
+2. 临时开启 Windows 屏幕阅读器标志，再启动自研 UIA 客户端或辅助功能客户端，让微信有机会暴露 UIA Provider。
+3. 客户端启动后再检测 `mmui::MainWindow`、`mmui::LoginWindow` 和节点数。
+4. 如果 raw/control/content 明显大于 10，判定已经解锁，返回 `True`。
+5. 如果只看到登录窗口，暂停业务 API，等待用户登录。
+6. 如果客户端启动后仍未解锁，再按 `restart_if_needed` 决定是否关闭/重启微信。
+7. 重启后继续保持客户端运行，再等待并检测 `mmui::MainWindow` 节点数。
+8. 如果自研客户端成功，关闭自研客户端并恢复屏幕阅读器标志，再次确认 UIA 仍可读。
 9. 如果自研客户端失败，并且 `fallback_to_narrator=True`，再启动 Narrator，重启微信，重复验证。
 10. Narrator 成功后关闭 Narrator，再次确认 UIA 仍可读。
 
@@ -149,7 +149,7 @@ def probe_wechat_uia(
 | 微信未启动 | 找不到 Weixin/WeChat 进程或窗口 | 可直接进入解锁启动流程 |
 | 微信登录页 | 只看到 `mmui::LoginWindow` | 不做业务 API，等待用户登录或启动微信后再检测 |
 | 微信已登录但 UIA 未解锁 | 有 `mmui::MainWindow`，但 raw/control/content 接近 `1/1/1` | 先自研无障碍客户端，失败再 Narrator |
-| 微信已登录且 UIA 已解锁 | 有 `mmui::MainWindow`，raw/control/content 大于 10 | 直接返回，不重启 |
+| 微信已登录且 UIA 已解锁 | 解锁客户端启动后有 `mmui::MainWindow`，raw/control/content 大于 10 | 直接返回，不重启 |
 
 现成实现参考：
 
@@ -216,13 +216,6 @@ result     : UIA exposed
 
 ```python
 def ensure_wechat_uia(...):
-    probe = probe_wechat_uia()
-    if probe["logged_in"] and probe["uia_exposed"]:
-        return True
-
-    if probe["login_window"]:
-        return False
-
     if strategy in ("auto", "a11y_client") and prefer_a11y_client:
         if unlock_with_a11y_client(restart_if_needed=restart_if_needed):
             return True

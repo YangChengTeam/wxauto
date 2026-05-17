@@ -101,7 +101,6 @@ def enqueue_watch_chats(
     store: TaskStore,
     account_id: str,
     friends: list[str],
-    duration: str,
     auto_reply: bool,
     reply_all: bool,
     select_sender: bool,
@@ -111,10 +110,27 @@ def enqueue_watch_chats(
         TaskType.WATCH_CHATS,
         {
             "friends": friends,
-            "duration": duration,
             "auto_reply": auto_reply,
             "reply_all": reply_all,
             "select_sender": select_sender,
+            "dry_run": not real,
+        },
+        account_id,
+    )
+
+
+def enqueue_post_moments(
+    store: TaskStore,
+    account_id: str,
+    text: str,
+    medias: list[str],
+    real: bool,
+) -> Task:
+    return store.create_task(
+        TaskType.POST_MOMENTS,
+        {
+            "text": text,
+            "medias": medias,
             "dry_run": not real,
         },
         account_id,

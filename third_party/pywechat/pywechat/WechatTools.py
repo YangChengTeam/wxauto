@@ -864,18 +864,27 @@ class Navigator():
         retry_interval=0.5
         #处理登录界面的闭包函数，点击进入微信，若微信登录界面存在直接传入窗口句柄，否则自己查找
         def move_window_to_center(main_window:WindowSpecification):
-            #将微信主界面移动到窗口正中间,并调整全屏
-            main_window.restore()
-            win32gui.SetWindowPos(main_window.handle,win32con.HWND_TOPMOST, 
-            0, 0,window_size[0], window_size[1],win32con.SWP_NOMOVE)
-            window_width,window_height=window_size[0],window_size[1]
-            screen_width,screen_height=win32api.GetSystemMetrics(win32con.SM_CXSCREEN),win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
-            new_left=(screen_width-window_width)//2
-            new_top=(screen_height-window_height)//2
-            if screen_width!=window_width:
-                #移动窗口到屏幕中央
-                win32gui.MoveWindow(main_window.handle,new_left,new_top,window_width,window_height,True)
-            ###############################
+            # 温和激活微信主窗口：不强制置顶、不改尺寸，避免 Qt 主窗口被重排后白屏/灰屏。
+            handle=main_window.handle
+            try:
+                show_cmd=win32con.SW_RESTORE if win32gui.IsIconic(handle) else win32con.SW_SHOW
+                win32gui.ShowWindow(handle,show_cmd)
+            except Exception:
+                try:
+                    main_window.restore()
+                except Exception:
+                    pass
+            try:
+                win32gui.SetWindowPos(handle,win32con.HWND_TOP,
+                0, 0,0,0,win32con.SWP_NOMOVE|win32con.SWP_NOSIZE|win32con.SWP_SHOWWINDOW|win32con.SWP_NOOWNERZORDER)
+                win32gui.BringWindowToTop(handle)
+                win32gui.SetForegroundWindow(handle)
+            except Exception:
+                try:
+                    main_window.set_focus()
+                except Exception:
+                    pass
+            time.sleep(0.15)
             return main_window
     
         def handle_login_window(is_maximize=is_maximize,max_retry_times=max_retry_times,retry_interval=retry_interval):

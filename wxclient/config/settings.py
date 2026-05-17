@@ -13,12 +13,11 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default=Path(".wxclient"))
     database_path: Path | None = None
-    host: str = "127.0.0.1"
-    port: int = 8765
-    webhook_token: str | None = None
     default_account_id: str = "default"
     wechat_path: Path | None = None
     dry_run: bool = True
+    wechat_driver_order: list[str] = Field(default_factory=lambda: ["uia"])
+    omni_visual_rpa_config: dict[str, Any] = Field(default_factory=dict)
     friend_check_interval_seconds: int = 60
     message_scan_interval_seconds: int = 15
     agent_provider: str = "openai_agents"
@@ -42,5 +41,5 @@ def load_settings(path: str | Path | None = None) -> Settings:
     if path:
         config_path = Path(path)
         if config_path.exists():
-            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw = json.loads(config_path.read_text(encoding="utf-8-sig"))
     return Settings(**raw)

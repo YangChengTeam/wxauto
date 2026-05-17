@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import httpx
+from openai import AsyncOpenAI
 from pydantic import SecretStr
 
 from .errors import AgentConfigError, AgentExecutionError
@@ -29,35 +30,10 @@ class OpenAIAgentsChatAgent:
     def __init__(self, config: OpenAIAgentsConfig) -> None:
         self.config = config
         self._validate_config(config)
-
-        try:
-            from agents import (  # type: ignore[import-not-found]
-                Agent,
-                OpenAIChatCompletionsModel,
-                Runner,
-                set_tracing_disabled,
-            )
-            from openai import AsyncOpenAI
-        except ImportError as exc:
-            raise AgentConfigError(
-                "OpenAI Agents SDK is not installed. Install project dependencies first."
-            ) from exc
-
-        set_tracing_disabled(disabled=True)
-        client = AsyncOpenAI(
+        self._client = AsyncOpenAI(
             base_url=normalize_openai_base_url(config.base_url),
             api_key=config.api_key.get_secret_value(),
             http_client=_build_http_client(),
-        )
-        model = OpenAIChatCompletionsModel(
-            model=config.model,
-            openai_client=client,
-        )
-        self._runner = Runner
-        self._agent = Agent(
-            name="WeChat Reply Agent",
-            instructions=config.system_prompt,
-            model=model,
         )
 
     def reply(self, message: str, context: list[str] | None = None) -> str:
@@ -71,7 +47,13 @@ class OpenAIAgentsChatAgent:
         prompt = self._build_prompt(message, context)
         try:
             result = await asyncio.wait_for(
-                self._runner.run(self._agent, prompt),
+                self._client.chat.completions.create(
+                    model=self.config.model,
+                    messages=[
+                        {"role": "system", "content": self.config.system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                ),
                 timeout=self.config.timeout_seconds,
             )
         except asyncio.TimeoutError as exc:
@@ -81,7 +63,9 @@ class OpenAIAgentsChatAgent:
         except Exception as exc:
             raise AgentExecutionError(f"OpenAI agent call failed: {exc}") from exc
 
-        text = _stringify_output(result.final_output).strip()
+        choice = result.choices[0] if getattr(result, "choices", None) else None
+        message_obj = getattr(choice, "message", None) if choice is not None else None
+        text = _stringify_output(getattr(message_obj, "content", "")).strip()
         if not text:
             raise AgentExecutionError("OpenAI agent returned an empty reply")
         return text

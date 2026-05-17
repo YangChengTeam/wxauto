@@ -1,73 +1,46 @@
 from __future__ import annotations
 
 import platform
-import subprocess
 import time
-import ctypes
-from ctypes import wintypes
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from .constants import (
+    DEFAULT_UIA_PROBE_MAX_DEPTH,
+    DEFAULT_UIA_PROBE_MAX_NODES,
+    MIN_UIA_EXPOSED_DESCENDANTS,
+)
+from .keepalive import (
+    ensure_a11y_hook_keepalive,
+    ensure_screen_reader_keepalive,
+    ensure_uia_keepalive,
+    uia_keepalive_snapshot,
+)
+from .native_com import (
+    _native_wechat_window_kind,
+    probe_wechat_uia_native,
+    try_unlock_with_native_com_client,
+)
+from .pywinauto_probe import probe_wechat_uia
+from .windows import (
+    _is_wechat_window_candidate,
+    bring_wechat_to_front,
+    close_wechat_windows,
+    ensure_wechat_foreground,
+    start_wechat,
+)
 
-WECHAT_WINDOW_TITLE = "微信"
-WECHAT_PROCESS_NAMES = {"wechat.exe", "weixin.exe"}
-WECHAT_MAIN_CLASSES = {"WeChatMainWndForPC", "WeChatLoginWndForPC"}
-WECHAT_UTILITY_CLASSES = {
-    "Base_PowerMessageWindow",
-    "Chrome_SystemMessageWindow",
-    "DisplayICC_SystemMessageWindow",
-    "IME",
-    "MSCTFIME UI",
-    "Qt51514WxTrayIconMessageWindowClass",
-    "Sogou_TSF_UI",
-    "SoWB_Status",
-    "SoWB_UI",
-    "libusb-1.0-windows-hotplug",
-}
-SPI_GETSCREENREADER = 0x0046
-SPI_SETSCREENREADER = 0x0047
-SPIF_SENDCHANGE = 0x0002
-SW_SHOW = 5
-SW_RESTORE = 9
-
-
-def probe_wechat_uia(max_depth: int = 10, max_nodes: int = 5000) -> dict[str, Any]:
-    """Read-only probe for current WeChat UIA exposure."""
-    if platform.system() != "Windows":
-        return {
-            "platform": platform.system(),
-            "logged_in": False,
-            "login_window": False,
-            "uia_exposed": False,
-            "reason": "UIA probing is only available on Windows",
-        }
-
-    try:
-        windows = _find_wechat_windows(max_depth=max_depth, max_nodes=max_nodes)
-    except Exception as exc:
-        return {
-            "platform": "Windows",
-            "logged_in": False,
-            "login_window": False,
-            "uia_exposed": False,
-            "reason": f"probe failed: {exc}",
-        }
-
-    selected = windows[0] if windows else None
-    exposed = bool(selected and selected["descendant_count"] > 10)
-
-    return {
-        "platform": "Windows",
-        "logged_in": bool(windows),
-        "login_window": False,
-        "uia_exposed": exposed,
-        "window_count": len(windows),
-        "selected_window": selected,
-        "windows": windows,
-        "max_depth": max_depth,
-        "max_nodes": max_nodes,
-        "reason": "UIA exposed" if exposed else "WeChat UIA is not exposed",
-    }
+__all__ = [
+    "bootstrap_wechat_uia",
+    "bring_wechat_to_front",
+    "ensure_wechat_foreground",
+    "ensure_wechat_uia",
+    "probe_wechat_uia",
+    "probe_wechat_uia_native",
+    "try_unlock_with_native_com_client",
+    "_is_wechat_window_candidate",
+    "_native_wechat_window_kind",
+]
 
 
 def bootstrap_wechat_uia(
@@ -76,44 +49,205 @@ def bootstrap_wechat_uia(
     restart_if_needed: bool = False,
     startup_wait: float = 35.0,
     quick_timeout: float = 5.0,
-    probe_max_depth: int = 4,
-    probe_max_nodes: int = 120,
+    probe_max_depth: int = DEFAULT_UIA_PROBE_MAX_DEPTH,
+    probe_max_nodes: int = DEFAULT_UIA_PROBE_MAX_NODES,
+    log: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Try a fast unlock first, then optionally fall back to Narrator + restart."""
-    bring_wechat_to_front(timeout=2.0)
-    probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
-    if probe.get("uia_exposed") is True:
-        return {"success": True, "mode": "already", "probe": probe}
-    if probe.get("platform") != "Windows":
-        return {"success": False, "mode": "unsupported", "probe": probe}
+    """Unlock UIA by trying each mode in a stable, foreground-safe order."""
 
-    if try_unlock_without_restart(
+    def _log(msg: str) -> None:
+        if log is not None:
+            log(msg)
+
+    if platform.system() != "Windows":
+        return {
+            "success": False,
+            "mode": "unsupported",
+            "probe": _unsupported_probe(),
+            "foreground": False,
+        }
+
+    _log("先开启屏幕阅读器标志，再连接微信 UIA...")
+    ensure_screen_reader_keepalive(log=_log)
+    _log("屏幕阅读器标志已设置，启动辅助功能 Hook 后再用 pywinauto 检测...")
+    ensure_a11y_hook_keepalive(log=_log)
+    wechat_started = False
+    try:
+        wechat_started = start_wechat(wechat_path)
+    except RuntimeError:
+        _log("未检测到微信进程，但未找到微信启动路径，继续检测当前窗口状态。")
+    if wechat_started:
+        _log("未检测到微信进程，已启动微信，等待主窗口出现...")
+        time.sleep(2)
+    _log("正在通过 pyweixin 检查并激活微信主窗口...")
+    if not ensure_wechat_foreground(timeout=8.0 if wechat_started else 2.0):
+        _log("pyweixin 未能把微信主窗口切到前台，继续检测 UIA 状态。")
+
+    result = _run_unlock_modes(
         wechat_path=wechat_path,
+        restart_if_needed=restart_if_needed,
+        startup_wait=startup_wait,
+        quick_timeout=quick_timeout,
+        probe_max_depth=probe_max_depth,
+        probe_max_nodes=probe_max_nodes,
+        log=_log,
+    )
+    _attach_keepalive_snapshot(result)
+    return result
+
+
+def _run_unlock_modes(
+    wechat_path: str | Path | None,
+    *,
+    restart_if_needed: bool,
+    startup_wait: float,
+    quick_timeout: float,
+    probe_max_depth: int,
+    probe_max_nodes: int,
+    log: Callable[[str], None],
+) -> dict[str, Any]:
+    _log = log
+    _log("先使用 pywinauto 检测微信 UIA...")
+    probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+    if probe.get("uia_exposed"):
+        foreground = ensure_wechat_foreground(timeout=2.0)
+        if foreground:
+            _log("pywinauto 检测到 UIA 已可用，跳过 native COM 兜底。")
+        else:
+            _log("pywinauto 检测到 UIA 已可用；微信当前未在前台，执行动作前会再次尝试切换。")
+        return {
+            "success": True,
+            "mode": "pywinauto",
+            "probe": probe,
+            "native_probe": {},
+            "foreground": foreground,
+        }
+
+    _log(f"pywinauto 检测 UIA 不可用：{probe.get('reason') or '未知原因'}，等待 Hook 生效后继续用 pywinauto 复查。")
+    if _wait_for_uia_exposed(quick_timeout, probe_max_depth, probe_max_nodes):
+        foreground = ensure_wechat_foreground(timeout=2.0)
+        probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+        if foreground:
+            _log("辅助功能 Hook 生效，pywinauto 检测到 UIA 已解锁。")
+        else:
+            _log("辅助功能 Hook 生效，pywinauto 检测到 UIA 已解锁；微信当前未在前台，执行动作前会再次尝试切换。")
+        return {
+            "success": bool(probe.get("uia_exposed")),
+            "mode": "hook",
+            "probe": probe,
+            "native_probe": {},
+            "foreground": foreground,
+        }
+
+    _log("Hook 后 pywinauto 复查仍不可用，启动 native COM 兜底。")
+    ensure_uia_keepalive(log=_log)
+    _log("启动原生 COM UIAutomation 客户端，然后检测 UIA...")
+    native_result = try_unlock_with_native_com_client(
         timeout=quick_timeout,
         probe_max_depth=probe_max_depth,
         probe_max_nodes=probe_max_nodes,
-    ):
-        probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
-        return {"success": bool(probe.get("uia_exposed")), "mode": "quick", "probe": probe}
-
-    probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
-    if probe.get("uia_exposed") is True:
-        return {"success": True, "mode": "quick", "probe": probe}
-    if not restart_if_needed:
-        return {"success": False, "mode": "quick_failed", "probe": probe}
-
-    success = unlock_with_narrator(
-        wechat_path=wechat_path,
-        restart_wechat=True,
-        startup_wait=startup_wait,
-        probe_max_depth=probe_max_depth,
-        probe_max_nodes=probe_max_nodes,
+        log=_log,
     )
+    native_probe = native_result.get("native_probe")
+    if native_result.get("success"):
+        probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+        if probe.get("uia_exposed"):
+            foreground = ensure_wechat_foreground(timeout=2.0)
+            if not foreground:
+                _log("原生 COM UIAutomation 客户端已解锁 UIA；微信当前未在前台，执行动作前会再次尝试切换。")
+                return {
+                    "success": True,
+                    "mode": "native_com",
+                    "probe": probe,
+                    "native_probe": native_probe,
+                    "foreground": False,
+                }
+            _log("原生 COM UIAutomation 客户端生效，UIA 已解锁。")
+            return {
+                "success": True,
+                "mode": "native_com",
+                "probe": probe,
+                "native_probe": native_probe,
+                "foreground": True,
+            }
+        _log("原生 COM UIAutomation 客户端探测到短暂可用，复查未稳定，继续兜底...")
+    _log("原生 COM UIAutomation 客户端启动后检测仍未解锁，继续等待常驻辅助功能钩子生效...")
+    time.sleep(2)
+
+    if _wait_for_uia_exposed(quick_timeout, probe_max_depth, probe_max_nodes):
+        foreground = ensure_wechat_foreground(timeout=2.0)
+        probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+        if foreground:
+            _log("常驻辅助功能钩子生效，UIA 已解锁。")
+        else:
+            _log("常驻辅助功能钩子已解锁 UIA；微信当前未在前台，执行动作前会再次尝试切换。")
+        return {
+            "success": bool(probe.get("uia_exposed")),
+            "mode": "quick",
+            "probe": probe,
+            "native_probe": native_probe,
+            "foreground": foreground,
+        }
+
+    if not restart_if_needed:
+        foreground = ensure_wechat_foreground(timeout=2.0)
+        probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+        mode = "quick_failed"
+        if _is_empty_qt_shell_probe(probe):
+            mode = "account_shell_locked"
+            _log(
+                "检测到微信窗口存在但只暴露 Qt 空壳，常见于切换账号后该账号/数据目录未开放 UIA；"
+                "请完全退出微信，再由本程序启动微信后登录该账号。"
+            )
+        else:
+            _log("常驻辅助功能钩子未生效，UIA 仍未解锁。")
+        return {
+            "success": False,
+            "mode": mode,
+            "probe": probe,
+            "native_probe": native_probe,
+            "foreground": foreground,
+        }
+
+    _log("常驻辅助功能钩子未生效，关闭微信准备重启...")
+    close_wechat_windows()
+    time.sleep(2)
+    try:
+        started = start_wechat(wechat_path)
+        if started:
+            _log("微信已重新启动，等待 UIA 节点暴露...")
+        else:
+            _log("检测到微信进程仍在运行，未启动新的微信。")
+    except RuntimeError:
+        foreground = ensure_wechat_foreground(timeout=2.0)
+        probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+        _log("微信启动失败。")
+        return {
+            "success": False,
+            "mode": "winevent_failed",
+            "probe": probe,
+            "native_probe": native_probe,
+            "foreground": foreground,
+        }
+    ensure_wechat_foreground(timeout=min(8.0, startup_wait))
+
+    exposed = _wait_for_uia_exposed(startup_wait, probe_max_depth, probe_max_nodes)
+    time.sleep(2)
+
+    foreground = ensure_wechat_foreground(timeout=2.0)
     probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
+    exposed = exposed and probe.get("uia_exposed")
     return {
-        "success": bool(success and probe.get("uia_exposed")),
-        "mode": "restart" if success and probe.get("uia_exposed") else "restart_failed",
+        "success": bool(exposed),
+        "mode": _unlock_result_mode(
+            success_mode="winevent",
+            exposed=bool(exposed),
+            foreground=foreground,
+            failure_mode="winevent_failed",
+        ),
         "probe": probe,
+        "native_probe": native_probe,
+        "foreground": foreground,
     }
 
 
@@ -121,396 +255,113 @@ def ensure_wechat_uia(
     restart_if_needed: bool = False,
     wechat_path: str | Path | None = None,
     startup_wait: float = 35.0,
+    log: Callable[[str], None] | None = None,
 ) -> bool:
-    result = bootstrap_wechat_uia(
-        wechat_path=wechat_path,
-        restart_if_needed=restart_if_needed,
-        startup_wait=startup_wait,
+    def _log(message: str) -> None:
+        if log is not None:
+            log(message)
+
+    if platform.system() != "Windows":
+        _log("动作前 UIA 检查失败：当前平台不是 Windows。")
+        return False
+
+    # Business actions call this before every WeChat operation. If the UIA tree is
+    # already exposed, do not rerun the heavier unlock flow because native COM may
+    # see a LoginWindow-like shell while pywinauto can already operate the tree.
+    _log("动作前复查微信 UIA...")
+    foreground = ensure_wechat_foreground(timeout=2.0)
+    if not foreground:
+        _log("动作前未能确认微信在前台，继续尝试检测 UIA。")
+    probe = probe_wechat_uia(
+        max_depth=DEFAULT_UIA_PROBE_MAX_DEPTH,
+        max_nodes=DEFAULT_UIA_PROBE_MAX_NODES,
     )
-    return bool(result.get("success"))
-
-
-def get_screen_reader_active() -> bool | None:
-    """Return the Windows screen reader flag, or None when it cannot be read."""
-    if platform.system() != "Windows":
-        return None
-
-    try:
-        value = wintypes.BOOL()
-        result = _system_parameters_info(
-            SPI_GETSCREENREADER,
-            0,
-            ctypes.byref(value),
-            0,
-        )
-    except Exception:
-        return None
-    if not result:
-        return None
-    return bool(value.value)
-
-
-def set_screen_reader_active(active: bool) -> bool:
-    """Set the Windows screen reader flag and broadcast the change to all windows."""
-    if platform.system() != "Windows":
-        return False
-
-    try:
-        result = _system_parameters_info(
-            SPI_SETSCREENREADER,
-            1 if active else 0,
-            None,
-            SPIF_SENDCHANGE,
-        )
-    except Exception:
-        return False
-    if not result:
-        return False
-    notify_screen_reader_change()
-    return True
-
-
-def notify_screen_reader_change() -> bool:
-    """Broadcast WM_SETTINGCHANGE so running apps re-check accessibility settings."""
-    if platform.system() != "Windows":
-        return False
-    try:
-        user32 = ctypes.windll.user32
-        SMTO_ABORTIFHUNG = 0x0002
-        SMTO_BLOCK = 0x0020
-        result = ctypes.c_ulong_PTR(0)
-        user32.SendMessageTimeoutW.restype = ctypes.c_ulong_PTR
-        user32.SendMessageTimeoutW.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
-            ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_uint,
-            ctypes.POINTER(ctypes.c_ulong_PTR),
-        ]
-        ret = user32.SendMessageTimeoutW(
-            0xFFFF, 0x001A, 0, "Accessibility",
-            SMTO_ABORTIFHUNG | SMTO_BLOCK, 5000, result,
-        )
-        return bool(ret)
-    except Exception:
-        return False
-
-
-def try_unlock_without_restart(
-    wechat_path: str | Path | None = None,
-    timeout: float = 5.0,
-    *,
-    probe_max_depth: int = 4,
-    probe_max_nodes: int = 120,
-) -> bool:
-    """Try to unlock UIA by setting the screen reader flag + broadcast, without restarting WeChat."""
-    if platform.system() != "Windows":
-        return False
-    bring_wechat_to_front(timeout=2.0)
-    probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
     if probe.get("uia_exposed"):
+        if not foreground:
+            _log("动作前 UIA 已可用，但微信未在前台；请先手动打开微信主界面后重试。")
+            return False
+        _log("动作前 UIA 已可用，继续执行当前微信操作。")
         return True
-    if not set_screen_reader_active(True):
-        return False
+    _log(f"动作前 UIA 不可用：{probe.get('reason') or '未知原因'}，正在现场解锁。")
+
+    kwargs: dict[str, Any] = {
+        "wechat_path": wechat_path,
+        "restart_if_needed": restart_if_needed,
+        "startup_wait": startup_wait,
+    }
+    if log is not None:
+        kwargs["log"] = log
+    result = bootstrap_wechat_uia(**kwargs)
+    success = bool(result.get("success"))
+    if success and result.get("foreground") is not False:
+        _log("现场解锁成功，继续执行当前微信操作。")
+    elif success:
+        _log("现场 UIA 已解锁，但微信未在前台；请先手动打开微信主界面后重试。")
+        success = False
+    else:
+        probe = result.get("probe") if isinstance(result.get("probe"), dict) else {}
+        _log(f"现场解锁失败：{probe.get('reason') or result.get('mode') or '未知原因'}。")
+    return success
+
+
+def _wait_for_uia_exposed(
+    timeout: float,
+    probe_max_depth: int,
+    probe_max_nodes: int,
+) -> bool:
+    ensure_wechat_foreground(timeout=2.0)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(1)
-        if probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes).get("uia_exposed"):
+        if probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes).get(
+            "uia_exposed"
+        ):
             return True
     return False
 
 
-def unlock_with_narrator(
-    wechat_path: str | Path | None = None,
-    restart_wechat: bool = True,
-    startup_wait: float = 35.0,
-    stop_narrator_after_wechat: bool = True,
+def _unlock_result_mode(
     *,
-    probe_max_depth: int = 4,
-    probe_max_nodes: int = 120,
-) -> bool:
-    if platform.system() != "Windows":
+    success_mode: str,
+    exposed: bool,
+    foreground: bool,
+    failure_mode: str,
+) -> str:
+    if exposed:
+        return success_mode
+    return failure_mode
+
+
+def _is_empty_qt_shell_probe(probe: dict[str, Any]) -> bool:
+    if probe.get("uia_exposed") or probe.get("login_window") or probe.get("logged_in"):
         return False
-
-    if not restart_wechat:
-        bring_wechat_to_front(timeout=2.0)
-    start_narrator()
-    if restart_wechat:
-        close_wechat_windows()
-        time.sleep(2)
-        start_wechat(wechat_path)
-        bring_wechat_to_front(timeout=min(8.0, startup_wait))
-
-    deadline = time.monotonic() + startup_wait
-    exposed = False
-    while time.monotonic() < deadline:
-        probe = probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes)
-        if probe.get("uia_exposed") is True:
-            exposed = True
-            break
-        time.sleep(1)
-
-    if stop_narrator_after_wechat:
-        stop_narrator()
-        time.sleep(1)
-        exposed = bool(
-            probe_wechat_uia(max_depth=probe_max_depth, max_nodes=probe_max_nodes).get(
-                "uia_exposed"
-            )
-        )
-    return exposed
-
-
-def start_narrator() -> None:
-    subprocess.Popen(
-        ["Narrator.exe"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    selected = probe.get("selected_window")
+    if not isinstance(selected, dict):
+        return False
+    class_name = str(selected.get("class_name") or "")
+    descendant_count = int(selected.get("descendant_count") or 0)
+    return (
+        selected.get("kind") == "other"
+        and class_name.startswith("Qt")
+        and "QWindowIcon" in class_name
+        and descendant_count < MIN_UIA_EXPOSED_DESCENDANTS
     )
 
 
-def stop_narrator() -> None:
-    subprocess.run(
-        ["taskkill", "/IM", "Narrator.exe", "/F"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+def _attach_keepalive_snapshot(result: dict[str, Any]) -> None:
+    keepalive = uia_keepalive_snapshot()
+    if keepalive:
+        result["keepalive"] = keepalive
+        screen_reader = keepalive.get("screen_reader")
+        if isinstance(screen_reader, dict):
+            result["screen_reader"] = screen_reader
 
 
-def start_wechat(wechat_path: str | Path | None = None) -> None:
-    path = Path(wechat_path) if wechat_path else _guess_wechat_path()
-    if not path or not path.exists():
-        raise RuntimeError("WeChat executable path was not found")
-    subprocess.Popen(
-        [str(path)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-
-
-def close_wechat_windows() -> None:
-    for candidate in _find_wechat_window_candidates():
-        window = candidate.get("_window")
-        if window is None:
-            continue
-        try:
-            window.close()
-        except Exception:
-            continue
-
-
-def bring_wechat_to_front(timeout: float = 3.0) -> bool:
-    """Best-effort foreground activation before UIA unlock attempts."""
-    if platform.system() != "Windows":
-        return False
-
-    deadline = time.monotonic() + max(timeout, 0.0)
-    while True:
-        for candidate in _find_wechat_window_candidates():
-            if _focus_wechat_candidate(candidate):
-                return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.25)
-
-
-def _find_wechat_windows(max_depth: int, max_nodes: int) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for candidate in _find_wechat_window_candidates():
-        handle = candidate.get("handle")
-        if not handle:
-            continue
-        try:
-            window = _desktop("uia").window(handle=handle)
-        except Exception:
-            window = candidate.get("_window")
-        descendant_count = _count_descendants(
-            window,
-            max_depth=max_depth,
-            max_nodes=max_nodes,
-        )
-        items.append(
-            {
-                "handle": handle,
-                "process_id": candidate.get("process_id"),
-                "process_name": candidate.get("process_name"),
-                "process_path": candidate.get("process_path"),
-                "class_name": candidate.get("class_name"),
-                "title": candidate.get("title"),
-                "descendant_count": descendant_count,
-                "candidate_score": candidate.get("score", 0),
-            }
-        )
-    items.sort(key=lambda item: (-item["descendant_count"], -item["candidate_score"]))
-    return items
-
-
-def _focus_wechat_candidate(candidate: dict[str, Any]) -> bool:
-    handle = candidate.get("handle")
-    if isinstance(handle, int) and handle > 0:
-        if _restore_and_foreground_window(handle):
-            return True
-
-    window = candidate.get("_window")
-    if window is None:
-        return False
-    try:
-        window.restore()
-    except Exception:
-        pass
-    try:
-        window.set_focus()
-        return True
-    except Exception:
-        return False
-
-
-def _restore_and_foreground_window(handle: int) -> bool:
-    try:
-        user32 = ctypes.windll.user32
-        user32.IsWindow.argtypes = [wintypes.HWND]
-        user32.IsWindow.restype = wintypes.BOOL
-        if not user32.IsWindow(handle):
-            return False
-
-        user32.IsIconic.argtypes = [wintypes.HWND]
-        user32.IsIconic.restype = wintypes.BOOL
-        show_command = SW_RESTORE if user32.IsIconic(handle) else SW_SHOW
-        user32.ShowWindow(handle, show_command)
-        user32.BringWindowToTop(handle)
-        return bool(user32.SetForegroundWindow(handle))
-    except Exception:
-        return False
-
-
-def _find_wechat_window_candidates() -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    seen_handles: set[int] = set()
-    for window in _desktop("win32").windows():
-        title = str(_safe_call(window.window_text) or "").strip()
-        class_name = str(_safe_call(window.class_name) or "").strip()
-        handle = _safe_call(lambda: window.handle)
-        if not isinstance(handle, int) or handle in seen_handles:
-            continue
-        process_id = _safe_call(window.process_id)
-        process_info = _process_info(process_id)
-        process_name = str(process_info.get("name") or "").strip()
-        if not _is_wechat_window_candidate(title, class_name, process_name):
-            continue
-        seen_handles.add(handle)
-        candidates.append(
-            {
-                "_window": window,
-                "handle": handle,
-                "process_id": process_id,
-                "process_name": process_name,
-                "process_path": process_info.get("path"),
-                "class_name": class_name,
-                "title": title,
-                "score": _wechat_candidate_score(title, class_name),
-            }
-        )
-    candidates.sort(key=lambda item: -int(item.get("score") or 0))
-    return candidates
-
-
-def _is_wechat_window_candidate(title: str, class_name: str, process_name: str) -> bool:
-    if process_name.lower() not in WECHAT_PROCESS_NAMES:
-        return False
-    if title != WECHAT_WINDOW_TITLE:
-        return False
-    if class_name in WECHAT_UTILITY_CLASSES:
-        return False
-    if title == "WxTrayIconMessageWindow" or "TrayIcon" in class_name:
-        return False
-    if class_name in WECHAT_MAIN_CLASSES:
-        return True
-    return "QWindowIcon" in class_name and class_name.startswith("Qt")
-
-
-def _wechat_candidate_score(title: str, class_name: str) -> int:
-    score = 0
-    if title == WECHAT_WINDOW_TITLE:
-        score += 30
-    if class_name in WECHAT_MAIN_CLASSES:
-        score += 10
-    if "QWindowIcon" in class_name:
-        score += 5
-    return score
-
-
-def _process_info(process_id: Any) -> dict[str, str]:
-    if not isinstance(process_id, int):
-        return {}
-    try:
-        import psutil
-
-        process = psutil.Process(process_id)
-        return {
-            "name": process.name(),
-            "path": process.exe(),
-        }
-    except Exception:
-        return {}
-
-
-def _count_descendants(window: Any, max_depth: int, max_nodes: int) -> int:
-    count = 0
-    queue: list[tuple[Any, int]] = [(window, 0)]
-    while queue and count < max_nodes:
-        node, depth = queue.pop(0)
-        if depth >= max_depth:
-            continue
-        try:
-            children = node.children()
-        except Exception:
-            continue
-        count += len(children)
-        if count >= max_nodes:
-            return max_nodes
-        queue.extend((child, depth + 1) for child in children)
-    return count
-
-
-def _desktop(backend: str = "uia") -> Any:
-    from pywinauto import Desktop
-
-    return Desktop(backend=backend)
-
-
-def _system_parameters_info(
-    action: int,
-    ui_param: int,
-    pv_param: Any,
-    flags: int,
-) -> bool:
-    user32 = ctypes.windll.user32
-    system_parameters_info = user32.SystemParametersInfoW
-    system_parameters_info.argtypes = [
-        wintypes.UINT,
-        wintypes.UINT,
-        wintypes.LPVOID,
-        wintypes.UINT,
-    ]
-    system_parameters_info.restype = wintypes.BOOL
-    return bool(system_parameters_info(action, ui_param, pv_param, flags))
-
-
-def _guess_wechat_path() -> Path | None:
-    try:
-        import winreg
-
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Tencent\Weixin") as key:
-            install_dir = winreg.QueryValueEx(key, "InstallPath")[0]
-        return Path(install_dir) / "Weixin.exe"
-    except Exception:
-        return None
-
-
-def _safe_call(func: Any) -> Any:
-    try:
-        return func()
-    except Exception:
-        return None
+def _unsupported_probe() -> dict[str, Any]:
+    return {
+        "platform": platform.system(),
+        "logged_in": False,
+        "login_window": False,
+        "uia_exposed": False,
+        "reason": "UIA probing is only available on Windows",
+    }

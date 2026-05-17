@@ -27,6 +27,22 @@ env/
 *.db-wal
 *.log
 third_party/pywechat/.git-vendor-backup/
+wxclient/uia_unlock/diagnostics/
+runtime_images/
+
+# Third-party source copies
+third_party/omni-bot-sdk-oss/
+
+# Exported design artifacts
+docs/wxclient-architecture.png
+docs/wxclient-gui-design-draft.svg
+docs/wxclient-gui-figma-board.svg
+
+# Probe/debug scripts
+scripts/probe_wechat_native_com.py
+
+# Experimental dependencies
+requirements-omni-visual-rpa.txt
 
 # Local secrets/config
 .env
