@@ -30,10 +30,14 @@ dependencies = [
 
 [project.scripts]
 wxclient = "wxclient.app.cli:main"
+wxclient-mcp = "wxclient.mcp_server.__main__:main"
 
 [project.optional-dependencies]
 build = [
   "PyInstaller>=6.14",
+]
+mcp = [
+  "mcp>=1.26,<2",
 ]
 
 [tool.setuptools.packages.find]
@@ -41,4 +45,4 @@ where = ["."]
 include = ["wxclient*"]
 
 [tool.setuptools.package-data]
-wxclient = ["ui/assets/*"]
+wxclient = ["ui/assets/*", "mcp_server/assets/*"]

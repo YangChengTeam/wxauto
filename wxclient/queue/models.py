@@ -22,12 +22,14 @@ class TaskType(str, Enum):
     ACCEPT_NEW_FRIENDS = "accept_new_friends"
     SEND_MESSAGE = "send_message"
     SCAN_MESSAGES = "scan_messages"
+    READ_CHAT_SESSIONS = "read_chat_sessions"
     READ_VISIBLE_MESSAGES = "read_visible_messages"
     CHECK_UNREAD_MESSAGES = "check_unread_messages"
     REPLY_CHAT = "reply_chat"
     REPLY_UNREAD = "reply_unread"
     WATCH_CHATS = "watch_chats"
     POST_MOMENTS = "post_moments"
+    READ_RECENT_MOMENTS = "read_recent_moments"
 
 
 def utcnow() -> str:

@@ -174,6 +174,32 @@ class UiaWeChatDriver:
         logger.info("moments.post.done", media_count=len(_medias))
         return {"dry_run": False, "action": "post_moments", "media_count": len(_medias)}
 
+    def read_recent_moments(
+        self,
+        limit: int = 5,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        if self._is_dry_run(dry_run):
+            return {"dry_run": True, "action": "read_recent_moments", "posts": []}
+        self._ensure_ready()
+        safe_limit = min(max(int(limit), 1), 20)
+        Moments = self._pyweixin_class("Moments")
+        try:
+            posts = Moments.dump_recent_posts(
+                recent="Today",
+                number=safe_limit,
+                is_maximize=False,
+                close_weixin=False,
+            )
+        except Exception as exc:
+            raise WeChatApiError(f"读取朋友圈失败：{exc}") from exc
+        return {
+            "dry_run": False,
+            "action": "read_recent_moments",
+            "posts": posts,
+            "post_count": len(posts),
+        }
+
     def _post_moments_impl(self, text: str, medias: list[str]) -> None:
         """用 pyweixin 底层 UIA 操作发朋友圈。
 
@@ -1595,6 +1621,17 @@ class WeChatApi(UiaWeChatDriver):
         dry_run: bool | None = None,
     ) -> dict[str, Any]:
         return self._run_driver("post_moments", text=text, medias=medias, dry_run=dry_run)
+
+    def read_recent_moments(
+        self,
+        limit: int = 5,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        return self._run_driver(
+            "read_recent_moments",
+            limit=limit,
+            dry_run=dry_run,
+        )
 
     def send_current_chat_message(
         self,

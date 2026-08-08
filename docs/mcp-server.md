@@ -1,0 +1,127 @@
+# Windows 微信 MCP 服务
+
+`wxclient.mcp_server` 是独立于 GUI 的 MCP 服务模块。它把微信动作放入现有 SQLite
+任务队列，由一个 worker 串行执行，因此 MCP、GUI 和定时器不会在同一服务进程内直接
+并发操作微信窗口。
+
+## 能力
+
+- `wx_probe_uia`：只读探测微信登录与 UIA 状态。
+- `wx_upload_media`：Linux Agent 以 Base64 上传图片/视频，返回 `media_id`。
+- `wx_add_friend`：发送好友申请。
+- `wx_check_new_friends`：检查好友申请，可选择同意。
+- `wx_send_message`：发送文字消息。
+- `wx_listen_messages`：监听一个会话，不自动回复。
+- `wx_watch_chats`：监听多个会话，默认不自动回复。
+- `wx_list_chat_sessions`：列出主窗口当前会话列表中的准确名称。
+- `wx_read_visible_messages`：读取当前可见聊天记录。
+- `wx_post_moments`：用 `media_id` 发布朋友圈。
+- `wx_read_recent_moments`：读取当天最近朋友圈，用于发布后验证。
+- `wx_get_task` / `wx_list_tasks`：查询异步任务和失败原因。
+
+所有微信 UI 动作仍经过 `wxclient/wechat_api/` 和单消费者任务队列。新增工具组时实现
+`McpToolProvider.register()`，再与 `WeChatToolProvider` 一起传给 `create_mcp_server()`。
+
+## 本机安装与启动
+
+MCP Python SDK 需要 Python 3.10+。GUI 的基础安装仍可使用项目原来的 Python 版本范围。
+
+```powershell
+python -m pip install -e ".[mcp]"
+python -m wxclient.mcp_server `
+  --config .wxclient\settings.json `
+  --allow-real-actions
+```
+
+默认地址为 `http://127.0.0.1:8765/mcp`。本机冒烟测试：
+
+```powershell
+python scripts\wxclient_mcp_client.py
+python scripts\wxclient_mcp_client.py --tool wx_probe_uia
+```
+
+也可以生成独立控制台 EXE：
+
+```powershell
+python scripts\build_mcp_onefile.py --dry-run
+python scripts\build_mcp_onefile.py
+```
+
+输出为 `dist\wxclient-mcp.exe`。
+
+## Windows 远程部署、Linux Agent 调用
+
+UI 自动化必须运行在已登录、未锁屏的交互式 Windows 桌面中。不要把进程放到 Windows
+Service 的 Session 0；可以用登录后的计划任务启动。
+
+在 Windows 上设置一个随机长令牌。不要把令牌写进仓库或命令行历史：
+
+```powershell
+$env:WXCLIENT_MCP_AUTH_TOKEN = "<random-long-token>"
+$env:WXCLIENT_MCP_PUBLIC_URL = "http://192.168.1.20:8765"
+python -m wxclient.mcp_server `
+  --config C:\wxauto\.wxclient\settings.json `
+  --host 0.0.0.0 `
+  --port 8765 `
+  --allowed-host "192.168.1.20:*" `
+  --allow-real-actions
+```
+
+其中 `192.168.1.20` 应替换为 Windows 主机的实际地址或域名。非回环监听如果没有
+`WXCLIENT_MCP_AUTH_TOKEN`，服务会拒绝启动。DNS 重绑定保护也要求显式配置允许的 Host。
+
+Linux Agent 使用 Streamable HTTP MCP，通用配置形态如下（不同 Agent 的配置键名可能
+略有区别）：
+
+```json
+{
+  "mcpServers": {
+    "windows-wechat": {
+      "type": "http",
+      "url": "http://192.168.1.20:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer ${WXCLIENT_MCP_AUTH_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+不要把未加密 HTTP 直接暴露到公网。跨公网时应使用 VPN，或在 Windows MCP 前放置
+TLS 反向代理，并限制来源 IP。
+
+## 真实动作确认
+
+工具默认 `dry_run=true`。真实 UI/写入动作需要同时满足：
+
+1. 服务使用 `--allow-real-actions` 启动；
+2. 工具参数设置 `dry_run=false`；
+3. 工具参数设置 `confirmation="EXECUTE_REAL_ACTION"`。
+
+朋友圈的远程调用先执行 `wx_upload_media`，再把返回的 `media_id` 传给
+`wx_post_moments`。服务只解析自己的上传目录，不接受 Agent 提供任意 Windows 文件路径。
+
+## 扩展工具组
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+from wxclient.mcp_server import McpServerSettings, create_mcp_server
+from wxclient.mcp_server.providers import WeChatToolProvider
+
+
+class DiagnosticsProvider:
+    def register(self, mcp: FastMCP, runtime) -> None:
+        @mcp.tool(name="wx_runtime_status", structured_output=True)
+        async def wx_runtime_status() -> dict:
+            return {"worker_running": runtime.worker.running}
+
+
+mcp = create_mcp_server(
+    settings=McpServerSettings(),
+    providers=[WeChatToolProvider(), DiagnosticsProvider()],
+)
+```
+
+扩展模块只负责注册工具；微信窗口动作必须继续投递到 `WxMcpRuntime.submit()`，不能在
+工具函数里绕过队列直接调用 pyweixin。

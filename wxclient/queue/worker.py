@@ -147,6 +147,8 @@ class OperationWorker:
                 save_media=bool(payload.get("save_media", False)),
                 dry_run=payload.get("dry_run"),
             )
+        if task.type == TaskType.READ_CHAT_SESSIONS:
+            return self.api.read_chat_sessions(dry_run=payload.get("dry_run"))
         if task.type == TaskType.READ_VISIBLE_MESSAGES:
             return self.api.read_visible_messages(
                 friend=str(payload["friend"]),
@@ -196,6 +198,11 @@ class OperationWorker:
             return self.api.post_moments(
                 text=str(payload.get("text") or ""),
                 medias=payload.get("medias") or [],
+                dry_run=payload.get("dry_run"),
+            )
+        if task.type == TaskType.READ_RECENT_MOMENTS:
+            return self.api.read_recent_moments(
+                limit=int(payload.get("limit", 5)),
                 dry_run=payload.get("dry_run"),
             )
         raise ValueError(f"Unsupported task type: {task.type}")

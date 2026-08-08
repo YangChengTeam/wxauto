@@ -1,5 +1,7 @@
 # wxauto-client
 
+Windows 微信 MCP 远程控制与部署说明见 [docs/mcp-server.md](docs/mcp-server.md)。
+
 Windows 微信自动化客户端，基于 `third_party/pywechat/pyweixin` 和只读 UIA 探测构建。当前版本以任务队列为核心，默认 `dry_run`，只有显式开启真实动作才会操作微信。
 
 ## 现在能做什么
