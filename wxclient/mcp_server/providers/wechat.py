@@ -4,6 +4,7 @@ import asyncio
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from wxclient.queue import TaskType
 from wxclient.uia_probe import probe_wechat_uia
@@ -11,16 +12,30 @@ from wxclient.uia_probe import probe_wechat_uia
 from ..runtime import WxMcpRuntime
 
 
+READ_ONLY_TOOL = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+WRITE_TOOL = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+
+
 class WeChatToolProvider:
     """Registers the built-in WeChat MCP tools."""
 
     def register(self, mcp: FastMCP, runtime: WxMcpRuntime) -> None:
-        @mcp.tool(name="wx_probe_uia", structured_output=True)
+        @mcp.tool(name="wx_probe_uia", annotations=READ_ONLY_TOOL, structured_output=True)
         async def wx_probe_uia() -> dict[str, Any]:
             """Probe WeChat login and UIA availability without changing WeChat state."""
             return await asyncio.to_thread(probe_wechat_uia)
 
-        @mcp.tool(name="wx_upload_media", structured_output=True)
+        @mcp.tool(name="wx_upload_media", annotations=WRITE_TOOL, structured_output=True)
         async def wx_upload_media(filename: str, content_base64: str) -> dict[str, Any]:
             """Upload an image/video to Windows and return a media_id for Moments."""
             return await asyncio.to_thread(
@@ -29,7 +44,7 @@ class WeChatToolProvider:
                 content_base64,
             )
 
-        @mcp.tool(name="wx_add_friend", structured_output=True)
+        @mcp.tool(name="wx_add_friend", annotations=WRITE_TOOL, structured_output=True)
         async def wx_add_friend(
             number: str,
             greetings: str = "你好",
@@ -51,7 +66,7 @@ class WeChatToolProvider:
                 confirmation=confirmation,
             )
 
-        @mcp.tool(name="wx_check_new_friends", structured_output=True)
+        @mcp.tool(name="wx_check_new_friends", annotations=WRITE_TOOL, structured_output=True)
         async def wx_check_new_friends(
             accept: bool = False,
             limit: int = 8,
@@ -68,7 +83,7 @@ class WeChatToolProvider:
                 confirmation=confirmation,
             )
 
-        @mcp.tool(name="wx_send_message", structured_output=True)
+        @mcp.tool(name="wx_send_message", annotations=WRITE_TOOL, structured_output=True)
         async def wx_send_message(
             friend: str,
             text: str,
@@ -84,7 +99,7 @@ class WeChatToolProvider:
                 confirmation=confirmation,
             )
 
-        @mcp.tool(name="wx_listen_messages", structured_output=True)
+        @mcp.tool(name="wx_listen_messages", annotations=READ_ONLY_TOOL, structured_output=True)
         async def wx_listen_messages(
             friend: str,
             duration: str = "30s",
@@ -110,7 +125,7 @@ class WeChatToolProvider:
                 confirmation=confirmation,
             )
 
-        @mcp.tool(name="wx_watch_chats", structured_output=True)
+        @mcp.tool(name="wx_watch_chats", annotations=READ_ONLY_TOOL, structured_output=True)
         async def wx_watch_chats(
             friends: list[str],
             duration: str = "30s",
@@ -131,7 +146,7 @@ class WeChatToolProvider:
                 confirmation=confirmation,
             )
 
-        @mcp.tool(name="wx_list_chat_sessions", structured_output=True)
+        @mcp.tool(name="wx_list_chat_sessions", annotations=READ_ONLY_TOOL, structured_output=True)
         async def wx_list_chat_sessions(
             dry_run: bool = True,
             confirmation: str = "",
@@ -145,7 +160,7 @@ class WeChatToolProvider:
                 confirmation=confirmation,
             )
 
-        @mcp.tool(name="wx_read_visible_messages", structured_output=True)
+        @mcp.tool(name="wx_read_visible_messages", annotations=READ_ONLY_TOOL, structured_output=True)
         async def wx_read_visible_messages(
             friend: str,
             dry_run: bool = True,
@@ -160,7 +175,7 @@ class WeChatToolProvider:
                 confirmation=confirmation,
             )
 
-        @mcp.tool(name="wx_post_moments", structured_output=True)
+        @mcp.tool(name="wx_post_moments", annotations=WRITE_TOOL, structured_output=True)
         async def wx_post_moments(
             text: str,
             media_ids: list[str] | None = None,
@@ -180,12 +195,12 @@ class WeChatToolProvider:
                 confirmation=confirmation,
             )
 
-        @mcp.tool(name="wx_get_task", structured_output=True)
+        @mcp.tool(name="wx_get_task", annotations=READ_ONLY_TOOL, structured_output=True)
         async def wx_get_task(task_id: str) -> dict[str, Any]:
             """Get a queued WeChat task and its terminal result or error."""
             return await asyncio.to_thread(runtime.get_task, task_id)
 
-        @mcp.tool(name="wx_read_recent_moments", structured_output=True)
+        @mcp.tool(name="wx_read_recent_moments", annotations=READ_ONLY_TOOL, structured_output=True)
         async def wx_read_recent_moments(
             limit: int = 5,
             dry_run: bool = True,
@@ -200,7 +215,7 @@ class WeChatToolProvider:
                 confirmation=confirmation,
             )
 
-        @mcp.tool(name="wx_list_tasks", structured_output=True)
+        @mcp.tool(name="wx_list_tasks", annotations=READ_ONLY_TOOL, structured_output=True)
         async def wx_list_tasks(limit: int = 20) -> dict[str, Any]:
             """List recent serialized WeChat tasks."""
             tasks = await asyncio.to_thread(runtime.list_tasks, limit)

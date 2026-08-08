@@ -125,6 +125,10 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                 watch_properties = watch_tool.inputSchema["properties"]
                 self.assertNotIn("auto_reply", watch_properties)
                 self.assertNotIn("reply_all", watch_properties)
+                probe_tool = next(tool for tool in tools.tools if tool.name == "wx_probe_uia")
+                send_tool = next(tool for tool in tools.tools if tool.name == "wx_send_message")
+                self.assertTrue(probe_tool.annotations.readOnlyHint)
+                self.assertFalse(send_tool.annotations.readOnlyHint)
 
                 result = await client.call_tool(
                     "wx_send_message",
