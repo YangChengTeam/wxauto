@@ -45,13 +45,8 @@ from pydantic import SecretStr
 from wxclient.config import Settings
 from wxclient.logging_config import configure_logging
 from wxclient.queue import OperationWorker, TaskStatus, TaskStore, TaskType
-from wxclient.uia_unlock import (
-    bootstrap_wechat_uia,
-    format_uia_diagnostics,
-    probe_wechat_uia,
-    stop_uia_keepalive,
-)
-from wxclient.uia_unlock.constants import (
+from wxclient.uia_probe import format_uia_diagnostics, probe_wechat_uia
+from wxclient.uia_probe.constants import (
     DEFAULT_UIA_PROBE_MAX_DEPTH,
     DEFAULT_UIA_PROBE_MAX_NODES,
 )
@@ -109,7 +104,6 @@ class TaskPanelBinding:
 class MainWindow(QMainWindow):
     log_requested = Signal(str)
     uia_probe_finished = Signal(dict)
-    uia_bootstrap_finished = Signal(dict)
     worker_start_finished = Signal(dict)
     worker_stop_finished = Signal(dict)
 
@@ -119,13 +113,12 @@ class MainWindow(QMainWindow):
         self._last_uia_signature: tuple[str, str] | None = None
         self._uia_probe_running = False
         self._closing = False
-        self._uia_bootstrapped = False
+        self._uia_available = False
         self._last_operation_state: str | None = None
         self._worker_starting = False
         self._worker_stopping = False
         self.log_requested.connect(self._append_log)
         self.uia_probe_finished.connect(self._handle_uia_probe_result)
-        self.uia_bootstrap_finished.connect(self._handle_uia_bootstrap_result)
         self.worker_start_finished.connect(self._handle_worker_start_result)
         self.worker_stop_finished.connect(self._handle_worker_stop_result)
         self._append_log("正在启动 AI微信自动化。")
@@ -177,7 +170,7 @@ class MainWindow(QMainWindow):
         self._append_log("后台状态刷新已启动。")
         self.refresh_all()
         self.refresh_operation_state()
-        self._bootstrap_uia_on_startup()
+        self.refresh_uia_status()
 
     def closeEvent(self, event: Any) -> None:  # type: ignore[override]
         self._closing = True
@@ -189,7 +182,6 @@ class MainWindow(QMainWindow):
         self.watch_timer.stop()
         self._append_log("正在关闭应用，准备停止后台服务。")
         self.worker.stop(wait=False)
-        stop_uia_keepalive(log=self._append_log)
         super().closeEvent(event)
 
     def _make_timer(self, callback: Any):
@@ -813,7 +805,7 @@ class MainWindow(QMainWindow):
         self._worker_starting = True
         self.worker_button.setEnabled(False)
         self.worker_button.setText("启动中...")
-        self._append_log("正在后台检查 UIA、自动解锁并启动服务，请稍等。")
+        self._append_log("正在后台探测 UIA；确认可用后将启动服务。")
         thread = threading.Thread(
             target=self._start_worker_in_background,
             name="wx-ui-worker-start",
@@ -823,31 +815,17 @@ class MainWindow(QMainWindow):
 
     def _start_worker_in_background(self) -> None:
         try:
-            current_probe = probe_wechat_uia(
+            probe = probe_wechat_uia(
                 max_depth=DEFAULT_UIA_PROBE_MAX_DEPTH,
                 max_nodes=DEFAULT_UIA_PROBE_MAX_NODES,
             )
-            if self._uia_bootstrapped and current_probe.get("uia_exposed") is True:
-                self.log_requested.emit("启动服务前复查 UIA 已可用，跳过解锁步骤。")
-                bootstrap = {"success": True, "mode": "already", "probe": current_probe}
-            else:
-                if self._uia_bootstrapped:
-                    self._uia_bootstrapped = False
-                    self.log_requested.emit("上次 UIA 状态已失效，重新执行解锁。")
-                bootstrap = bootstrap_wechat_uia(
-                    wechat_path=self.settings.wechat_path,
-                    restart_if_needed=False,
-                    log=lambda msg: self.log_requested.emit(msg),
-                )
-            probe = bootstrap.get("probe") if isinstance(bootstrap.get("probe"), dict) else {}
-            self._uia_bootstrapped = bool(bootstrap.get("success") and probe.get("uia_exposed"))
-            if not bootstrap.get("success"):
+            self._uia_available = bool(probe.get("uia_exposed"))
+            if not self._uia_available:
                 self.worker_start_finished.emit(
                     {
                         "success": False,
                         "reason": "uia_not_ready",
                         "probe": probe,
-                        "bootstrap": bootstrap,
                     }
                 )
                 return
@@ -863,7 +841,7 @@ class MainWindow(QMainWindow):
                 {"success": False, "reason": "error", "error": str(exc)}
             )
             return
-        self.worker_start_finished.emit({"success": True, "probe": probe, "bootstrap": bootstrap})
+        self.worker_start_finished.emit({"success": True, "probe": probe})
 
     def _handle_worker_start_result(self, result: dict[str, Any]) -> None:
         self._worker_starting = False
@@ -872,22 +850,13 @@ class MainWindow(QMainWindow):
             return
         self.worker_button.setEnabled(True)
         if result.get("success"):
-            bootstrap = result.get("bootstrap") if isinstance(result.get("bootstrap"), dict) else {}
-            mode = str(bootstrap.get("mode") or "")
-            if mode == "already":
-                self._append_log("启动服务前 UIA 已可用。")
-            if mode == "quick":
-                self._append_log("启动服务前已自动解锁 UIA（无需重启微信）。")
-            elif mode == "restart":
-                self._append_log("启动服务前已自动解锁 UIA（已重启微信）。")
-            if bootstrap.get("foreground") is False:
-                self._append_log("启动服务前 UIA 已解锁；微信当前未在前台，执行具体任务前会再次尝试切换。")
             self.worker_running = True
             self.worker_button.setText("停止服务")
+            self._append_log("启动服务前探测到 UIA 可用。")
             self._append_log(f"服务已启动，日志文件：{self.log_path}")
             self._append_log("服务线程已启动，开始轮询任务队列。")
-            self._append_uia_diagnostics(bootstrap, "启动服务前 UIA 诊断")
-            probe = bootstrap.get("probe") if isinstance(bootstrap.get("probe"), dict) else {}
+            probe = result.get("probe") if isinstance(result.get("probe"), dict) else {}
+            self._append_uia_diagnostics(probe, "启动服务前 UIA 诊断")
             if probe:
                 self._handle_uia_probe_result(probe)
             self.refresh_operation_state(force=True)
@@ -896,25 +865,19 @@ class MainWindow(QMainWindow):
         self.worker_running = False
         self.worker_button.setText("启动服务")
         if result.get("reason") == "uia_not_ready":
-            bootstrap = result.get("bootstrap") if isinstance(result.get("bootstrap"), dict) else {}
-            probe = bootstrap.get("probe") if isinstance(bootstrap.get("probe"), dict) else {}
-            if bootstrap.get("mode") == "foreground_failed" and probe.get("uia_exposed"):
-                self._append_log("UIA 已解锁，但微信未在前台，服务未启动。请先手动打开微信主界面后重试。")
-            elif bootstrap.get("mode") == "account_shell_locked":
-                self._append_log("检测到微信账号空壳 UIA，服务未启动。请完全退出微信，再由本程序启动微信后登录该账号。")
-            else:
-                self._append_log("UIA 解锁失败，服务未启动。")
-            self._append_uia_diagnostics(bootstrap, "启动服务失败 UIA 诊断")
+            probe = result.get("probe") if isinstance(result.get("probe"), dict) else {}
+            self._append_log("UIA 不可用，服务未启动。请检查微信状态后重试。")
+            self._append_uia_diagnostics(probe, "启动服务失败 UIA 诊断")
             QMessageBox.warning(
                 self,
-                "UIA 解锁失败",
-                "微信 UIA 未就绪，或微信未在前台。请先手动打开微信主界面后重试。",
+                "UIA 不可用",
+                "未探测到可用的微信 UIA。程序不会尝试解锁、启动或重启微信，请手动处理后重试。",
             )
             self.refresh_uia_status()
             return
-            detail = str(result.get("error") or "未知错误")
-            self._append_log(f"服务启动失败：{detail}")
-            QMessageBox.warning(self, "启动失败", str(detail))
+        detail = str(result.get("error") or "未知错误")
+        self._append_log(f"服务启动失败：{detail}")
+        QMessageBox.warning(self, "启动失败", str(detail))
 
     def toggle_friend_timer(self) -> None:
         if self.friend_timer.isActive():
@@ -1192,35 +1155,35 @@ class MainWindow(QMainWindow):
         if self._closing:
             return
         if probe.get("uia_exposed") is True:
-            self._uia_bootstrapped = True
+            self._uia_available = True
             state = "ok"
             title = "UIA 正常"
-            panel_title = "已解锁"
+            panel_title = "UIA 可用"
             panel_detail = "微信 UIA 节点已正常暴露"
         elif probe.get("login_window"):
-            self._uia_bootstrapped = False
+            self._uia_available = False
             state = "bad"
             title = "微信未登录"
             panel_title = "微信未登录"
             panel_detail = "请先登录微信"
         elif probe.get("logged_in"):
-            self._uia_bootstrapped = False
+            self._uia_available = False
             state = "warn"
-            title = "UIA 未解锁"
-            panel_title = "UIA 未解锁"
+            title = "UIA 不可用"
+            panel_title = "UIA 不可用"
             panel_detail = "微信已运行但 UIA 节点未暴露"
         elif _probe_has_wechat_window(probe):
-            self._uia_bootstrapped = False
+            self._uia_available = False
             state = "warn"
-            title = "UIA 未解锁"
-            panel_title = "UIA 未解锁"
+            title = "UIA 不可用"
+            panel_title = "UIA 不可用"
             panel_detail = (
                 "已找到微信窗口，但当前只暴露 Qt 空壳"
                 if _probe_selected_qt_shell(probe)
                 else "已找到微信窗口，但 UIA 节点未暴露"
             )
         else:
-            self._uia_bootstrapped = False
+            self._uia_available = False
             state = "bad"
             title = "未找到微信主窗口"
             panel_title = "未找到微信"
@@ -1243,63 +1206,9 @@ class MainWindow(QMainWindow):
             self._last_uia_signature = signature
             self._append_log(f"UIA 检测完成：{title}。{reason}")
 
-    def _bootstrap_uia_on_startup(self) -> None:
-        if self._closing:
-            return
-        self._append_log("程序启动时自动尝试解锁 UIA...")
-        threading.Thread(
-            target=self._run_startup_uia_bootstrap_in_background,
-            name="wx-ui-uia-bootstrap",
-            daemon=True,
-        ).start()
-
-    def _run_startup_uia_bootstrap_in_background(self) -> None:
+    def _append_uia_diagnostics(self, probe: dict[str, Any], context: str) -> None:
         try:
-            result = bootstrap_wechat_uia(
-                wechat_path=self.settings.wechat_path,
-                restart_if_needed=False,
-                log=lambda msg: self.log_requested.emit(msg),
-            )
-        except Exception as exc:
-            self.uia_bootstrap_finished.emit(
-                {"success": False, "mode": "error", "error": str(exc)}
-            )
-            return
-        self.uia_bootstrap_finished.emit(result)
-
-    def _handle_uia_bootstrap_result(self, result: dict[str, Any]) -> None:
-        if self._closing:
-            return
-        probe = result.get("probe") if isinstance(result.get("probe"), dict) else {}
-        if result.get("success"):
-            self._uia_bootstrapped = bool(probe.get("uia_exposed"))
-            mode = str(result.get("mode") or "")
-            if mode == "already":
-                self._append_log("程序启动时 UIA 已可用。")
-            elif mode == "quick":
-                self._append_log("程序启动时已自动解锁 UIA。")
-            elif mode == "winevent":
-                self._append_log("程序启动时已自动解锁 UIA（已重启微信）。")
-            else:
-                self._append_log("程序启动时 UIA 已就绪。")
-            if result.get("foreground") is False:
-                self._append_log("程序启动时 UIA 已解锁；微信当前未在前台，执行具体任务前会再次尝试切换。")
-        else:
-            if result.get("mode") == "foreground_failed" and probe.get("uia_exposed"):
-                self._append_log("程序启动时 UIA 已解锁，但微信未在前台；请手动打开微信主界面后再启动服务。")
-            elif result.get("mode") == "account_shell_locked":
-                self._append_log("程序启动时检测到微信账号空壳 UIA：请完全退出微信，再由本程序启动微信后登录该账号。")
-            else:
-                self._append_log("程序启动时 UIA 自动解锁失败。")
-        self._append_uia_diagnostics(result, "程序启动 UIA 诊断")
-        if isinstance(probe, dict) and probe:
-            self._handle_uia_probe_result(probe)
-        elif not result.get("success"):
-            self.refresh_uia_status()
-
-    def _append_uia_diagnostics(self, result: dict[str, Any], context: str) -> None:
-        try:
-            lines = format_uia_diagnostics(result, context=context)
+            lines = format_uia_diagnostics(probe, context=context)
         except Exception as exc:
             self._append_log(f"{context}：生成失败：{exc}")
             return
@@ -1786,7 +1695,7 @@ def _event_label(event: str) -> str:
         "task.succeeded": "任务执行完成",
         "task.blocked": "任务被阻塞",
         "task.failed": "任务执行失败",
-        "uia.operation_unlock": "动作前 UIA 解锁",
+        "uia.operation_probe": "动作前 UIA 探测",
         "watch.chats.start": "消息监听开始",
         "watch.chats.read": "消息监听完成",
         "watch.chats.skipped": "消息监听跳过回复",

@@ -1,4 +1,6 @@
-# pyweixin + WeChat UIA 解锁集成说明
+# pyweixin + WeChat UIA 历史验证记录
+
+> 注意：本文中的 UIA 解锁、屏幕阅读器、native COM、WinEvent hook 和微信重启方案仅保留为历史研究记录，当前产品代码已移除这些能力。现行实现只调用 `wxclient.uia_probe.probe_wechat_uia()` 进行只读探测；不得依据下文重新接入任何解锁或窗口/系统状态修改流程。
 
 本文档用于把本次 PoC 迁移到后续正式项目，避免重新摸索“解锁 UIA、发消息、收消息、好友、朋友圈”等流程。
 

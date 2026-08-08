@@ -10,7 +10,11 @@ from typing import Any
 
 import structlog
 
-from wxclient.uia_unlock import ensure_wechat_uia
+from wxclient.uia_probe import probe_wechat_uia
+from wxclient.uia_probe.constants import (
+    DEFAULT_UIA_PROBE_MAX_DEPTH,
+    DEFAULT_UIA_PROBE_MAX_NODES,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -666,15 +670,19 @@ class UiaWeChatDriver:
         return self.dry_run if override is None else override
 
     def _ensure_ready(self) -> None:
-        def _log_uia_unlock(message: str) -> None:
-            logger.info("uia.operation_unlock", message=message)
-
-        if not ensure_wechat_uia(
-            restart_if_needed=False,
-            wechat_path=self.wechat_path,
-            log=_log_uia_unlock,
-        ):
-            raise WeChatApiUnavailableError("WeChat UIA is not available")
+        probe = probe_wechat_uia(
+            max_depth=DEFAULT_UIA_PROBE_MAX_DEPTH,
+            max_nodes=DEFAULT_UIA_PROBE_MAX_NODES,
+        )
+        logger.info(
+            "uia.operation_probe",
+            uia_exposed=bool(probe.get("uia_exposed")),
+            reason=probe.get("reason"),
+        )
+        if not probe.get("uia_exposed"):
+            raise WeChatApiUnavailableError(
+                f"WeChat UIA is not available: {probe.get('reason') or 'unknown reason'}"
+            )
 
     def _pyweixin_class(self, name: str) -> Any:
         vendor = self.project_root / "third_party" / "pywechat"

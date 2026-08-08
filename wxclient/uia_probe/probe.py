@@ -3,16 +3,12 @@ from __future__ import annotations
 import platform
 from typing import Any
 
-from .constants import (
-    MIN_UIA_EXPOSED_DESCENDANTS,
-    NATIVE_UIA_LOGIN_CLASSES,
-    NATIVE_UIA_MAIN_CLASSES,
-)
+from .constants import MIN_UIA_EXPOSED_DESCENDANTS, UIA_LOGIN_CLASSES, UIA_MAIN_CLASSES
 from .windows import find_wechat_windows
 
 
 def probe_wechat_uia(max_depth: int = 10, max_nodes: int = 5000) -> dict[str, Any]:
-    """Read-only probe for current WeChat UIA exposure."""
+    """Inspect current WeChat UIA exposure without changing system or window state."""
     if platform.system() != "Windows":
         return {
             "platform": platform.system(),
@@ -71,9 +67,9 @@ def _classify_wechat_window(window: dict[str, Any]) -> dict[str, Any]:
         str(item.get("uia_class_name") or ""),
         str(item.get("class_name") or ""),
     }
-    if class_names & NATIVE_UIA_MAIN_CLASSES:
+    if class_names & UIA_MAIN_CLASSES:
         item["kind"] = "main"
-    elif class_names & NATIVE_UIA_LOGIN_CLASSES:
+    elif class_names & UIA_LOGIN_CLASSES:
         item["kind"] = "login"
     else:
         item["kind"] = "other"

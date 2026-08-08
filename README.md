@@ -1,6 +1,6 @@
 # wxauto-client
 
-Windows 微信自动化客户端，基于 `third_party/pywechat/pyweixin` 和 UIA 解锁能力构建。当前版本以任务队列为核心，默认 `dry_run`，只有显式开启真实动作才会操作微信。
+Windows 微信自动化客户端，基于 `third_party/pywechat/pyweixin` 和只读 UIA 探测构建。当前版本以任务队列为核心，默认 `dry_run`，只有显式开启真实动作才会操作微信。
 
 ## 现在能做什么
 
@@ -37,16 +37,14 @@ wxclient gui
 
 GUI 打开后不会自动执行微信动作；任务真正执行仍然要在首页点击“启动服务”。如果只是看日志或改配置，不启动 worker 也没关系。
 
-GUI 启动时会先启动 UIA 辅助功能常驻会话，再检测微信 UIA 树是否暴露。点击“停止服务”会等待 worker 线程真正退出，退出后才恢复为“启动服务”。
+GUI 启动时只读探测微信 UIA 树是否暴露，不会修改屏幕阅读器标志、创建辅助功能常驻会话，也不会启动、关闭、重启或切换微信窗口。点击“停止服务”会等待 worker 线程真正退出，退出后才恢复为“启动服务”。
 
 ## 常用命令
 
-UIA 探测与解锁：
+UIA 探测：
 
 ```powershell
 wxclient probe-uia
-wxclient unlock-uia
-wxclient unlock-uia --restart
 ```
 
 任务入队（默认 dry-run）：
@@ -96,17 +94,16 @@ GUI 包含这些页面：
 
 GUI 里常用的自动化入口都在左侧，先在首页点“启动服务”，再去好友检测、未读回复、消息监听、添加好友、朋友圈这些页面触发任务。
 
-## UIA 解锁
+## UIA 探测
 
-UIA 解锁采用“先启动辅助功能客户端，再检测 UIA”的顺序：
+程序只通过 pywinauto 读取当前微信窗口和 UIA 树：
 
-- 临时开启 Windows 屏幕阅读器标志。
-- 启动原生 COM UIAutomation 常驻客户端。
-- 启动 WinEvent 辅助功能 hook 常驻线程。
-- 将微信切到前台后检测 `mmui::MainWindow` / `mmui::LoginWindow` 和 UIA 节点数。
-- GUI 关闭或进程退出时，停止常驻线程并恢复屏幕阅读器标志。
+- 识别 `mmui::MainWindow` / `mmui::LoginWindow` 和 UIA 节点数。
+- 不修改 Windows 辅助功能状态，不创建 native COM/WinEvent 常驻会话。
+- 不自动启动、关闭、重启微信，也不把微信切到前台。
+- UIA 不可用时阻止 worker 或当前业务动作，并提示用户手动处理。
 
-GUI 日志会输出 UIA 诊断摘要，包括当前用户、管理员状态、前台窗口、微信候选窗口、pywinauto probe、native COM probe、屏幕阅读器标志和常驻会话状态。
+GUI 日志会输出只读 UIA 诊断摘要，包括当前用户、管理员状态、前台窗口、微信候选窗口和 probe 结果。
 
 ## 打包成单体 EXE
 
@@ -135,8 +132,8 @@ python scripts/build_gui_onefile.py
 - 所有真实微信动作都必须先进入队列，再由单消费者 worker 串行执行
 - 定时器、UI 只负责投递任务，不能直接碰微信窗口
 - 业务层只通过 `wxclient/wechat_api/` 封装调用 `pyweixin`
-- UIA 解锁只走 `ensure_wechat_uia()`
-- UIA 解锁模块只做辅助功能标志、UIAutomation 客户端和 WinEvent hook，不做 DLL 注入或微信进程伪装
+- UIA 状态检查只走 `wxclient.uia_probe.probe_wechat_uia()`，且必须保持只读
+- UIA 不可用时直接阻止动作，不在探测层启动、关闭、重启或切换微信窗口
 - 真实加好友、同意好友、发消息、发朋友圈都应保留 `dry_run` 或确认机制
 
 ## 文档

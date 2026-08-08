@@ -9,11 +9,7 @@ from wxclient.agents import AgentError, build_chat_agent
 from wxclient.config import Settings, load_settings
 from wxclient.logging_config import configure_logging
 from wxclient.queue import OperationWorker, Task, TaskStore, TaskType
-from wxclient.uia_unlock import (
-    bootstrap_wechat_uia,
-    probe_wechat_uia,
-    probe_wechat_uia_native,
-)
+from wxclient.uia_probe import probe_wechat_uia
 from wxclient.wechat_api import OmniVisualDriver, WeChatApi, WeChatApiError
 
 app = typer.Typer(help="Windows WeChat automation client")
@@ -43,20 +39,13 @@ def callback(log_level: str = typer.Option("INFO", help="Python logging level"))
 def worker(config: Path | None = typer.Option(None, help="Path to JSON config file")) -> None:
     settings, store, api = _runtime(config)
     configure_logging(level=_LOG_LEVEL, log_file=settings.data_dir / "logs" / "worker.log")
-    try:
-        bootstrap = bootstrap_wechat_uia(
-            wechat_path=settings.wechat_path,
-            restart_if_needed=True,
-        )
-    except Exception as exc:
-        bootstrap = {"success": False, "mode": "error", "error": str(exc), "probe": {}}
-    if not bootstrap.get("success"):
+    probe = probe_wechat_uia()
+    if not probe.get("uia_exposed"):
         typer.echo(
             json.dumps(
                 {
                     "uia_exposed": False,
-                    "mode": bootstrap.get("mode"),
-                    "reason": bootstrap.get("error") or (bootstrap.get("probe") or {}).get("reason"),
+                    "reason": probe.get("reason"),
                 },
                 ensure_ascii=False,
             )
@@ -362,39 +351,9 @@ def visual_open_chat(
 
 
 @app.command("probe-uia")
-def probe_uia(
-    native_com: bool = typer.Option(
-        False,
-        "--native-com",
-        help="Probe through native COM UIAutomation",
-    ),
-) -> None:
-    probe = probe_wechat_uia_native() if native_com else probe_wechat_uia()
+def probe_uia() -> None:
+    probe = probe_wechat_uia()
     typer.echo(json.dumps(probe, ensure_ascii=False, indent=2))
-
-
-@app.command("unlock-uia")
-def unlock_uia(
-    restart: bool = typer.Option(False, help="Close and restart WeChat"),
-    startup_wait: float = typer.Option(35.0, help="Seconds to wait for WeChat UIA"),
-    config: Path | None = typer.Option(None, help="Path to JSON config file"),
-) -> None:
-    settings = load_settings(config)
-    result = bootstrap_wechat_uia(
-        wechat_path=settings.wechat_path,
-        restart_if_needed=restart,
-        startup_wait=startup_wait,
-    )
-    typer.echo(
-        json.dumps(
-            {
-                "success": result.get("success"),
-                "mode": result.get("mode"),
-                "foreground": result.get("foreground"),
-            },
-            ensure_ascii=False,
-        )
-    )
 
 
 def _task_to_dict(task: Task) -> dict:

@@ -2,7 +2,7 @@
 
 ## 目标能力
 
-基于 `third_party/pywechat/pyweixin` 和现有 UIA 解锁 PoC，先做一个本机 Windows 常驻客户端，提供三类能力：
+基于 `third_party/pywechat/pyweixin` 和只读 UIA 探测，先做一个本机 Windows 常驻客户端，提供三类能力：
 
 1. 通过手机号、微信号或可搜索账号主动添加微信好友。
 2. 检查新的好友申请，并按策略自动同意。
@@ -16,7 +16,7 @@
 wxclient/
   app/                         # Windows 客户端入口、生命周期、托盘/窗口
   config/                      # 账号、触发器、白名单、限频、LLM 配置
-  uia_unlock/                  # ensure_wechat_uia/probe_wechat_uia
+  uia_probe/                   # 只读 probe_wechat_uia
   wechat_api/                  # pyweixin 二次封装
   trigger/                     # 定时任务、本地事件
   queue/                       # 单消费者任务队列、去重、重试、状态机
@@ -31,11 +31,10 @@ wxclient/
 
 ## 调用边界
 
-`uia_unlock` 只负责 UIA 状态：
+`uia_probe` 只负责只读 UIA 状态探测：
 
 ```python
 probe_wechat_uia() -> dict
-ensure_wechat_uia(restart_if_needed=False) -> bool
 ```
 
 `wechat_api` 只暴露业务动作：
@@ -51,10 +50,10 @@ listen_chat(account_id, friend, duration)
 每个真实操作前都执行：
 
 ```python
-ensure_wechat_uia(restart_if_needed=False)
+probe_wechat_uia()
 ```
 
-如果 UIA 未解锁，任务进入 `blocked` 状态，由 UI 提示用户处理登录/解锁，不在业务调用中随意重启微信。
+如果 UIA 不可用，任务进入 `blocked` 状态，由 UI 提示用户手动处理。探测层不得启动、关闭、重启或切换微信窗口，也不得修改系统辅助功能状态。
 
 ## 触发方式
 
@@ -77,7 +76,7 @@ ensure_wechat_uia(restart_if_needed=False)
 - 手动添加好友。
 - 手动检查/通过好友申请。
 - 手动发送测试消息。
-- 重新执行 UIA 解锁诊断。
+- 重新执行 UIA 探测诊断。
 
 ## 核心执行模型
 
@@ -93,7 +92,7 @@ Scheduler / UI
   WeChatOperationWorker(single consumer)
         |
         v
-  ensure_wechat_uia -> pyweixin -> result/audit log
+  probe_wechat_uia -> pyweixin -> result/audit log
 ```
 
 原因：pywechat 文档明确提示不要多线程同时操作同一个微信界面，否则容易死锁或卡 UI。可以多线程接收事件、调用大模型、写数据库，但微信 UI 自动化动作必须串行。
@@ -106,7 +105,7 @@ Scheduler / UI
 UI/CLI 提交 add_friend
   -> 校验手机号/微信号、白名单、频率限制
   -> 入队
-  -> ensure_wechat_uia
+  -> probe_wechat_uia
   -> FriendSettings.add_new_friend(...)
   -> 记录结果
 ```
@@ -117,7 +116,7 @@ UI/CLI 提交 add_friend
 
 ```text
 定时器触发 check_new_friends
-  -> ensure_wechat_uia
+  -> probe_wechat_uia
   -> Contacts.check_new_friends(verify=False)
   -> 写入申请列表
   -> 策略判断
@@ -153,7 +152,7 @@ UI/CLI 提交 add_friend
 可以做到工程上可用：
 
 - 固定支持范围：Windows 10/11、Python 3.9+、微信 4.1.9.x 优先。
-- 启动时先启动 UIA 解锁客户端，再跑 `probe_wechat_uia()` 确认节点是否暴露。
+- 启动时只运行 `probe_wechat_uia()` 确认节点是否暴露。
 - 每次任务前检查 UIA 状态，失败进入可恢复状态。
 - 所有真实动作有 `dry_run`、限频、重试、审计日志。
 - UI 操作串行化，避免死锁。
@@ -196,12 +195,12 @@ uia_status
 - 任务页：待执行、执行中、失败、已完成。
 - 好友申请页：申请列表、自动通过规则、手动通过按钮。
 - 聊天页：最近消息、模型回复草稿、发送状态。
-- 设置页：微信路径、解锁策略、LLM 配置、限频策略。
+- 设置页：微信路径、LLM 配置、限频策略。
 - 诊断页：运行 `probe_wechat_uia`、导出控件树、查看最近错误。
 
 ## 最小落地顺序
 
-1. 封装 `uia_unlock.ensure_wechat_uia()` 和 `probe_wechat_uia()`。
+1. 封装只读的 `uia_probe.probe_wechat_uia()`。
 2. 封装 `wechat_api.send_message()`，先打通文件传输助手。
 3. 加单消费者任务队列和 SQLite 任务表。
 4. 加定时 `check_new_friends(verify=False)`，先只展示申请。

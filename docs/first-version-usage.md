@@ -11,7 +11,7 @@
 - Typer CLI。
 - Pydantic Settings 配置。
 - pywinauto UIA 探测：识别 `mmui::MainWindow`、`mmui::LoginWindow` 和节点暴露状态。
-- Narrator 解锁入口：可选重启微信。
+- 只读 UIA 状态探测；不提供 UIA 解锁或微信重启入口。
 - pyweixin 真实动作：发送消息、添加好友、检查/同意好友申请。
 
 ## 数据目录
@@ -22,7 +22,7 @@
 .wxclient/wxclient.db
 ```
 
-## UIA 检查与解锁
+## UIA 检查
 
 只读探测：
 
@@ -30,17 +30,7 @@
 python -m wxclient.app.cli probe-uia
 ```
 
-不重启微信，只启动 Narrator 尝试解锁：
-
-```powershell
-python -m wxclient.app.cli unlock-uia
-```
-
-确认可以关闭/重启微信后，再使用：
-
-```powershell
-python -m wxclient.app.cli unlock-uia --restart
-```
+该命令只读取当前窗口和 UIA 树。UIA 不可用时，程序不会尝试解锁、启动、关闭或重启微信，需要用户手动处理微信状态后再次探测。
 
 ## CLI dry-run
 

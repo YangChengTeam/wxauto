@@ -16,7 +16,7 @@
 | `Desktop / Run Console` | 1280 x 780 | 默认首页，运行日志与服务状态 |
 | `Desktop / Automation Detail` | 1280 x 780 | 好友检测、未读回复、消息监听、添加好友、朋友圈共用结构 |
 | `Desktop / Settings` | 1280 x 780 | 基础设备与 Agent 设置 |
-| `Desktop / Blocked State` | 1280 x 780 | UIA 未解锁、微信未登录、任务阻塞时的状态 |
+| `Desktop / Blocked State` | 1280 x 780 | UIA 不可用、微信未登录、任务阻塞时的状态 |
 
 视觉预览：[`docs/wxclient-gui-design-draft.svg`](wxclient-gui-design-draft.svg)
 

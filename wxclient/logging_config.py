@@ -354,20 +354,9 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"{_skip_reason_label(payload.get('reason'))}"
         )
 
-    if event == "uia.unlock.start":
-        return "正在解锁微信 UIA..."
-    if event == "uia.unlock.broadcast":
-        return "已广播屏幕阅读器变更通知。"
-    if event == "uia.unlock.quick_success":
-        return "UIA 解锁成功（无需重启微信）。"
-    if event == "uia.unlock.restart_needed":
-        return "广播后 UIA 未解锁，需要重启微信。"
-    if event == "uia.unlock.restart_success":
-        return "UIA 解锁成功（已重启微信）。"
-    if event == "uia.unlock.failed":
-        return f"UIA 解锁失败：{payload.get('error', '')}"
-    if event == "uia.operation_unlock":
-        return str(payload.get("message") or "动作前 UIA 状态更新。")
+    if event == "uia.operation_probe":
+        state = "可用" if payload.get("uia_exposed") else "不可用"
+        return f"动作前 UIA 探测：{state}（{payload.get('reason') or '-'}）"
 
     if event == "worker.started":
         return f"服务已启动，轮询间隔 {payload.get('poll_interval', '-')} 秒。"

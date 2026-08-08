@@ -34,18 +34,8 @@ from wxclient.queue import OperationWorker, Task, TaskStatus, TaskStore, TaskTyp
 from wxclient.ui.config import load_gui_settings, save_gui_settings
 from wxclient.ui.main_window import MainWindow, _summarize_task_result, _task_terminal_log_lines
 from wxclient.ui.task_actions import enqueue_reply_unread, enqueue_watch_chats
-from wxclient.uia_unlock.service import (
-    bootstrap_wechat_uia,
-    bring_wechat_to_front,
-    ensure_wechat_foreground,
-    ensure_wechat_uia,
-    _is_wechat_window_candidate,
-    _native_wechat_window_kind,
-    probe_wechat_uia,
-    probe_wechat_uia_native,
-)
-from wxclient.uia_unlock.diagnostics import format_uia_diagnostics
-from wxclient.uia_unlock.screen_reader import ScreenReaderFlagSession
+from wxclient.uia_probe import format_uia_diagnostics, probe_wechat_uia
+from wxclient.uia_probe.windows import is_wechat_window_candidate
 from wxclient.wechat_api import WeChatApi
 from wxclient.wechat_api.service import (
     CompositeWeChatDriver,
@@ -1203,40 +1193,34 @@ class CoreTests(unittest.TestCase):
 
         self.assertIs(WeChatApi(dry_run=True)._find_native_open_button(dialog), open_button)
 
-    def test_uia_unlock_rejects_explorer_weixin_window(self) -> None:
+    def test_uia_probe_rejects_explorer_weixin_window(self) -> None:
         self.assertFalse(
-            _is_wechat_window_candidate("Weixin", "CabinetWClass", "explorer.exe")
+            is_wechat_window_candidate("Weixin", "CabinetWClass", "explorer.exe")
         )
 
-    def test_uia_unlock_rejects_real_weixin_non_chinese_title(self) -> None:
+    def test_uia_probe_rejects_real_weixin_non_chinese_title(self) -> None:
         self.assertFalse(
-            _is_wechat_window_candidate("Weixin", "Qt51514QWindowIcon", "Weixin.exe")
+            is_wechat_window_candidate("Weixin", "Qt51514QWindowIcon", "Weixin.exe")
         )
 
-    def test_uia_unlock_accepts_real_weixin_qt_window(self) -> None:
+    def test_uia_probe_accepts_real_weixin_qt_window(self) -> None:
         self.assertTrue(
-            _is_wechat_window_candidate("微信", "Qt51514QWindowIcon", "Weixin.exe")
+            is_wechat_window_candidate("微信", "Qt51514QWindowIcon", "Weixin.exe")
         )
 
-    def test_uia_unlock_rejects_wechat_tray_window(self) -> None:
+    def test_uia_probe_rejects_wechat_tray_window(self) -> None:
         self.assertFalse(
-            _is_wechat_window_candidate(
+            is_wechat_window_candidate(
                 "WxTrayIconMessageWindow",
                 "Qt51514WxTrayIconMessageWindowClass",
                 "Weixin.exe",
             )
         )
 
-    def test_native_uia_window_class_kinds(self) -> None:
-        self.assertEqual(_native_wechat_window_kind("mmui::MainWindow"), "main")
-        self.assertEqual(_native_wechat_window_kind("WeChatMainWndForPC"), "main")
-        self.assertEqual(_native_wechat_window_kind("mmui::LoginWindow"), "login")
-        self.assertEqual(_native_wechat_window_kind("NotWeChat"), "other")
-
     def test_pywinauto_probe_rejects_qt_shell_without_main_uia_class(self) -> None:
-        with patch("wxclient.uia_unlock.pywinauto_probe.platform.system", return_value="Windows"):
+        with patch("wxclient.uia_probe.probe.platform.system", return_value="Windows"):
             with patch(
-                "wxclient.uia_unlock.pywinauto_probe.find_wechat_windows",
+                "wxclient.uia_probe.probe.find_wechat_windows",
                 return_value=[
                     {
                         "handle": 1315200,
@@ -1256,9 +1240,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["reason"], "WeChat UIA is not exposed")
 
     def test_pywinauto_probe_requires_main_window_for_exposed_state(self) -> None:
-        with patch("wxclient.uia_unlock.pywinauto_probe.platform.system", return_value="Windows"):
+        with patch("wxclient.uia_probe.probe.platform.system", return_value="Windows"):
             with patch(
-                "wxclient.uia_unlock.pywinauto_probe.find_wechat_windows",
+                "wxclient.uia_probe.probe.find_wechat_windows",
                 return_value=[
                     {
                         "handle": 1315200,
@@ -1277,9 +1261,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["selected_window"]["kind"], "main")
 
     def test_pywinauto_probe_rejects_sparse_main_window_tree(self) -> None:
-        with patch("wxclient.uia_unlock.pywinauto_probe.platform.system", return_value="Windows"):
+        with patch("wxclient.uia_probe.probe.platform.system", return_value="Windows"):
             with patch(
-                "wxclient.uia_unlock.pywinauto_probe.find_wechat_windows",
+                "wxclient.uia_probe.probe.find_wechat_windows",
                 return_value=[
                     {
                         "handle": 1315200,
@@ -1298,9 +1282,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["reason"], "WeChat UIA is not exposed")
 
     def test_pywinauto_probe_reports_login_window(self) -> None:
-        with patch("wxclient.uia_unlock.pywinauto_probe.platform.system", return_value="Windows"):
+        with patch("wxclient.uia_probe.probe.platform.system", return_value="Windows"):
             with patch(
-                "wxclient.uia_unlock.pywinauto_probe.find_wechat_windows",
+                "wxclient.uia_probe.probe.find_wechat_windows",
                 return_value=[
                     {
                         "handle": 1315200,
@@ -1319,467 +1303,33 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["selected_window"]["kind"], "login")
         self.assertEqual(result["reason"], "WeChat login window is open")
 
-    def test_native_uia_probe_reports_unsupported_platform(self) -> None:
-        with patch("wxclient.uia_unlock.native_com.platform.system", return_value="Linux"):
-            result = probe_wechat_uia_native()
-
-        self.assertEqual(result["provider"], "native_com")
-        self.assertFalse(result["uia_exposed"])
-        self.assertIn("only available on Windows", result["reason"])
-
-    def test_native_uia_loader_loads_dotnet_uia_assemblies(self) -> None:
-        from wxclient.uia_unlock import native_com
-
-        previous_handles = list(native_com._UIA_DOTNET_HANDLES)
-        previous_state = {
-            key: list(value) if isinstance(value, list) else value
-            for key, value in native_com._UIA_DOTNET_STATE.items()
-        }
-        native_com._UIA_DOTNET_HANDLES.clear()
-        native_com._UIA_DOTNET_STATE.update(
-            {"attempted": False, "loaded": [], "missing": [], "errors": []}
-        )
-        try:
-            assembly_paths = {
-                "UIAutomationTypes.dll": Path("C:/Windows/Microsoft.NET/WPF/UIAutomationTypes.dll"),
-                "UIAutomationClient.dll": Path("C:/Windows/Microsoft.NET/WPF/UIAutomationClient.dll"),
-            }
-            messages: list[str] = []
-            with patch("wxclient.uia_unlock.native_com.platform.system", return_value="Windows"):
-                with patch(
-                    "wxclient.uia_unlock.native_com._uia_dotnet_assembly_paths",
-                    return_value=assembly_paths,
-                ):
-                    with patch(
-                        "wxclient.uia_unlock.native_com.ctypes.WinDLL",
-                        side_effect=lambda path: SimpleNamespace(path=path),
-                    ) as load_library:
-                        snapshot = native_com.load_uia_dotnet_client_assemblies(log=messages.append)
-
-            self.assertTrue(snapshot["attempted"])
-            self.assertEqual(snapshot["missing"], [])
-            self.assertEqual(snapshot["errors"], [])
-            self.assertEqual(len(snapshot["loaded"]), 2)
-            self.assertEqual(load_library.call_count, 2)
-            self.assertIn(
-                ".NET UIAutomation 程序集加载完成：loaded=2，missing=0，errors=0。",
-                messages,
-            )
-            self.assertEqual(
-                [message for message in messages if message.startswith(".NET UIAutomation 已加载：")],
-                [
-                    ".NET UIAutomation 已加载：C:\\Windows\\Microsoft.NET\\WPF\\UIAutomationTypes.dll",
-                    ".NET UIAutomation 已加载：C:\\Windows\\Microsoft.NET\\WPF\\UIAutomationClient.dll",
-                ],
-            )
-        finally:
-            native_com._UIA_DOTNET_HANDLES[:] = previous_handles
-            native_com._UIA_DOTNET_STATE.update(previous_state)
-
-    def test_screen_reader_flag_session_restores_previous_value(self) -> None:
-        changes: list[bool] = []
-        with patch("wxclient.uia_unlock.screen_reader.get_screen_reader_active", return_value=False):
-            with patch(
-                "wxclient.uia_unlock.screen_reader.set_screen_reader_active",
-                side_effect=lambda active: changes.append(active) or True,
-            ):
-                session = ScreenReaderFlagSession()
-
-                self.assertIn("临时开启", session.enable())
-                self.assertIn("恢复为关闭", session.restore() or "")
-                self.assertEqual(
-                    session.snapshot(),
-                    {"previous": False, "enabled": True, "restored": True, "current": False},
-                )
-
-        self.assertEqual(changes, [True, False])
-
-    def test_uia_bootstrap_uses_pywinauto_before_native_fallback(self) -> None:
-        calls: list[str] = []
-
-        def _probe(**_: object) -> dict[str, object]:
-            calls.append("probe")
-            return {"platform": "Windows", "uia_exposed": True}
-
-        def _screen_reader(**_: object) -> None:
-            calls.append("screen_reader")
-
-        def _hook(**_: object) -> None:
-            calls.append("hook")
-
-        with patch("wxclient.uia_unlock.service.platform.system", return_value="Windows"):
-            with patch("wxclient.uia_unlock.service.ensure_wechat_foreground", return_value=True):
-                with patch("wxclient.uia_unlock.service.start_wechat", return_value=False) as start:
-                    with patch(
-                        "wxclient.uia_unlock.service.ensure_screen_reader_keepalive",
-                        side_effect=_screen_reader,
-                    ) as screen_reader:
-                        with patch(
-                            "wxclient.uia_unlock.service.ensure_a11y_hook_keepalive",
-                            side_effect=_hook,
-                        ) as hook:
-                            with patch("wxclient.uia_unlock.service.ensure_uia_keepalive") as keepalive:
-                                with patch(
-                                    "wxclient.uia_unlock.service.uia_keepalive_snapshot",
-                                    return_value={},
-                                ):
-                                    with patch(
-                                        "wxclient.uia_unlock.service.try_unlock_with_native_com_client",
-                                    ) as native_unlock:
-                                        with patch(
-                                            "wxclient.uia_unlock.service.probe_wechat_uia",
-                                            side_effect=_probe,
-                                        ):
-                                            result = bootstrap_wechat_uia(quick_timeout=0)
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["mode"], "pywinauto")
-        self.assertEqual(calls, ["screen_reader", "hook", "probe"])
-        start.assert_called_once_with(None)
-        screen_reader.assert_called_once()
-        hook.assert_called_once()
-        keepalive.assert_not_called()
-        native_unlock.assert_not_called()
-
-    def test_uia_bootstrap_starts_wechat_before_pywinauto_when_not_running(self) -> None:
-        calls: list[str] = []
-
-        def _probe(**_: object) -> dict[str, object]:
-            calls.append("probe")
-            return {"platform": "Windows", "uia_exposed": True}
-
-        def _foreground(*, timeout: float) -> bool:
-            calls.append(f"foreground:{timeout}")
-            return True
-
-        def _screen_reader(**_: object) -> None:
-            calls.append("screen_reader")
-
-        def _hook(**_: object) -> None:
-            calls.append("hook")
-
-        def _start(path: object = None) -> bool:
-            calls.append(f"start:{path or '-'}")
-            return True
-
-        with patch("wxclient.uia_unlock.service.platform.system", return_value="Windows"):
-            with patch("wxclient.uia_unlock.service.ensure_wechat_foreground", side_effect=_foreground):
-                with patch("wxclient.uia_unlock.service.start_wechat", side_effect=_start):
-                    with patch(
-                        "wxclient.uia_unlock.service.ensure_screen_reader_keepalive",
-                        side_effect=_screen_reader,
-                    ):
-                        with patch(
-                            "wxclient.uia_unlock.service.ensure_a11y_hook_keepalive",
-                            side_effect=_hook,
-                        ):
-                            with patch("wxclient.uia_unlock.service.time.sleep"):
-                                with patch(
-                                    "wxclient.uia_unlock.service.uia_keepalive_snapshot",
-                                    return_value={},
-                                ):
-                                    with patch(
-                                        "wxclient.uia_unlock.service.probe_wechat_uia",
-                                        side_effect=_probe,
-                                    ):
-                                        result = bootstrap_wechat_uia(
-                                            wechat_path="C:/Weixin.exe",
-                                            quick_timeout=0,
-                                        )
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["mode"], "pywinauto")
-        self.assertEqual(
-            calls[:5],
-            ["screen_reader", "hook", "start:C:/Weixin.exe", "foreground:8.0", "probe"],
-        )
-
-    def test_uia_bootstrap_waits_for_hook_before_native_fallback(self) -> None:
-        calls: list[str] = []
-
-        def _probe(**_: object) -> dict[str, object]:
-            calls.append("probe")
-            return {
-                "platform": "Windows",
-                "uia_exposed": calls.count("probe") >= 2,
-                "reason": "UIA exposed" if calls.count("probe") >= 2 else "WeChat UIA is not exposed",
-            }
-
-        def _screen_reader(**_: object) -> None:
-            calls.append("screen_reader")
-
-        def _hook(**_: object) -> None:
-            calls.append("hook")
-
-        with patch("wxclient.uia_unlock.service.platform.system", return_value="Windows"):
-            with patch("wxclient.uia_unlock.service.ensure_wechat_foreground", return_value=True):
-                with patch("wxclient.uia_unlock.service.start_wechat", return_value=False):
-                    with patch(
-                        "wxclient.uia_unlock.service.ensure_screen_reader_keepalive",
-                        side_effect=_screen_reader,
-                    ):
-                        with patch(
-                            "wxclient.uia_unlock.service.ensure_a11y_hook_keepalive",
-                            side_effect=_hook,
-                        ):
-                            with patch("wxclient.uia_unlock.service.ensure_uia_keepalive") as keepalive:
-                                with patch(
-                                    "wxclient.uia_unlock.service.try_unlock_with_native_com_client",
-                                ) as native_unlock:
-                                    with patch("wxclient.uia_unlock.service.time.sleep"):
-                                        with patch(
-                                            "wxclient.uia_unlock.service.probe_wechat_uia",
-                                            side_effect=_probe,
-                                        ):
-                                            result = bootstrap_wechat_uia(quick_timeout=2)
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["mode"], "hook")
-        self.assertEqual(calls, ["screen_reader", "hook", "probe", "probe", "probe"])
-        keepalive.assert_not_called()
-        native_unlock.assert_not_called()
-
-    def test_uia_bootstrap_uses_native_after_pywinauto_failure(self) -> None:
-        calls: list[str] = []
-
-        def _probe(**_: object) -> dict[str, object]:
-            calls.append("probe")
-            if calls.count("probe") == 1:
-                return {
-                    "platform": "Windows",
-                    "uia_exposed": False,
-                    "reason": "WeChat UIA is not exposed",
-                }
-            return {"platform": "Windows", "uia_exposed": True}
-
-        def _native_unlock(**_: object) -> dict[str, object]:
-            calls.append("native")
-            return {"success": True, "native_probe": {"provider": "native_com"}}
-
-        def _keepalive(**_: object) -> None:
-            calls.append("keepalive")
-
-        def _screen_reader(**_: object) -> None:
-            calls.append("screen_reader")
-
-        def _hook(**_: object) -> None:
-            calls.append("hook")
-
-        with patch("wxclient.uia_unlock.service.platform.system", return_value="Windows"):
-            with patch("wxclient.uia_unlock.service.ensure_wechat_foreground", return_value=True):
-                with patch("wxclient.uia_unlock.service.start_wechat", return_value=False):
-                    with patch(
-                        "wxclient.uia_unlock.service.ensure_screen_reader_keepalive",
-                        side_effect=_screen_reader,
-                    ):
-                        with patch(
-                            "wxclient.uia_unlock.service.ensure_a11y_hook_keepalive",
-                            side_effect=_hook,
-                        ):
-                            with patch(
-                                "wxclient.uia_unlock.service.ensure_uia_keepalive",
-                                side_effect=_keepalive,
-                            ):
-                                with patch(
-                                    "wxclient.uia_unlock.service.uia_keepalive_snapshot",
-                                    return_value={"started": True},
-                                ):
-                                    with patch(
-                                        "wxclient.uia_unlock.service.try_unlock_with_native_com_client",
-                                        side_effect=_native_unlock,
-                                    ):
-                                        with patch(
-                                            "wxclient.uia_unlock.service.probe_wechat_uia",
-                                            side_effect=_probe,
-                                        ):
-                                            result = bootstrap_wechat_uia(quick_timeout=0)
-
-        self.assertTrue(result["success"])
-        self.assertEqual(result["mode"], "native_com")
-        self.assertEqual(calls, ["screen_reader", "hook", "probe", "keepalive", "native", "probe"])
-        self.assertEqual(result["keepalive"], {"started": True})
-
-    def test_uia_bootstrap_reports_account_shell_locked_for_empty_qt_shell(self) -> None:
-        messages: list[str] = []
-        empty_shell_probe = {
-            "platform": "Windows",
-            "logged_in": False,
-            "login_window": False,
-            "uia_exposed": False,
-            "reason": "WeChat UIA is not exposed",
-            "selected_window": {
-                "handle": 329792,
-                "kind": "other",
-                "class_name": "Qt51514QWindowIcon",
-                "descendant_count": 0,
-                "process_name": "Weixin.exe",
-            },
-        }
-
-        with patch("wxclient.uia_unlock.service.platform.system", return_value="Windows"):
-            with patch("wxclient.uia_unlock.service.ensure_wechat_foreground", return_value=True):
-                with patch("wxclient.uia_unlock.service.start_wechat", return_value=False):
-                    with patch("wxclient.uia_unlock.service.ensure_screen_reader_keepalive"):
-                        with patch("wxclient.uia_unlock.service.ensure_a11y_hook_keepalive"):
-                            with patch("wxclient.uia_unlock.service.ensure_uia_keepalive"):
-                                with patch(
-                                    "wxclient.uia_unlock.service.uia_keepalive_snapshot",
-                                    return_value={},
-                                ):
-                                    with patch(
-                                        "wxclient.uia_unlock.service.try_unlock_with_native_com_client",
-                                        return_value={"success": False, "native_probe": {}},
-                                    ):
-                                        with patch("wxclient.uia_unlock.service.time.sleep"):
-                                            with patch(
-                                                "wxclient.uia_unlock.service.probe_wechat_uia",
-                                                return_value=empty_shell_probe,
-                                            ):
-                                                result = bootstrap_wechat_uia(
-                                                    quick_timeout=0,
-                                                    log=messages.append,
-                                                )
-
-        self.assertFalse(result["success"])
-        self.assertEqual(result["mode"], "account_shell_locked")
-        self.assertIn(
-            "检测到微信窗口存在但只暴露 Qt 空壳，常见于切换账号后该账号/数据目录未开放 UIA；请完全退出微信，再由本程序启动微信后登录该账号。",
-            messages,
-        )
-
-    def test_uia_diagnostics_explains_skipped_native_probe(self) -> None:
-        with patch("wxclient.uia_unlock.diagnostics.platform.system", return_value="Windows"):
-            with patch("wxclient.uia_unlock.diagnostics._safe_username", return_value="ZK"):
-                with patch("wxclient.uia_unlock.diagnostics._admin_label", return_value="否"):
-                    with patch(
-                        "wxclient.uia_unlock.diagnostics.get_screen_reader_active",
-                        return_value=False,
-                    ):
-                        with patch(
-                            "wxclient.uia_unlock.diagnostics._foreground_window_handle",
-                            return_value=0,
-                        ):
-                            with patch(
-                                "wxclient.uia_unlock.diagnostics._safe_wechat_window_candidates",
-                                return_value=[],
-                            ):
-                                lines = format_uia_diagnostics(
-                                    {
-                                        "mode": "pywinauto",
-                                        "probe": {
-                                            "logged_in": True,
-                                            "login_window": False,
-                                            "uia_exposed": True,
-                                            "window_count": 1,
-                                            "reason": "UIA exposed",
-                                        },
-                                        "native_probe": {},
-                                    },
-                                    context="程序启动 UIA 诊断",
-                                )
-
-        self.assertNotIn("native COM probe=无", "\n".join(lines))
-        self.assertIn(
-            "程序启动 UIA 诊断：native COM probe=未执行（pywinauto 已可用，未进入 native 兜底）",
-            lines,
-        )
-
-    def test_ensure_wechat_uia_returns_true_when_probe_already_exposed(self) -> None:
-        with patch("wxclient.uia_unlock.service.platform.system", return_value="Windows"):
-            with patch("wxclient.uia_unlock.service.ensure_wechat_foreground") as foreground:
-                with patch(
-                    "wxclient.uia_unlock.service.probe_wechat_uia",
-                    return_value={"uia_exposed": True},
-                ) as probe:
-                    with patch("wxclient.uia_unlock.service.bootstrap_wechat_uia") as bootstrap:
-                        self.assertTrue(ensure_wechat_uia())
-
-        foreground.assert_called_once_with(timeout=2.0)
-        probe.assert_called_once_with(max_depth=6, max_nodes=500)
-        bootstrap.assert_not_called()
-
-    def test_ensure_wechat_uia_bootstraps_when_probe_not_exposed(self) -> None:
-        with patch("wxclient.uia_unlock.service.platform.system", return_value="Windows"):
-            with patch("wxclient.uia_unlock.service.ensure_wechat_foreground"):
-                with patch(
-                    "wxclient.uia_unlock.service.probe_wechat_uia",
-                    return_value={"uia_exposed": False},
-                ):
-                    with patch(
-                        "wxclient.uia_unlock.service.bootstrap_wechat_uia",
-                        return_value={"success": True},
-                    ) as bootstrap:
-                        self.assertTrue(
-                            ensure_wechat_uia(
-                                restart_if_needed=False,
-                                wechat_path="C:/Weixin.exe",
-                                startup_wait=12,
-                            )
-                        )
-
-        bootstrap.assert_called_once_with(
-            wechat_path="C:/Weixin.exe",
-            restart_if_needed=False,
-            startup_wait=12,
-        )
-
-    def test_ensure_wechat_uia_logs_operation_unlock_attempt(self) -> None:
-        messages: list[str] = []
-        with patch("wxclient.uia_unlock.service.platform.system", return_value="Windows"):
-            with patch("wxclient.uia_unlock.service.ensure_wechat_foreground", return_value=True):
-                with patch(
-                    "wxclient.uia_unlock.service.probe_wechat_uia",
-                    return_value={
-                        "uia_exposed": False,
-                        "reason": "WeChat UIA is not exposed",
-                    },
-                ):
-                    with patch(
-                        "wxclient.uia_unlock.service.bootstrap_wechat_uia",
-                        return_value={
-                            "success": True,
-                            "probe": {"uia_exposed": True},
-                        },
-                    ) as bootstrap:
-                        self.assertTrue(ensure_wechat_uia(log=messages.append))
-
-        bootstrap.assert_called_once()
-        self.assertIn(
-            "动作前 UIA 不可用：WeChat UIA is not exposed，正在现场解锁。",
-            messages,
-        )
-        self.assertIn("现场解锁成功，继续执行当前微信操作。", messages)
-
-    def test_wechat_api_ensure_ready_logs_operation_unlock(self) -> None:
-        def _ensure_ready(**kwargs: object) -> bool:
-            log = kwargs.get("log")
-            if callable(log):
-                log("动作前 UIA 不可用，正在现场解锁。")
-            return True
-
+    def test_wechat_api_ensure_ready_only_probes_uia(self) -> None:
         with patch(
-            "wxclient.wechat_api.service.ensure_wechat_uia",
-            side_effect=_ensure_ready,
-        ) as ensure:
+            "wxclient.wechat_api.service.probe_wechat_uia",
+            return_value={"uia_exposed": True, "reason": "UIA exposed"},
+        ) as probe:
             with patch("wxclient.wechat_api.service.logger") as fake_logger:
                 WeChatApi(dry_run=False)._ensure_ready()
 
-        ensure.assert_called_once()
-        self.assertEqual(ensure.call_args.kwargs["restart_if_needed"], False)
+        probe.assert_called_once()
         fake_logger.info.assert_called_with(
-            "uia.operation_unlock",
-            message="动作前 UIA 不可用，正在现场解锁。",
+            "uia.operation_probe",
+            uia_exposed=True,
+            reason="UIA exposed",
         )
 
-    def test_wechat_api_ensure_ready_raises_after_failed_operation_unlock(self) -> None:
+    def test_wechat_api_ensure_ready_raises_after_failed_probe(self) -> None:
         with patch(
-            "wxclient.wechat_api.service.ensure_wechat_uia",
-            return_value=False,
+            "wxclient.wechat_api.service.probe_wechat_uia",
+            return_value={
+                "uia_exposed": False,
+                "reason": "WeChat UIA is not exposed",
+            },
         ):
             with self.assertRaisesRegex(WeChatApiError, "WeChat UIA is not available"):
                 WeChatApi(dry_run=False)._ensure_ready()
 
-    def test_gui_worker_start_revalidates_stale_uia_cache(self) -> None:
+    def test_gui_worker_start_stops_when_probe_is_unavailable(self) -> None:
         class FakeSignal:
             def __init__(self) -> None:
                 self.calls: list[tuple[object, ...]] = []
@@ -1795,11 +1345,10 @@ class CoreTests(unittest.TestCase):
                 self.started = True
 
         fake = SimpleNamespace(
-            _uia_bootstrapped=True,
+            _uia_available=True,
             _closing=False,
             log_requested=FakeSignal(),
             worker_start_finished=FakeSignal(),
-            settings=SimpleNamespace(wechat_path=None),
             log_path=Path("ui.log"),
             worker=FakeWorker(),
         )
@@ -1807,24 +1356,17 @@ class CoreTests(unittest.TestCase):
             "wxclient.ui.main_window.probe_wechat_uia",
             return_value={"uia_exposed": False},
         ):
-            with patch(
-                "wxclient.ui.main_window.bootstrap_wechat_uia",
-                return_value={
-                    "success": True,
-                    "mode": "quick",
-                    "probe": {"uia_exposed": True},
-                },
-            ) as bootstrap:
-                with patch("wxclient.ui.main_window.configure_logging"):
-                    MainWindow._start_worker_in_background(fake)
+            with patch("wxclient.ui.main_window.configure_logging") as configure:
+                MainWindow._start_worker_in_background(fake)
 
-        bootstrap.assert_called_once()
-        self.assertTrue(fake._uia_bootstrapped)
-        self.assertTrue(fake.worker.started)
-        self.assertIn(("上次 UIA 状态已失效，重新执行解锁。",), fake.log_requested.calls)
-        self.assertEqual(fake.worker_start_finished.calls[-1][0]["success"], True)
+        configure.assert_not_called()
+        self.assertFalse(fake._uia_available)
+        self.assertFalse(fake.worker.started)
+        result = fake.worker_start_finished.calls[-1][0]
+        self.assertEqual(result["success"], False)
+        self.assertEqual(result["reason"], "uia_not_ready")
 
-    def test_gui_probe_failure_clears_unlocked_state(self) -> None:
+    def test_gui_probe_failure_clears_available_state(self) -> None:
         class FakeStyle:
             def unpolish(self, _widget: object) -> None:
                 pass
@@ -1857,7 +1399,7 @@ class CoreTests(unittest.TestCase):
 
         panel = FakeWidget()
         fake = SimpleNamespace(
-            _uia_bootstrapped=True,
+            _uia_available=True,
             _uia_probe_running=True,
             _closing=False,
             _last_uia_signature=None,
@@ -1878,11 +1420,11 @@ class CoreTests(unittest.TestCase):
             },
         )
 
-        self.assertFalse(fake._uia_bootstrapped)
-        self.assertEqual(fake.uia_state_label.text, "UIA 未解锁")
+        self.assertFalse(fake._uia_available)
+        self.assertEqual(fake.uia_state_label.text, "UIA 不可用")
         self.assertEqual(fake.uia_detail_label.text, "微信已运行但 UIA 节点未暴露")
 
-    def test_gui_uia_status_reports_qt_shell_as_locked_not_missing(self) -> None:
+    def test_gui_uia_status_reports_qt_shell_as_unavailable_not_missing(self) -> None:
         class FakeStyle:
             def unpolish(self, widget: object) -> None:
                 return None
@@ -1915,7 +1457,7 @@ class CoreTests(unittest.TestCase):
 
         panel = FakeWidget()
         fake = SimpleNamespace(
-            _uia_bootstrapped=True,
+            _uia_available=True,
             _uia_probe_running=True,
             _closing=False,
             _last_uia_signature=None,
@@ -1944,218 +1486,10 @@ class CoreTests(unittest.TestCase):
             },
         )
 
-        self.assertFalse(fake._uia_bootstrapped)
-        self.assertEqual(fake.uia_state_label.text, "UIA 未解锁")
+        self.assertFalse(fake._uia_available)
+        self.assertEqual(fake.uia_state_label.text, "UIA 不可用")
         self.assertEqual(fake.uia_detail_label.text, "已找到微信窗口，但当前只暴露 Qt 空壳")
         self.assertEqual(panel.properties["state"], "warn")
-
-    def test_ensure_wechat_foreground_accepts_current_wechat_window(self) -> None:
-        with patch("wxclient.uia_unlock.windows.platform.system", return_value="Windows"):
-            with patch("wxclient.uia_unlock.windows._foreground_window_handle", return_value=123):
-                with patch(
-                    "wxclient.uia_unlock.windows._safe_wechat_window_candidates",
-                    return_value=[
-                        {
-                            "handle": 123,
-                            "class_name": "WeChatMainWndForPC",
-                            "title": "微信",
-                        }
-                    ],
-                ):
-                    with patch("wxclient.uia_unlock.windows.bring_wechat_to_front") as bring:
-                        self.assertTrue(ensure_wechat_foreground())
-
-        bring.assert_not_called()
-
-    def test_ensure_wechat_foreground_accepts_current_qt_wechat_without_uia_nodes(self) -> None:
-        with patch("wxclient.uia_unlock.windows.platform.system", return_value="Windows"):
-            with patch("wxclient.uia_unlock.windows._foreground_window_handle", return_value=123):
-                with patch(
-                    "wxclient.uia_unlock.windows._safe_wechat_window_candidates",
-                    return_value=[
-                        {
-                            "handle": 123,
-                            "class_name": "Qt51514QWindowIcon",
-                            "uia_class_name": "mmui::MainWindow",
-                            "uia_descendant_count": 0,
-                            "title": "微信",
-                        }
-                    ],
-                ):
-                    with patch("wxclient.uia_unlock.windows.bring_wechat_to_front") as bring:
-                        self.assertTrue(ensure_wechat_foreground())
-
-        bring.assert_not_called()
-
-    def test_bring_wechat_to_front_rejects_empty_qt_shell_without_uia_class(self) -> None:
-        candidate = {
-            "handle": 123,
-            "class_name": "Qt51514QWindowIcon",
-            "uia_class_name": "",
-            "uia_descendant_count": 0,
-            "title": "微信",
-        }
-        with patch("wxclient.uia_unlock.windows.platform.system", return_value="Windows"):
-            with patch(
-                "wxclient.uia_unlock.windows._safe_wechat_window_candidates",
-                return_value=[candidate],
-            ):
-                with patch("wxclient.uia_unlock.windows.start_wechat") as start:
-                    with patch("wxclient.uia_unlock.windows._restore_and_foreground_window", return_value=True) as restore:
-                        with patch("wxclient.uia_unlock.windows._find_wechat_window_handle_by_title", return_value=0):
-                            self.assertFalse(bring_wechat_to_front(timeout=0))
-
-        start.assert_not_called()
-        restore.assert_not_called()
-
-    def test_bring_wechat_to_front_rejects_tray_qt_main_window_without_uia_nodes(self) -> None:
-        candidate = {
-            "handle": 123,
-            "class_name": "Qt51514QWindowIcon",
-            "uia_class_name": "mmui::MainWindow",
-            "uia_descendant_count": 0,
-            "title": "微信",
-        }
-        with patch("wxclient.uia_unlock.windows.platform.system", return_value="Windows"):
-            with patch(
-                "wxclient.uia_unlock.windows._safe_wechat_window_candidates",
-                return_value=[candidate],
-            ):
-                with patch("wxclient.uia_unlock.windows.start_wechat") as start:
-                    with patch("wxclient.uia_unlock.windows._restore_and_foreground_window", return_value=True) as restore:
-                        with patch("wxclient.uia_unlock.windows._find_wechat_window_handle_by_title", return_value=0):
-                            self.assertFalse(bring_wechat_to_front(timeout=0))
-
-        start.assert_not_called()
-        restore.assert_not_called()
-
-    def test_bring_wechat_to_front_rejects_minimized_qt_main_window_with_uia_nodes(self) -> None:
-        candidate = {
-            "handle": 123,
-            "class_name": "Qt51514QWindowIcon",
-            "uia_class_name": "mmui::MainWindow",
-            "uia_descendant_count": 40,
-            "title": "寰俊",
-        }
-        with patch("wxclient.uia_unlock.windows.platform.system", return_value="Windows"):
-            with patch(
-                "wxclient.uia_unlock.windows._safe_wechat_window_candidates",
-                return_value=[candidate],
-            ):
-                with patch(
-                    "wxclient.uia_unlock.windows._window_visibility_snapshot",
-                    return_value={
-                        "visible": True,
-                        "iconic": True,
-                        "offscreen_minimized": True,
-                        "width": 160,
-                        "height": 28,
-                    },
-                ):
-                    with patch("wxclient.uia_unlock.windows.start_wechat") as start:
-                        with patch("wxclient.uia_unlock.windows._restore_and_foreground_window", return_value=True) as restore:
-                            with patch("wxclient.uia_unlock.windows._find_wechat_window_handle_by_title", return_value=0):
-                                self.assertFalse(bring_wechat_to_front(timeout=0))
-
-        start.assert_not_called()
-        restore.assert_not_called()
-
-    def test_bring_wechat_to_front_uses_pyweixin_first(self) -> None:
-        with patch("wxclient.uia_unlock.windows.platform.system", return_value="Windows"):
-            with patch(
-                "wxclient.uia_unlock.windows._bring_wechat_to_front_with_pyweixin",
-                return_value=789,
-            ) as pyweixin:
-                with patch(
-                    "wxclient.uia_unlock.windows._foreground_window_handle",
-                    return_value=789,
-                ):
-                    with patch("wxclient.uia_unlock.windows._safe_wechat_window_candidates") as candidates:
-                        self.assertTrue(bring_wechat_to_front(timeout=1))
-
-        pyweixin.assert_called_once()
-        candidates.assert_not_called()
-
-    def test_bring_wechat_to_front_allows_visible_qt_shell_without_uia_nodes(self) -> None:
-        candidate = {
-            "handle": 123,
-            "class_name": "Qt51514QWindowIcon",
-            "uia_class_name": "",
-            "uia_descendant_count": 0,
-            "title": "微信",
-        }
-        with patch("wxclient.uia_unlock.windows.platform.system", return_value="Windows"):
-            with patch(
-                "wxclient.uia_unlock.windows._safe_wechat_window_candidates",
-                return_value=[candidate],
-            ):
-                with patch("wxclient.uia_unlock.windows._bring_wechat_to_front_with_pyweixin", return_value=0):
-                    with patch(
-                        "wxclient.uia_unlock.windows._window_visibility_snapshot",
-                        return_value={
-                            "visible": True,
-                            "iconic": False,
-                            "offscreen_minimized": False,
-                            "width": 960,
-                            "height": 720,
-                        },
-                    ):
-                        with patch("wxclient.uia_unlock.windows._restore_and_foreground_window", return_value=True) as restore:
-                            with patch("wxclient.uia_unlock.windows._foreground_window_handle", side_effect=[0, 123]):
-                                self.assertTrue(bring_wechat_to_front(timeout=1))
-
-        restore.assert_called_once_with(123)
-
-    def test_start_wechat_does_not_spawn_when_weixin_process_exists(self) -> None:
-        from wxclient.uia_unlock import windows as uia_windows
-
-        with patch("wxclient.uia_unlock.windows._is_wechat_process_running", return_value=True):
-            with patch("wxclient.uia_unlock.windows.subprocess.Popen") as popen:
-                self.assertFalse(uia_windows.start_wechat("D:/Program Files/Tencent/Weixin/Weixin.exe"))
-
-        popen.assert_not_called()
-
-    def test_bring_wechat_to_front_allows_qt_main_window_with_uia_nodes(self) -> None:
-        candidate = {
-            "handle": 123,
-            "class_name": "Qt51514QWindowIcon",
-            "uia_class_name": "mmui::MainWindow",
-            "uia_descendant_count": 40,
-            "title": "微信",
-        }
-        with patch("wxclient.uia_unlock.windows.platform.system", return_value="Windows"):
-            with patch(
-                "wxclient.uia_unlock.windows._safe_wechat_window_candidates",
-                return_value=[candidate],
-            ):
-                with patch("wxclient.uia_unlock.windows._bring_wechat_to_front_with_pyweixin", return_value=0):
-                    with patch("wxclient.uia_unlock.windows.start_wechat") as start:
-                        with patch("wxclient.uia_unlock.windows._restore_and_foreground_window", return_value=True) as restore:
-                            with patch("wxclient.uia_unlock.windows._foreground_window_handle", side_effect=[0, 123]):
-                                self.assertTrue(bring_wechat_to_front())
-
-        start.assert_not_called()
-        restore.assert_called_once_with(123)
-
-    def test_bring_wechat_to_front_uses_real_main_window_without_singleton(self) -> None:
-        candidate = {
-            "handle": 456,
-            "class_name": "WeChatMainWndForPC",
-            "title": "微信",
-        }
-        with patch("wxclient.uia_unlock.windows.platform.system", return_value="Windows"):
-            with patch(
-                "wxclient.uia_unlock.windows._safe_wechat_window_candidates",
-                return_value=[candidate],
-            ):
-                with patch("wxclient.uia_unlock.windows._bring_wechat_to_front_with_pyweixin", return_value=0):
-                    with patch("wxclient.uia_unlock.windows.start_wechat") as start:
-                        with patch("wxclient.uia_unlock.windows._restore_and_foreground_window", return_value=True) as restore:
-                            with patch("wxclient.uia_unlock.windows._foreground_window_handle", side_effect=[0, 456]):
-                                self.assertTrue(bring_wechat_to_front())
-
-        start.assert_not_called()
-        restore.assert_called_once_with(456)
 
     def test_wechat_api_check_unread_messages_does_not_use_multiselect(self) -> None:
         api = FakeUnreadWeChatApi()
