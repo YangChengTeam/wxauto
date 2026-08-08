@@ -93,7 +93,6 @@ import win32api
 import pyautogui
 import win32gui
 import win32con
-import win32com.client
 from typing import Literal
 from packaging import version
 from pywinauto import mouse,Desktop
@@ -184,49 +183,34 @@ class Tools():
         该方法通过检测当前windows系统的进程中
         是否有Weixin.exe该项进程来判断微信是否在运行
         '''
-        wmi=win32com.client.GetObject('winmgmts:')
-        processes=wmi.InstancesOf('Win32_Process')
-        for process in processes:
-            if process.Name.lower()=='Weixin.exe'.lower():
+        for process in psutil.process_iter(['name']):
+            try:
+                process_name=str(process.info.get('name') or '')
+            except (psutil.NoSuchProcess,psutil.AccessDenied,psutil.ZombieProcess):
+                continue
+            if process_name.lower()=='weixin.exe':
                 return True
         return False
     
     @staticmethod
     def where_weixin(copy_to_clipboard:bool=False)->str:
-        '''该方法用来查找微信的路径,无论微信是否运行都可以查找到(如果没安装那就找不到)
+        '''该方法通过注册表查找微信的安装路径
         Args:
             copy_to_clipboard:是否将微信路径复制到剪贴板
         Returns:
             weixin_path:微信exe路径
         '''
-        #执行顺序 正在运行->查询注册表
-        if Tools.is_weixin_running():
-            weixin_path=''
-            wmi=win32com.client.GetObject('winmgmts:')
-            processes=wmi.InstancesOf('Win32_Process')
-            for process in processes:
-                if process.Name.lower()=='Weixin.exe'.lower():
-                    weixin_path=process.ExecutablePath
-            if weixin_path:
-                #规范化路径并检查文件是否存在
-                weixin_path=os.path.abspath(weixin_path)
+        try:
+            reg_path=r"Software\Tencent\Weixin"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,reg_path) as key:
+                Installdir=winreg.QueryValueEx(key,"InstallPath")[0]
+            weixin_path=os.path.join(Installdir,'Weixin.exe')
             if copy_to_clipboard:
                 SystemSettings.copy_text_to_clipboard(weixin_path)
                 print("已将微信路径复制到剪贴板")
             return weixin_path
-        else:
-           
-            try:
-                reg_path=r"Software\Tencent\Weixin"
-                with winreg.OpenKey(winreg.HKEY_CURRENT_USER,reg_path) as key:
-                    Installdir=winreg.QueryValueEx(key,"InstallPath")[0]
-                weixin_path=os.path.join(Installdir,'Weixin.exe')
-                if copy_to_clipboard:
-                    SystemSettings.copy_text_to_clipboard(weixin_path)
-                    print("已将微信路径复制到剪贴板")
-                return weixin_path
-            except FileNotFoundError:
-                raise NotInstalledError
+        except FileNotFoundError:
+            raise NotInstalledError
     
     @staticmethod
     def where_wxid_folder(open_folder:bool=False)->str:
