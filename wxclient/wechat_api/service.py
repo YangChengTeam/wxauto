@@ -146,6 +146,211 @@ class UiaWeChatDriver:
             "exact_count": exact_count,
         }
 
+    def get_contact_profile(self, friend: str) -> dict[str, Any]:
+        normalized_friend = str(friend or "").strip()
+        if not normalized_friend:
+            raise ValueError("联系人名称不能为空")
+        self._ensure_ready()
+        logger.info("contact.profile.start", friend=normalized_friend)
+        Navigator = self._pyweixin_class("Navigator")
+        main_window = None
+        try:
+            chatinfo_pane, main_window = Navigator.open_chatinfo(
+                friend=normalized_friend,
+                search_pages=5,
+                is_maximize=False,
+            )
+            friend_button = chatinfo_pane.child_window(
+                title=normalized_friend,
+                control_type="Button",
+            )
+            friend_button.wait(wait_for="ready", timeout=3)
+            friend_button.click_input()
+            deadline = time.monotonic() + 3
+            profile: dict[str, str] = {}
+            while time.monotonic() < deadline and not profile:
+                profile = self._read_open_contact_profile()
+                if not profile:
+                    time.sleep(0.1)
+            if not profile:
+                raise WeChatApiError("未找到联系人资料窗口")
+        except Exception as exc:
+            raise WeChatApiError(f"读取联系人资料失败：{exc}") from exc
+        finally:
+            if main_window is not None:
+                try:
+                    Uielements = self._pyweixin_submodule("Uielements")
+                    main_window.child_window(**Uielements.Buttons.ChatInfoButton).click_input()
+                except Exception:
+                    pass
+        normalized_profile = profile if isinstance(profile, dict) else {"raw": profile}
+        logger.info("contact.profile.done", friend=normalized_friend)
+        return {
+            "action": "get_contact_profile",
+            "friend": normalized_friend,
+            "profile": normalized_profile,
+        }
+
+    def _read_open_contact_profile(self) -> dict[str, str]:
+        """Read the top-level WeChat 4.x profile popup left open by pyweixin."""
+        try:
+            Desktop = __import__("pywinauto", fromlist=["Desktop"]).Desktop
+            popup = next(
+                (
+                    window
+                    for window in Desktop(backend="uia").windows()
+                    if str(_safe_call(window.class_name) or "") == "mmui::ProfileUniquePop"
+                ),
+                None,
+            )
+            if popup is None:
+                return {}
+            texts = [
+                str(_safe_call(control.window_text) or "").strip()
+                for control in popup.descendants(control_type="Text")
+            ]
+            texts = [text for text in texts if text]
+            if not texts:
+                return {}
+            labels = {
+                "昵称": "昵称",
+                "微信号": "微信号",
+                "地区": "地区",
+                "备注": "备注",
+                "电话": "电话",
+                "标签": "标签",
+                "描述": "描述",
+                "朋友权限": "朋友权限",
+                "共同群聊": "共同群聊",
+                "个性签名": "个性签名",
+                "来源": "来源",
+                "添加时间": "添加时间",
+            }
+            profile: dict[str, str] = {"昵称": texts[0]}
+            for index, text in enumerate(texts[:-1]):
+                normalized_label = text.rstrip("：:").strip()
+                key = labels.get(normalized_label)
+                if key:
+                    profile[key] = texts[index + 1]
+            try:
+                popup.close()
+            except Exception:
+                pass
+            return profile
+        except Exception:
+            return {}
+
+    def list_group_members(self, group: str) -> dict[str, Any]:
+        normalized_group = str(group or "").strip()
+        if not normalized_group:
+            raise ValueError("群聊名称不能为空")
+        self._ensure_ready()
+        logger.info("group.members.start", group=normalized_group)
+        history_window = None
+        popover = None
+        try:
+            Desktop = __import__("pywinauto", fromlist=["Desktop"]).Desktop
+            desktop = Desktop(backend="uia")
+            for window in desktop.windows():
+                class_name = str(_safe_call(window.class_name) or "")
+                if class_name in {"mmui::XPopover", "mmui::SearchMsgUniqueChatWindow"}:
+                    self._try_close_window(window)
+            main_window = self._open_main_dialog_window(friend=normalized_group, select=False)
+            Uielements = self._pyweixin_submodule("Uielements")
+            history_button = main_window.child_window(**Uielements.Buttons.ChatHistoryButton)
+            history_button.click_input()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and history_window is None:
+                for window in desktop.windows():
+                    if str(_safe_call(window.class_name) or "") != "mmui::SearchMsgUniqueChatWindow":
+                        continue
+                    if normalized_group in str(_safe_call(window.window_text) or ""):
+                        history_window = window
+                        break
+                if history_window is None:
+                    time.sleep(0.1)
+            if history_window is None:
+                raise WeChatApiError("未找到群聊记录窗口")
+            history_window.maximize()
+            time.sleep(0.3)
+            group_tab = next(
+                (
+                    tab
+                    for tab in history_window.descendants(control_type="TabItem")
+                    if str(_safe_call(tab.window_text) or "").strip() == "群成员"
+                ),
+                None,
+            )
+            if group_tab is None:
+                raise WeChatApiError("聊天记录窗口没有群成员标签")
+            group_tab.click_input()
+            deadline = time.monotonic() + 3
+            member_list = None
+            while time.monotonic() < deadline and member_list is None:
+                for window in desktop.windows():
+                    if str(_safe_call(window.class_name) or "") != "mmui::XPopover":
+                        continue
+                    lists = [
+                        control
+                        for control in window.descendants(control_type="List")
+                        if str(_element_info_value(control, "automation_id") or "")
+                        == "chatroom_member_list"
+                    ]
+                    if lists:
+                        popover = window
+                        member_list = lists[0]
+                        break
+                if member_list is None:
+                    time.sleep(0.1)
+            if member_list is None:
+                raise WeChatApiError("未找到群成员列表")
+            title_match = re.search(r"\((\d+)\)\s*$", str(_safe_call(history_window.window_text) or ""))
+            total_member_count = int(title_match.group(1)) if title_match else 0
+            mouse = __import__("pywinauto", fromlist=["mouse"]).mouse
+            rectangle = member_list.rectangle()
+            coords = (rectangle.mid_point().x, rectangle.mid_point().y)
+            members: list[str] = []
+            previous_visible: tuple[str, ...] = ()
+            stagnant_pages = 0
+            max_pages = min(max(total_member_count + 30, 100), 600)
+            for _ in range(max_pages):
+                visible = tuple(
+                    name
+                    for item in member_list.children(control_type="ListItem")
+                    if (name := str(_safe_call(item.window_text) or "").strip())
+                )
+                if visible and visible != previous_visible:
+                    overlap = min(len(members), len(visible))
+                    while overlap and members[-overlap:] != list(visible[:overlap]):
+                        overlap -= 1
+                    members.extend(visible[overlap:])
+                    previous_visible = visible
+                    stagnant_pages = 0
+                else:
+                    stagnant_pages += 1
+                if total_member_count and len(members) >= total_member_count:
+                    break
+                if stagnant_pages >= 6:
+                    break
+                mouse.scroll(coords=coords, wheel_dist=-40)
+                time.sleep(0.1)
+        except Exception as exc:
+            raise WeChatApiError(f"读取群成员失败：{exc}") from exc
+        finally:
+            if popover is not None:
+                self._try_close_window(popover)
+            if history_window is not None:
+                self._try_close_window(history_window)
+        logger.info("group.members.done", group=normalized_group, member_count=len(members))
+        return {
+            "action": "list_group_members",
+            "group": normalized_group,
+            "members": members,
+            "member_count": len(members),
+            "total_member_count": total_member_count or len(members),
+            "complete": not total_member_count or len(members) >= total_member_count,
+        }
+
     def check_new_friends(
         self,
         verify: bool = False,
@@ -218,6 +423,48 @@ class UiaWeChatDriver:
             close_weixin=False,
         )
         return {"dry_run": False, "action": "send_message", "friend": friend}
+
+    def send_files(
+        self,
+        friend: str,
+        files: list[str],
+        text: str = "",
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        normalized_friend = str(friend or "").strip()
+        normalized_files = [str(Path(path).resolve()) for path in files if str(path).strip()]
+        if not normalized_friend:
+            raise ValueError("接收人不能为空")
+        if not normalized_files:
+            raise ValueError("至少需要一个待发送文件")
+        result = {
+            "dry_run": self._is_dry_run(dry_run),
+            "action": "send_files",
+            "friend": normalized_friend,
+            "file_count": len(normalized_files),
+            "filenames": [Path(path).name for path in normalized_files],
+        }
+        if result["dry_run"]:
+            return result
+        self._ensure_ready()
+        Files = self._pyweixin_class("Files")
+        logger.info("files.send.start", friend=normalized_friend, file_count=len(normalized_files))
+        try:
+            Files.send_files_to_friend(
+                friend=normalized_friend,
+                files=normalized_files,
+                with_messages=bool(text),
+                messages=[text] if text else [],
+                messages_first=True,
+                clear=True,
+                is_maximize=False,
+                close_weixin=False,
+            )
+        except Exception as exc:
+            raise WeChatApiError(f"发送文件失败：{exc}") from exc
+        logger.info("files.send.done", friend=normalized_friend, file_count=len(normalized_files))
+        result["text_sent"] = bool(text)
+        return result
 
     def open_chat(
         self,
@@ -586,6 +833,53 @@ class UiaWeChatDriver:
             "errors_by_chat": errors_by_chat,
         }
 
+    def get_unread_messages(self) -> dict[str, Any]:
+        """Return unread counts and session previews without opening any chat."""
+        self._ensure_ready()
+        utils = self._pyweixin_submodule("utils")
+        Navigator = self._pyweixin_class("Navigator")
+        try:
+            main_window = Navigator.open_weixin(is_maximize=False)
+            unread_counts = utils.scan_for_new_messages(
+                main_window=main_window,
+                is_maximize=False,
+                close_weixin=False,
+            )
+            sessions = self._collect_chat_sessions(main_window)
+        except Exception as exc:
+            raise WeChatApiError(f"读取未读消息失败：{exc}") from exc
+
+        session_by_name = {str(item.get("name")): item for item in sessions}
+        unread_sessions: list[dict[str, Any]] = []
+        total_unread = 0
+        for raw_name, raw_count in (unread_counts or {}).items():
+            name = str(raw_name).strip()
+            count = _safe_int(raw_count)
+            if not name or count <= 0:
+                continue
+            session = session_by_name.get(name, {})
+            unread_sessions.append(
+                {
+                    "name": name,
+                    "unread_count": count,
+                    "preview": session.get("preview"),
+                    "timestamp_text": session.get("timestamp_text"),
+                }
+            )
+            total_unread += count
+        logger.info(
+            "messages.unread.read",
+            session_count=len(unread_sessions),
+            total_unread=total_unread,
+        )
+        return {
+            "action": "get_unread_messages",
+            "unread_sessions": unread_sessions,
+            "unread_session_count": len(unread_sessions),
+            "total_unread": total_unread,
+            "marks_read": False,
+        }
+
     def read_chat_sessions(self, dry_run: bool | None = None) -> dict[str, Any]:
         if self._is_dry_run(dry_run):
             return {
@@ -611,6 +905,66 @@ class UiaWeChatDriver:
             "sessions": sessions,
             "selected_session": selected,
             "session_count": len(sessions),
+        }
+
+    def read_chat_history(self, friend: str, limit: int = 50) -> dict[str, Any]:
+        normalized_friend = str(friend or "").strip()
+        if not normalized_friend:
+            raise ValueError("会话名称不能为空")
+        safe_limit = min(max(int(limit), 1), 200)
+        self._ensure_ready()
+        logger.info("chat.history.start", friend=normalized_friend, limit=safe_limit)
+        dialog_window = None
+        try:
+            dialog_window, reused_window = self._open_or_reuse_separate_dialog_window(
+                friend=normalized_friend,
+                select=False,
+                window_minimize=False,
+            )
+            chat_list = self._resolve_chat_list(dialog_window)
+            if chat_list is None:
+                raise WeChatApiError("未找到聊天消息列表")
+            messages: list[dict[str, Any]] = []
+            seen: set[tuple[Any, ...]] = set()
+            max_pages = min(max((safe_limit + 7) // 8, 2), 30)
+            for _ in range(max_pages):
+                current = self._collect_visible_message_nodes(
+                    dialog_window,
+                    chat_name=normalized_friend,
+                    log_collection=False,
+                )
+                older = [item for item in current if _message_key(item) not in seen]
+                for item in current:
+                    seen.add(_message_key(item))
+                if older:
+                    messages = older + messages
+                elif messages:
+                    break
+                if len(messages) >= safe_limit:
+                    break
+                chat_list.click_input()
+                chat_list.type_keys("{PGUP}")
+                time.sleep(0.25)
+                if not current:
+                    break
+            try:
+                chat_list.type_keys("{END}")
+            except Exception:
+                pass
+        except Exception as exc:
+            raise WeChatApiError(f"读取聊天记录失败：{exc}") from exc
+        finally:
+            if dialog_window is not None:
+                self._try_close_window(dialog_window)
+        messages = messages[-safe_limit:]
+        logger.info("chat.history.done", friend=normalized_friend, message_count=len(messages))
+        return {
+            "action": "read_chat_history",
+            "friend": normalized_friend,
+            "messages": messages,
+            "message_count": len(messages),
+            "limit": safe_limit,
+            "window_reused": reused_window,
         }
 
     def scan_messages(
@@ -1664,6 +2018,12 @@ class WeChatApi(UiaWeChatDriver):
     def search_contacts(self, query: str, limit: int = 10) -> dict[str, Any]:
         return self._run_driver("search_contacts", query=query, limit=limit)
 
+    def get_contact_profile(self, friend: str) -> dict[str, Any]:
+        return self._run_driver("get_contact_profile", friend=friend)
+
+    def list_group_members(self, group: str) -> dict[str, Any]:
+        return self._run_driver("list_group_members", group=group)
+
     def check_new_friends(
         self,
         verify: bool = False,
@@ -1684,6 +2044,21 @@ class WeChatApi(UiaWeChatDriver):
         dry_run: bool | None = None,
     ) -> dict[str, Any]:
         return self._run_driver("send_message", friend=friend, text=text, dry_run=dry_run)
+
+    def send_files(
+        self,
+        friend: str,
+        files: list[str],
+        text: str = "",
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        return self._run_driver(
+            "send_files",
+            friend=friend,
+            files=files,
+            text=text,
+            dry_run=dry_run,
+        )
 
     def open_chat(
         self,
@@ -1721,8 +2096,14 @@ class WeChatApi(UiaWeChatDriver):
     def check_unread_messages(self, dry_run: bool | None = None) -> dict[str, Any]:
         return self._run_driver("check_unread_messages", dry_run=dry_run)
 
+    def get_unread_messages(self) -> dict[str, Any]:
+        return self._run_driver("get_unread_messages")
+
     def read_chat_sessions(self, dry_run: bool | None = None) -> dict[str, Any]:
         return self._run_driver("read_chat_sessions", dry_run=dry_run)
+
+    def read_chat_history(self, friend: str, limit: int = 50) -> dict[str, Any]:
+        return self._run_driver("read_chat_history", friend=friend, limit=limit)
 
     def scan_messages(
         self,

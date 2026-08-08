@@ -18,12 +18,17 @@ class TaskStatus(str, Enum):
 
 class TaskType(str, Enum):
     SEARCH_CONTACTS = "search_contacts"
+    GET_CONTACT_PROFILE = "get_contact_profile"
+    LIST_GROUP_MEMBERS = "list_group_members"
     ADD_FRIEND = "add_friend"
     CHECK_NEW_FRIENDS = "check_new_friends"
     ACCEPT_NEW_FRIENDS = "accept_new_friends"
     SEND_MESSAGE = "send_message"
+    SEND_FILES = "send_files"
     SCAN_MESSAGES = "scan_messages"
+    GET_UNREAD_MESSAGES = "get_unread_messages"
     READ_CHAT_SESSIONS = "read_chat_sessions"
+    READ_CHAT_HISTORY = "read_chat_history"
     READ_VISIBLE_MESSAGES = "read_visible_messages"
     WATCH_CHATS = "watch_chats"
     POST_MOMENTS = "post_moments"

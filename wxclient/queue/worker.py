@@ -87,6 +87,10 @@ class OperationWorker:
                 query=str(payload["query"]),
                 limit=int(payload.get("limit", 10)),
             )
+        if task.type == TaskType.GET_CONTACT_PROFILE:
+            return self.api.get_contact_profile(friend=str(payload["friend"]))
+        if task.type == TaskType.LIST_GROUP_MEMBERS:
+            return self.api.list_group_members(group=str(payload["group"]))
         if task.type == TaskType.ADD_FRIEND:
             return self.api.add_friend(
                 number=str(payload["number"]),
@@ -106,12 +110,26 @@ class OperationWorker:
                 text=str(payload["text"]),
                 dry_run=payload.get("dry_run"),
             )
+        if task.type == TaskType.SEND_FILES:
+            return self.api.send_files(
+                friend=str(payload["friend"]),
+                files=[str(path) for path in payload.get("files") or []],
+                text=str(payload.get("text") or ""),
+                dry_run=payload.get("dry_run"),
+            )
         if task.type == TaskType.SCAN_MESSAGES:
             return self._scan_messages(payload)
+        if task.type == TaskType.GET_UNREAD_MESSAGES:
+            return self.api.get_unread_messages()
         if task.type == TaskType.WATCH_CHATS:
             return self._watch_chats(payload)
         if task.type == TaskType.READ_CHAT_SESSIONS:
             return self.api.read_chat_sessions(dry_run=payload.get("dry_run"))
+        if task.type == TaskType.READ_CHAT_HISTORY:
+            return self.api.read_chat_history(
+                friend=str(payload["friend"]),
+                limit=int(payload.get("limit", 50)),
+            )
         if task.type == TaskType.READ_VISIBLE_MESSAGES:
             return self.api.read_visible_messages(
                 friend=str(payload["friend"]),

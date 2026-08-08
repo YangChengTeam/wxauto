@@ -120,6 +120,11 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                 names = {tool.name for tool in tools.tools}
                 self.assertIn("wx_add_friend", names)
                 self.assertIn("wx_search_contacts", names)
+                self.assertIn("wx_get_unread_messages", names)
+                self.assertIn("wx_send_files", names)
+                self.assertIn("wx_read_chat_history", names)
+                self.assertIn("wx_get_contact_profile", names)
+                self.assertIn("wx_list_group_members", names)
                 self.assertIn("wx_listen_messages", names)
                 self.assertIn("wx_post_moments", names)
                 watch_tool = next(tool for tool in tools.tools if tool.name == "wx_watch_chats")
@@ -131,9 +136,15 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                     tool for tool in tools.tools if tool.name == "wx_search_contacts"
                 )
                 send_tool = next(tool for tool in tools.tools if tool.name == "wx_send_message")
+                unread_tool = next(
+                    tool for tool in tools.tools if tool.name == "wx_get_unread_messages"
+                )
+                files_tool = next(tool for tool in tools.tools if tool.name == "wx_send_files")
                 self.assertTrue(probe_tool.annotations.readOnlyHint)
                 self.assertTrue(search_tool.annotations.readOnlyHint)
+                self.assertTrue(unread_tool.annotations.readOnlyHint)
                 self.assertFalse(send_tool.annotations.readOnlyHint)
+                self.assertFalse(files_tool.annotations.readOnlyHint)
 
                 searched = await client.call_tool(
                     "wx_search_contacts",
@@ -177,6 +188,62 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(task_type, TaskType.POST_MOMENTS)
             self.assertEqual(len(payload["medias"]), 1)
             self.assertTrue(Path(payload["medias"][0]).is_absolute())
+
+    async def test_uploaded_document_can_be_sent_by_media_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _FakeMcpRuntime(Path(tmp))
+            mcp = create_mcp_server(
+                settings=McpServerSettings(),
+                runtime=runtime,  # type: ignore[arg-type]
+            )
+            async with create_connected_server_and_client_session(mcp) as client:
+                uploaded = await client.call_tool(
+                    "wx_upload_media",
+                    {
+                        "filename": "automation-test.txt",
+                        "content_base64": base64.b64encode(b"mcp file test").decode("ascii"),
+                    },
+                )
+                sent = await client.call_tool(
+                    "wx_send_files",
+                    {
+                        "friend": "文件传输助手",
+                        "media_ids": [uploaded.structuredContent["media_id"]],
+                        "dry_run": True,
+                    },
+                )
+
+            self.assertFalse(sent.isError)
+            task_type, payload = runtime.calls[-1]
+            self.assertEqual(task_type, TaskType.SEND_FILES)
+            self.assertEqual(Path(payload["files"][0]).suffix, ".txt")
+            self.assertTrue(Path(payload["files"][0]).is_absolute())
+
+    async def test_document_upload_is_rejected_for_moments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _FakeMcpRuntime(Path(tmp))
+            mcp = create_mcp_server(
+                settings=McpServerSettings(),
+                runtime=runtime,  # type: ignore[arg-type]
+            )
+            async with create_connected_server_and_client_session(mcp) as client:
+                uploaded = await client.call_tool(
+                    "wx_upload_media",
+                    {
+                        "filename": "not-a-moment.txt",
+                        "content_base64": base64.b64encode(b"text").decode("ascii"),
+                    },
+                )
+                posted = await client.call_tool(
+                    "wx_post_moments",
+                    {
+                        "text": "test",
+                        "media_ids": [uploaded.structuredContent["media_id"]],
+                        "dry_run": True,
+                    },
+                )
+
+            self.assertTrue(posted.isError)
 
 
 @unittest.skipUnless(MCP_AVAILABLE, "MCP optional dependency is not installed")

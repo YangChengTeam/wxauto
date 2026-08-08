@@ -21,6 +21,33 @@ class _FakeApi:
             "limit": limit,
         }
 
+    def get_contact_profile(self, friend: str) -> dict[str, Any]:
+        return {"action": "get_contact_profile", "friend": friend, "profile": {"昵称": friend}}
+
+    def list_group_members(self, group: str) -> dict[str, Any]:
+        return {"action": "list_group_members", "group": group, "members": ["甲", "乙"]}
+
+    def send_files(
+        self,
+        friend: str,
+        files: list[str],
+        text: str,
+        dry_run: bool | None,
+    ) -> dict[str, Any]:
+        return {
+            "action": "send_files",
+            "friend": friend,
+            "files": files,
+            "text": text,
+            "dry_run": bool(dry_run),
+        }
+
+    def get_unread_messages(self) -> dict[str, Any]:
+        return {"action": "get_unread_messages", "total_unread": 2}
+
+    def read_chat_history(self, friend: str, limit: int) -> dict[str, Any]:
+        return {"action": "read_chat_history", "friend": friend, "limit": limit}
+
     def scan_messages(
         self,
         friend: str,
@@ -110,6 +137,29 @@ class WorkerDispatchTests(unittest.TestCase):
         self.assertEqual(result["chat_count"], 2)
         self.assertEqual(result["message_count"], 2)
         self.assertNotIn("reply_count", result)
+
+    def test_new_core_capabilities_are_dispatched_through_worker(self) -> None:
+        api = _FakeApi()
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = OperationWorker(TaskStore(Path(tmp) / "tasks.db"), api)  # type: ignore[arg-type]
+            profile = worker.dispatch(Task.new(TaskType.GET_CONTACT_PROFILE, {"friend": "大月"}))
+            members = worker.dispatch(Task.new(TaskType.LIST_GROUP_MEMBERS, {"group": "测试群"}))
+            unread = worker.dispatch(Task.new(TaskType.GET_UNREAD_MESSAGES, {}))
+            history = worker.dispatch(
+                Task.new(TaskType.READ_CHAT_HISTORY, {"friend": "大月", "limit": 20})
+            )
+            files = worker.dispatch(
+                Task.new(
+                    TaskType.SEND_FILES,
+                    {"friend": "文件传输助手", "files": ["a.txt"], "dry_run": True},
+                )
+            )
+
+        self.assertEqual(profile["profile"]["昵称"], "大月")
+        self.assertEqual(members["members"], ["甲", "乙"])
+        self.assertEqual(unread["total_unread"], 2)
+        self.assertEqual(history["limit"], 20)
+        self.assertTrue(files["dry_run"])
 
 
 if __name__ == "__main__":

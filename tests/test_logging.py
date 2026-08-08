@@ -60,6 +60,14 @@ class ChineseLogRendererTests(unittest.TestCase):
         self.assertIn("搜索联系人", task_output)
         self.assertIn("联系人搜索完成：匹配 1 条，精确匹配 1 条", search_output)
 
+    def test_renders_new_capability_logs_in_chinese(self) -> None:
+        unread = self.render("messages.unread.read", session_count=2, total_unread=3)
+        files = self.render("files.send.done", friend="文件传输助手", file_count=1)
+        history = self.render("task.succeeded", task_type="read_chat_history", task_id="abcd1234")
+        self.assertIn("未读消息汇总完成：2 个会话，共 3 条", unread)
+        self.assertIn("文件发送完成", files)
+        self.assertIn("读取聊天记录", history)
+
 
 if __name__ == "__main__":
     unittest.main()

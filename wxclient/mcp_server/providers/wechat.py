@@ -37,7 +37,7 @@ class WeChatToolProvider:
 
         @mcp.tool(name="wx_upload_media", annotations=WRITE_TOOL, structured_output=True)
         async def wx_upload_media(filename: str, content_base64: str) -> dict[str, Any]:
-            """Upload an image/video to Windows and return a media_id for Moments."""
+            """Upload a supported media/document file and return a media_id."""
             return await asyncio.to_thread(
                 runtime.media_store.save_base64,
                 filename,
@@ -57,6 +57,36 @@ class WeChatToolProvider:
             return await runtime.submit(
                 TaskType.SEARCH_CONTACTS,
                 {"query": normalized_query, "limit": min(max(int(limit), 1), 50)},
+                wait=wait,
+            )
+
+        @mcp.tool(name="wx_get_contact_profile", annotations=READ_ONLY_TOOL, structured_output=True)
+        async def wx_get_contact_profile(
+            friend: str,
+            wait: bool = True,
+        ) -> dict[str, Any]:
+            """Get the profile of an existing WeChat contact without sending anything."""
+            normalized_friend = friend.strip()
+            if not normalized_friend:
+                raise ValueError("Contact name cannot be empty")
+            return await runtime.submit(
+                TaskType.GET_CONTACT_PROFILE,
+                {"friend": normalized_friend},
+                wait=wait,
+            )
+
+        @mcp.tool(name="wx_list_group_members", annotations=READ_ONLY_TOOL, structured_output=True)
+        async def wx_list_group_members(
+            group: str,
+            wait: bool = True,
+        ) -> dict[str, Any]:
+            """List member names in an existing WeChat group."""
+            normalized_group = group.strip()
+            if not normalized_group:
+                raise ValueError("Group name cannot be empty")
+            return await runtime.submit(
+                TaskType.LIST_GROUP_MEMBERS,
+                {"group": normalized_group},
                 wait=wait,
             )
 
@@ -111,6 +141,33 @@ class WeChatToolProvider:
             return await runtime.submit(
                 TaskType.SEND_MESSAGE,
                 {"friend": friend, "text": text, "dry_run": dry_run},
+                wait=wait,
+                confirmation=confirmation,
+            )
+
+        @mcp.tool(name="wx_send_files", annotations=WRITE_TOOL, structured_output=True)
+        async def wx_send_files(
+            friend: str,
+            media_ids: list[str],
+            text: str = "",
+            dry_run: bool = True,
+            confirmation: str = "",
+            wait: bool = True,
+        ) -> dict[str, Any]:
+            """Send uploaded files to a friend or group through the serialized queue."""
+            if not friend.strip():
+                raise ValueError("Recipient cannot be empty")
+            if not media_ids:
+                raise ValueError("At least one media_id is required")
+            files = await asyncio.to_thread(runtime.media_store.resolve_many, media_ids)
+            return await runtime.submit(
+                TaskType.SEND_FILES,
+                {
+                    "friend": friend.strip(),
+                    "files": files,
+                    "text": text,
+                    "dry_run": dry_run,
+                },
                 wait=wait,
                 confirmation=confirmation,
             )
@@ -176,6 +233,27 @@ class WeChatToolProvider:
                 confirmation=confirmation,
             )
 
+        @mcp.tool(name="wx_get_unread_messages", annotations=READ_ONLY_TOOL, structured_output=True)
+        async def wx_get_unread_messages(wait: bool = True) -> dict[str, Any]:
+            """Summarize unread sessions without opening chats or marking them read."""
+            return await runtime.submit(TaskType.GET_UNREAD_MESSAGES, {}, wait=wait)
+
+        @mcp.tool(name="wx_read_chat_history", annotations=READ_ONLY_TOOL, structured_output=True)
+        async def wx_read_chat_history(
+            friend: str,
+            limit: int = 50,
+            wait: bool = True,
+        ) -> dict[str, Any]:
+            """Read recent chat history for one friend or group."""
+            normalized_friend = friend.strip()
+            if not normalized_friend:
+                raise ValueError("Chat name cannot be empty")
+            return await runtime.submit(
+                TaskType.READ_CHAT_HISTORY,
+                {"friend": normalized_friend, "limit": min(max(int(limit), 1), 200)},
+                wait=wait,
+            )
+
         @mcp.tool(name="wx_read_visible_messages", annotations=READ_ONLY_TOOL, structured_output=True)
         async def wx_read_visible_messages(
             friend: str,
@@ -203,7 +281,7 @@ class WeChatToolProvider:
             ids = media_ids or []
             if not text.strip() and not ids:
                 raise ValueError("Moments text or at least one media_id is required")
-            medias = await asyncio.to_thread(runtime.media_store.resolve_many, ids)
+            medias = await asyncio.to_thread(runtime.media_store.resolve_many_for_moments, ids)
             return await runtime.submit(
                 TaskType.POST_MOMENTS,
                 {"text": text, "medias": medias, "dry_run": dry_run},

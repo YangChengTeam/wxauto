@@ -6,14 +6,20 @@
 ## 能力
 
 - `wx_probe_uia`：只读探测微信登录与 UIA 状态。
-- `wx_upload_media`：以 Base64 上传图片/视频，返回 `media_id`。
+- `wx_upload_media`：以 Base64 上传受支持的媒体或文档，返回 `media_id`。
 - `wx_search_contacts`：按名称搜索现有联系人、群聊、服务号和公众号，不发送消息。
+- `wx_get_contact_profile`：读取联系人资料。
+- `wx_list_group_members`：读取群成员名称；同时返回群人数、已读取人数和 `complete`，避免把
+  微信未暴露完整列表时的部分结果误判为完整结果。
 - `wx_add_friend`：发送好友申请。
 - `wx_check_new_friends`：检查好友申请，可选择同意。
 - `wx_send_message`：发送文字消息。
+- `wx_send_files`：把已上传文件发送给好友或群聊，可附带文字。
 - `wx_listen_messages`：监听一个会话，不自动回复。
 - `wx_watch_chats`：依次监听多个会话，不生成或发送回复。
 - `wx_list_chat_sessions`：列出主窗口当前会话列表中的准确名称。
+- `wx_get_unread_messages`：汇总未读会话、数量和预览，不打开会话、不标记已读。
+- `wx_read_chat_history`：读取指定好友或群聊的最近聊天记录。
 - `wx_read_visible_messages`：读取当前可见聊天记录。
 - `wx_post_moments`：用 `media_id` 发布朋友圈。
 - `wx_read_recent_moments`：读取当天最近朋友圈，用于发布后验证。
@@ -103,11 +109,15 @@ TLS 反向代理，并限制来源 IP。
 2. 工具参数设置 `dry_run=false`；
 3. 工具参数设置 `confirmation="EXECUTE_REAL_ACTION"`。
 
-`wx_probe_uia`、`wx_search_contacts`、`wx_get_task` 和 `wx_list_tasks` 是只读工具，
-不要求真实动作确认；其中联系人搜索仍通过串行 worker 执行，避免与其他微信动作冲突。
+`wx_probe_uia`、`wx_search_contacts`、`wx_get_contact_profile`、`wx_list_group_members`、
+`wx_get_unread_messages`、`wx_read_chat_history`、`wx_get_task` 和 `wx_list_tasks` 是只读工具，
+不要求真实动作确认；除 UIA 探测和任务查询外，微信读取操作仍通过串行 worker 执行，
+避免与其他微信动作冲突。
 
-朋友圈的远程调用先执行 `wx_upload_media`，再把返回的 `media_id` 传给
-`wx_post_moments`。服务只解析自己的上传目录，不接受调用方指定任意 Windows 文件路径。
+朋友圈或文件发送的远程调用先执行 `wx_upload_media`，再把返回的 `media_id` 传给
+`wx_post_moments` 或 `wx_send_files`。服务只解析自己的上传目录，不接受调用方指定任意
+Windows 文件路径。可上传图片、视频，以及 PDF、Office 文档、文本、CSV、JSON、ZIP、7z；
+不接受可执行文件和脚本。
 
 ## 扩展工具组
 
