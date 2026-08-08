@@ -52,15 +52,6 @@ class TaskStore:
             Column("result", Text),
             Index("idx_tasks_pick", "status", "available_at", "created_at"),
         )
-        self.message_cursors = Table(
-            "message_cursors",
-            self.metadata,
-            Column("account_id", String, primary_key=True),
-            Column("chat_name", String, primary_key=True),
-            Column("source", String, primary_key=True),
-            Column("cursor", Text, nullable=False),
-            Column("updated_at", String, nullable=False),
-        )
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -186,88 +177,6 @@ class TaskStore:
                 select(self.tasks).where(self.tasks.c.id == task_id)
             ).mappings().fetchone()
         return self._from_row(row) if row else None
-
-    def get_message_cursor(
-        self,
-        account_id: str,
-        chat_name: str,
-        source: str = "visible",
-    ) -> dict[str, Any] | None:
-        with self.engine.connect() as conn:
-            row = conn.execute(
-                select(self.message_cursors.c.cursor).where(
-                    and_(
-                        self.message_cursors.c.account_id == account_id,
-                        self.message_cursors.c.chat_name == chat_name,
-                        self.message_cursors.c.source == source,
-                    )
-                )
-            ).mappings().fetchone()
-        if not row:
-            return None
-        return json.loads(row["cursor"])
-
-    def set_message_cursor(
-        self,
-        account_id: str,
-        chat_name: str,
-        cursor: dict[str, Any],
-        source: str = "visible",
-    ) -> None:
-        now = utcnow()
-        payload = json.dumps(cursor, ensure_ascii=False)
-        with self.engine.begin() as conn:
-            existing = conn.execute(
-                select(self.message_cursors.c.account_id).where(
-                    and_(
-                        self.message_cursors.c.account_id == account_id,
-                        self.message_cursors.c.chat_name == chat_name,
-                        self.message_cursors.c.source == source,
-                    )
-                )
-            ).fetchone()
-            if existing:
-                conn.execute(
-                    update(self.message_cursors)
-                    .where(
-                        and_(
-                            self.message_cursors.c.account_id == account_id,
-                            self.message_cursors.c.chat_name == chat_name,
-                            self.message_cursors.c.source == source,
-                        )
-                    )
-                    .values(cursor=payload, updated_at=now)
-                )
-                return
-            conn.execute(
-                insert(self.message_cursors).values(
-                    account_id=account_id,
-                    chat_name=chat_name,
-                    source=source,
-                    cursor=payload,
-                    updated_at=now,
-                )
-            )
-
-    def list_message_cursor_chats(
-        self,
-        account_id: str,
-        source: str = "visible",
-        limit: int = 20,
-    ) -> list[str]:
-        with self.engine.connect() as conn:
-            rows = conn.execute(
-                select(self.message_cursors.c.chat_name)
-                .where(
-                    and_(
-                        self.message_cursors.c.account_id == account_id,
-                        self.message_cursors.c.source == source,
-                    )
-                )
-                .order_by(self.message_cursors.c.updated_at.desc())
-                .limit(limit)
-            ).mappings().fetchall()
-        return [str(row["chat_name"]) for row in rows]
 
     def _set_terminal(
         self,

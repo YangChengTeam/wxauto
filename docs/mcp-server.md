@@ -1,8 +1,8 @@
 # Windows 微信 MCP 服务
 
-`wxclient.mcp_server` 是独立于 GUI 的 MCP 服务模块。它把微信动作放入现有 SQLite
-任务队列，由一个 worker 串行执行，因此 MCP、GUI 和定时器不会在同一服务进程内直接
-并发操作微信窗口。
+`wxclient.mcp_server` 是本项目唯一的产品入口。它把微信动作放入 SQLite 任务队列，
+由一个 worker 串行执行。对话理解和回复生成由远程 Agent 完成，Windows 服务不内嵌
+大模型，也不自动回复消息。
 
 ## 能力
 
@@ -12,7 +12,7 @@
 - `wx_check_new_friends`：检查好友申请，可选择同意。
 - `wx_send_message`：发送文字消息。
 - `wx_listen_messages`：监听一个会话，不自动回复。
-- `wx_watch_chats`：监听多个会话，默认不自动回复。
+- `wx_watch_chats`：依次监听多个会话，不生成或发送回复。
 - `wx_list_chat_sessions`：列出主窗口当前会话列表中的准确名称。
 - `wx_read_visible_messages`：读取当前可见聊天记录。
 - `wx_post_moments`：用 `media_id` 发布朋友圈。
@@ -24,10 +24,10 @@
 
 ## 本机安装与启动
 
-MCP Python SDK 需要 Python 3.10+。GUI 的基础安装仍可使用项目原来的 Python 版本范围。
+需要 Python 3.10+。
 
 ```powershell
-python -m pip install -e ".[mcp]"
+python -m pip install -e .
 python -m wxclient.mcp_server `
   --config .wxclient\settings.json `
   --allow-real-actions

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import tempfile
 import unittest
@@ -122,6 +121,10 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("wx_add_friend", names)
                 self.assertIn("wx_listen_messages", names)
                 self.assertIn("wx_post_moments", names)
+                watch_tool = next(tool for tool in tools.tools if tool.name == "wx_watch_chats")
+                watch_properties = watch_tool.inputSchema["properties"]
+                self.assertNotIn("auto_reply", watch_properties)
+                self.assertNotIn("reply_all", watch_properties)
 
                 result = await client.call_tool(
                     "wx_send_message",

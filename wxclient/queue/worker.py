@@ -1,18 +1,10 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
 from typing import Any
 
 import structlog
 
-from wxclient.agentbridge.reply_flow import (
-    reply_to_chat_messages,
-    reply_to_unread_messages,
-    watch_chats_messages,
-)
-from wxclient.agents import ChatAgent, build_chat_agent
-from wxclient.config import Settings
 from wxclient.wechat_api import WeChatApi, WeChatApiError
 
 from .models import Task, TaskType
@@ -21,35 +13,21 @@ from .store import TaskStore
 logger = structlog.get_logger(__name__)
 
 
-class _LazyChatAgent:
-    def __init__(self, factory: Callable[[], ChatAgent]) -> None:
-        self._factory = factory
-        self._agent: ChatAgent | None = None
-
-    def reply(self, message: str, context: list[str] | None = None) -> str:
-        if self._agent is None:
-            self._agent = self._factory()
-        return self._agent.reply(message, context=context)
-
-
 class OperationWorker:
+    """The single consumer allowed to operate the WeChat UI."""
+
     def __init__(
         self,
         store: TaskStore,
         api: WeChatApi,
-        settings: Settings | None = None,
-        agent: ChatAgent | None = None,
         poll_interval: float = 1.0,
     ) -> None:
         self.store = store
         self.api = api
-        self.settings = settings or Settings()
-        self._agent = agent
         self.poll_interval = poll_interval
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._busy = False
-        self._visible_watch_chats: list[str] = []
 
     @property
     def busy(self) -> bool:
@@ -60,11 +38,10 @@ class OperationWorker:
         return bool(self._thread and self._thread.is_alive())
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self.running:
             return
         self._stop.clear()
-        self._thread = threading.Thread(target=self.run_forever, name="wx-operation-worker")
-        self._thread.daemon = True
+        self._thread = threading.Thread(target=self.run_forever, name="wx-mcp-worker", daemon=True)
         self._thread.start()
 
     def stop(self, wait: bool = True, timeout: float | None = 5.0) -> None:
@@ -75,8 +52,7 @@ class OperationWorker:
     def run_forever(self) -> None:
         logger.info("worker.started", poll_interval=self.poll_interval)
         while not self._stop.is_set():
-            did_work = self.run_once()
-            if not did_work:
+            if not self.run_once():
                 self._stop.wait(self.poll_interval)
         logger.info("worker.stopped")
 
@@ -87,12 +63,7 @@ class OperationWorker:
         if task is None:
             return False
         self._busy = True
-        task_logger = logger.bind(
-            task_id=task.id,
-            task_type=task.type.value,
-            account_id=task.account_id,
-            attempts=task.attempts,
-        )
+        task_logger = logger.bind(task_id=task.id, task_type=task.type.value)
         task_logger.info("task.running")
         try:
             result = self.dispatch(task)
@@ -103,10 +74,8 @@ class OperationWorker:
             self.store.fail(task.id, str(exc), retry=True)
             task_logger.exception("task.failed", error=str(exc))
         else:
-            if task.type == TaskType.REPLY_UNREAD:
-                self._remember_visible_watch_chats(result)
             self.store.complete(task.id, result)
-            task_logger.info("task.succeeded", result=self._summarize_result(task.type, result))
+            task_logger.info("task.succeeded", action=result.get("action"))
         finally:
             self._busy = False
         return True
@@ -120,15 +89,9 @@ class OperationWorker:
                 remark=payload.get("remark"),
                 dry_run=payload.get("dry_run"),
             )
-        if task.type == TaskType.CHECK_NEW_FRIENDS:
+        if task.type in {TaskType.CHECK_NEW_FRIENDS, TaskType.ACCEPT_NEW_FRIENDS}:
             return self.api.check_new_friends(
-                verify=bool(payload.get("verify", False)),
-                limit=int(payload.get("limit", 8)),
-                dry_run=payload.get("dry_run"),
-            )
-        if task.type == TaskType.ACCEPT_NEW_FRIENDS:
-            return self.api.check_new_friends(
-                verify=True,
+                verify=task.type == TaskType.ACCEPT_NEW_FRIENDS,
                 limit=int(payload.get("limit", 8)),
                 dry_run=payload.get("dry_run"),
             )
@@ -139,60 +102,15 @@ class OperationWorker:
                 dry_run=payload.get("dry_run"),
             )
         if task.type == TaskType.SCAN_MESSAGES:
-            return self.api.scan_messages(
-                friend=str(payload["friend"]),
-                duration=str(payload.get("duration") or "30s"),
-                select_sender=bool(payload.get("select_sender", False)),
-                save_file=bool(payload.get("save_file", False)),
-                save_media=bool(payload.get("save_media", False)),
-                dry_run=payload.get("dry_run"),
-            )
+            return self._scan_messages(payload)
+        if task.type == TaskType.WATCH_CHATS:
+            return self._watch_chats(payload)
         if task.type == TaskType.READ_CHAT_SESSIONS:
             return self.api.read_chat_sessions(dry_run=payload.get("dry_run"))
         if task.type == TaskType.READ_VISIBLE_MESSAGES:
             return self.api.read_visible_messages(
                 friend=str(payload["friend"]),
                 dry_run=payload.get("dry_run"),
-            )
-        if task.type == TaskType.CHECK_UNREAD_MESSAGES:
-            return self.api.check_unread_messages(dry_run=payload.get("dry_run"))
-        if task.type == TaskType.REPLY_CHAT:
-            return reply_to_chat_messages(
-                api=self.api,
-                agent=self._chat_agent(),
-                friend=str(payload["friend"]),
-                duration=str(payload.get("duration") or "30s"),
-                real=not bool(payload.get("dry_run", True)),
-                reply_all=bool(payload.get("reply_all", False)),
-                select_sender=bool(payload.get("select_sender", False)),
-                source=str(payload.get("source") or "new"),
-                context_message_limit=self.settings.agent_context_message_count,
-            )
-        if task.type == TaskType.REPLY_UNREAD:
-            friend = payload.get("friend")
-            return reply_to_unread_messages(
-                api=self.api,
-                agent=self._chat_agent(),
-                real=not bool(payload.get("dry_run", True)),
-                reply_all=bool(payload.get("reply_all", False)),
-                friend=str(friend) if friend else None,
-                cursor_store=self.store,
-                account_id=task.account_id,
-                context_message_limit=self.settings.agent_context_message_count,
-            )
-        if task.type == TaskType.WATCH_CHATS:
-            return watch_chats_messages(
-                api=self.api,
-                agent=_LazyChatAgent(self._chat_agent),
-                friends=_payload_friends(payload),
-                duration=str(payload.get("duration") or ""),
-                real=not bool(payload.get("dry_run", True)),
-                auto_reply=bool(payload.get("auto_reply", True)),
-                reply_all=bool(payload.get("reply_all", False)),
-                select_sender=bool(payload.get("select_sender", False)),
-                context_message_limit=self.settings.agent_context_message_count,
-                cursor_store=self.store,
-                account_id=task.account_id,
             )
         if task.type == TaskType.POST_MOMENTS:
             return self.api.post_moments(
@@ -207,94 +125,56 @@ class OperationWorker:
             )
         raise ValueError(f"Unsupported task type: {task.type}")
 
-    def _chat_agent(self) -> ChatAgent:
-        if self._agent is None:
-            self._agent = build_chat_agent(self.settings)
-        return self._agent
-
-    def _visible_watch_targets(self, account_id: str, friend: str | None) -> list[str]:
-        targets = list(self._visible_watch_chats)
-        try:
-            targets.extend(self.store.list_message_cursor_chats(account_id))
-        except Exception:
-            pass
-        if friend:
-            targets.insert(0, friend)
-        return _dedupe(targets)
-
-    def _remember_visible_watch_chats(self, result: dict[str, Any]) -> None:
-        chats = result.get("processed_chats")
-        if not isinstance(chats, list):
-            return
-        combined = [str(chat) for chat in chats if str(chat or "").strip()]
-        combined.extend(self._visible_watch_chats)
-        self._visible_watch_chats = _dedupe(combined)[:20]
-
-    @staticmethod
-    def _summarize_result(task_type: TaskType, result: dict[str, Any]) -> dict[str, Any]:
-        summary: dict[str, Any] = {"action": result.get("action")}
-        for key in (
-            "dry_run",
-            "reply_count",
-            "chat_count",
-            "message_count",
-            "new_message_count",
-            "visible_message_count",
-            "cursor_seed_count",
-            "error_count",
-        ):
-            if key in result:
-                summary[key] = result.get(key)
-        if task_type == TaskType.REPLY_CHAT:
-            summary["message_source"] = result.get("message_source")
-        if task_type == TaskType.REPLY_UNREAD:
-            summary["friend_filter"] = result.get("friend_filter")
-            summary["visible_chat_count"] = result.get("visible_chat_count")
-            summary["current_chat"] = result.get("current_chat")
-            summary["current_chat_replied"] = result.get("current_chat_replied")
-            summary["current_chat_latest_is_today"] = result.get("current_chat_latest_is_today")
-        if task_type == TaskType.WATCH_CHATS:
-            summary["chat_summaries"] = _watch_chat_summaries(result)
-        return summary
-
-
-def _watch_chat_summaries(result: dict[str, Any]) -> list[dict[str, Any]]:
-    rows = result.get("results")
-    if not isinstance(rows, list):
-        return []
-    summaries: list[dict[str, Any]] = []
-    for row in rows[:6]:
-        if not isinstance(row, dict):
-            continue
-        summaries.append(
-            {
-                "chat": row.get("friend"),
-                "visible_message_count": row.get("visible_message_count", 0),
-                "reply_count": row.get("reply_count", 0),
-                "latest_message": row.get("latest_message"),
-                "decision_reason": row.get("decision_reason"),
-            }
+    def _scan_messages(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self.api.scan_messages(
+            friend=str(payload["friend"]),
+            duration=str(payload.get("duration") or "30s"),
+            select_sender=bool(payload.get("select_sender", False)),
+            save_file=bool(payload.get("save_file", False)),
+            save_media=bool(payload.get("save_media", False)),
+            dry_run=payload.get("dry_run"),
         )
-    return summaries
 
-
-def _dedupe(values: list[str]) -> list[str]:
-    rows: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        text = str(value or "").strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        rows.append(text)
-    return rows
+    def _watch_chats(self, payload: dict[str, Any]) -> dict[str, Any]:
+        friends = _payload_friends(payload)
+        if not friends:
+            raise ValueError("friends must contain at least one chat name")
+        results: list[dict[str, Any]] = []
+        error_count = 0
+        message_count = 0
+        for friend in friends:
+            scan_payload = dict(payload, friend=friend)
+            try:
+                result = self._scan_messages(scan_payload)
+            except Exception as exc:
+                error_count += 1
+                results.append({"friend": friend, "error": str(exc)})
+                continue
+            result.setdefault("friend", friend)
+            messages = result.get("messages")
+            count = result.get("message_count")
+            if count is None and isinstance(messages, list):
+                count = len(messages)
+            message_count += int(count or 0)
+            results.append(result)
+        return {
+            "action": "watch_chats",
+            "dry_run": bool(payload.get("dry_run", True)),
+            "chat_count": len(friends),
+            "message_count": message_count,
+            "error_count": error_count,
+            "results": results,
+        }
 
 
 def _payload_friends(payload: dict[str, Any]) -> list[str]:
-    value = payload.get("friends")
-    if isinstance(value, list):
-        return [str(item) for item in value]
-    single = payload.get("friend")
-    if single:
-        return [str(single)]
-    return []
+    raw = payload.get("friends")
+    values = raw if isinstance(raw, list) else [payload.get("friend")]
+    friends: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        friend = str(value or "").strip()
+        if friend and friend not in seen:
+            seen.add(friend)
+            friends.append(friend)
+    return friends

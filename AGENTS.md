@@ -1,127 +1,66 @@
 # AGENTS.md
 
-本仓库目标是做一个 Windows 微信自动化客户端，基于 `third_party/pywechat/pyweixin`
-和只读 UIA 探测，优先实现加好友、自动同意好友申请、聊天与大模型回复。
+本仓库只维护一个 Windows 微信 MCP 服务。Windows 端负责微信 UI 自动化和串行任务执行，
+Linux 或其他远程 AI Agent 通过 Streamable HTTP MCP 调用。仓库不再维护 GUI、托盘、
+桌面客户端 CLI、定时调度或内嵌大模型回复模块。
 
-## 文档索引
+## 文档与源码
 
-- UIA/pyweixin 历史验证记录：`docs/pyweixin-uia-integration.md`
-- Windows 客户端模块、触发方式、稳定性、多微信方案：`docs/windows-client-architecture.md`
-- 首版使用说明：`docs/first-version-usage.md`
-- 第三方库源码：`third_party/pywechat/pyweixin/`
-- pywechat 官方说明：`third_party/pywechat/README.md`
-- 微信 4.1+ UI 自动化说明：`third_party/pywechat/Weixin4.0.md`
+- MCP 部署、鉴权、工具和扩展：`docs/mcp-server.md`
+- MCP 服务：`wxclient/mcp_server/`
+- 微信动作封装：`wxclient/wechat_api/`
+- 只读 UIA 探测：`wxclient/uia_probe/`
+- 串行任务队列：`wxclient/queue/`
+- 第三方 pyweixin：`third_party/pywechat/pyweixin/`
+- MCP 入口：`scripts/wxclient_mcp.py`
+- 单体 EXE 构建：`scripts/build_mcp_onefile.py`
 
 ## 外部文档规则
 
-- 涉及库、框架、SDK、API、CLI 或云服务时，必须先用 ctx7 查当前文档。
-- 先执行 `npx ctx7@latest library <name> "<完整问题>"`，再执行 `npx ctx7@latest docs <libraryId> "<完整问题>"`。
-- ctx7 请求要在 Codex 默认沙箱外运行；遇到 DNS、ENOTFOUND、fetch failed 等错误时，用同一命令在沙箱外重试。
-- 不要把密钥、密码、token 放进 ctx7 查询。
-- ctx7 不用于业务逻辑、重构、代码审查或纯概念问题。
+涉及库、框架、SDK、API、CLI 或云服务时，先使用 ctx7 获取当前文档：
 
-## 架构原则
+1. `npx ctx7@latest library <name> "<完整问题>"`
+2. 选择官方且匹配的 `/org/project` ID。
+3. `npx ctx7@latest docs <libraryId> "<完整问题>"`
 
-- 微信 UI 自动化动作必须串行执行。
-- 定时器、UI、Agent 只能投递任务，不能直接操作微信窗口。
-- 所有 pyweixin 调用必须经由 `wxclient/wechat_api/` 封装层。
-- UIA 探测能力独立成模块，业务层只调用 `probe_wechat_uia()`。
-- 真实加好友、同意好友、发消息、发朋友圈必须支持 `dry_run` 或确认机制。
-- 默认不做 DLL 注入、微信进程伪装或绕过微信限制的实现。
-- UIA 探测必须只读，不得修改屏幕阅读器标志、创建 native COM/WinEvent 常驻会话，或启动、关闭、重启、切换微信窗口。
-- 消息监听优先复用主窗口/已有窗口，不频繁打开或关闭独立聊天窗口。
-- 消息监听只负责采集和摘要，不要把 GUI 当前会话额外塞进监听集合。
-- 聊天回复应基于完整上下文生成，不要把回复范围限制为“本轮新消息”。
-- 未读回复或聊天回复完成后，优先返回“文件传输助手”，避免停留在会话页导致未读消息被吃掉。
-- 每轮消息监听都要记录已读消息摘要，便于回溯。
-- 同一类型任务如果已经存在 `PENDING` 未执行任务，就不要重复入队，避免消息堆积。
-- GUI 打开后不自动执行微信动作，worker 仍应通过“启动服务”或对应入口显式开启。
-- 点击“停止服务”必须等待 worker 线程真实退出后再更新为已停止状态。
+每个问题最多执行 3 条 ctx7 命令，不在查询中放入密钥。ctx7 不用于业务逻辑重构、
+纯代码审查或从零编写普通脚本。配额不足时明确提示登录或配置 `CONTEXT7_API_KEY`。
 
-## 推荐模块
+## 架构约束
 
-```text
-wxclient/
-  app/           # 客户端入口、生命周期、托盘/窗口
-  config/        # 账号、触发器、白名单、限频、LLM 配置
-  uia_probe/     # 只读 UIA 探测与诊断
-  wechat_api/    # pyweixin 二次封装
-  trigger/       # 定时任务、本地事件
-  queue/         # 单消费者任务队列、去重、重试、状态机
-  agents/        # 大模型或后续智能体
-  agentbridge/   # WeChat 事件 <-> Agent 请求/响应协议
-  storage/       # SQLite：任务、消息游标、好友申请、审计日志
-  ui/            # 配置、状态、人工确认、运行日志
-  diagnostics/   # UIA 诊断、控件树、健康检查
-```
+- 所有微信 UI 动作必须由 `mcp_server -> queue -> wechat_api` 调用。
+- 微信 UI 自动化必须由单消费者 worker 串行执行。
+- MCP 工具只负责校验参数和投递任务，不得直接操作微信窗口。
+- 对话理解、回复生成和工作流编排属于远程 Agent，不在 Windows 服务中实现。
+- 同类型 `PENDING` 任务不重复入队。
+- MVP 只支持一个 Windows 交互式用户会话中的一个微信账号。
+- 不在 Session 0 的 Windows Service 中运行 UI 自动化。
 
-## UIA 与 pyweixin 调用规则
+## UIA 规则
 
-- 每个业务动作前只调用 `probe_wechat_uia()` 检查状态。
-- `probe_wechat_uia()` 只能检测状态，不启动、关闭、重启或切换微信窗口。
-- 不得修改 Windows 屏幕阅读器标志，不得创建 native COM UIAutomation 或 WinEvent hook 常驻会话。
-- UIA 不可用时暂停业务任务并提示用户手动处理。
-- 如果看到 `mmui::LoginWindow`，暂停业务任务并提示用户登录。
-- 如果 `mmui::MainWindow` 的 raw/control/content 接近 `1/1/1`，视为 UIA 不可用。
-- GUI 日志中必须输出只读 UIA 诊断摘要，包括前台窗口、微信候选窗口和 pywinauto probe。
-- `pyweixin` 配置默认保持 `close_weixin=False`、`is_maximize=False`。
-- 打包版如果出现 `pyweixin is unavailable`，优先检查 `third_party/pywechat` 是否被正确带入。
-- 打包版如果出现 `logger/logging.conf doesn't exist`，优先检查打包数据是否遗漏。
+- `probe_wechat_uia()` 只能读取状态，不启动、关闭、重启、切换或解锁微信。
+- 业务动作前必须确认微信已登录且 UIA 可用。
+- 看到 `mmui::LoginWindow` 时阻止任务并提示登录。
+- 不实现 DLL 注入、进程伪装、屏幕阅读器标志修改或其他绕过微信限制的方案。
 
-## 触发规则
+## 真实动作安全
 
-- 好友申请：定时检查为主，UI/CLI 可触发立即检查。
-- 外部发送消息、加好友：现阶段通过 UI/CLI 入队。
-- 聊天回复：消息扫描生成事件，Agent 基于上下文产出回复，再入队发送。
-- 定时检查、UI 按钮都不得绕过队列。
-- 好友检测、未读回复、消息监听、添加好友、朋友圈等自动化入口都应走同一队列与同一状态机。
+- 加好友、同意好友、发消息和发朋友圈默认 `dry_run=true`。
+- 真实动作必须同时由服务端开启 `--allow-real-actions`，并由单次 MCP 调用提供确认短语。
+- MCP 上传只接受 Base64 内容并返回 `media_id`；工具不接受 Agent 指定任意 Windows 路径。
+- 失败任务要保留原因、状态和重试次数，供 Agent 查询。
 
-## UI 约定
+## 扩展方式
 
-- 自动化页的主要功能按钮统一放左侧，尺寸和间距保持一致。
-- 自动化页的任务面板默认隐藏，通过勾选项开启。
-- 自动化页的日志默认隐藏或折叠，按时间倒序展示。
-- 每个功能页的右侧标题和主体布局要保持一致，日志折叠后不要把页面高度挤歪。
-- 设置页按职责拆成 tab，至少区分“基础设备”和“Agent 设置”。
+- 新 MCP 工具组实现 `McpToolProvider.register()`，通过 `create_mcp_server()` 注册。
+- 新微信能力先加入 `wechat_api` 封装，再增加任务类型和 worker 分发，最后暴露 MCP 工具。
+- 不恢复 GUI、客户端 CLI、定时器或内嵌 Agent；若产品方向变化，应单独讨论架构。
 
-## GUI 与打包
+## 测试与打包
 
-- GUI 入口脚本是 `scripts/wxclient_gui.py`。
-- 单体 EXE 构建脚本是 `scripts/build_gui_onefile.py`。
-- onefile 打包时要同时带上 `third_party/pywechat/pyweixin`、`third_party/pywechat/pywechat` 和 `logger/logging.conf`。
-- 打包后需要验证 `dist/wxclient-gui.exe` 能启动并正常显示 GUI。
-- GUI 相关改动后要确认启动图会主动关闭，避免卡住不消失。
-- 配置 JSON 读取要兼容 UTF-8 与 UTF-8-SIG，避免 BOM 报错。
-- 修改 GUI、启动路径、打包入口或 vendor 目录时，优先跑 `python scripts/build_gui_onefile.py --dry-run`，必要时再完整构建验证。
-- 打包或启动异常时，优先排查 `pyweixin`、`logger/logging.conf`、相对路径和 `sys._MEIPASS` 兼容。
-
-## 稳定性边界
-
-- 不承诺跨微信版本 100% 稳定。
-- 优先支持 Windows 10/11、Python 3.9+、微信 4.1.9.x。
-- UI 改版、微信重启、登录失效、窗口焦点异常都要进入可恢复失败状态。
-- 任务失败要记录原因、截图/诊断信息、重试次数和下一次处理时间。
-- 若需要修改会影响真实动作，请先保证有 `dry_run`、确认机制或清晰回退路径。
-
-## 多微信规则
-
-- MVP 只支持单 Windows 用户会话中的单个微信账号。
-- 多账号优先采用一账号一 Windows 会话、虚拟机或独立客户端实例。
-- 不要在同一物理桌面并发操作多个微信窗口。
-- 后续多账号必须绑定 `account_id -> process_id/window_handle`，且每账号串行执行。
-
-## 开发顺序
-
-1. 先打通只读 `uia_probe`。
-2. 再封装 `wechat_api.send_message()`，并打通文件传输助手。
-3. 再实现 SQLite 任务表和单消费者队列。
-4. 再实现好友申请 `dry_run` 检查和 UI 展示。
-5. 再实现白名单策略下的自动同意。
-6. 最后实现消息扫描、`agentbridge`、大模型回复。
-
-## 变更要求
-
-- 做完代码改动后，先运行相关检查，再提交 Git。
-- 如果工作区已有与当前任务无关的修改，不要回退它们。
-- 编辑文件时优先使用 `apply_patch`。
-- 涉及打包、启动路径、编码或第三方 vendor 的改动，至少要做一次实际验证。
+- 修改后运行 `python -m ruff check wxclient scripts tests`。
+- 运行 `python -m unittest discover -s tests -v`。
+- 修改入口、依赖、vendor 或打包脚本时，先运行
+  `python scripts/build_mcp_onefile.py --dry-run`，再实际构建并验证 `dist/wxclient-mcp.exe`。
+- 打包必须包含 `third_party/pywechat/pyweixin` 和其所需的 `logger/logging.conf`。
+- 完成并验证后提交 Git；不得回退用户无关的工作区修改。

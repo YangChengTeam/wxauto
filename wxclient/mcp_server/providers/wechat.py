@@ -114,20 +114,16 @@ class WeChatToolProvider:
         async def wx_watch_chats(
             friends: list[str],
             duration: str = "30s",
-            auto_reply: bool = False,
-            reply_all: bool = False,
             dry_run: bool = True,
             confirmation: str = "",
             wait: bool = True,
         ) -> dict[str, Any]:
-            """Watch multiple chats; auto_reply is off unless explicitly enabled."""
+            """Listen to multiple chats without generating or sending replies."""
             return await runtime.submit(
                 TaskType.WATCH_CHATS,
                 {
                     "friends": friends,
                     "duration": duration,
-                    "auto_reply": auto_reply,
-                    "reply_all": reply_all,
                     "select_sender": False,
                     "dry_run": dry_run,
                 },

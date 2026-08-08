@@ -1,17 +1,58 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
 import shlex
 import sys
 from pathlib import Path
 
-from build_gui_onefile import (
-    _find_logger_conf,
-    _omni_visual_vendor_data,
-    _vendor_package_data,
-    _vendor_package_modules,
-)
+
+def _find_logger_conf() -> Path | None:
+    spec = importlib.util.find_spec("logger")
+    if spec is None or spec.origin is None:
+        return None
+    path = Path(spec.origin).resolve().parent / "logging.conf"
+    return path if path.exists() else None
+
+
+def _vendor_package_modules(vendor_dir: Path, package_names: tuple[str, ...]) -> list[str]:
+    modules: list[str] = []
+    for package_name in package_names:
+        package_dir = vendor_dir / package_name
+        for py_file in sorted(package_dir.rglob("*.py")) if package_dir.exists() else []:
+            relative = py_file.relative_to(vendor_dir).with_suffix("")
+            parts = list(relative.parts)
+            if parts[-1] == "__init__":
+                parts.pop()
+            module = ".".join(parts)
+            if module and module not in modules:
+                modules.append(module)
+    return modules
+
+
+def _vendor_package_data(vendor_dir: Path, package_names: tuple[str, ...]) -> list[str]:
+    args: list[str] = []
+    for package_name in package_names:
+        source = vendor_dir / package_name
+        if source.exists():
+            args.extend(["--add-data", f"{source}{os.pathsep}third_party/pywechat/{package_name}"])
+    return args
+
+
+def _omni_visual_vendor_data(repo_root: Path) -> list[str]:
+    vendor_dir = repo_root / "third_party" / "omni-bot-sdk-oss"
+    items = [
+        (vendor_dir / "src" / "omni_bot_sdk", "third_party/omni-bot-sdk-oss/src/omni_bot_sdk"),
+        (vendor_dir / "LICENSE", "third_party/omni-bot-sdk-oss"),
+        (vendor_dir / "README.md", "third_party/omni-bot-sdk-oss"),
+        (vendor_dir / "pyproject.toml", "third_party/omni-bot-sdk-oss"),
+    ]
+    args: list[str] = []
+    for source, target in items:
+        if source.exists():
+            args.extend(["--add-data", f"{source}{os.pathsep}{target}"])
+    return args
 
 
 def _build_args(repo_root: Path, name: str) -> list[str]:
@@ -111,7 +152,7 @@ def main() -> int:
         import PyInstaller.__main__
     except ImportError as exc:
         print(
-            "PyInstaller is not installed. Install it with `pip install -e \".[build,mcp]\"`.",
+            "PyInstaller is not installed. Install it with `pip install -e \".[build]\"`.",
             file=sys.stderr,
         )
         raise SystemExit(1) from exc

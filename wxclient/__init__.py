@@ -1,3 +1,3 @@
-"""Windows WeChat automation client."""
+"""Windows WeChat MCP service."""
 
 __version__ = "0.1.0"

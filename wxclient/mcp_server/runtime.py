@@ -44,7 +44,6 @@ class WxMcpRuntime:
         self.worker = worker or OperationWorker(
             self.store,
             self.api,
-            settings=wechat_settings,
             poll_interval=0.1,
         )
         upload_dir = mcp_settings.upload_dir or wechat_settings.data_dir / "mcp_uploads"
