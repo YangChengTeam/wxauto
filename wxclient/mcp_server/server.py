@@ -40,9 +40,10 @@ def create_mcp_server(
     mcp = FastMCP(
         "wxauto-mcp",
         instructions=(
-            "Controls one logged-in Windows WeChat session through a serialized task queue. "
-            "Real UI/write operations require dry_run=false and confirmation=EXECUTE_REAL_ACTION."
+            "通过串行任务队列操作一个已登录的 Windows 微信会话。"
+            "真实界面或写入操作需要 dry_run=false 且 confirmation=EXECUTE_REAL_ACTION。"
         ),
+        log_level="WARNING",
         host=server_settings.host,
         port=server_settings.port,
         streamable_http_path=server_settings.path,

@@ -707,7 +707,7 @@ class UiaWeChatDriver:
         )
         if not probe.get("uia_exposed"):
             raise WeChatApiUnavailableError(
-                f"WeChat UIA is not available: {probe.get('reason') or 'unknown reason'}"
+                f"微信 UIA 不可用：{probe.get('reason') or '未知原因'}"
             )
 
     def _pyweixin_class(self, name: str) -> Any:

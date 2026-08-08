@@ -15,7 +15,7 @@ def probe_wechat_uia(max_depth: int = 10, max_nodes: int = 5000) -> dict[str, An
             "logged_in": False,
             "login_window": False,
             "uia_exposed": False,
-            "reason": "UIA probing is only available on Windows",
+            "reason": "UIA 探测仅支持 Windows",
         }
 
     try:
@@ -26,7 +26,7 @@ def probe_wechat_uia(max_depth: int = 10, max_nodes: int = 5000) -> dict[str, An
             "logged_in": False,
             "login_window": False,
             "uia_exposed": False,
-            "reason": f"probe failed: {exc}",
+            "reason": f"UIA 探测失败：{exc}",
         }
 
     classified_windows = [_classify_wechat_window(window) for window in windows]
@@ -39,13 +39,13 @@ def probe_wechat_uia(max_depth: int = 10, max_nodes: int = 5000) -> dict[str, An
         and int(selected.get("descendant_count") or 0) >= MIN_UIA_EXPOSED_DESCENDANTS
     )
     if exposed:
-        reason = "UIA exposed"
+        reason = "UIA 已暴露"
     elif login_windows and not main_windows:
-        reason = "WeChat login window is open"
+        reason = "微信登录窗口已打开"
     elif classified_windows:
-        reason = "WeChat UIA is not exposed"
+        reason = "微信 UIA 未暴露"
     else:
-        reason = "WeChat window not found"
+        reason = "未找到微信窗口"
 
     return {
         "platform": "Windows",

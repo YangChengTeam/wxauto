@@ -41,6 +41,19 @@ python scripts\build_mcp_onefile.py
 
 输出为 `dist\wxclient-mcp.exe`。
 
+## 日志
+
+服务日志使用中文，并包含服务启动/停止、UIA 探测、任务类型、任务短 ID、执行结果和失败
+原因。控制台重定向时统一写入 UTF-8，可直接保存：
+
+```powershell
+.\dist\wxclient-mcp.exe --allow-real-actions `
+  *> .wxclient\mcp.log
+```
+
+MCP SDK 和 Uvicorn 的常规英文启动提示已隐藏；第三方库抛出的原始异常文本可能仍保留，
+便于排查具体错误。
+
 ## Windows 远程部署
 
 UI 自动化必须运行在已登录、未锁屏的交互式 Windows 桌面中。不要把进程放到 Windows

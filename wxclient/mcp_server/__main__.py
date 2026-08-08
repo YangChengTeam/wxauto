@@ -3,11 +3,15 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import structlog
+
 from wxclient.logging_config import configure_logging
 
 from .config import McpServerSettings
 from .runtime import WxMcpRuntime
 from .server import create_mcp_server
+
+logger = structlog.get_logger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,11 +52,17 @@ def main() -> None:
     configure_logging(level="INFO")
     runtime = WxMcpRuntime.from_config(args.config, settings)
     mcp = create_mcp_server(args.config, settings=settings, runtime=runtime)
+    logger.info(
+        "mcp.server.starting",
+        endpoint=settings.endpoint,
+        real_actions=settings.allow_real_actions,
+    )
     runtime.start()
     try:
         mcp.run(transport="streamable-http")
     finally:
         runtime.stop()
+        logger.info("mcp.server.stopped")
 
 
 if __name__ == "__main__":

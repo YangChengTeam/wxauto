@@ -123,7 +123,7 @@ class OperationWorker:
                 limit=int(payload.get("limit", 5)),
                 dry_run=payload.get("dry_run"),
             )
-        raise ValueError(f"Unsupported task type: {task.type}")
+        raise ValueError(f"不支持的任务类型：{task.type}")
 
     def _scan_messages(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self.api.scan_messages(
@@ -138,7 +138,7 @@ class OperationWorker:
     def _watch_chats(self, payload: dict[str, Any]) -> dict[str, Any]:
         friends = _payload_friends(payload)
         if not friends:
-            raise ValueError("friends must contain at least one chat name")
+            raise ValueError("friends 至少需要包含一个会话名称")
         results: list[dict[str, Any]] = []
         error_count = 0
         message_count = 0
