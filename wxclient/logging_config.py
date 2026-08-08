@@ -19,6 +19,7 @@ _LEVEL_LABELS = {
 }
 
 _TASK_LABELS = {
+    "search_contacts": "搜索联系人",
     "add_friend": "添加好友",
     "check_new_friends": "检查好友申请",
     "accept_new_friends": "同意好友申请",
@@ -132,6 +133,16 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "task.duplicate_skipped":
         return f"跳过重复待执行任务：{task_type}，已有任务 #{task_id}"
 
+    if event == "contact.search.start":
+        return (
+            f"开始搜索联系人：{payload.get('query') or '-'}，"
+            f"最多 {payload.get('limit', 0)} 条"
+        )
+    if event == "contact.search.done":
+        return (
+            f"联系人搜索完成：匹配 {payload.get('match_count', 0)} 条，"
+            f"精确匹配 {payload.get('exact_count', 0)} 条"
+        )
     if event == "friend.add.start":
         return f"开始添加好友：{payload.get('number')}"
     if event == "friend.add.done":
@@ -180,6 +191,8 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         return f"会话类型识别完成：「{payload.get('chat_name') or '-'}」为{kind}"
     if event == "StreamableHTTP session manager started":
         return "MCP HTTP 会话管理器已启动"
+    if event == "Terminating session: None":
+        return "MCP 会话已结束"
 
     request_prefix = "Processing request of type "
     if event.startswith(request_prefix):

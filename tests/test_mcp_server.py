@@ -119,6 +119,7 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                 tools = await client.list_tools()
                 names = {tool.name for tool in tools.tools}
                 self.assertIn("wx_add_friend", names)
+                self.assertIn("wx_search_contacts", names)
                 self.assertIn("wx_listen_messages", names)
                 self.assertIn("wx_post_moments", names)
                 watch_tool = next(tool for tool in tools.tools if tool.name == "wx_watch_chats")
@@ -126,9 +127,20 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("auto_reply", watch_properties)
                 self.assertNotIn("reply_all", watch_properties)
                 probe_tool = next(tool for tool in tools.tools if tool.name == "wx_probe_uia")
+                search_tool = next(
+                    tool for tool in tools.tools if tool.name == "wx_search_contacts"
+                )
                 send_tool = next(tool for tool in tools.tools if tool.name == "wx_send_message")
                 self.assertTrue(probe_tool.annotations.readOnlyHint)
+                self.assertTrue(search_tool.annotations.readOnlyHint)
                 self.assertFalse(send_tool.annotations.readOnlyHint)
+
+                searched = await client.call_tool(
+                    "wx_search_contacts",
+                    {"query": "彭杏", "limit": 5},
+                )
+                self.assertFalse(searched.isError)
+                self.assertEqual(runtime.calls[0][0], TaskType.SEARCH_CONTACTS)
 
                 result = await client.call_tool(
                     "wx_send_message",
@@ -137,7 +149,7 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertFalse(result.isError)
             self.assertEqual(result.structuredContent["status"], "succeeded")
-            self.assertEqual(runtime.calls[0][0], TaskType.SEND_MESSAGE)
+            self.assertEqual(runtime.calls[1][0], TaskType.SEND_MESSAGE)
 
     async def test_media_upload_and_moments_reference_use_media_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -82,6 +82,11 @@ class OperationWorker:
 
     def dispatch(self, task: Task) -> dict[str, Any]:
         payload = task.payload
+        if task.type == TaskType.SEARCH_CONTACTS:
+            return self.api.search_contacts(
+                query=str(payload["query"]),
+                limit=int(payload.get("limit", 10)),
+            )
         if task.type == TaskType.ADD_FRIEND:
             return self.api.add_friend(
                 number=str(payload["number"]),

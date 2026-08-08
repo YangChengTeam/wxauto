@@ -12,6 +12,15 @@ class _FakeApi:
     def __init__(self) -> None:
         self.scanned: list[str] = []
 
+    def search_contacts(self, query: str, limit: int) -> dict[str, Any]:
+        return {
+            "action": "search_contacts",
+            "query": query,
+            "matches": [{"name": query, "type": "contact", "exact": True}],
+            "match_count": 1,
+            "limit": limit,
+        }
+
     def scan_messages(
         self,
         friend: str,
@@ -66,6 +75,20 @@ class TaskStoreTests(unittest.TestCase):
 
 
 class WorkerDispatchTests(unittest.TestCase):
+    def test_search_contacts_is_dispatched_through_worker(self) -> None:
+        api = _FakeApi()
+        with tempfile.TemporaryDirectory() as tmp:
+            worker = OperationWorker(
+                TaskStore(Path(tmp) / "tasks.db"),
+                api,  # type: ignore[arg-type]
+            )
+            result = worker.dispatch(
+                Task.new(TaskType.SEARCH_CONTACTS, {"query": "彭杏", "limit": 5})
+            )
+
+        self.assertEqual(result["action"], "search_contacts")
+        self.assertEqual(result["matches"][0]["name"], "彭杏")
+
     def test_watch_chats_is_pure_monitoring(self) -> None:
         api = _FakeApi()
         with tempfile.TemporaryDirectory() as tmp:

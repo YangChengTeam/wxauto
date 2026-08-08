@@ -71,6 +71,81 @@ class UiaWeChatDriver:
         logger.info("friend.add.done", number=number)
         return {"dry_run": False, "action": "add_friend", "number": number}
 
+    def search_contacts(self, query: str, limit: int = 10) -> dict[str, Any]:
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            raise ValueError("搜索内容不能为空")
+        safe_limit = min(max(int(limit), 1), 50)
+        self._ensure_ready()
+        logger.info("contact.search.start", query=normalized_query, limit=safe_limit)
+
+        Navigator = self._pyweixin_class("Navigator")
+        Uielements = self._pyweixin_submodule("Uielements")
+        main_window = Navigator.open_weixin(is_maximize=False)
+        chat_button = main_window.child_window(**Uielements.SideBar.Weixin)
+        search_edit = None
+        try:
+            chat_button.click_input()
+            search_edits = main_window.descendants(**Uielements.Edits.SearchEdit)
+            if not search_edits:
+                raise WeChatApiError("未找到微信顶部搜索框")
+            search_edit = search_edits[0]
+            search_edit.click_input()
+            search_edit.set_text(normalized_query)
+            time.sleep(0.5)
+            search_results = main_window.child_window(**Uielements.Lists.SearchResult)
+            result_items: list[Any] = []
+            if search_results.exists(timeout=1):
+                result_items = search_results.descendants(control_type="ListItem")
+            if not result_items:
+                Desktop = __import__("pywinauto", fromlist=["Desktop"]).Desktop
+                desktop = Desktop(backend="uia")
+                for window in desktop.windows():
+                    try:
+                        result_lists = window.descendants(
+                            control_type="List",
+                            auto_id="search_list",
+                        )
+                    except Exception:
+                        continue
+                    for result_list in result_lists:
+                        result_items = result_list.descendants(control_type="ListItem")
+                        if result_items:
+                            break
+                    if result_items:
+                        break
+            matches = _collect_contact_search_matches(
+                result_items,
+                normalized_query,
+                safe_limit,
+            )
+        except WeChatApiError:
+            raise
+        except Exception as exc:
+            raise WeChatApiError(f"搜索联系人失败：{exc}") from exc
+        finally:
+            if search_edit is not None:
+                try:
+                    search_edit.set_text("")
+                    search_edit.type_keys("{ESC}")
+                except Exception:
+                    pass
+
+        exact_count = sum(1 for item in matches if item["exact"])
+        logger.info(
+            "contact.search.done",
+            query=normalized_query,
+            match_count=len(matches),
+            exact_count=exact_count,
+        )
+        return {
+            "action": "search_contacts",
+            "query": normalized_query,
+            "matches": matches,
+            "match_count": len(matches),
+            "exact_count": exact_count,
+        }
+
     def check_new_friends(
         self,
         verify: bool = False,
@@ -1586,6 +1661,9 @@ class WeChatApi(UiaWeChatDriver):
             dry_run=dry_run,
         )
 
+    def search_contacts(self, query: str, limit: int = 10) -> dict[str, Any]:
+        return self._run_driver("search_contacts", query=query, limit=limit)
+
     def check_new_friends(
         self,
         verify: bool = False,
@@ -1718,6 +1796,100 @@ def _normalize_driver_order(value: list[str] | None) -> list[str]:
         seen.add(driver_name)
         normalized.append(driver_name)
     return normalized or ["uia"]
+
+
+_SEARCH_RESULT_SECTIONS = {
+    "最近使用": ("recent", "unknown"),
+    "联系人": ("contacts", "contact"),
+    "群聊": ("groups", "group"),
+    "服务号": ("service_accounts", "service_account"),
+    "公众号": ("official_accounts", "official_account"),
+    "最常使用": ("frequent", "unknown"),
+    "功能": ("features", "feature"),
+    "聊天记录": ("chat_history", "chat_history"),
+    "Recent used": ("recent", "unknown"),
+    "Contacts": ("contacts", "contact"),
+    "Groups": ("groups", "group"),
+    "Service Accounts": ("service_accounts", "service_account"),
+    "Official Accounts": ("official_accounts", "official_account"),
+    "Most used": ("frequent", "unknown"),
+    "Features": ("features", "feature"),
+    "Chat History": ("chat_history", "chat_history"),
+    "聯絡人": ("contacts", "contact"),
+    "群組": ("groups", "group"),
+    "服務賬號": ("service_accounts", "service_account"),
+    "官方賬號": ("official_accounts", "official_account"),
+    "聊天記錄": ("chat_history", "chat_history"),
+}
+def _collect_contact_search_matches(
+    items: list[Any],
+    query: str,
+    limit: int,
+) -> list[dict[str, Any]]:
+    query_key = query.casefold()
+    current_section = "unknown"
+    current_type = "unknown"
+    matches: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for item in items:
+        item_class_name = str(_safe_call(getattr(item, "class_name", None)) or "")
+        raw_text = str(_safe_call(getattr(item, "window_text", None)) or "").strip()
+        texts = [raw_text] if raw_text else []
+        try:
+            descendants = item.descendants(control_type="Text")
+        except Exception:
+            descendants = []
+        for descendant in descendants:
+            value = str(
+                _safe_call(getattr(descendant, "window_text", None)) or ""
+            ).strip()
+            if value and value not in texts:
+                texts.append(value)
+        if not texts:
+            continue
+
+        section = _SEARCH_RESULT_SECTIONS.get(raw_text) if len(texts) == 1 else None
+        if section is not None:
+            current_section, current_type = section
+            continue
+        if current_section == "chat_history":
+            continue
+        if any(
+            text.startswith(("网络查找手机/QQ号", "Search mobile/QQ ID", "網路搜尋手機/QQ"))
+            for text in texts
+        ):
+            continue
+        if item_class_name != "mmui::SearchContentCellView" and not (
+            item_class_name == "mmui::XTableCell" and current_type == "feature"
+        ):
+            continue
+        lines = [
+            line.strip()
+            for text in texts
+            for line in text.splitlines()
+            if line.strip()
+        ]
+        matching_lines = [line for line in lines if query_key in line.casefold()]
+        if not matching_lines:
+            continue
+        exact_lines = [line for line in matching_lines if line.casefold() == query_key]
+        name = exact_lines[0] if exact_lines else matching_lines[0]
+        dedupe_key = (name.casefold(), current_type)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        matches.append(
+            {
+                "name": name,
+                "type": current_type,
+                "section": current_section,
+                "exact": bool(exact_lines),
+            }
+        )
+        if len(matches) >= limit:
+            break
+    return matches
 
 
 def _safe_call(func: Any) -> Any:

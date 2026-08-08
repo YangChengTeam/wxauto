@@ -17,6 +17,7 @@ class TaskStatus(str, Enum):
 
 
 class TaskType(str, Enum):
+    SEARCH_CONTACTS = "search_contacts"
     ADD_FRIEND = "add_friend"
     CHECK_NEW_FRIENDS = "check_new_friends"
     ACCEPT_NEW_FRIENDS = "accept_new_friends"

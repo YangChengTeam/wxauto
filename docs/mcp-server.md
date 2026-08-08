@@ -7,6 +7,7 @@
 
 - `wx_probe_uia`：只读探测微信登录与 UIA 状态。
 - `wx_upload_media`：以 Base64 上传图片/视频，返回 `media_id`。
+- `wx_search_contacts`：按名称搜索现有联系人、群聊、服务号和公众号，不发送消息。
 - `wx_add_friend`：发送好友申请。
 - `wx_check_new_friends`：检查好友申请，可选择同意。
 - `wx_send_message`：发送文字消息。
@@ -96,11 +97,14 @@ TLS 反向代理，并限制来源 IP。
 
 ## 真实动作确认
 
-工具默认 `dry_run=true`。真实 UI/写入动作需要同时满足：
+涉及真实 UI/写入的工具默认 `dry_run=true`。真实动作需要同时满足：
 
 1. 服务使用 `--allow-real-actions` 启动；
 2. 工具参数设置 `dry_run=false`；
 3. 工具参数设置 `confirmation="EXECUTE_REAL_ACTION"`。
+
+`wx_probe_uia`、`wx_search_contacts`、`wx_get_task` 和 `wx_list_tasks` 是只读工具，
+不要求真实动作确认；其中联系人搜索仍通过串行 worker 执行，避免与其他微信动作冲突。
 
 朋友圈的远程调用先执行 `wx_upload_media`，再把返回的 `media_id` 传给
 `wx_post_moments`。服务只解析自己的上传目录，不接受调用方指定任意 Windows 文件路径。

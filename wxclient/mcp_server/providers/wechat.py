@@ -44,6 +44,22 @@ class WeChatToolProvider:
                 content_base64,
             )
 
+        @mcp.tool(name="wx_search_contacts", annotations=READ_ONLY_TOOL, structured_output=True)
+        async def wx_search_contacts(
+            query: str,
+            limit: int = 10,
+            wait: bool = True,
+        ) -> dict[str, Any]:
+            """Search existing WeChat contacts, groups, and accounts without sending or adding."""
+            normalized_query = query.strip()
+            if not normalized_query:
+                raise ValueError("Search query cannot be empty")
+            return await runtime.submit(
+                TaskType.SEARCH_CONTACTS,
+                {"query": normalized_query, "limit": min(max(int(limit), 1), 50)},
+                wait=wait,
+            )
+
         @mcp.tool(name="wx_add_friend", annotations=WRITE_TOOL, structured_output=True)
         async def wx_add_friend(
             number: str,

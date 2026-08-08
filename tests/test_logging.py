@@ -46,6 +46,20 @@ class ChineseLogRendererTests(unittest.TestCase):
         )
         self.assertIn("微信 UIA 探测完成：可用", output)
 
+    def test_renders_contact_search_in_chinese(self) -> None:
+        task_output = self.render(
+            "task.succeeded",
+            task_type="search_contacts",
+            task_id="12345678-abcd",
+        )
+        search_output = self.render(
+            "contact.search.done",
+            match_count=1,
+            exact_count=1,
+        )
+        self.assertIn("搜索联系人", task_output)
+        self.assertIn("联系人搜索完成：匹配 1 条，精确匹配 1 条", search_output)
+
 
 if __name__ == "__main__":
     unittest.main()
