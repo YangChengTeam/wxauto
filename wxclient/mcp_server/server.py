@@ -38,7 +38,7 @@ def create_mcp_server(
         )
 
     mcp = FastMCP(
-        "wxclient-windows",
+        "wxauto-mcp",
         instructions=(
             "Controls one logged-in Windows WeChat session through a serialized task queue. "
             "Real UI/write operations require dry_run=false and confirmation=EXECUTE_REAL_ACTION."

@@ -12,8 +12,8 @@ from .server import create_mcp_server
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Windows WeChat MCP server")
-    parser.add_argument("--config", type=Path, default=None, help="wxclient JSON config")
-    parser.add_argument("--host", default=None, help="listen host; use 0.0.0.0 for remote agents")
+    parser.add_argument("--config", type=Path, default=None, help="WeChat MCP JSON config")
+    parser.add_argument("--host", default=None, help="listen host; use 0.0.0.0 for remote access")
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--path", default=None, help="Streamable HTTP path, default /mcp")
     parser.add_argument(

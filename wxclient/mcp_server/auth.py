@@ -16,6 +16,6 @@ class StaticTokenVerifier(TokenVerifier):
             return None
         return AccessToken(
             token=token,
-            client_id="wxclient-mcp-agent",
+            client_id="wxauto-mcp",
             scopes=["wxclient:control"],
         )

@@ -1,13 +1,12 @@
 # Windows 微信 MCP 服务
 
 `wxclient.mcp_server` 是本项目唯一的产品入口。它把微信动作放入 SQLite 任务队列，
-由一个 worker 串行执行。对话理解和回复生成由远程 Agent 完成，Windows 服务不内嵌
-大模型，也不自动回复消息。
+由一个 worker 串行执行。服务只提供 MCP 工具，不包含大模型或自动回复逻辑。
 
 ## 能力
 
 - `wx_probe_uia`：只读探测微信登录与 UIA 状态。
-- `wx_upload_media`：Linux Agent 以 Base64 上传图片/视频，返回 `media_id`。
+- `wx_upload_media`：以 Base64 上传图片/视频，返回 `media_id`。
 - `wx_add_friend`：发送好友申请。
 - `wx_check_new_friends`：检查好友申请，可选择同意。
 - `wx_send_message`：发送文字消息。
@@ -33,14 +32,7 @@ python -m wxclient.mcp_server `
   --allow-real-actions
 ```
 
-默认地址为 `http://127.0.0.1:8765/mcp`。本机冒烟测试：
-
-```powershell
-python scripts\wxclient_mcp_client.py
-python scripts\wxclient_mcp_client.py --tool wx_probe_uia
-```
-
-也可以生成独立控制台 EXE：
+默认地址为 `http://127.0.0.1:8765/mcp`。也可以生成独立控制台 EXE：
 
 ```powershell
 python scripts\build_mcp_onefile.py --dry-run
@@ -49,7 +41,7 @@ python scripts\build_mcp_onefile.py
 
 输出为 `dist\wxclient-mcp.exe`。
 
-## Windows 远程部署、Linux Agent 调用
+## Windows 远程部署
 
 UI 自动化必须运行在已登录、未锁屏的交互式 Windows 桌面中。不要把进程放到 Windows
 Service 的 Session 0；可以用登录后的计划任务启动。
@@ -70,8 +62,7 @@ python -m wxclient.mcp_server `
 其中 `192.168.1.20` 应替换为 Windows 主机的实际地址或域名。非回环监听如果没有
 `WXCLIENT_MCP_AUTH_TOKEN`，服务会拒绝启动。DNS 重绑定保护也要求显式配置允许的 Host。
 
-Linux Agent 使用 Streamable HTTP MCP，通用配置形态如下（不同 Agent 的配置键名可能
-略有区别）：
+调用方使用 Streamable HTTP MCP，通用连接配置如下：
 
 ```json
 {
@@ -99,7 +90,7 @@ TLS 反向代理，并限制来源 IP。
 3. 工具参数设置 `confirmation="EXECUTE_REAL_ACTION"`。
 
 朋友圈的远程调用先执行 `wx_upload_media`，再把返回的 `media_id` 传给
-`wx_post_moments`。服务只解析自己的上传目录，不接受 Agent 提供任意 Windows 文件路径。
+`wx_post_moments`。服务只解析自己的上传目录，不接受调用方指定任意 Windows 文件路径。
 
 ## 扩展工具组
 

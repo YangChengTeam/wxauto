@@ -1,8 +1,7 @@
 # AGENTS.md
 
-本仓库只维护一个 Windows 微信 MCP 服务。Windows 端负责微信 UI 自动化和串行任务执行，
-Linux 或其他远程 AI Agent 通过 Streamable HTTP MCP 调用。仓库不再维护 GUI、托盘、
-桌面客户端 CLI、定时调度或内嵌大模型回复模块。
+本仓库只维护一个 Windows 微信 MCP 服务，负责微信 UI 自动化和串行任务执行。仓库不
+维护 GUI、托盘、独立调用客户端、定时调度或大模型回复模块。
 
 ## 文档与源码
 
@@ -31,7 +30,7 @@ Linux 或其他远程 AI Agent 通过 Streamable HTTP MCP 调用。仓库不再�
 - 所有微信 UI 动作必须由 `mcp_server -> queue -> wechat_api` 调用。
 - 微信 UI 自动化必须由单消费者 worker 串行执行。
 - MCP 工具只负责校验参数和投递任务，不得直接操作微信窗口。
-- 对话理解、回复生成和工作流编排属于远程 Agent，不在 Windows 服务中实现。
+- MCP 服务只提供工具，不实现对话理解、回复生成或工作流编排。
 - 同类型 `PENDING` 任务不重复入队。
 - MVP 只支持一个 Windows 交互式用户会话中的一个微信账号。
 - 不在 Session 0 的 Windows Service 中运行 UI 自动化。
@@ -47,14 +46,14 @@ Linux 或其他远程 AI Agent 通过 Streamable HTTP MCP 调用。仓库不再�
 
 - 加好友、同意好友、发消息和发朋友圈默认 `dry_run=true`。
 - 真实动作必须同时由服务端开启 `--allow-real-actions`，并由单次 MCP 调用提供确认短语。
-- MCP 上传只接受 Base64 内容并返回 `media_id`；工具不接受 Agent 指定任意 Windows 路径。
-- 失败任务要保留原因、状态和重试次数，供 Agent 查询。
+- MCP 上传只接受 Base64 内容并返回 `media_id`；工具不接受调用方指定任意 Windows 路径。
+- 失败任务要保留原因、状态和重试次数，供 MCP 工具查询。
 
 ## 扩展方式
 
 - 新 MCP 工具组实现 `McpToolProvider.register()`，通过 `create_mcp_server()` 注册。
 - 新微信能力先加入 `wechat_api` 封装，再增加任务类型和 worker 分发，最后暴露 MCP 工具。
-- 不恢复 GUI、客户端 CLI、定时器或内嵌 Agent；若产品方向变化，应单独讨论架构。
+- 不恢复 GUI、调用客户端、定时器或大模型模块；若产品方向变化，应单独讨论架构。
 
 ## 测试与打包
 

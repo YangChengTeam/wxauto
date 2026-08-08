@@ -1,7 +1,6 @@
 # wxauto-mcp
 
-面向远程 AI Agent 的 Windows 微信 MCP 服务。Windows 端只负责 UIA 探测、微信动作和
-串行执行；对话理解、回复生成与工作流编排全部由 MCP 客户端侧 Agent 完成。
+Windows 微信 MCP 服务，提供 UIA 探测和微信自动化工具，并通过单消费者队列串行执行。
 
 ## 能力
 
@@ -12,11 +11,11 @@
 - SQLite 任务记录、同类待执行任务去重、单 worker 串行操作微信
 - Streamable HTTP、Bearer Token、真实动作双重确认
 
-本项目不再包含 GUI、托盘、客户端 CLI、定时调度或内嵌大模型回复模块。
+本项目只提供 MCP 服务，不包含 GUI、托盘、独立调用客户端、定时调度或大模型模块。
 
 ## 安装与启动
 
-要求 Windows 10/11、Python 3.10+、已登录的微信 PC 客户端，以及未锁屏的交互式桌面。
+要求 Windows 10/11、Python 3.10+、已登录的微信 PC 端，以及未锁屏的交互式桌面。
 
 ```powershell
 python -m pip install -e .

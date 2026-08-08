@@ -66,7 +66,7 @@ class TaskStoreTests(unittest.TestCase):
 
 
 class WorkerDispatchTests(unittest.TestCase):
-    def test_watch_chats_is_pure_monitoring_without_agent(self) -> None:
+    def test_watch_chats_is_pure_monitoring(self) -> None:
         api = _FakeApi()
         with tempfile.TemporaryDirectory() as tmp:
             worker = OperationWorker(

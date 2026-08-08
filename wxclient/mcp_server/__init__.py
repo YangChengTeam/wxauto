@@ -1,4 +1,4 @@
-"""Remote MCP facade for the Windows WeChat automation client."""
+"""Windows WeChat MCP server."""
 
 from typing import Any
 
