@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 from uuid import uuid4
@@ -35,6 +37,17 @@ class TaskType(str, Enum):
     READ_RECENT_MOMENTS = "read_recent_moments"
 
 
+REAL_WRITE_TASK_TYPES = frozenset(
+    {
+        TaskType.ADD_FRIEND,
+        TaskType.ACCEPT_NEW_FRIENDS,
+        TaskType.SEND_MESSAGE,
+        TaskType.SEND_FILES,
+        TaskType.POST_MOMENTS,
+    }
+)
+
+
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -46,11 +59,14 @@ class Task:
     payload: dict[str, Any]
     status: TaskStatus
     account_id: str
+    idempotency_key: str
     attempts: int
     max_attempts: int
     created_at: str
     updated_at: str
     available_at: str
+    lease_owner: str | None = None
+    lease_expires_at: str | None = None
     last_error: str | None = None
     result: dict[str, Any] | None = None
 
@@ -69,9 +85,47 @@ class Task:
             payload=payload,
             status=TaskStatus.PENDING,
             account_id=account_id,
+            idempotency_key=task_idempotency_key(task_type, payload, account_id),
             attempts=0,
             max_attempts=max_attempts,
             created_at=now,
             updated_at=now,
             available_at=now,
+            lease_owner=None,
+            lease_expires_at=None,
         )
+
+
+def task_idempotency_key(
+    task_type: TaskType,
+    payload: dict[str, Any],
+    account_id: str,
+) -> str:
+    """Return a stable identity for one logical request.
+
+    Queue-owned continuation fields are intentionally ignored so yielding a
+    long-running task does not change its dedupe identity.
+    """
+    public_payload = {
+        key: value
+        for key, value in payload.items()
+        if not str(key).startswith("_wxclient_")
+    }
+    canonical_payload = json.dumps(
+        public_payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    identity = f"{account_id}\0{task_type.value}\0{canonical_payload}"
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def lease_deadline(seconds: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=max(0.0, seconds))).isoformat()
+
+
+def is_real_write(task: Task) -> bool:
+    return task.type in REAL_WRITE_TASK_TYPES and not bool(
+        task.payload.get("dry_run", False)
+    )

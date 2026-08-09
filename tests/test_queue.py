@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -68,8 +70,21 @@ class _FakeApi:
         }
 
 
+class _FailingApi(_FakeApi):
+    def search_contacts(self, query: str, limit: int) -> dict[str, Any]:
+        raise RuntimeError("transient read failure")
+
+    def send_message(
+        self,
+        friend: str,
+        text: str,
+        dry_run: bool | None,
+    ) -> dict[str, Any]:
+        raise RuntimeError("result unknown")
+
+
 class TaskStoreTests(unittest.TestCase):
-    def test_pending_tasks_of_same_type_are_deduplicated(self) -> None:
+    def test_only_identical_pending_tasks_are_deduplicated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TaskStore(Path(tmp) / "tasks.db")
             first = store.create_task(
@@ -77,12 +92,79 @@ class TaskStoreTests(unittest.TestCase):
                 {"friend": "a", "text": "one"},
                 "default",
             )
-            second = store.create_task(
+            duplicate = store.create_task(
+                TaskType.SEND_MESSAGE,
+                {"text": "one", "friend": "a"},
+                "default",
+            )
+            different = store.create_task(
                 TaskType.SEND_MESSAGE,
                 {"friend": "b", "text": "two"},
                 "default",
             )
-        self.assertEqual(first.id, second.id)
+        self.assertEqual(first.id, duplicate.id)
+        self.assertNotEqual(first.id, different.id)
+
+    def test_atomic_claim_has_only_one_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "tasks.db"
+            TaskStore(database_path).create_task(
+                TaskType.SCAN_MESSAGES,
+                {"friend": "chat-a", "duration": "1s"},
+                "default",
+            )
+
+            def claim(owner: str) -> Task | None:
+                return TaskStore(database_path).claim_next(owner, lease_seconds=30)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                claimed = list(executor.map(claim, ["worker-a", "worker-b"]))
+
+        winners = [task for task in claimed if task is not None]
+        self.assertEqual(len(winners), 1)
+
+    def test_expired_running_task_is_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "tasks.db")
+            task = store.create_task(
+                TaskType.SCAN_MESSAGES,
+                {"friend": "chat-a", "duration": "1s"},
+                "default",
+            )
+            claimed = store.claim_next("worker-a", lease_seconds=0)
+            self.assertEqual(claimed.id, task.id)  # type: ignore[union-attr]
+
+            recovered = store.recover_expired()
+            reclaimed = store.claim_next("worker-b", lease_seconds=30)
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(reclaimed.id, task.id)  # type: ignore[union-attr]
+        self.assertEqual(reclaimed.lease_owner, "worker-b")  # type: ignore[union-attr]
+
+    def test_ui_worker_lease_allows_only_one_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "tasks.db")
+            self.assertTrue(store.acquire_worker("worker-a", lease_seconds=30))
+            self.assertFalse(store.acquire_worker("worker-b", lease_seconds=30))
+            store.release_worker("worker-a")
+            self.assertTrue(store.acquire_worker("worker-b", lease_seconds=30))
+
+    def test_expired_real_write_is_not_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "tasks.db")
+            task = store.create_task(
+                TaskType.SEND_MESSAGE,
+                {"friend": "chat-a", "text": "hello", "dry_run": False},
+                "default",
+            )
+            store.claim_next("worker-a", lease_seconds=0)
+
+            recovered = store.recover_expired()
+            current = store.get(task.id)
+
+        self.assertEqual(recovered, 1)
+        self.assertEqual(current.status, TaskStatus.FAILED)  # type: ignore[union-attr]
+        self.assertEqual(current.result["outcome"], "unknown")  # type: ignore[union-attr,index]
 
     def test_worker_completes_a_serialized_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -102,6 +184,30 @@ class TaskStoreTests(unittest.TestCase):
 
 
 class WorkerDispatchTests(unittest.TestCase):
+    def test_read_failure_is_requeued_but_real_write_failure_is_not(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "tasks.db")
+            worker = OperationWorker(store, _FailingApi())  # type: ignore[arg-type]
+            read_task = store.create_task(
+                TaskType.SEARCH_CONTACTS,
+                {"query": "彭杏", "limit": 5},
+                "default",
+            )
+            self.assertTrue(worker.run_once())
+            self.assertEqual(store.get(read_task.id).status, TaskStatus.PENDING)  # type: ignore[union-attr]
+            store.fail(read_task.id, "end test retry", retry=False)
+
+            write_task = store.create_task(
+                TaskType.SEND_MESSAGE,
+                {"friend": "大月", "text": "你好", "dry_run": False},
+                "default",
+            )
+            self.assertTrue(worker.run_once())
+            current = store.get(write_task.id)
+
+        self.assertEqual(current.status, TaskStatus.FAILED)  # type: ignore[union-attr]
+        self.assertEqual(current.result["outcome"], "unknown")  # type: ignore[union-attr,index]
+        self.assertTrue(current.result["retry_suppressed"])  # type: ignore[union-attr,index]
     def test_search_contacts_is_dispatched_through_worker(self) -> None:
         api = _FakeApi()
         with tempfile.TemporaryDirectory() as tmp:
@@ -116,26 +222,45 @@ class WorkerDispatchTests(unittest.TestCase):
         self.assertEqual(result["action"], "search_contacts")
         self.assertEqual(result["matches"][0]["name"], "彭杏")
 
-    def test_watch_chats_is_pure_monitoring(self) -> None:
+    def test_watch_chats_yields_between_short_slices(self) -> None:
         api = _FakeApi()
         with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "tasks.db")
             worker = OperationWorker(
-                TaskStore(Path(tmp) / "tasks.db"),
+                store,
                 api,  # type: ignore[arg-type]
+                watch_slice_seconds=1,
             )
-            task = Task.new(
+            watch = store.create_task(
                 TaskType.WATCH_CHATS,
                 {
                     "friends": ["chat-a", "chat-b", "chat-a"],
-                    "duration": "1s",
+                    "duration": "2s",
                     "dry_run": True,
                 },
+                "default",
             )
-            result = worker.dispatch(task)
+            search = store.create_task(
+                TaskType.SEARCH_CONTACTS,
+                {"query": "彭杏", "limit": 5},
+                "default",
+            )
 
-        self.assertEqual(api.scanned, ["chat-a", "chat-b"])
+            self.assertTrue(worker.run_once())
+            self.assertEqual(api.scanned, ["chat-a"])
+            self.assertEqual(store.get(watch.id).status, TaskStatus.PENDING)  # type: ignore[union-attr]
+
+            self.assertTrue(worker.run_once())
+            self.assertEqual(store.get(search.id).status, TaskStatus.SUCCEEDED)  # type: ignore[union-attr]
+
+            while store.get(watch.id).status != TaskStatus.SUCCEEDED:  # type: ignore[union-attr]
+                time.sleep(0.11)
+                worker.run_once()
+            result = store.get(watch.id).result  # type: ignore[union-attr]
+
+        self.assertEqual(api.scanned, ["chat-a", "chat-a", "chat-b", "chat-b"])
         self.assertEqual(result["chat_count"], 2)
-        self.assertEqual(result["message_count"], 2)
+        self.assertEqual(result["message_count"], 4)
         self.assertNotIn("reply_count", result)
 
     def test_new_core_capabilities_are_dispatched_through_worker(self) -> None:
