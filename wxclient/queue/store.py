@@ -93,6 +93,35 @@ class TaskStore:
                 conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN lease_owner VARCHAR")
             if "lease_expires_at" not in columns:
                 conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN lease_expires_at VARCHAR")
+            legacy_rows = conn.execute(
+                select(
+                    self.tasks.c.id,
+                    self.tasks.c.type,
+                    self.tasks.c.payload,
+                    self.tasks.c.account_id,
+                ).where(self.tasks.c.idempotency_key.is_(None))
+            ).mappings().fetchall()
+            if legacy_rows:
+                # A previous release may already have created this partial
+                # index while legacy rows still had NULL keys. Drop it inside
+                # the schema transaction so every key can be backfilled before
+                # duplicate active rows are resolved and uniqueness is restored.
+                conn.exec_driver_sql(
+                    "DROP INDEX IF EXISTS uq_tasks_active_idempotency"
+                )
+                for row in legacy_rows:
+                    payload = json.loads(row["payload"])
+                    conn.execute(
+                        update(self.tasks)
+                        .where(self.tasks.c.id == row["id"])
+                        .values(
+                            idempotency_key=task_idempotency_key(
+                                TaskType(row["type"]),
+                                payload,
+                                row["account_id"],
+                            )
+                        )
+                    )
             conn.exec_driver_sql(
                 "CREATE INDEX IF NOT EXISTS idx_tasks_dedupe "
                 "ON tasks (account_id, type, idempotency_key, status)"
@@ -175,7 +204,10 @@ class TaskStore:
                     self.tasks.c.available_at <= now,
                 )
             )
-            .order_by(self.tasks.c.created_at.asc())
+            .order_by(
+                self.tasks.c.available_at.asc(),
+                self.tasks.c.created_at.asc(),
+            )
             .limit(1)
             .scalar_subquery()
         )

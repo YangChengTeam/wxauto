@@ -4,10 +4,13 @@ import tempfile
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
+from sqlite3 import connect
 from typing import Any
 
 from wxclient.queue import OperationWorker, Task, TaskStatus, TaskStore, TaskType
+from wxclient.wechat_api import WeChatApiError
 
 
 class _FakeApi:
@@ -72,7 +75,7 @@ class _FakeApi:
 
 class _FailingApi(_FakeApi):
     def search_contacts(self, query: str, limit: int) -> dict[str, Any]:
-        raise RuntimeError("transient read failure")
+        raise WeChatApiError("transient read failure")
 
     def send_message(
         self,
@@ -80,7 +83,7 @@ class _FailingApi(_FakeApi):
         text: str,
         dry_run: bool | None,
     ) -> dict[str, Any]:
-        raise RuntimeError("result unknown")
+        raise WeChatApiError("result unknown")
 
 
 class TaskStoreTests(unittest.TestCase):
@@ -104,6 +107,50 @@ class TaskStoreTests(unittest.TestCase):
             )
         self.assertEqual(first.id, duplicate.id)
         self.assertNotEqual(first.id, different.id)
+
+    def test_legacy_pending_task_is_backfilled_and_deduplicated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "tasks.db"
+            with closing(connect(database_path)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE tasks (
+                        id VARCHAR PRIMARY KEY,
+                        type VARCHAR NOT NULL,
+                        payload TEXT NOT NULL,
+                        status VARCHAR NOT NULL,
+                        account_id VARCHAR NOT NULL,
+                        attempts INTEGER NOT NULL,
+                        max_attempts INTEGER NOT NULL,
+                        created_at VARCHAR NOT NULL,
+                        updated_at VARCHAR NOT NULL,
+                        available_at VARCHAR NOT NULL,
+                        last_error TEXT,
+                        result TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO tasks VALUES (
+                        'legacy-task', 'send_message',
+                        '{"friend":"a","text":"one"}', 'pending', 'default',
+                        0, 3, '2026-01-01T00:00:00+00:00',
+                        '2026-01-01T00:00:00+00:00',
+                        '2026-01-01T00:00:00+00:00', NULL, NULL
+                    )
+                    """
+                )
+                connection.commit()
+
+            store = TaskStore(database_path)
+            duplicate = store.create_task(
+                TaskType.SEND_MESSAGE,
+                {"text": "one", "friend": "a"},
+                "default",
+            )
+
+        self.assertEqual(duplicate.id, "legacy-task")
 
     def test_atomic_claim_has_only_one_winner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -166,6 +213,44 @@ class TaskStoreTests(unittest.TestCase):
         self.assertEqual(current.status, TaskStatus.FAILED)  # type: ignore[union-attr]
         self.assertEqual(current.result["outcome"], "unknown")  # type: ignore[union-attr,index]
 
+    def test_yielded_task_does_not_jump_a_new_ready_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "tasks.db")
+            watch = store.create_task(
+                TaskType.WATCH_CHATS,
+                {"friends": ["chat-a"], "duration": "2s", "dry_run": True},
+                "default",
+            )
+            store.claim_next("worker-a", lease_seconds=30)
+            self.assertTrue(
+                store.yield_task(
+                    watch.id,
+                    "worker-a",
+                    watch.payload,
+                    delay_seconds=0,
+                )
+            )
+            search = store.create_task(
+                TaskType.SEARCH_CONTACTS,
+                {"query": "彭杏", "limit": 5},
+                "default",
+            )
+            with store.engine.begin() as connection:
+                connection.exec_driver_sql(
+                    "UPDATE tasks SET available_at = '2026-01-02T00:00:00+00:00' "
+                    "WHERE id = ?",
+                    (watch.id,),
+                )
+                connection.exec_driver_sql(
+                    "UPDATE tasks SET available_at = '2026-01-01T00:00:00+00:00' "
+                    "WHERE id = ?",
+                    (search.id,),
+                )
+
+            claimed = store.claim_next("worker-b", lease_seconds=30)
+
+        self.assertEqual(claimed.id, search.id)  # type: ignore[union-attr]
+
     def test_worker_completes_a_serialized_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TaskStore(Path(tmp) / "tasks.db")
@@ -208,6 +293,7 @@ class WorkerDispatchTests(unittest.TestCase):
         self.assertEqual(current.status, TaskStatus.FAILED)  # type: ignore[union-attr]
         self.assertEqual(current.result["outcome"], "unknown")  # type: ignore[union-attr,index]
         self.assertTrue(current.result["retry_suppressed"])  # type: ignore[union-attr,index]
+
     def test_search_contacts_is_dispatched_through_worker(self) -> None:
         api = _FakeApi()
         with tempfile.TemporaryDirectory() as tmp:
