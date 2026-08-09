@@ -28,6 +28,20 @@
 所有微信 UI 动作仍经过 `wxclient/wechat_api/` 和单消费者任务队列。新增工具组时实现
 `McpToolProvider.register()`，再与 `WeChatToolProvider` 一起传给 `create_mcp_server()`。
 
+## 队列可靠性
+
+- 任务使用账号、类型和规范化 payload 生成幂等键。内容相同且仍处于 `PENDING` 或
+  `RUNNING` 的任务会复用现有任务；同类型但参数不同的任务不会再被错误合并。
+- SQLite 通过原子更新领取任务，并为任务和微信 UI worker 保存可续期租约。因此即使误启
+  多个 MCP 进程，同一时刻也只有一个 worker 可以操作微信界面。
+- 服务启动和领取任务时会恢复租约过期的任务。只读任务可以在重试上限内按指数退避重试；
+  真实写操作如果执行结果未知，会直接标记失败并设置 `retry_suppressed=true`，避免重复发送。
+- `wx_watch_chats` 按短时间片执行，每个时间片结束后把续作放回队列，让发送消息等新任务
+  获得执行机会，同时仍保持所有 UI 动作由单消费者串行完成。
+
+`wxclient.wechat_api.service` 只保留兼容导出；统一门面和驱动编排位于 `api.py`，UIA 实现
+位于 `uia.py`，可选视觉驱动位于 `omni.py`，异常类型位于 `errors.py`。
+
 ## 本机安装与启动
 
 需要 Python 3.10+。

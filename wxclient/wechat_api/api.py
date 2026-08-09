@@ -12,25 +12,6 @@ from .uia import UiaWeChatDriver
 logger = structlog.get_logger(__name__)
 
 
-class _SelfUiaDriver:
-    driver_name = "uia"
-
-    def __init__(self, api: UiaWeChatDriver) -> None:
-        self._api = api
-
-    def __getattr__(self, name: str) -> Any:
-        attr = getattr(UiaWeChatDriver, name, None)
-        if attr is None or name.startswith("_"):
-            raise AttributeError(name)
-        if not callable(attr):
-            return attr
-
-        def _call(*args: Any, **kwargs: Any) -> Any:
-            return attr(self._api, *args, **kwargs)
-
-        return _call
-
-
 class CompositeWeChatDriver:
     def __init__(self, drivers: list[Any]) -> None:
         self.drivers = drivers
@@ -74,7 +55,7 @@ class CompositeWeChatDriver:
         raise WeChatApiUnavailableError(f"No available WeChat driver for {action_name}: {detail}")
 
 
-class WeChatApi(UiaWeChatDriver):
+class WeChatApi:
     def __init__(
         self,
         project_root: Path | None = None,
@@ -83,14 +64,23 @@ class WeChatApi(UiaWeChatDriver):
         wechat_driver_order: list[str] | None = None,
         omni_visual_rpa_config: dict[str, Any] | None = None,
     ) -> None:
-        super().__init__(
+        self._uia_driver = UiaWeChatDriver(
             project_root=project_root,
             dry_run=dry_run,
             wechat_path=wechat_path,
         )
+        self.project_root = self._uia_driver.project_root
+        self.dry_run = self._uia_driver.dry_run
         self.wechat_driver_order = _normalize_driver_order(wechat_driver_order)
         self.omni_visual_rpa_config = omni_visual_rpa_config or {}
         self._composite_driver = CompositeWeChatDriver(self._build_drivers())
+
+    def __getattr__(self, name: str) -> Any:
+        """Preserve legacy UIA helper access while keeping the facade compositional."""
+        uia_driver = self.__dict__.get("_uia_driver")
+        if uia_driver is None:
+            raise AttributeError(name)
+        return getattr(uia_driver, name)
 
     def add_friend(
         self,
@@ -241,7 +231,7 @@ class WeChatApi(UiaWeChatDriver):
         drivers: list[Any] = []
         for driver_name in self.wechat_driver_order:
             if driver_name == "uia":
-                drivers.append(_SelfUiaDriver(self))
+                drivers.append(self._uia_driver)
             elif driver_name == "omni_visual":
                 drivers.append(
                     OmniVisualDriver(
@@ -253,7 +243,7 @@ class WeChatApi(UiaWeChatDriver):
             else:
                 logger.warning("wechat.driver.unknown", driver=driver_name)
         if not drivers:
-            drivers.append(_SelfUiaDriver(self))
+            drivers.append(self._uia_driver)
         return drivers
 
 

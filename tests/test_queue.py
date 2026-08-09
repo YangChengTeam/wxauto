@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from contextlib import closing
 from pathlib import Path
 from sqlite3 import connect
@@ -84,6 +86,20 @@ class _FailingApi(_FakeApi):
         dry_run: bool | None,
     ) -> dict[str, Any]:
         raise WeChatApiError("result unknown")
+
+
+class _BlockingApi(_FakeApi):
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.call_count = 0
+
+    def search_contacts(self, query: str, limit: int) -> dict[str, Any]:
+        self.call_count += 1
+        self.entered.set()
+        self.release.wait(timeout=5)
+        return super().search_contacts(query, limit)
 
 
 class TaskStoreTests(unittest.TestCase):
@@ -337,17 +353,54 @@ class TaskStoreTests(unittest.TestCase):
 
 
 class WorkerDispatchTests(unittest.TestCase):
+    def test_one_worker_instance_cannot_dispatch_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "tasks.db")
+            api = _BlockingApi()
+            worker = OperationWorker(store, api)  # type: ignore[arg-type]
+            first = store.create_task(
+                TaskType.SEARCH_CONTACTS,
+                {"query": "first", "limit": 5},
+                "default",
+            )
+            second = store.create_task(
+                TaskType.SEARCH_CONTACTS,
+                {"query": "second", "limit": 5},
+                "default",
+            )
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                running = executor.submit(worker.run_once)
+                self.assertTrue(api.entered.wait(timeout=2))
+                concurrent_result = executor.submit(worker.run_once).result(timeout=2)
+                api.release.set()
+                self.assertTrue(running.result(timeout=2))
+
+            self.assertFalse(concurrent_result)
+            self.assertEqual(api.call_count, 1)
+            self.assertEqual(store.get(first.id).status, TaskStatus.SUCCEEDED)  # type: ignore[union-attr]
+            self.assertEqual(store.get(second.id).status, TaskStatus.PENDING)  # type: ignore[union-attr]
+
     def test_read_failure_is_requeued_but_real_write_failure_is_not(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TaskStore(Path(tmp) / "tasks.db")
-            worker = OperationWorker(store, _FailingApi())  # type: ignore[arg-type]
+            worker = OperationWorker(
+                store,
+                _FailingApi(),  # type: ignore[arg-type]
+                retry_base_seconds=5,
+            )
             read_task = store.create_task(
                 TaskType.SEARCH_CONTACTS,
                 {"query": "彭杏", "limit": 5},
                 "default",
             )
             self.assertTrue(worker.run_once())
-            self.assertEqual(store.get(read_task.id).status, TaskStatus.PENDING)  # type: ignore[union-attr]
+            pending_read = store.get(read_task.id)
+            self.assertEqual(pending_read.status, TaskStatus.PENDING)  # type: ignore[union-attr]
+            retry_delay = datetime.fromisoformat(  # type: ignore[union-attr]
+                pending_read.available_at
+            ) - datetime.fromisoformat(pending_read.updated_at)  # type: ignore[union-attr]
+            self.assertGreaterEqual(retry_delay.total_seconds(), 4.9)
             store.fail(read_task.id, "end test retry", retry=False)
 
             write_task = store.create_task(

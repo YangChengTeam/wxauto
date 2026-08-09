@@ -431,18 +431,22 @@ class TaskStore:
         retry: bool = False,
         owner_id: str | None = None,
         result: dict[str, Any] | None = None,
+        retry_delay_seconds: float = 0.0,
     ) -> bool:
         task = self.get(task_id)
         if retry and task and task.attempts < task.max_attempts:
             status = TaskStatus.PENDING
+            available_at = lease_deadline(retry_delay_seconds)
         else:
             status = TaskStatus.FAILED
+            available_at = utcnow()
         return self._set_terminal(
             task_id,
             status,
             error=error,
             result=result,
             owner_id=owner_id,
+            available_at=available_at,
         )
 
     def block(self, task_id: str, error: str, owner_id: str | None = None) -> bool:
@@ -505,6 +509,7 @@ class TaskStore:
         error: str | None = None,
         result: dict[str, Any] | None = None,
         owner_id: str | None = None,
+        available_at: str | None = None,
     ) -> bool:
         conditions = [self.tasks.c.id == task_id]
         if owner_id is not None:
@@ -521,7 +526,7 @@ class TaskStore:
                 .values(
                     status=status.value,
                     updated_at=utcnow(),
-                    available_at=utcnow(),
+                    available_at=available_at or utcnow(),
                     lease_owner=None,
                     lease_expires_at=None,
                     last_error=error,

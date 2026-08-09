@@ -32,6 +32,8 @@ class OperationWorker:
         lease_seconds: float = 30.0,
         worker_id: str | None = None,
         watch_slice_seconds: float = 5.0,
+        retry_base_seconds: float = 1.0,
+        retry_max_seconds: float = 30.0,
     ) -> None:
         self.store = store
         self.api = api
@@ -39,9 +41,13 @@ class OperationWorker:
         self.lease_seconds = max(1.0, lease_seconds)
         self.worker_id = worker_id or str(uuid4())
         self.watch_slice_seconds = max(0.1, watch_slice_seconds)
+        self.retry_base_seconds = max(0.0, retry_base_seconds)
+        self.retry_max_seconds = max(self.retry_base_seconds, retry_max_seconds)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._busy = False
+        self._lifecycle_lock = threading.Lock()
+        self._execution_lock = threading.Lock()
 
     @property
     def busy(self) -> bool:
@@ -52,18 +58,24 @@ class OperationWorker:
         return bool(self._thread and self._thread.is_alive())
 
     def start(self) -> None:
-        if self.running:
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self.run_forever, name="wx-mcp-worker", daemon=True)
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self.running:
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self.run_forever,
+                name="wx-mcp-worker",
+                daemon=True,
+            )
+            self._thread.start()
 
     def stop(self, wait: bool = True, timeout: float | None = 5.0) -> None:
-        self._stop.set()
-        if wait and self._thread:
-            self._thread.join(timeout=timeout)
-        if not self.running:
-            self.store.release_worker(self.worker_id)
+        with self._lifecycle_lock:
+            self._stop.set()
+            if wait and self._thread:
+                self._thread.join(timeout=timeout)
+            if not self.running:
+                self.store.release_worker(self.worker_id)
 
     def run_forever(self) -> None:
         logger.info("worker.started", poll_interval=self.poll_interval)
@@ -76,6 +88,16 @@ class OperationWorker:
             logger.info("worker.stopped")
 
     def run_once(self) -> bool:
+        if self._stop.is_set():
+            return False
+        if not self._execution_lock.acquire(blocking=False):
+            return False
+        try:
+            return self._run_once_locked()
+        finally:
+            self._execution_lock.release()
+
+    def _run_once_locked(self) -> bool:
         if self._stop.is_set():
             return False
         if not self.store.acquire_worker(self.worker_id, self.lease_seconds):
@@ -142,7 +164,12 @@ class OperationWorker:
             str(exc),
             retry=True,
             owner_id=self.worker_id,
+            retry_delay_seconds=self._retry_delay(task.attempts),
         )
+
+    def _retry_delay(self, attempts: int) -> float:
+        exponent = max(0, attempts - 1)
+        return min(self.retry_base_seconds * (2**exponent), self.retry_max_seconds)
 
     def _renew_leases(self, task_id: str, stop: threading.Event) -> None:
         interval = max(0.25, self.lease_seconds / 3)

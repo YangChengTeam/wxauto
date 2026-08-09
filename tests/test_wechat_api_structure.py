@@ -24,6 +24,14 @@ class WeChatApiStructureTests(unittest.TestCase):
         self.assertIs(OmniVisualDriver, SplitOmniVisualDriver)
         self.assertIs(WeChatApiError, SplitWeChatApiError)
 
+    def test_facade_composes_uia_driver_without_inheriting_it(self) -> None:
+        api = WeChatApi(dry_run=True)
+
+        self.assertNotIsInstance(api, UiaWeChatDriver)
+        self.assertIsInstance(api._uia_driver, UiaWeChatDriver)
+        self.assertIs(api._composite_driver.drivers[0], api._uia_driver)
+        self.assertTrue(api._is_dry_run(None))
+
 
 if __name__ == "__main__":
     unittest.main()
