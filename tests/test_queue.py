@@ -152,6 +152,74 @@ class TaskStoreTests(unittest.TestCase):
 
         self.assertEqual(duplicate.id, "legacy-task")
 
+    def test_legacy_running_tasks_are_recovered_safely_on_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "tasks.db"
+            with closing(connect(database_path)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE tasks (
+                        id VARCHAR PRIMARY KEY,
+                        type VARCHAR NOT NULL,
+                        payload TEXT NOT NULL,
+                        status VARCHAR NOT NULL,
+                        account_id VARCHAR NOT NULL,
+                        attempts INTEGER NOT NULL,
+                        max_attempts INTEGER NOT NULL,
+                        created_at VARCHAR NOT NULL,
+                        updated_at VARCHAR NOT NULL,
+                        available_at VARCHAR NOT NULL,
+                        last_error TEXT,
+                        result TEXT
+                    )
+                    """
+                )
+                connection.executemany(
+                    "INSERT INTO tasks VALUES (?, ?, ?, ?, 'default', 1, 3, ?, ?, ?, NULL, NULL)",
+                    [
+                        (
+                            "legacy-read",
+                            "scan_messages",
+                            '{"friend":"a","duration":"1s"}',
+                            "running",
+                            "2026-01-01T00:00:00+00:00",
+                            "2026-01-01T00:00:00+00:00",
+                            "2026-01-01T00:00:00+00:00",
+                        ),
+                        (
+                            "legacy-write-pending",
+                            "send_message",
+                            '{"friend":"a","text":"one","dry_run":false}',
+                            "pending",
+                            "2026-01-01T00:00:00+00:00",
+                            "2026-01-01T00:00:00+00:00",
+                            "2026-01-01T00:00:00+00:00",
+                        ),
+                        (
+                            "legacy-write-running",
+                            "send_message",
+                            '{"friend":"a","text":"one","dry_run":false}',
+                            "running",
+                            "2026-01-02T00:00:00+00:00",
+                            "2026-01-02T00:00:00+00:00",
+                            "2026-01-02T00:00:00+00:00",
+                        ),
+                    ],
+                )
+                connection.commit()
+
+            store = TaskStore(database_path)
+            recovered_read = store.get("legacy-read")
+            cancelled_duplicate = store.get("legacy-write-pending")
+            unknown_write = store.get("legacy-write-running")
+
+        self.assertEqual(recovered_read.status, TaskStatus.PENDING)  # type: ignore[union-attr]
+        self.assertIsNone(recovered_read.lease_expires_at)  # type: ignore[union-attr]
+        self.assertEqual(cancelled_duplicate.status, TaskStatus.CANCELLED)  # type: ignore[union-attr]
+        self.assertEqual(unknown_write.status, TaskStatus.FAILED)  # type: ignore[union-attr]
+        self.assertEqual(unknown_write.result["outcome"], "unknown")  # type: ignore[union-attr,index]
+        self.assertTrue(unknown_write.result["retry_suppressed"])  # type: ignore[union-attr,index]
+
     def test_atomic_claim_has_only_one_winner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database_path = Path(tmp) / "tasks.db"

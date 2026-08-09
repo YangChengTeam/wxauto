@@ -82,6 +82,7 @@ class TaskStore:
 
     def _init_schema(self) -> None:
         self.metadata.create_all(self.engine)
+        migration_now = utcnow()
         with self.engine.begin() as conn:
             columns = {
                 str(row[1])
@@ -130,7 +131,8 @@ class TaskStore:
                 "UPDATE tasks SET status = 'cancelled', "
                 "last_error = '迁移时取消重复的活动任务' WHERE id IN ("
                 "SELECT id FROM (SELECT id, ROW_NUMBER() OVER ("
-                "PARTITION BY account_id, type, idempotency_key ORDER BY created_at, id"
+                "PARTITION BY account_id, type, idempotency_key ORDER BY "
+                "CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at, id"
                 ") AS duplicate_number FROM tasks WHERE idempotency_key IS NOT NULL "
                 "AND status IN ('pending', 'running')) WHERE duplicate_number > 1)"
             )
@@ -139,6 +141,20 @@ class TaskStore:
                 "ON tasks (account_id, type, idempotency_key) "
                 "WHERE idempotency_key IS NOT NULL AND status IN ('pending', 'running')"
             )
+            # Databases created before leases can contain RUNNING rows without
+            # an expiry. Treat them as expired on upgrade: reads may be retried,
+            # while real writes are moved to an unknown terminal outcome.
+            conn.execute(
+                update(self.tasks)
+                .where(
+                    and_(
+                        self.tasks.c.status == TaskStatus.RUNNING.value,
+                        self.tasks.c.lease_expires_at.is_(None),
+                    )
+                )
+                .values(lease_expires_at=migration_now)
+            )
+        self.recover_expired()
 
     def create_task(self, task_type: TaskType, payload: dict[str, Any], account_id: str) -> Task:
         idempotency_key = task_idempotency_key(task_type, payload, account_id)
@@ -237,6 +253,7 @@ class TaskStore:
 
     def recover_expired(self) -> int:
         now = utcnow()
+        recovered = 0
         with self.engine.begin() as conn:
             rows = conn.execute(
                 select(self.tasks)
@@ -279,7 +296,7 @@ class TaskStore:
                         status=TaskStatus.FAILED.value,
                         last_error="任务租约过期且已达到最大尝试次数",
                     )
-                conn.execute(
+                result = conn.execute(
                     update(self.tasks)
                     .where(
                         and_(
@@ -290,7 +307,8 @@ class TaskStore:
                     )
                     .values(**values)
                 )
-        return len(rows)
+                recovered += int(result.rowcount or 0)
+        return recovered
 
     def renew_task(self, task_id: str, owner_id: str, lease_seconds: float) -> bool:
         with self.engine.begin() as conn:
