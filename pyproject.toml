@@ -23,6 +23,8 @@ dependencies = [
   "sounddevice>=0.5.1",
   "soundfile>=0.13.1",
   "SQLAlchemy>=2.0",
+  "httpx>=0.27",
+  "websockets>=13",
 ]
 
 [project.scripts]

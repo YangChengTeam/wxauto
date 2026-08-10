@@ -1,0 +1,160 @@
+"""Fake 劳小智 AI 端 WS 服务——按契约回放事件序列，让协议层在 Linux 上可测。
+
+只实现 ``CLAUDE.md`` §4.2 的对外契约，不含任何 codex / 大模型。
+Phase B 的入站/出站测试也复用它。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+from uuid import uuid4
+
+from websockets.asyncio.server import serve
+
+
+@dataclass
+class TurnScript:
+    """一轮的回放脚本。"""
+
+    deltas: list[str] = field(default_factory=list)
+    cards: list[dict[str, Any]] = field(default_factory=list)
+    elapsed_ms: int = 1234
+    error: dict[str, Any] | None = None
+    delay_seconds: float = 0.0
+    """收到 message.send 后先拖多久——用来测超时。"""
+
+
+class FakeAgentServer:
+    """按契约应答的假 AI 端。
+
+    ``turn_script`` 可以是固定脚本，也可以是 ``(session_id, text) -> TurnScript``
+    的函数，用来按输入分支。
+    """
+
+    def __init__(
+        self,
+        *,
+        valid_tickets: set[str] | None = None,
+        turn_script: TurnScript | Callable[[str, str], TurnScript] | None = None,
+    ) -> None:
+        self._valid_tickets = valid_tickets
+        self._turn_script = turn_script or TurnScript(
+            deltas=["你好", "，还在招人"],
+            cards=[{"type": "info", "body": {"kind": "wechat_reply", "reply_segments": ["你好"]}}],
+        )
+        self.sessions: set[str] = set()
+        self.received: list[dict[str, Any]] = []
+        """收到的所有客户端帧，供断言。"""
+        self._server: Any = None
+        self.port: int = 0
+
+    @property
+    def url(self) -> str:
+        return f"ws://127.0.0.1:{self.port}/v1/ws"
+
+    async def __aenter__(self) -> FakeAgentServer:
+        self._server = await serve(self._handle, "127.0.0.1", 0)
+        self.port = self._server.sockets[0].getsockname()[1]
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+
+    # ────────────────────────── 协议实现 ──────────────────────────
+
+    async def _handle(self, websocket: Any) -> None:
+        authenticated = False
+        async for raw in websocket:
+            try:
+                frame = json.loads(raw)
+            except Exception:  # noqa: BLE001
+                continue
+            self.received.append(frame)
+
+            op = frame.get("op")
+            ack = frame.get("id")
+            data = frame.get("data") or {}
+
+            if op == "auth":
+                ticket = data.get("session_ticket") or ""
+                if self._valid_tickets is not None and ticket not in self._valid_tickets:
+                    await self._emit(websocket, ack, "error", {
+                        "code": "unauthorized",
+                        "message": "authentication failed",
+                    })
+                    await websocket.close(4401, "unauthorized")
+                    return
+                authenticated = True
+                await self._emit(websocket, ack, "status", {"state": "authenticated"})
+                continue
+
+            if not authenticated:
+                await self._emit(websocket, ack, "error", {
+                    "code": "unauthorized",
+                    "message": "auth required",
+                })
+                continue
+
+            if op == "session.start":
+                session_id = str(uuid4())
+                self.sessions.add(session_id)
+                await self._emit(websocket, ack, "session.created", {"session_id": session_id})
+                continue
+
+            if op == "session.resume":
+                session_id = data.get("session_id") or ""
+                if session_id not in self.sessions:
+                    await self._emit(websocket, ack, "error", {
+                        "code": "forbidden",
+                        "message": "session does not belong to current principal",
+                    })
+                    continue
+                await self._emit(websocket, ack, "session.resumed", {"session_id": session_id})
+                continue
+
+            if op == "message.send":
+                asyncio.create_task(self._run_turn(websocket, ack, data))
+                continue
+
+    async def _run_turn(self, websocket: Any, ack: str | None, data: dict[str, Any]) -> None:
+        session_id = data.get("session_id") or ""
+        text = data.get("text") or ""
+        script = (
+            self._turn_script(session_id, text)
+            if callable(self._turn_script)
+            else self._turn_script
+        )
+
+        await self._emit(websocket, ack, "status", {"session_id": session_id, "state": "running"})
+        if script.delay_seconds:
+            await asyncio.sleep(script.delay_seconds)
+
+        if script.error is not None:
+            await self._emit(websocket, ack, "error", {"session_id": session_id, **script.error})
+            return
+
+        for delta in script.deltas:
+            await self._emit(
+                websocket, ack, "text.delta", {"session_id": session_id, "delta": delta}
+            )
+        for card in script.cards:
+            await self._emit(websocket, ack, "card", {"session_id": session_id, "card": card})
+        await self._emit(
+            websocket,
+            ack,
+            "status",
+            {"session_id": session_id, "state": "done", "elapsed_ms": script.elapsed_ms},
+        )
+
+    @staticmethod
+    async def _emit(websocket: Any, ack: str | None, ev: str, data: dict[str, Any]) -> None:
+        frame: dict[str, Any] = {"v": 1, "ev": ev, "data": data}
+        if ack:
+            frame["ack"] = ack
+        await websocket.send(json.dumps(frame, ensure_ascii=False))

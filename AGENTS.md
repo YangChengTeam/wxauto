@@ -1,12 +1,17 @@
 # AGENTS.md
 
-本仓库只维护一个 Windows 微信 MCP 服务，负责微信 UI 自动化和串行任务执行。仓库不
-维护 GUI、托盘、独立调用客户端、定时调度或大模型回复模块。
+本仓库维护 Windows 微信自动化服务，负责微信 UI 自动化和串行任务执行，对外提供两个
+入口：被动的 MCP 工具服务（`mcp_server/`）和主动的 WS 网关（`gateway/`）。仓库不维护
+GUI、托盘、独立调用客户端或大模型回复模块。
+
+> 协作约定、跨仓接口契约与红线见 [`CLAUDE.md`](CLAUDE.md)，本文只讲本仓代码规则。
 
 ## 文档与源码
 
+- 协作约定与跨仓契约：`CLAUDE.md`
 - MCP 部署、鉴权、工具和扩展：`docs/mcp-server.md`
 - MCP 服务：`wxclient/mcp_server/`
+- WS 网关：`wxclient/gateway/`
 - 微信动作封装：`wxclient/wechat_api/`
 - 只读 UIA 探测：`wxclient/uia_probe/`
 - 串行任务队列：`wxclient/queue/`
@@ -27,10 +32,12 @@
 
 ## 架构约束
 
-- 所有微信 UI 动作必须由 `mcp_server -> queue -> wechat_api` 调用。
+- 所有微信 UI 动作必须由 `mcp_server -> queue -> wechat_api` 或 `gateway -> queue -> wechat_api`
+  调用，两个入口共用同一套队列与封装，不得各自复制一份。
 - 微信 UI 自动化必须由单消费者 worker 串行执行。
-- MCP 工具只负责校验参数和投递任务，不得直接操作微信窗口。
-- MCP 服务只提供工具，不实现对话理解、回复生成或工作流编排。
+- MCP 工具和网关都只负责校验参数和投递任务，不得直接操作微信窗口或绕过队列调 pyweixin。
+- 两个入口都不实现对话理解与回复生成——这些在劳小智 AI 端。`gateway` 只做确定性编排
+  （去重、去抖、串行、频次、黑名单），话术内容一律来自 AI 端返回。
 - 同类型 `PENDING` 任务不重复入队。
 - MVP 只支持一个 Windows 交互式用户会话中的一个微信账号。
 - 不在 Session 0 的 Windows Service 中运行 UI 自动化。
@@ -52,8 +59,11 @@
 ## 扩展方式
 
 - 新 MCP 工具组实现 `McpToolProvider.register()`，通过 `create_mcp_server()` 注册。
-- 新微信能力先加入 `wechat_api` 封装，再增加任务类型和 worker 分发，最后暴露 MCP 工具。
-- 不恢复 GUI、调用客户端、定时器或大模型模块；若产品方向变化，应单独讨论架构。
+- 新微信能力先加入 `wechat_api` 封装，再增加任务类型和 worker 分发，最后暴露给 MCP 工具
+  或网关。
+- 不恢复 GUI、托盘、调用客户端或大模型模块；若产品方向变化，应单独讨论架构。
+- `gateway` 的常驻轮询循环是既定架构（入站只能轮询，见 `CLAUDE.md` §4.3），不属于被禁的
+  「定时调度」。
 
 ## 测试与打包
 

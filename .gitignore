@@ -47,6 +47,9 @@ requirements-omni-visual-rpa.txt
 # Local secrets/config
 .env
 .env.*
+# 网关联调用的本地票据文件（LocalFileTicketProvider）——含短票密文，绝不入库
+tickets.json
+*.tickets.json
 
 # OS/editor
 .DS_Store
