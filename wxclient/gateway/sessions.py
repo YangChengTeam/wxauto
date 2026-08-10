@@ -37,6 +37,14 @@ CREATE TABLE IF NOT EXISTS gateway_blacklist (
   created_at TEXT NOT NULL,
   PRIMARY KEY (account_id, peer_id)
 );
+CREATE TABLE IF NOT EXISTS gateway_cursors (
+  account_id     TEXT NOT NULL,
+  peer_id        TEXT NOT NULL,
+  last_signature TEXT NOT NULL,
+  seq            INTEGER NOT NULL DEFAULT 0,
+  updated_at     TEXT NOT NULL,
+  PRIMARY KEY (account_id, peer_id)
+);
 CREATE TABLE IF NOT EXISTS gateway_send_log (
   account_id TEXT NOT NULL,
   peer_id    TEXT NOT NULL,
@@ -128,6 +136,36 @@ class GatewayStore:
                 "INSERT OR IGNORE INTO gateway_seen_messages "
                 "(account_id, peer_id, msg_id, seen_at) VALUES (?,?,?,?)",
                 rows,
+            )
+            conn.commit()
+
+    # ────────────────────────── 读取游标 ──────────────────────────
+    #
+    # 微信 UI 里读不到稳定的消息 id，所以用「上一条已处理消息的签名」当游标：
+    # 每次读到聊天记录，找到该签名最后出现的位置，取它之后的才算新消息。
+    # ★ 首次见到某个联系人时游标为空 —— 此时**一条都不处理**，只把游标对齐到最新，
+    #   否则网关一上线就会对着几个月的历史记录逐条回复。
+
+    def get_cursor(self, account_id: str, peer_id: str) -> tuple[str | None, int]:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT last_signature, seq FROM gateway_cursors WHERE account_id=? AND peer_id=?",
+                (account_id, peer_id),
+            ).fetchone()
+        return (row[0], int(row[1])) if row else (None, 0)
+
+    def set_cursor(self, account_id: str, peer_id: str, signature: str, seq: int) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO gateway_cursors (account_id, peer_id, last_signature, seq, updated_at)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(account_id, peer_id) DO UPDATE SET
+                  last_signature=excluded.last_signature,
+                  seq=excluded.seq,
+                  updated_at=excluded.updated_at
+                """,
+                (account_id, peer_id, signature, seq, _utcnow().isoformat()),
             )
             conn.commit()
 

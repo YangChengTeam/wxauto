@@ -60,7 +60,28 @@ wxclient/gateway/
 > **设计裁决（B5）**：命中拒绝词后**连告别语都不发**。需求文档 §7 要求「不再对其发起任何自动化动作」，
 > 再回一句「好的打扰了」同样是一次联系。宁可显得冷淡，不可越过这条线。
 
+### Phase AB · 合流：端到端（Linux 全可测）✅ 完成 2026-08-10
+
+> 规划时漏排了这一环——A 层和 B 层各自可测，但没有把它们接起来的编排。补上：
+
+- [x] AB1. `runner.py`：`ConnectionPool`（一专员一连接、断线现换新票重连）+ `GatewayRunner`
+      （取连接 → 建/接会话 → 发一轮 → 收卡 → 交出站）
+- [x] AB2. 会话生命周期：本连接首次用到某会话才 `resume`（顺带触发 AI 端重投影）；
+      AI 端不认的旧会话 → 丢掉重建，不卡死该联系人；断线单次重试
+- [x] AB3. `wechat_io.py`：队列版 source/sink + **游标切新消息**（首次见到某联系人只对齐游标，
+      绝不照着历史逐条回复）
+- [x] AB4. `__main__.py`：`python -m wxclient.gateway`，**默认 dry-run**，真发需显式
+      `--allow-real-actions`（与 MCP 模式同一条纪律）
+- [x] AB5. 端到端测试 17 条：链路上只有微信那一端是假的
+
+  **Checkpoint AB** ✅：候选人消息进 → 换票建连 → 建会话 → 一轮 → 卡片 → 逐段发出，整条打通。
+  网关累计 75 条测试全绿，`ruff` 0 错误。
+
 ### Phase C · 真机（需 Windows 通路）
+
+> ⚠️ `wechat_io.py` 的字段映射来自对 `uia.py` 的静态阅读，**尚未在真机验证**。
+> C1 必须专门验这三条：① 连发两条一模一样的消息两条都要处理；② 网关首次上线不回复历史；
+> ③ 专员本人手打的消息 `sender == "我"` 要被标成 `from_self`。
 
 - [ ] C1. 真机装依赖、`uia_probe` 确认微信 UIA 可用
 - [ ] C2. MCP 模式手动验证底座：读消息、发一条消息
@@ -87,13 +108,23 @@ wxclient/gateway/
 ## 4. 配置项（全部走环境变量，不入库）
 
 ```
-WXCLIENT_GATEWAY_AI_WS_URL          wss://<ai-host>/v1/ws
-WXCLIENT_GATEWAY_BUSINESS_API_URL   https://<business-host>
-WXCLIENT_GATEWAY_INTERNAL_KEY       <网关专用 internal key>   ← 网关唯一持有的秘密
-WXCLIENT_GATEWAY_POLL_INTERVAL      入站轮询间隔（秒）
-WXCLIENT_GATEWAY_DEBOUNCE_SECONDS   去抖窗口（秒）
-WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR 每号每小时发送上限
-WXCLIENT_GATEWAY_ACTIVE_HOURS       工作时间窗，如 09:00-21:00
+WXCLIENT_GATEWAY_AI_WS_URL             wss://<ai-host>/v1/ws
+WXCLIENT_GATEWAY_BUSINESS_API_URL      https://<business-host>
+WXCLIENT_GATEWAY_INTERNAL_KEY          <网关专用 internal key>   ← 网关唯一持有的秘密
+WXCLIENT_GATEWAY_LOCAL_TICKET_FILE     联调用本地票据文件（与上面两项互斥，生产留空）
+WXCLIENT_GATEWAY_TASK_TYPE             默认 wechat_reply
+WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS 入站轮询间隔
+WXCLIENT_GATEWAY_DEBOUNCE_SECONDS      去抖窗口
+WXCLIENT_GATEWAY_TURN_TIMEOUT_SECONDS  一轮上限，默认 180
+WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR    每号每小时发送上限
+WXCLIENT_GATEWAY_ACTIVE_HOURS          工作时间窗，如 09:00-21:00
+```
+
+启动：
+
+```powershell
+python -m wxclient.gateway --account wxid_zhangsan_work            # dry-run，不真发
+python -m wxclient.gateway --account wxid_zhangsan_work --allow-real-actions
 ```
 
 ## 5. 当前阻塞

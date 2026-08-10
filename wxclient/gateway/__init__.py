@@ -22,7 +22,15 @@ from .inbound import (
     format_transcript,
 )
 from .outbound import DeliveryResult, MessageSink, OutboundSender, extract_reply
+from .runner import ConnectionPool, GatewayRunner
 from .sessions import GatewayStore
+from .wechat_io import (
+    QueueMessageSink,
+    QueueMessageSource,
+    message_signature,
+    split_new_messages,
+    to_inbound,
+)
 from .ticket import (
     BusinessTicketProvider,
     LocalFileTicketProvider,
@@ -41,8 +49,10 @@ __all__ = [
     "AgentWsClient",
     "AgentWsError",
     "BusinessTicketProvider",
+    "ConnectionPool",
     "Debouncer",
     "DeliveryResult",
+    "GatewayRunner",
     "GatewaySettings",
     "GatewayStore",
     "GuardDecision",
@@ -53,6 +63,8 @@ __all__ = [
     "MessageSource",
     "OutboundGuard",
     "OutboundSender",
+    "QueueMessageSink",
+    "QueueMessageSource",
     "TicketError",
     "TicketProvider",
     "TurnResult",
@@ -61,6 +73,9 @@ __all__ = [
     "extract_reply",
     "format_transcript",
     "looks_like_rejection",
+    "message_signature",
     "parse_active_hours",
+    "split_new_messages",
+    "to_inbound",
     "within_active_hours",
 ]

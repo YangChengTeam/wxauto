@@ -1,0 +1,425 @@
+"""网关端到端（Phase A+B 合流）——一条微信消息进，一条回复出。
+
+链路上**只有微信那一端是假的**：真 GatewayRunner、真 GatewayStore（真 SQLite）、
+真 AgentWsClient（真 WebSocket），对面是按契约应答的 Fake AI 端。
+
+微信端用假驱动是有意为之：真微信只能在 Windows 上跑，而这条链路的所有逻辑
+——换票、建连、会话映射、去抖、串行、守门、出站——都不该依赖它才能验证。
+"""
+
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+from fake_agent_ws import FakeAgentServer, TurnScript
+
+from wxclient.gateway import (
+    GatewayRunner,
+    GatewaySettings,
+    GatewayStore,
+    InboundMessage,
+    LocalFileTicketProvider,
+    message_signature,
+    split_new_messages,
+    to_inbound,
+)
+
+T0 = datetime(2026, 8, 10, 14, 0, 0, tzinfo=timezone.utc)
+ACCOUNT = "wxid_zhangsan_work"
+PEER = "候选人-王建国"
+
+
+def wechat_card(segments: list[str], **body: Any) -> dict[str, Any]:
+    return {
+        "type": "info",
+        "skill": "wechat_reply",
+        "body": {
+            "kind": "wechat_reply",
+            "reply_segments": segments,
+            "intent": "consult",
+            "funnel_stage": "intent_check",
+            "actions": [],
+            **body,
+        },
+    }
+
+
+class ScriptedSource:
+    """假微信驱动：按 tick 顺序吐批次。"""
+
+    def __init__(self, batches: list[list[InboundMessage]]) -> None:
+        self._batches = list(batches)
+
+    async def fetch(self, account_id: str) -> list[InboundMessage]:
+        if not self._batches:
+            return []
+        return self._batches.pop(0)
+
+
+class RecordingSink:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str, str]] = []
+
+    async def send(self, account_id: str, peer_id: str, text: str) -> str:
+        self.sent.append((account_id, peer_id, text))
+        return f"task-{len(self.sent)}"
+
+
+def inbound(text: str, *, msg_id: str, at: datetime, from_self: bool = False) -> InboundMessage:
+    return InboundMessage(
+        account_id=ACCOUNT, peer_id=PEER, msg_id=msg_id, text=text, at=at, from_self=from_self
+    )
+
+
+class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.store = GatewayStore(root / "gateway.db")
+        self.tickets_file = root / "tickets.json"
+        self.tickets_file.write_text(json.dumps({ACCOUNT: "tkt-ok"}), encoding="utf-8")
+        self.now = T0
+
+    async def asyncTearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _settings(self, server: FakeAgentServer, **overrides: Any) -> GatewaySettings:
+        base: dict[str, Any] = {
+            "ai_ws_url": server.url,
+            "local_ticket_file": self.tickets_file,
+            "debounce_seconds": 3.0,
+            "turn_timeout_seconds": 10.0,
+        }
+        base.update(overrides)
+        return GatewaySettings(**base)
+
+    def _runner(self, server: FakeAgentServer, source, sink, **overrides: Any) -> GatewayRunner:
+        return GatewayRunner(
+            settings=self._settings(server, **overrides),
+            ticket_provider=LocalFileTicketProvider(self.tickets_file),
+            store=self.store,
+            source=source,
+            sink=sink,
+            accounts=[ACCOUNT],
+            clock=lambda: self.now,
+        )
+
+    async def _advance_and_tick(self, runner: GatewayRunner, seconds: int) -> int:
+        self.now = self.now + timedelta(seconds=seconds)
+        count = await runner.tick()
+        await runner.drain()
+        return count
+
+    # ────────────────────────── 主路径 ──────────────────────────
+
+    async def test_inbound_message_produces_wechat_reply(self) -> None:
+        """完整回路：候选人发消息 → 换票建连 → 建会话 → 一轮 → 卡片 → 逐段发出。"""
+        script = TurnScript(cards=[wechat_card(["你好，我们这边还在招普工", "方便说下你在哪个区吗"])])
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}, turn_script=script) as server:
+            source = ScriptedSource([[inbound("还招人吗", msg_id="m1", at=T0)], []])
+            sink = RecordingSink()
+            runner = self._runner(server, source, sink)
+            try:
+                self.assertEqual(await runner.tick(), 0)          # 去抖窗口内
+                self.assertEqual(await self._advance_and_tick(runner, 10), 1)
+
+                # 两段回复 = 两条微信消息，顺序不变、内容原样
+                self.assertEqual(
+                    [text for _, _, text in sink.sent],
+                    ["你好，我们这边还在招普工", "方便说下你在哪个区吗"],
+                )
+                self.assertTrue(all(peer == PEER for _, peer, _ in sink.sent))
+
+                # 会话映射已落库，下次同一个人接着聊
+                self.assertIsNotNone(self.store.get_session(ACCOUNT, PEER))
+                # 发送已记账，供频次守门
+                self.assertEqual(self.store.sends_in_last_hour(ACCOUNT, self.now), 2)
+            finally:
+                await runner.stop()
+
+    async def test_second_turn_reuses_same_session(self) -> None:
+        """同一个候选人的第二轮必须复用同一会话——换会话等于丢掉上下文。"""
+        script = TurnScript(cards=[wechat_card(["好的"])])
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}, turn_script=script) as server:
+            source = ScriptedSource([
+                [inbound("还招人吗", msg_id="m1", at=T0)],
+                [],
+                [inbound("在武汉", msg_id="m2", at=T0 + timedelta(minutes=1))],
+                [],
+            ])
+            runner = self._runner(server, source, RecordingSink())
+            try:
+                await runner.tick()
+                await self._advance_and_tick(runner, 10)
+                first_session = self.store.get_session(ACCOUNT, PEER)
+
+                await self._advance_and_tick(runner, 10)   # 第二条到达
+                await self._advance_and_tick(runner, 10)   # 派发第二轮
+
+                self.assertEqual(self.store.get_session(ACCOUNT, PEER), first_session)
+                starts = [f for f in server.received if f.get("op") == "session.start"]
+                self.assertEqual(len(starts), 1, "第二轮不该再建新会话")
+            finally:
+                await runner.stop()
+
+    async def test_transcript_carries_speaker_and_meta(self) -> None:
+        """发给 AI 端的必须是带说话人标注的上下文，并声明专员是否插过话。"""
+        async with FakeAgentServer(
+            valid_tickets={"tkt-ok"}, turn_script=TurnScript(cards=[wechat_card(["好"])])
+        ) as server:
+            source = ScriptedSource([[
+                inbound("还招人吗", msg_id="m1", at=T0),
+                inbound("稍等我看下", msg_id="m2", at=T0 + timedelta(minutes=2), from_self=True),
+            ], []])
+            runner = self._runner(server, source, RecordingSink())
+            try:
+                await runner.tick()
+                await self._advance_and_tick(runner, 10)
+
+                sent = next(f for f in server.received if f.get("op") == "message.send")
+                text = sent["data"]["text"]
+                self.assertIn("[对方 · 14:00] 还招人吗", text)
+                self.assertIn("[专员本人 · 14:02] 稍等我看下", text)
+                self.assertNotIn(PEER, text)          # 不泄露联系人标识
+                self.assertTrue(sent["data"]["wechat"]["operator_intervened"])
+            finally:
+                await runner.stop()
+
+    # ────────────────────────── 不回复与拉黑 ──────────────────────────
+
+    async def test_no_reply_card_sends_nothing(self) -> None:
+        card = wechat_card([], no_reply_reason="对方只发了表情", intent="smalltalk")
+        async with FakeAgentServer(
+            valid_tickets={"tkt-ok"}, turn_script=TurnScript(cards=[card])
+        ) as server:
+            sink = RecordingSink()
+            runner = self._runner(server, ScriptedSource([[inbound("👌", msg_id="m1", at=T0)], []]), sink)
+            try:
+                await runner.tick()
+                await self._advance_and_tick(runner, 10)
+                self.assertEqual(sink.sent, [])
+            finally:
+                await runner.stop()
+
+    async def test_inbound_rejection_stops_everything_before_any_ai_call(self) -> None:
+        """确定性拒绝闸在最前面：不建连、不发轮、不回消息，直接拉黑。"""
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
+            sink = RecordingSink()
+            runner = self._runner(
+                server, ScriptedSource([[inbound("别再联系我了", msg_id="m1", at=T0)], []]), sink
+            )
+            try:
+                await runner.tick()
+                await self._advance_and_tick(runner, 10)
+
+                self.assertEqual(sink.sent, [])
+                self.assertTrue(self.store.is_blacklisted(ACCOUNT, PEER))
+                self.assertEqual(server.received, [], "拒绝的人不该触发任何 AI 调用")
+            finally:
+                await runner.stop()
+
+    async def test_ai_blacklist_action_blocks_later_turns(self) -> None:
+        """AI 端判定拒绝 → 拉黑生效，后续消息一律不再处理。"""
+        card = wechat_card(
+            [], no_reply_reason="对方拒绝", intent="reject", funnel_stage="closed",
+            actions=[{"type": "blacklist", "reason": "对方明确表示不要再联系"}],
+        )
+        async with FakeAgentServer(
+            valid_tickets={"tkt-ok"}, turn_script=TurnScript(cards=[card])
+        ) as server:
+            sink = RecordingSink()
+            source = ScriptedSource([
+                [inbound("我考虑一下吧不用了", msg_id="m1", at=T0)],
+                [],
+                [inbound("再问一句", msg_id="m2", at=T0 + timedelta(minutes=5))],
+                [],
+            ])
+            runner = self._runner(server, source, sink)
+            try:
+                await runner.tick()
+                await self._advance_and_tick(runner, 10)
+                self.assertTrue(self.store.is_blacklisted(ACCOUNT, PEER))
+
+                sends_before = len([f for f in server.received if f.get("op") == "message.send"])
+                await self._advance_and_tick(runner, 10)
+                await self._advance_and_tick(runner, 10)
+                sends_after = len([f for f in server.received if f.get("op") == "message.send"])
+
+                self.assertEqual(sends_before, sends_after, "已拉黑的人不该再触发一轮")
+                self.assertEqual(sink.sent, [])
+            finally:
+                await runner.stop()
+
+    # ────────────────────────── 韧性 ──────────────────────────
+
+    async def test_ai_error_sends_nothing_and_keeps_running(self) -> None:
+        """AI 端报错 → 不发消息、不崩，下一条照常处理。"""
+        scripts = iter([
+            TurnScript(error={"code": "upstream_error", "message": "繁忙",
+                              "fallback_card": {"type": "info", "body": {"text": "稍后重试"}}}),
+            TurnScript(cards=[wechat_card(["你好"])]),
+        ])
+        current = {"script": next(scripts)}
+
+        def script_for(_s: str, _t: str) -> TurnScript:
+            return current["script"]
+
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}, turn_script=script_for) as server:
+            sink = RecordingSink()
+            source = ScriptedSource([
+                [inbound("第一条", msg_id="m1", at=T0)],
+                [],
+                [inbound("第二条", msg_id="m2", at=T0 + timedelta(minutes=1))],
+                [],
+            ])
+            runner = self._runner(server, source, sink)
+            try:
+                await runner.tick()
+                await self._advance_and_tick(runner, 10)
+                self.assertEqual(sink.sent, [])         # 报错轮什么都不发
+
+                current["script"] = next(scripts)
+                await self._advance_and_tick(runner, 10)
+                await self._advance_and_tick(runner, 10)
+                self.assertEqual([t for _, _, t in sink.sent], ["你好"])
+            finally:
+                await runner.stop()
+
+    async def test_reconnects_after_ai_端_drops_connection(self) -> None:
+        """AI 端断线 → 现换新票重连 → 接回同一会话继续，不丢上下文。"""
+        async with FakeAgentServer(
+            valid_tickets={"tkt-ok"}, turn_script=TurnScript(cards=[wechat_card(["好的"])])
+        ) as server:
+            sink = RecordingSink()
+            source = ScriptedSource([
+                [inbound("第一条", msg_id="m1", at=T0)],
+                [],
+                [inbound("第二条", msg_id="m2", at=T0 + timedelta(minutes=1))],
+                [],
+            ])
+            runner = self._runner(server, source, sink)
+            try:
+                await runner.tick()
+                await self._advance_and_tick(runner, 10)
+                session_id = self.store.get_session(ACCOUNT, PEER)
+
+                # 模拟断线：把连接踢掉
+                await runner._pool.invalidate(ACCOUNT)  # noqa: SLF001
+
+                await self._advance_and_tick(runner, 10)
+                await self._advance_and_tick(runner, 10)
+
+                auths = [f for f in server.received if f.get("op") == "auth"]
+                resumes = [f for f in server.received if f.get("op") == "session.resume"]
+                self.assertEqual(len(auths), 2, "重连必须重新鉴权（现换新票）")
+                self.assertEqual(len(resumes), 1, "重连后应接回原会话而不是新建")
+                self.assertEqual(resumes[0]["data"]["session_id"], session_id)
+                self.assertEqual(self.store.get_session(ACCOUNT, PEER), session_id)
+                self.assertEqual(len([t for _, _, t in sink.sent]), 2)
+            finally:
+                await runner.stop()
+
+    async def test_stale_session_is_rebuilt(self) -> None:
+        """库里存的会话 AI 端已经不认（被驱逐）→ 丢掉重建，不能卡死这个联系人。"""
+        async with FakeAgentServer(
+            valid_tickets={"tkt-ok"}, turn_script=TurnScript(cards=[wechat_card(["你好"])])
+        ) as server:
+            # 预置一个 AI 端根本不知道的 session_id
+            self.store.put_session(ACCOUNT, PEER, "session-from-a-previous-life")
+            sink = RecordingSink()
+            runner = self._runner(server, ScriptedSource([[inbound("在吗", msg_id="m1", at=T0)], []]), sink)
+            try:
+                await runner.tick()
+                await self._advance_and_tick(runner, 10)
+
+                self.assertNotEqual(self.store.get_session(ACCOUNT, PEER), "session-from-a-previous-life")
+                self.assertEqual([t for _, _, t in sink.sent], ["你好"])
+            finally:
+                await runner.stop()
+
+    async def test_bad_ticket_does_not_send_anything(self) -> None:
+        """换不到有效票 → fail-closed，一条都不发。"""
+        async with FakeAgentServer(valid_tickets={"tkt-only-valid-one"}) as server:
+            sink = RecordingSink()
+            runner = self._runner(server, ScriptedSource([[inbound("在吗", msg_id="m1", at=T0)], []]), sink)
+            try:
+                await runner.tick()
+                await self._advance_and_tick(runner, 10)
+                self.assertEqual(sink.sent, [])
+            finally:
+                await runner.stop()
+
+    async def test_rate_limit_stops_sending(self) -> None:
+        async with FakeAgentServer(
+            valid_tickets={"tkt-ok"}, turn_script=TurnScript(cards=[wechat_card(["你好", "在哪个区"])])
+        ) as server:
+            sink = RecordingSink()
+            runner = self._runner(
+                server, ScriptedSource([[inbound("在吗", msg_id="m1", at=T0)], []]),
+                sink, max_sends_per_hour=1,
+            )
+            try:
+                self.store.record_send(ACCOUNT, PEER, T0 - timedelta(minutes=5))
+                await runner.tick()
+                await self._advance_and_tick(runner, 10)
+                self.assertEqual(sink.sent, [], "超过频次上限就一条都不发")
+            finally:
+                await runner.stop()
+
+
+class WeChatIoMappingTests(unittest.TestCase):
+    """微信侧字段映射的纯函数部分（真机验证前先把逻辑钉住）。"""
+
+    def test_first_sight_of_peer_replies_to_nothing(self) -> None:
+        """★ 网关首次见到某个联系人：只对齐游标，绝不照着历史逐条回复。"""
+        history = [
+            {"sender": "对方", "text": "三个月前的消息"},
+            {"sender": "我", "text": "早就回过了"},
+        ]
+        fresh, cursor = split_new_messages(history, None)
+        self.assertEqual(fresh, [])
+        self.assertEqual(cursor, message_signature(history[-1]))
+
+    def test_only_messages_after_cursor_are_new(self) -> None:
+        history = [
+            {"sender": "对方", "text": "老消息"},
+            {"sender": "我", "text": "已回复"},
+            {"sender": "对方", "text": "新问题"},
+        ]
+        cursor = message_signature(history[1])
+        fresh, new_cursor = split_new_messages(history, cursor)
+        self.assertEqual([m["text"] for m in fresh], ["新问题"])
+        self.assertEqual(new_cursor, message_signature(history[-1]))
+
+    def test_cursor_scrolled_out_does_not_backfill(self) -> None:
+        """游标滚出读取窗口 → 保守跳过，不回溯几十条老消息。"""
+        history = [{"sender": "对方", "text": "只剩这条"}]
+        fresh, cursor = split_new_messages(history, "signature-that-no-longer-exists")
+        self.assertEqual(fresh, [])
+        self.assertEqual(cursor, message_signature(history[0]))
+
+    def test_empty_history(self) -> None:
+        self.assertEqual(split_new_messages([], "abc"), ([], "abc"))
+
+    def test_self_sender_marks_operator_message(self) -> None:
+        message = to_inbound("acct", "peer", {"sender": "我", "text": "稍等"}, seq=1)
+        self.assertTrue(message.from_self)
+        self.assertEqual(message.msg_id, "peer#1")
+
+        other = to_inbound("acct", "peer", {"sender": "王建国", "text": "在吗"}, seq=2)
+        self.assertFalse(other.from_self)
+
+    def test_identical_consecutive_messages_get_distinct_ids(self) -> None:
+        """同一个人连发两条一模一样的话，两条都要能被处理。"""
+        first = to_inbound("acct", "peer", {"sender": "对方", "text": "在吗"}, seq=1)
+        second = to_inbound("acct", "peer", {"sender": "对方", "text": "在吗"}, seq=2)
+        self.assertNotEqual(first.msg_id, second.msg_id)
+
+
+if __name__ == "__main__":
+    unittest.main()
