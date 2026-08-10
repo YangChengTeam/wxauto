@@ -7,6 +7,22 @@
 from __future__ import annotations
 
 from .config import GatewaySettings
+from .guard import (
+    GuardDecision,
+    OutboundGuard,
+    looks_like_rejection,
+    parse_active_hours,
+    within_active_hours,
+)
+from .inbound import (
+    Debouncer,
+    InboundLoop,
+    InboundMessage,
+    MessageSource,
+    format_transcript,
+)
+from .outbound import DeliveryResult, MessageSink, OutboundSender, extract_reply
+from .sessions import GatewayStore
 from .ticket import (
     BusinessTicketProvider,
     LocalFileTicketProvider,
@@ -25,11 +41,26 @@ __all__ = [
     "AgentWsClient",
     "AgentWsError",
     "BusinessTicketProvider",
+    "Debouncer",
+    "DeliveryResult",
     "GatewaySettings",
+    "GatewayStore",
+    "GuardDecision",
+    "InboundLoop",
+    "InboundMessage",
     "LocalFileTicketProvider",
+    "MessageSink",
+    "MessageSource",
+    "OutboundGuard",
+    "OutboundSender",
     "TicketError",
     "TicketProvider",
     "TurnResult",
     "TurnTimeout",
     "Unauthorized",
+    "extract_reply",
+    "format_transcript",
+    "looks_like_rejection",
+    "parse_active_hours",
+    "within_active_hours",
 ]
