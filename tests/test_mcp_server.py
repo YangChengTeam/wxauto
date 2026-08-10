@@ -219,6 +219,36 @@ class McpProtocolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(Path(payload["files"][0]).suffix, ".txt")
             self.assertTrue(Path(payload["files"][0]).is_absolute())
 
+    async def test_uploaded_audio_can_be_sent_by_media_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _FakeMcpRuntime(Path(tmp))
+            mcp = create_mcp_server(
+                settings=McpServerSettings(),
+                runtime=runtime,  # type: ignore[arg-type]
+            )
+            async with create_connected_server_and_client_session(mcp) as client:
+                uploaded = await client.call_tool(
+                    "wx_upload_media",
+                    {
+                        "filename": "context-reply.wav",
+                        "content_base64": base64.b64encode(b"RIFFfake-wave").decode("ascii"),
+                    },
+                )
+                sent = await client.call_tool(
+                    "wx_send_files",
+                    {
+                        "friend": "AI Agent",
+                        "media_ids": [uploaded.structuredContent["media_id"]],
+                        "dry_run": True,
+                    },
+                )
+
+            self.assertFalse(sent.isError)
+            task_type, payload = runtime.calls[-1]
+            self.assertEqual(task_type, TaskType.SEND_FILES)
+            self.assertEqual(Path(payload["files"][0]).suffix, ".wav")
+            self.assertTrue(Path(payload["files"][0]).is_absolute())
+
     async def test_document_upload_is_rejected_for_moments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = _FakeMcpRuntime(Path(tmp))

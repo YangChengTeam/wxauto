@@ -10,10 +10,11 @@ from uuid import uuid4
 
 
 _MOMENTS_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".mp4"}
+_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".ogg", ".flac"}
 _ALLOWED_SUFFIXES = _MOMENTS_SUFFIXES | {
     ".pdf", ".txt", ".md", ".csv", ".json", ".doc", ".docx",
     ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".7z",
-}
+} | _AUDIO_SUFFIXES
 _MEDIA_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 

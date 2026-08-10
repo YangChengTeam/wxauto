@@ -130,8 +130,9 @@ TLS 反向代理，并限制来源 IP。
 
 朋友圈或文件发送的远程调用先执行 `wx_upload_media`，再把返回的 `media_id` 传给
 `wx_post_moments` 或 `wx_send_files`。服务只解析自己的上传目录，不接受调用方指定任意
-Windows 文件路径。可上传图片、视频，以及 PDF、Office 文档、文本、CSV、JSON、ZIP、7z；
-不接受可执行文件和脚本。
+Windows 文件路径。可上传图片、视频、WAV/MP3/M4A 等音频，以及 PDF、Office 文档、
+文本、CSV、JSON、ZIP、7z；不接受可执行文件和脚本。音频通过 `wx_send_files` 发送为文件，
+不是微信原生语音气泡。
 
 ## 扩展工具组
 
