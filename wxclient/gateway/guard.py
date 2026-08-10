@@ -13,7 +13,13 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, time
 
-# 明确的拒绝表达。宁可多拦，不可漏拦——被误拦的后果只是少发一条消息。
+# 明确的**拒绝联系**表达——命中即永久停止对该联系人的一切自动化动作并拉黑。
+# 宁可多拦，不可漏拦：被误拦的后果只是少发一条消息。
+#
+# ★ 这里只放「别联系我」这一档（需求文档 §7 的唯一硬性规则）。
+#   「已经找到工作了」「暂时没兴趣」是**软收口**，不进这道闸——那种人以后还要触达，
+#   永久拉黑是过度处置。软收口交给 AI 端（skill `wechat_reply` 的两档判定）：
+#   它会礼貌收个尾、把漏斗标成 closed，且**不提案拉黑**。
 _REJECT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     re.compile(p)
     for p in (
@@ -30,11 +36,6 @@ _REJECT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         r"退订",
         r"停止(发送|推送|联系)",
         r"取消关注",
-        r"没兴趣",
-        r"不感兴趣",
-        r"不需要[了，。!！]*$",
-        r"不找(工作|活)",
-        r"已经?(找到|上班|入职)",
         r"stop\b",
         r"unsubscribe",
     )
@@ -45,7 +46,10 @@ _QUESTION_MARKS = ("?", "？")
 
 
 def looks_like_rejection(text: str) -> bool:
-    """确定性拒绝判定。命中即应停止对该联系人的一切自动化动作。"""
+    """确定性**硬拒绝**判定。命中即应停止对该联系人的一切自动化动作并拉黑。
+
+    软收口（「已经找到工作了」「没兴趣」）**不在这里判**——交给 AI 端礼貌收尾、不拉黑。
+    """
     if not text:
         return False
     normalized = text.strip()

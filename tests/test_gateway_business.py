@@ -181,8 +181,6 @@ class RejectionTests(unittest.TestCase):
             "别烦我",
             "把我删了",
             "再发我就举报你",
-            "我已经找到工作了",
-            "没兴趣",
             "退订",
             "stop",
         ]:
@@ -197,6 +195,14 @@ class RejectionTests(unittest.TestCase):
             "在哪里上班",
             "",
         ]:
+            self.assertFalse(looks_like_rejection(text), text)
+
+    def test_soft_close_is_not_a_hard_rejection(self) -> None:
+        """★「已经找到工作了」不是硬拒绝——这道闸拦下就等于永久拉黑一个以后还要触达的人。
+
+        它归 AI 端处置（礼貌收尾、漏斗标 closed、不提案拉黑），所以必须能走到派发这一步。
+        """
+        for text in ["我已经找到工作了", "暂时没兴趣", "现在不找工作了"]:
             self.assertFalse(looks_like_rejection(text), text)
 
 
