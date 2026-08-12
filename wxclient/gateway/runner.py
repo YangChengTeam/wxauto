@@ -67,6 +67,10 @@ class ConnectionPool:
             _log.info("已为该账号建立 AI 端连接", account=account_id)
             return client
 
+    def connected_count(self) -> int:
+        """当前有几条 AI 端连接是活的。只读，给状态展示用（可跨线程读）。"""
+        return sum(1 for client in list(self._clients.values()) if client.connected)
+
     async def invalidate(self, account_id: str) -> None:
         """丢弃当前连接，下次 acquire 会重新换票建连。"""
         client = self._clients.pop(account_id, None)
@@ -219,6 +223,10 @@ class GatewayRunner:
 
     async def drain(self) -> None:
         await self.loop.drain()
+
+    def connected_count(self) -> int:
+        """活着的 AI 端连接数。只读，给桌面端状态栏用。"""
+        return self._pool.connected_count()
 
     async def run(self) -> None:
         await self.loop.run()

@@ -10,11 +10,12 @@ Windows 微信自动化网关，服务于劳小智招聘业务：把入站微信
 - 确定性守门：拒绝词表、频次上限、工作时间窗、黑名单
 - 发送消息、加好友、监听会话、读取可见消息、发布朋友圈
 - 只读探测微信 UIA 可用性
+- 桌面端：托盘常驻 + 日志窗口 + 参数设置
 - SQLite 任务记录、同类待执行任务去重、单 worker 串行操作微信
 - 真实动作三重确认（`--allow-real-actions` + `dry_run=false` + 确认短语）
 
 本项目**不做对话理解、不生成回复内容、不接大模型**——那些全在劳小智 AI 端
-（`lxz_agent_backend`）。本仓只负责传输、编排、执行。也不包含 GUI、托盘、定时调度。
+（`lxz_agent_backend`）。本仓只负责传输、编排、执行，也不做定时调度。
 
 ## 安装与启动
 
@@ -22,9 +23,23 @@ Windows 微信自动化网关，服务于劳小智招聘业务：把入站微信
 
 ```powershell
 python -m pip install -e .
-python -m wxclient.gateway --account wxid_zhangsan_work                        # dry-run，不真发
-python -m wxclient.gateway --account wxid_zhangsan_work --allow-real-actions   # 真发
+python -m wxclient.ui                                                          # 桌面端：开机即跑，缩到托盘
+python -m wxclient.gateway --account wxid_zhangsan_work                        # 命令行：dry-run，不真发
+python -m wxclient.gateway --account wxid_zhangsan_work --allow-real-actions   # 命令行：真发
 ```
+
+## 桌面端（托盘）
+
+`python -m wxclient.ui` 打开即启动服务并**直接缩到右下角托盘**，不弹窗。
+
+- 双击托盘图标 → 日志窗口（和日志文件里同一份内容，可暂停滚动、清空）
+- 托盘菜单 → 启动 / 停止服务、参数设置、退出
+- 托盘图标颜色即服务状态：绿=运行中，灰=已停止，红=启动失败（悬浮看原因）
+- 关闭日志窗口 = 缩回托盘，**不会停掉服务**；真要退出走托盘菜单「退出」
+
+参数设置界面写的是 `<data_dir>/gateway.env`（本机运行数据，永不入库）。真实环境变量
+优先于该文件，除非在界面上点了「保存并重启服务」。内部 key 在界面上只显示掩码，
+没动过就不会被写回。
 
 **默认 dry-run**：整条回路都跑，但不真往微信发消息。要真发必须显式加
 `--allow-real-actions`。接口契约与红线见 [`CLAUDE.md`](CLAUDE.md)，实施清单见
@@ -42,6 +57,7 @@ python -m wxclient.gateway --account wxid_zhangsan_work --allow-real-actions   #
 
 ```text
 wxclient/
+  ui/           # 桌面端：托盘 + 日志窗口 + 参数设置（不含业务逻辑，只是网关的一层皮）
   gateway/      # WS 网关：入站轮询、去抖、会话映射、换票、出站发送、守门
   runtime.py    # 共享运行时：任务队列 + 执行器 + 动作授权（各入口共用一个）
   queue/        # SQLite 任务与单消费者 worker

@@ -2,6 +2,8 @@
 
 默认 **dry-run**——整条回路都跑，但不真的往微信发消息。要真发必须显式加
 ``--allow-real-actions``（真实动作三重确认，见 ``CLAUDE.md`` §5.1）。
+
+装配在 ``factory.build_gateway()``，与 UI 共用一份；本文件只负责解析参数和生命周期。
 """
 
 from __future__ import annotations
@@ -9,19 +11,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from pathlib import Path
 
 import structlog
 
-from wxclient.config import load_settings
 from wxclient.logging_config import configure_logging
-from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
-from .config import GatewaySettings
-from .runner import GatewayRunner
-from .sessions import GatewayStore
-from .ticket import BusinessTicketProvider, LocalFileTicketProvider, TicketProvider
-from .wechat_io import QueueMessageSink, QueueMessageSource
+from .factory import build_gateway
 
 _log = structlog.get_logger(__name__)
 
@@ -41,68 +36,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def build_ticket_provider(settings: GatewaySettings) -> TicketProvider:
-    if settings.local_ticket_file is not None:
-        _log.warning("使用本地票据文件（仅供联调，生产禁用）")
-        return LocalFileTicketProvider(settings.local_ticket_file)
-    return BusinessTicketProvider(
-        settings.business_api_url,
-        settings.internal_key.get_secret_value(),
-        timeout_seconds=settings.ticket_timeout_seconds,
-    )
-
-
 async def run(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configure_logging()
 
-    accounts = [a.strip() for a in args.account if a.strip()]
-    if not accounts:
-        _log.error("至少要用 --account 指定一个微信号")
-        return 2
-
-    gateway_settings = GatewaySettings()
     try:
-        gateway_settings.validate_for_start()
+        gateway = build_gateway(
+            accounts=args.account,
+            allow_real_actions=args.allow_real_actions,
+            config_path=args.config,
+            gateway_db=args.gateway_db,
+        )
     except ValueError as exc:
-        _log.error("网关配置不合法", error=str(exc))
+        _log.error("网关无法启动", error=str(exc))
         return 2
 
-    wechat_settings = load_settings(args.config)
-    runtime_settings = RuntimeSettings(allow_real_actions=args.allow_real_actions)
-    runtime_settings.validate_for_start()
-    runtime = WeChatRuntime(wechat_settings, runtime_settings)
-
-    database_path = Path(args.gateway_db) if args.gateway_db else wechat_settings.data_dir / "gateway.db"
-    store = GatewayStore(database_path)
-
-    runner = GatewayRunner(
-        settings=gateway_settings,
-        ticket_provider=build_ticket_provider(gateway_settings),
-        store=store,
-        source=QueueMessageSource(runtime=runtime, store=store),
-        sink=QueueMessageSink(
-            runtime=runtime,
-            allow_real_actions=args.allow_real_actions,
-            confirmation=REAL_ACTION_CONFIRMATION,
-        ),
-        accounts=accounts,
-    )
-
-    runtime.start()
+    gateway.runtime.start()
     _log.info(
         "网关启动",
-        accounts=len(accounts),
-        real_actions=args.allow_real_actions,
-        ai_ws_url=gateway_settings.ai_ws_url,
+        accounts=len(gateway.accounts),
+        real_actions=gateway.allow_real_actions,
+        ai_ws_url=gateway.settings.ai_ws_url,
     )
     try:
-        await runner.run()
+        await gateway.runner.run()
     except KeyboardInterrupt:
         _log.info("收到中断，正在收尾")
     finally:
-        await runner.stop()
-        runtime.stop()
+        await gateway.runner.stop()
+        gateway.runtime.stop()
     return 0
 
 
