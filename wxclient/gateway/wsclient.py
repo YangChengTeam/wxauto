@@ -205,8 +205,9 @@ class AgentWsClient:
     async def ping(self) -> None:
         """保活：AI 端对 ``op=ping`` 回 ``pong``。
 
-        反代（线上是 nginx）默认 60s 就掐掉空闲的 WS，不定期 ping 的话连接会静悄悄地死，
-        等到真有候选人来消息时才发现——那时候要现重连，白等一次握手。
+        反代会掐空闲的 WS（线上 nginx 配的是 600s），不定期 ping 的话连接会静悄悄地死，
+        等到真有候选人来消息时才发现——那时候要现重连，白等一次握手。ping 顺带充当探活：
+        断了就能在下一拍重连，而不是攒到第一条真消息上。
         """
         await self._request("ping", {})
 

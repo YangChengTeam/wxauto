@@ -29,7 +29,8 @@ from .wsclient import AgentWsClient, AgentWsError, Unauthorized
 
 _log = structlog.get_logger(__name__)
 
-#: 建连/保活的节拍。反代默认 60s 掐空闲 WS，取一半留足余量。
+#: 建连/保活的节拍。线上 nginx 对 /agent-ws 配的是 600s 空闲上限，30s 一拍既够续命，
+#: 也让「连接已经死了」最多 30s 就被发现（而不是攒到第一条真消息上）。
 KEEPALIVE_INTERVAL_SECONDS = 30.0
 
 
@@ -258,7 +259,7 @@ class GatewayRunner:
         为什么不等第一条入站消息再连（原来的懒建连）：
         ① 界面得能立刻说清「通没通」，不然只能显示「连接中」干等；
         ② 票据/鉴权坏了要在**启动时**就炸出来，而不是等第一个真候选人来了才发现；
-        ③ 反代 60s 掐空闲连接，本来就需要一个周期性的 ping。
+        ③ 反代有空闲上限（线上 600s），本来就需要一个周期性的 ping 来续命兼探活。
         """
         for account_id in self._accounts:
             try:
