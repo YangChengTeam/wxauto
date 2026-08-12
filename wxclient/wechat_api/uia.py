@@ -1161,10 +1161,26 @@ class UiaWeChatDriver:
             Application = __import__("pywinauto", fromlist=["Application"]).Application
             app = Application(backend="uia").connect(title="微信")
             main_window = app.window(title="微信")
+            self._restore_if_minimized(main_window)
             main_window.wait("ready", timeout=5)
             return main_window
         except Exception as exc:
             raise WeChatApiError(f"无法定位当前微信主窗口：{exc}") from exc
+
+    @staticmethod
+    def _restore_if_minimized(window: Any) -> None:
+        """最小化的窗口在 pywinauto 眼里不算 ready，后面 ``wait("ready")`` 必然超时。
+
+        2026-08-12 真机实测：微信最小化时所有走本方法的动作（读会话/读可见消息/发消息）
+        一律报「无法定位当前微信主窗口」，而 ``uia_probe`` 因为是自己枚举窗口所以照样找得到
+        ——两边表现不一致最容易误判成「微信没登录」。恢复窗口是执行 UI 动作的前提，
+        与 ``uia_probe`` 那条「只读、不启动/不解锁微信」的约束无关：这里窗口本来就在。
+        """
+        try:
+            if window.is_minimized():
+                window.restore()
+        except Exception as exc:  # noqa: BLE001 - 恢复失败不该盖住后面真正的定位错误
+            logger.debug("window.restore_failed", error=str(exc))
 
     def _current_window_score(self, window: Any) -> int:
         score = 0

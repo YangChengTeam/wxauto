@@ -168,6 +168,55 @@ class TaskStoreTests(unittest.TestCase):
 
         self.assertEqual(duplicate.id, "legacy-task")
 
+    def test_unknown_legacy_task_type_does_not_block_startup(self) -> None:
+        """2026-08-12 真机：库里一条 'reply_chat' 让 TaskStore 构造直接抛异常，服务起不来。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "tasks.db"
+            with closing(connect(database_path)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE tasks (
+                        id VARCHAR PRIMARY KEY,
+                        type VARCHAR NOT NULL,
+                        payload TEXT NOT NULL,
+                        status VARCHAR NOT NULL,
+                        account_id VARCHAR NOT NULL,
+                        attempts INTEGER NOT NULL,
+                        max_attempts INTEGER NOT NULL,
+                        created_at VARCHAR NOT NULL,
+                        updated_at VARCHAR NOT NULL,
+                        available_at VARCHAR NOT NULL,
+                        last_error TEXT,
+                        result TEXT
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO tasks VALUES (
+                        'stale-task', 'reply_chat',
+                        '{"friend":"a"}', 'pending', 'default',
+                        0, 3, '2026-01-01T00:00:00+00:00',
+                        '2026-01-01T00:00:00+00:00',
+                        '2026-01-01T00:00:00+00:00', NULL, NULL
+                    )
+                    """
+                )
+                connection.commit()
+
+            store = TaskStore(database_path)  # 不抛异常就是本用例的核心断言
+
+            with closing(connect(database_path)) as connection:
+                row = connection.execute(
+                    "SELECT status, last_error FROM tasks WHERE id = 'stale-task'"
+                ).fetchone()
+
+            self.assertEqual(row[0], TaskStatus.CANCELLED.value)
+            self.assertIn("reply_chat", row[1])
+            # 脏数据不该拖累正常任务
+            fresh = store.create_task(TaskType.SEND_MESSAGE, {"friend": "b", "text": "hi"}, "default")
+            self.assertEqual(fresh.status, TaskStatus.PENDING)
+
     def test_legacy_running_tasks_are_recovered_safely_on_open(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database_path = Path(tmp) / "tasks.db"

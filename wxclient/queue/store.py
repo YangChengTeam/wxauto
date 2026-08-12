@@ -111,13 +111,30 @@ class TaskStore:
                     "DROP INDEX IF EXISTS uq_tasks_active_idempotency"
                 )
                 for row in legacy_rows:
+                    try:
+                        task_type = TaskType(row["type"])
+                    except ValueError:
+                        # 库里可能留着已删除/改名的任务类型（2026-08-12 真机上撞到过一条
+                        # 'reply_chat'）。当年为它建库的代码早没了，这行也不可能再被执行，
+                        # 但为它抛异常会让 TaskStore 构造失败 —— 一条陈年脏数据把整个服务
+                        # 挡在门外。作废掉它，让服务照常起来。
+                        conn.execute(
+                            update(self.tasks)
+                            .where(self.tasks.c.id == row["id"])
+                            .values(
+                                status=TaskStatus.CANCELLED.value,
+                                last_error=f"迁移时作废：未知任务类型 {row['type']!r}",
+                                updated_at=migration_now,
+                            )
+                        )
+                        continue
                     payload = json.loads(row["payload"])
                     conn.execute(
                         update(self.tasks)
                         .where(self.tasks.c.id == row["id"])
                         .values(
                             idempotency_key=task_idempotency_key(
-                                TaskType(row["type"]),
+                                task_type,
                                 payload,
                                 row["account_id"],
                             )

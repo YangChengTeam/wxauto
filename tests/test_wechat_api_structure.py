@@ -33,5 +33,42 @@ class WeChatApiStructureTests(unittest.TestCase):
         self.assertTrue(api._is_dry_run(None))
 
 
+class RestoreMinimizedWindowTests(unittest.TestCase):
+    """最小化的窗口必须先恢复，否则 pywinauto 的 wait("ready") 必然超时（2026-08-12 真机实测）。"""
+
+    class _Window:
+        def __init__(self, minimized: bool, restore_error: Exception | None = None) -> None:
+            self._minimized = minimized
+            self._restore_error = restore_error
+            self.restored = False
+
+        def is_minimized(self) -> bool:
+            return self._minimized
+
+        def restore(self) -> None:
+            if self._restore_error is not None:
+                raise self._restore_error
+            self.restored = True
+
+    def test_minimized_window_is_restored(self) -> None:
+        window = self._Window(minimized=True)
+
+        UiaWeChatDriver._restore_if_minimized(window)
+
+        self.assertTrue(window.restored)
+
+    def test_normal_window_is_left_alone(self) -> None:
+        window = self._Window(minimized=False)
+
+        UiaWeChatDriver._restore_if_minimized(window)
+
+        self.assertFalse(window.restored)
+
+    def test_restore_failure_does_not_mask_the_real_error(self) -> None:
+        window = self._Window(minimized=True, restore_error=RuntimeError("boom"))
+
+        UiaWeChatDriver._restore_if_minimized(window)  # 不抛，交给后面的 wait 报真正的错
+
+
 if __name__ == "__main__":
     unittest.main()
