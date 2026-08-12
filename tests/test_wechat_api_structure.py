@@ -42,6 +42,10 @@ class RestoreMinimizedWindowTests(unittest.TestCase):
             self._restore_error = restore_error
             self.restored = False
 
+        def wrapper_object(self) -> "RestoreMinimizedWindowTests._Window":
+            # pywinauto 的 WindowSpecification 只是查找条件，真窗口要 wrapper_object() 才拿得到
+            return self
+
         def is_minimized(self) -> bool:
             return self._minimized
 

@@ -1177,10 +1177,14 @@ class UiaWeChatDriver:
         与 ``uia_probe`` 那条「只读、不启动/不解锁微信」的约束无关：这里窗口本来就在。
         """
         try:
-            if window.is_minimized():
-                window.restore()
+            # 必须先拿到 wrapper：WindowSpecification 是「查找条件」不是窗口本身，
+            # 直接在它上面调 is_minimized/restore 不可靠。
+            wrapper = window.wrapper_object()
+            if wrapper.is_minimized():
+                wrapper.restore()
+                logger.info("window.restored", reason="窗口最小化，UI 动作前先恢复")
         except Exception as exc:  # noqa: BLE001 - 恢复失败不该盖住后面真正的定位错误
-            logger.debug("window.restore_failed", error=str(exc))
+            logger.warning("window.restore_failed", error=f"{type(exc).__name__}: {exc}")
 
     def _current_window_score(self, window: Any) -> int:
         score = 0
