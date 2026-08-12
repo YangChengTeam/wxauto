@@ -47,7 +47,7 @@ class MainWindow:
         service: GatewayService,
         *,
         data_dir: Path,
-        mode_text: str,
+        dry_run_notice: str = "",
         on_quit: Callable[[], None],
         on_settings_saved: Callable[[bool], None] | None = None,
         log_pipeline: Any = None,
@@ -59,10 +59,11 @@ class MainWindow:
         self._on_quit = on_quit
         self._settings_saved_callback = on_settings_saved
         self._log_pipeline = log_pipeline
-        self._mode_text = mode_text
+        self._dry_run_notice = dry_run_notice
         self._unsubscribe: Any = None
         self._wechat_status = ("未检测", theme.GRAY)
         self._probe_lock = threading.Lock()
+        self._shutting_down = False
 
         root.title("劳小智微信服务")
         root.geometry("1180x720")
@@ -167,9 +168,12 @@ class MainWindow:
         footer.pack_propagate(False)
         tk.Label(footer, text="窗口关闭后，服务继续在托盘运行", font=theme.FONT_SMALL,
                  bg=theme.FOOTER_BG, fg=theme.TEXT_MUTED).pack(side=tk.LEFT, padx=24)
-        self._mode_label = tk.Label(footer, text=self._mode_text, font=theme.FONT_SMALL,
-                                    bg=theme.FOOTER_BG, fg=theme.TEXT_MUTED)
-        self._mode_label.pack(side=tk.RIGHT, padx=24)
+        # 只在「不会真的发消息」时才出声。常态是真实发送，界面上摆个「模式：真实发送」
+        # 属于把开发档位摆给客户看；但反过来一声不吭更糟——开关没打开时界面一切正常、
+        # 消息其实一条没出去，那是静默陷阱。所以：正常无显示，异常才亮。
+        self._dry_run_label = tk.Label(footer, text="", font=theme.FONT_SMALL,
+                                       bg=theme.FOOTER_BG, fg=theme.ORANGE)
+        self._render_dry_run_notice()
 
     def _action(self, text: str, command: Callable[[], None]) -> tk.Label:
         item = tk.Label(self._header_actions, text=text, font=theme.FONT_SMALL,
@@ -226,6 +230,19 @@ class MainWindow:
     def hide(self) -> None:
         self.root.withdraw()
 
+    def begin_shutdown(self) -> bool:
+        """进入退出中：立刻把界面切成「正在停止…」。已经在退了返回 False。
+
+        点了退出之后停机要花上几秒（等网关线程收口 + 微信队列停），这几秒里界面必须
+        说得出自己在干什么，否则看起来就是卡死了。
+        """
+        if self._shutting_down:
+            return False
+        self._shutting_down = True
+        self._status_label.configure(text="正在停止…", fg=theme.ORANGE)
+        self._live_dot.configure(fg=theme.ORANGE)
+        return True
+
     def destroy(self) -> None:
         if self._unsubscribe is not None:
             self._unsubscribe()
@@ -249,13 +266,24 @@ class MainWindow:
     def open_settings(self) -> None:
         self._show_page("settings")
 
-    def set_mode_text(self, text: str) -> None:
-        self._mode_text = text
-        self._mode_label.configure(text=text)
+    def set_dry_run_notice(self, text: str) -> None:
+        """设置「当前不会真的发消息」的提示；传空字符串表示一切正常，不显示。"""
+        self._dry_run_notice = text
+        self._render_dry_run_notice()
+
+    def _render_dry_run_notice(self) -> None:
+        if self._dry_run_notice:
+            self._dry_run_label.configure(text=self._dry_run_notice)
+            self._dry_run_label.pack(side=tk.RIGHT, padx=24)
+        else:
+            self._dry_run_label.pack_forget()
 
     # ── 状态刷新 ──────────────────────────────────────────────────
 
     def refresh_state(self) -> None:
+        if self._shutting_down:
+            return  # 退出中：状态已经定格在「正在停止…」，别让每秒一次的刷新把它盖掉
+
         state = self.service.state
         color = _STATE_COLOR.get(state, theme.GRAY)
         self._status_label.configure(text=_STATE_TEXT.get(state, "-"), fg=color)

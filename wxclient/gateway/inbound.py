@@ -250,3 +250,15 @@ class InboundLoop:
 
     def stop(self) -> None:
         self._stopped.set()
+
+    def cancel_inflight(self) -> int:
+        """放弃还没收口的轮次，返回放弃了几轮。
+
+        只在退出时用：等一轮跑完最长要等到 turn_timeout（默认 180s），而人已经点了退出。
+        丢掉的那一轮不是灾难——对方的消息没标已读，下次起来照样会被重新读到。
+        """
+        pending = [task for task in self._inflight.values() if not task.done()]
+        for task in pending:
+            task.cancel()
+        self._inflight.clear()
+        return len(pending)

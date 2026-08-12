@@ -370,6 +370,24 @@ class InboundLoopTests(StoreTestCase):
         self.assertIn("在吗", seen[0])
         self.assertIn("还招人吗", seen[0])
 
+    async def test_cancel_inflight_gives_up_the_running_turn(self) -> None:
+        """★ 退出时不能被一轮没跑完的对话拖住——那一轮最长能占 180s。"""
+        started = asyncio.Event()
+
+        async def handler(_a: str, _p: str, _t: str, _m) -> None:
+            started.set()
+            await asyncio.sleep(3600)   # 模拟卡在一轮里
+
+        source = FakeSource([[msg("在吗", msg_id="m1")], []])
+        loop = self._loop(source, handler, now=T0)
+        await loop.tick()
+        self._now = T0 + timedelta(seconds=10)
+        self.assertEqual(await loop.tick(), 1)
+        await started.wait()
+
+        self.assertEqual(loop.cancel_inflight(), 1)
+        await loop.drain()               # 放弃之后 drain 立即返回，不再等
+
     async def test_duplicate_msg_id_triggers_only_once(self) -> None:
         """RPA 重推同一条消息不能触发第二轮。"""
         calls: list[str] = []

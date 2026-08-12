@@ -37,7 +37,6 @@ FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_TURN_TIMEOUT_SECONDS", "单轮上限（秒）"),
     Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "每小时发送上限"),
     Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "如 09:00-21:00，可跨午夜"),
-    Field("WXCLIENT_UI_ALLOW_REAL_ACTIONS", "真的发消息", "关闭时整条回路照跑但不真发", kind="bool"),
     Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", kind="bool"),
     Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", kind="bool"),
 )

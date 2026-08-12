@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import tkinter as tk
 
 import structlog
@@ -26,9 +27,10 @@ from .window import MainWindow
 _log = structlog.get_logger(__name__)
 
 
-def _mode_text(args: argparse.Namespace, settings: UiSettings) -> str:
+def _dry_run_notice(args: argparse.Namespace, settings: UiSettings) -> str:
+    """不会真的发消息时给的提示；正常（真实发送）返回空串，界面上不显示任何档位。"""
     real = args.allow_real_actions or settings.allow_real_actions
-    return "模式：真实发送" if real else "模式：dry-run（不真发）"
+    return "" if real else "⚠ 当前只走流程、不会真的发消息"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -81,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         settings_store.apply_to_environ(
             settings_store.load(wechat_settings.data_dir), force=True
         )
-        window.set_mode_text(_mode_text(args, UiSettings()))
+        window.set_dry_run_notice(_dry_run_notice(args, UiSettings()))
         service.start()
 
     window = MainWindow(
@@ -89,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         buffer,
         service,
         data_dir=wechat_settings.data_dir,
-        mode_text=_mode_text(args, settings),
+        dry_run_notice=_dry_run_notice(args, settings),
         on_quit=lambda: shutdown(root, window, service, tray),
         on_settings_saved=on_settings_saved,
         log_pipeline=log_pipeline,
@@ -117,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.show or not settings.start_hidden:
         window.show()
 
-    _log.info("桌面端已启动", mode=_mode_text(args, settings), autostart=autostart)
+    _log.info("桌面端已启动", real_actions=(args.allow_real_actions or settings.allow_real_actions), autostart=autostart)
     try:
         root.mainloop()
     except KeyboardInterrupt:
@@ -126,13 +128,24 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def shutdown(root: tk.Tk, window: MainWindow, service: GatewayService, tray: Tray) -> None:
+    """退出：界面立刻响应，真正的收尾扔到后台线程。
+
+    ``service.stop()`` 要等网关线程收口（最长 15s），放在 tkinter 主线程上跑，这段时间
+    窗口连重绘都不做——点下去像死了一样。所以主线程只负责「立刻看得见的部分」（撤托盘、
+    状态改成停止中），停机在后台跑完再回主线程销毁窗口。
+    """
+    if not window.begin_shutdown():
+        return  # 已经在退了，重复点不叠加
     _log.info("正在退出桌面端")
-    try:
-        service.stop()
-    finally:
-        tray.stop()
-        window.destroy()
-        root.quit()
+    tray.stop()
+
+    def finish() -> None:
+        try:
+            service.stop()
+        finally:
+            root.after(0, lambda: (window.destroy(), root.quit()))
+
+    threading.Thread(target=finish, name="wx-ui-shutdown", daemon=True).start()
 
 
 if __name__ == "__main__":

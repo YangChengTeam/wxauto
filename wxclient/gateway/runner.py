@@ -33,6 +33,9 @@ _log = structlog.get_logger(__name__)
 #: 也让「连接已经死了」最多 30s 就被发现（而不是攒到第一条真消息上）。
 KEEPALIVE_INTERVAL_SECONDS = 30.0
 
+#: 退出时最多等在途的一轮收口多久。超了就放弃那一轮——丢一轮远好过界面卡住不动。
+SHUTDOWN_DRAIN_SECONDS = 3.0
+
 
 class ConnectionPool:
     """一专员一连接。断线后重连——**重连必须现换一张新票**。"""
@@ -286,5 +289,11 @@ class GatewayRunner:
 
     async def stop(self) -> None:
         self.loop.stop()
-        await self.loop.drain()
+        # 收口给个上限：正常情况下几十毫秒就完了，但如果正卡在一轮对话里，drain 会一直等到
+        # turn_timeout（默认 180s）——人已经点了退出，不能让他对着一个不动的窗口干等。
+        try:
+            await asyncio.wait_for(self.loop.drain(), timeout=SHUTDOWN_DRAIN_SECONDS)
+        except TimeoutError:
+            abandoned = self.loop.cancel_inflight()
+            _log.warning("退出时还有未收口的轮次，已放弃", turns=abandoned)
         await self._pool.close_all()
