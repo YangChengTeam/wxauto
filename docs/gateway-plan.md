@@ -103,15 +103,30 @@ wxclient/gateway/
       （task `3a606859` / `18010203`，均 `succeeded`，全程约 10s），
       随后 `read_chat_history` 读回 2 条自测消息取证。
       ⚠️ 入站仍是脚本注入的，**真入站轮询没验**（见上面三条）。
-- [ ] C4. 网关模式接真 AI 端端到端（需 AI 端可达；目前只连过 Fake）
+- [x] C4. 网关模式接**真 AI 端**端到端（远程线上，不再是 Fake）
+      ✅ 2026-08-12 18:28：AI 端 = `wss://worker.laoxiaozhi.cn/agent-ws/v1/ws`（线上 nginx TLS 反代
+      到 `127.0.0.1:8137`，**不新开公网面**）。真票（`scope=wechat`，只准 `wechat_reply`）→ 建连 →
+      `session.start` → 一轮 → 卡片 1 段 → 真发到「文件传输助手」（task `a6b90603` `succeeded`，
+      `dry_run=false`，连上到发出约 30s），`read_chat_history` 读回原文取证：
+      「在招的呀，看你之前做过普工，是想继续找普工类的岗位吗？……」。
+      ⚠️ 入站仍是脚本注入的（`lxz_c4_windows.py`，一次性脚本不入库），**真入站轮询没验**。
 - [ ] C5. 拒绝→停发、频次超限、专员插话三个场景的真机验证
 
-**真机踩到并已修的两处**（都不是本次改造引入的）：
+**AI 端侧同批修掉的一个真缺口**：`wechat_reply` 的 persona 没写「卡片由 skill 的 `emit` 产出」，
+codex 把 JSON 叙述在正文里 → `card_count=0`，网关一个字也发不出去。已在 AI 端补两条命令
+（`run.mjs read` → 写 JSON → `run.mjs emit`），见 `lxz_agent_backend` 提交 `06f55ad6`。
+
+**真机踩到并已修的三处**（都不是本次改造引入的）：
 - 微信最小化时 `Application.connect(title="微信")` 直接抛 ElementNotFoundError，所有 UI 动作全废，
   而 `uia_probe` 自己枚举窗口仍报「UIA 可用」——两边不一致极易误判成「微信没登录」。
   已改为动作前按 hwnd 恢复窗口（`_ensure_ready`）。
 - 队列库里一条已删除的任务类型（本机遗留的 `reply_chat`）让 `TaskStore` 构造直接抛异常，
   服务整个起不来。已改为迁移时作废这类行。
+- **最小化时 UIA 子树塌到阈值以下 → 探测报「未暴露」→ `_ensure_ready` 直接拒**，而恢复窗口的代码
+  排在这个判定之后：网关常驻轮询在这里连挂十几分钟，手工恢复窗口后同一轮立刻通。已改为
+  「未暴露且还找得到句柄 → 强制恢复一次 → 复探 → 仍不行才算真不可用」（提交 `2f062a1`）。
+  ⚠️ 由此带出一个**产品问题**：窗口最小化时每轮轮询都会把微信弹回前台，机器没法用。
+  建议按「有活才恢复」改（先只读判断有没有未读，有才恢复窗口），未定。
 
 ### Phase D · 接线（需业务端）
 
@@ -156,10 +171,12 @@ python -m wxclient.gateway --account wxid_zhangsan_work --allow-real-actions
 | 阻塞 | 影响 |
 |---|---|
 | ~~Windows 主机 SSH 不通~~ | 已解除：2026-08-12 打通 172.16.20.86，C1–C3 已实跑 |
-| AI 端不可达（只听 localhost） | 只挡 C4；C3 用 `tests/e2e_windows_ws.py` 里的 Fake AI 端 |
-| 业务端签票接口未建 | 只挡 Phase D；联调期用 `LocalFileTicketProvider` |
+| ~~AI 端不可达~~ | 已解除：走线上 `wss://worker.laoxiaozhi.cn/agent-ws/v1/ws`（nginx TLS 反代），C4 已实跑 |
+| 业务端签票接口未建 | 只挡 Phase D；联调期用 `LocalFileTicketProvider`，票由 AI 端密钥手工签、有 TTL |
+| 入站只有「新消息」一类 | 加好友申请（`check_new_friends` / `accept_new_friends` 底座已有）还没接进轮询，
+AI 端也只有 `wechat_reply` 一个 task_type；「按时间/对象主动发起」同样没有承载的 action |
 
-**下一步优先级**：C5（拒绝/频次/插话三个真机场景）→ 入站轮询真机验证（那三条）→ C4。
+**下一步优先级**：入站轮询真机验证（那三条）→ 入站事件类型扩容（加好友 + 定时主动触达）→ C5。
 
 > ⚠️ 真机操作纪律：SSH 进去是 **Session 0**，UIA 够不着桌面，`taskkill` 也杀不到桌面里的进程。
 > 凡是要碰微信的，一律 `schtasks /create ... /RU <user> /IT` + `/run` 放进 Session 1 跑，把输出重定向到
