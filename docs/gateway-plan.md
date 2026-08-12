@@ -3,16 +3,18 @@
 > 接口契约见 [`../CLAUDE.md`](../CLAUDE.md) §4，**本文不复制**。
 > 对端（劳小智 AI 服务）的实施清单在 `lxz_agent_backend/.claude/specs/064-wechat-gateway/`。
 
-## 0. 双模式并存（明确保留）
+## 0. 单入口（2026-08-12 更新）
 
-本仓保留**两个入口**，共用同一套 `queue → wechat_api` 底座：
+本仓只有**一个入口**：
 
 | 模式 | 入口 | 用途 |
 |---|---|---|
-| **MCP 模式** | `python -m wxclient.mcp_server` | 本地调试、人工干预、单动作验证。**保留，不删** |
 | **网关模式** | `python -m wxclient.gateway` | 生产链路：入站轮询 → AI 端 → 出站发送 |
 
-两者可同时起（各自监听不同端口），但**同一时刻只有一个 worker 操作微信**——这由既有的 SQLite 租约保证，不需要额外机制。调试时用 MCP 手动发一条消息，不会和网关的自动回复打架，只会排队。
+> 历史：原先并存一个被动的 MCP 工具服务（`python -m wxclient.mcp_server`），用于本地调试与人工
+> 干预。自动化招聘要的是「事件来调 AI」，MCP 唤不醒入站消息，已整体移除；它唯一不可替代的部分
+> ——任务队列与真实动作授权——提到包级的 `wxclient/runtime.py`，由网关继续使用。
+> 单动作验证改用网关的 dry-run 模式加临时脚本，不再保留常驻的第二个入口。
 
 ## 1. 模块划分
 
@@ -29,7 +31,7 @@ wxclient/gateway/
   runner.py       # 编排：一专员一连接、重连、生命周期、优雅退出
 ```
 
-**依赖方向**：`gateway → queue → wechat_api`。`gateway` 不 import `mcp_server`，反之亦然。
+**依赖方向**：`gateway → runtime → queue → wechat_api`，单向不回头。
 
 ## 2. 阶段与任务
 
@@ -76,7 +78,7 @@ wxclient/gateway/
 - [x] AB3. `wechat_io.py`：队列版 source/sink + **游标切新消息**（首次见到某联系人只对齐游标，
       绝不照着历史逐条回复）
 - [x] AB4. `__main__.py`：`python -m wxclient.gateway`，**默认 dry-run**，真发需显式
-      `--allow-real-actions`（与 MCP 模式同一条纪律）
+      `--allow-real-actions`（授权判定在 `wxclient/runtime.py` 一处）
 - [x] AB5. 端到端测试 17 条：链路上只有微信那一端是假的
 
   **Checkpoint AB** ✅：候选人消息进 → 换票建连 → 建会话 → 一轮 → 卡片 → 逐段发出，整条打通。
@@ -89,7 +91,7 @@ wxclient/gateway/
 > ③ 专员本人手打的消息 `sender == "我"` 要被标成 `from_self`。
 
 - [ ] C1. 真机装依赖、`uia_probe` 确认微信 UIA 可用
-- [ ] C2. MCP 模式手动验证底座：读消息、发一条消息
+- [ ] C2. 用 `WeChatRuntime` 手动验证底座：读消息、发一条消息（临时脚本，不落常驻入口）
 - [ ] C3. 网关模式接 Fake AI 端跑通（真微信 + 假 AI），验证入站轮询与出站发送
 - [ ] C4. 网关模式接真 AI 端端到端
 - [ ] C5. 拒绝→停发、频次超限、专员插话三个场景的真机验证

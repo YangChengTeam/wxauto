@@ -1,23 +1,20 @@
 # AGENTS.md
 
-本仓库维护 Windows 微信自动化服务，负责微信 UI 自动化和串行任务执行，对外提供两个
-入口：被动的 MCP 工具服务（`mcp_server/`）和主动的 WS 网关（`gateway/`）。仓库不维护
-GUI、托盘、独立调用客户端或大模型回复模块。
+本仓库维护 Windows 微信自动化服务，负责微信 UI 自动化和串行任务执行，对外提供一个
+入口：主动的 WS 网关（`gateway/`）。仓库不维护 GUI、托盘、独立调用客户端或大模型回复模块。
 
 > 协作约定、跨仓接口契约与红线见 [`CLAUDE.md`](CLAUDE.md)，本文只讲本仓代码规则。
 
 ## 文档与源码
 
 - 协作约定与跨仓契约：`CLAUDE.md`
-- MCP 部署、鉴权、工具和扩展：`docs/mcp-server.md`
-- MCP 服务：`wxclient/mcp_server/`
+- 网关实施清单：`docs/gateway-plan.md`
 - WS 网关：`wxclient/gateway/`
+- 共享运行时（任务队列 + 执行器 + 动作授权）：`wxclient/runtime.py`
 - 微信动作封装：`wxclient/wechat_api/`
 - 只读 UIA 探测：`wxclient/uia_probe/`
 - 串行任务队列：`wxclient/queue/`
 - 第三方 pyweixin：`third_party/pywechat/pyweixin/`
-- MCP 入口：`scripts/wxclient_mcp.py`
-- 单体 EXE 构建：`scripts/build_mcp_onefile.py`
 
 ## 外部文档规则
 
@@ -32,11 +29,11 @@ GUI、托盘、独立调用客户端或大模型回复模块。
 
 ## 架构约束
 
-- 所有微信 UI 动作必须由 `mcp_server -> queue -> wechat_api` 或 `gateway -> queue -> wechat_api`
-  调用，两个入口共用同一套队列与封装，不得各自复制一份。
+- 所有微信 UI 动作必须由 `gateway -> runtime -> queue -> wechat_api` 调用；新增入口
+  必须复用同一个 `WeChatRuntime`，不得各自复制一份队列与封装。
 - 微信 UI 自动化必须由单消费者 worker 串行执行。
-- MCP 工具和网关都只负责校验参数和投递任务，不得直接操作微信窗口或绕过队列调 pyweixin。
-- 两个入口都不实现对话理解与回复生成——这些在劳小智 AI 端。`gateway` 只做确定性编排
+- 网关只负责校验参数和投递任务，不得直接操作微信窗口或绕过队列调 pyweixin。
+- 网关不实现对话理解与回复生成——这些在劳小智 AI 端。`gateway` 只做确定性编排
   （去重、去抖、串行、频次、黑名单），话术内容一律来自 AI 端返回。
 - 同类型 `PENDING` 任务不重复入队。
 - MVP 只支持一个 Windows 交互式用户会话中的一个微信账号。
@@ -52,24 +49,22 @@ GUI、托盘、独立调用客户端或大模型回复模块。
 ## 真实动作安全
 
 - 加好友、同意好友、发消息和发朋友圈默认 `dry_run=true`。
-- 真实动作必须同时由服务端开启 `--allow-real-actions`，并由单次 MCP 调用提供确认短语。
-- MCP 上传只接受 Base64 内容并返回 `media_id`；工具不接受调用方指定任意 Windows 路径。
-- 失败任务要保留原因、状态和重试次数，供 MCP 工具查询。
+- 真实动作必须同时由服务端开启 `--allow-real-actions`，并由单次调用提供确认短语
+  （`wxclient.runtime.REAL_ACTION_CONFIRMATION`）。
+- 授权判定只在 `WeChatRuntime._authorize_payload()` 一处，新增入口不得自建旁路。
+- 失败任务要保留原因、状态和重试次数，供调用方查询。
 
 ## 扩展方式
 
-- 新 MCP 工具组实现 `McpToolProvider.register()`，通过 `create_mcp_server()` 注册。
-- 新微信能力先加入 `wechat_api` 封装，再增加任务类型和 worker 分发，最后暴露给 MCP 工具
-  或网关。
+- 新微信能力先加入 `wechat_api` 封装，再增加任务类型和 worker 分发，最后暴露给网关。
 - 不恢复 GUI、托盘、调用客户端或大模型模块；若产品方向变化，应单独讨论架构。
 - `gateway` 的常驻轮询循环是既定架构（入站只能轮询，见 `CLAUDE.md` §4.3），不属于被禁的
   「定时调度」。
 
 ## 测试与打包
 
-- 修改后运行 `python -m ruff check wxclient scripts tests`。
+- 修改后运行 `python -m ruff check wxclient tests`。
 - 运行 `python -m unittest discover -s tests -v`。
-- 修改入口、依赖、vendor 或打包脚本时，先运行
-  `python scripts/build_mcp_onefile.py --dry-run`，再实际构建并验证 `dist/wxclient-mcp.exe`。
-- 打包必须包含 `third_party/pywechat/pyweixin` 和其所需的 `logger/logging.conf`。
+- 网关单体 exe 尚未做；`[build]` extra 里的 PyInstaller 为它预留（见 `README.md`「打包」）。
+  真做时打包必须包含 `third_party/pywechat/pyweixin` 和其所需的 `logger/logging.conf`。
 - 完成并验证后提交 Git；不得回退用户无关的工作区修改。

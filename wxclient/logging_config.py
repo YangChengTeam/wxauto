@@ -37,16 +37,8 @@ _TASK_LABELS = {
     "read_recent_moments": "读取最近朋友圈",
 }
 
-_MCP_REQUEST_LABELS = {
-    "InitializeRequest": "初始化连接",
-    "ListToolsRequest": "获取工具列表",
-    "CallToolRequest": "调用工具",
-    "PingRequest": "连接检查",
-}
-
-
 def configure_logging(level: str = "INFO", log_file: Path | None = None) -> None:
-    """Configure concise Chinese logs for the MCP server and WeChat worker."""
+    """网关与微信任务执行器的中文精简日志。"""
     _configure_redirected_stream_encoding()
     level_value = getattr(logging, level.upper(), logging.INFO)
     root = logging.getLogger()
@@ -118,11 +110,6 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     task_type = _TASK_LABELS.get(str(payload.get("task_type") or ""), "未知任务")
     task_id = _short_id(payload.get("task_id") or payload.get("active_task_id"))
 
-    if event == "mcp.server.starting":
-        mode = "已允许真实操作" if payload.get("real_actions") else "仅允许模拟操作"
-        return f"微信 MCP 服务正在启动：{payload.get('endpoint')}，{mode}"
-    if event == "mcp.server.stopped":
-        return "微信 MCP 服务已停止"
     if event == "worker.started":
         return f"微信任务执行器已启动，轮询间隔 {payload.get('poll_interval')} 秒"
     if event == "worker.stopped":
@@ -230,41 +217,8 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "collect_visible_messages.group_detect":
         kind = "群聊" if payload.get("is_group") else "单聊"
         return f"会话类型识别完成：「{payload.get('chat_name') or '-'}」为{kind}"
-    if event == "StreamableHTTP session manager started":
-        return "MCP HTTP 会话管理器已启动"
-    if event == "Terminating session: None":
-        return "MCP 会话已结束"
-
-    request_prefix = "Processing request of type "
-    if event.startswith(request_prefix):
-        request = event.removeprefix(request_prefix).strip()
-        return f"正在处理 MCP 请求：{_MCP_REQUEST_LABELS.get(request, request)}"
-
-    translated = _translate_framework_event(event)
-    if translated != event:
-        return translated
     extras = _format_extras(payload)
     return f"{event}{extras}" if event else extras.lstrip("，")
-
-
-def _translate_framework_event(event: str) -> str:
-    if event.startswith("Started server process"):
-        return event.replace("Started server process", "MCP 服务进程已启动", 1)
-    translations = {
-        "Waiting for application startup.": "正在初始化 MCP 服务。",
-        "Application startup complete.": "MCP 服务初始化完成。",
-        "Shutting down": "正在停止 MCP 服务。",
-        "Waiting for application shutdown.": "正在等待 MCP 服务停止。",
-        "Application shutdown complete.": "MCP 服务已停止。",
-        "Finished server process": "MCP 服务进程已退出",
-    }
-    for source, target in translations.items():
-        if event.startswith(source):
-            return event.replace(source, target, 1)
-    if event.startswith("Uvicorn running on "):
-        address = event.removeprefix("Uvicorn running on ").split(" (", 1)[0]
-        return f"微信 MCP 服务正在监听：{address}，按 Ctrl+C 停止"
-    return event
 
 
 def _format_extras(payload: dict[str, Any]) -> str:

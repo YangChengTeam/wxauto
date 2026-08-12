@@ -34,10 +34,6 @@ class ChineseLogRendererTests(unittest.TestCase):
             "2026-08-08 17:30:00 [信息] 微信任务执行成功：发送消息 #12345678",
         )
 
-    def test_renders_mcp_request_in_chinese(self) -> None:
-        output = self.render("Processing request of type CallToolRequest")
-        self.assertIn("正在处理 MCP 请求：调用工具", output)
-
     def test_renders_uia_probe_in_chinese(self) -> None:
         output = self.render(
             "uia.operation_probe",

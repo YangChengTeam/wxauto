@@ -64,7 +64,7 @@ class OperationWorker:
             self._stop.clear()
             self._thread = threading.Thread(
                 target=self.run_forever,
-                name="wx-mcp-worker",
+                name="wx-worker",
                 daemon=True,
             )
             self._thread.start()
@@ -112,7 +112,7 @@ class OperationWorker:
         heartbeat = threading.Thread(
             target=self._renew_leases,
             args=(task.id, heartbeat_stop),
-            name="wx-mcp-lease-heartbeat",
+            name="wx-lease-heartbeat",
             daemon=True,
         )
         heartbeat.start()

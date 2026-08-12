@@ -1,7 +1,7 @@
 """网关入口：``python -m wxclient.gateway``。
 
 默认 **dry-run**——整条回路都跑，但不真的往微信发消息。要真发必须显式加
-``--allow-real-actions``，与 MCP 模式同一条纪律。
+``--allow-real-actions``（真实动作三重确认，见 ``CLAUDE.md`` §5.1）。
 """
 
 from __future__ import annotations
@@ -15,8 +15,7 @@ import structlog
 
 from wxclient.config import load_settings
 from wxclient.logging_config import configure_logging
-from wxclient.mcp_server.config import REAL_ACTION_CONFIRMATION, McpServerSettings
-from wxclient.mcp_server.runtime import WxMcpRuntime
+from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
 from .config import GatewaySettings
 from .runner import GatewayRunner
@@ -70,8 +69,9 @@ async def run(argv: list[str] | None = None) -> int:
         return 2
 
     wechat_settings = load_settings(args.config)
-    mcp_settings = McpServerSettings(allow_real_actions=args.allow_real_actions)
-    runtime = WxMcpRuntime(wechat_settings, mcp_settings)
+    runtime_settings = RuntimeSettings(allow_real_actions=args.allow_real_actions)
+    runtime_settings.validate_for_start()
+    runtime = WeChatRuntime(wechat_settings, runtime_settings)
 
     database_path = Path(args.gateway_db) if args.gateway_db else wechat_settings.data_dir / "gateway.db"
     store = GatewayStore(database_path)

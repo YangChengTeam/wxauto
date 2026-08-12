@@ -15,7 +15,7 @@ def format_uia_diagnostics(
     *,
     context: str = "UIA 诊断",
 ) -> list[str]:
-    """Format read-only UIA and window snapshots for MCP diagnostics."""
+    """格式化只读的 UIA 与窗口快照，供启动诊断使用。"""
     probe = probe or {}
     lines = [f"{context}：平台={platform.system()}，用户={_safe_username()}，管理员={_admin_label()}"]
     lines.append(_format_foreground_line(context))

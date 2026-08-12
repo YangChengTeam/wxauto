@@ -99,7 +99,7 @@ class QueueMessageSource:
     def __init__(
         self,
         *,
-        runtime,  # WxMcpRuntime 或任何提供 submit(TaskType, payload) 的对象
+        runtime,  # WeChatRuntime 或任何提供 submit(TaskType, payload) 的对象
         store: GatewayStore,
         history_limit: int = 20,
         clock=None,
