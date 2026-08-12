@@ -1127,6 +1127,42 @@ class UiaWeChatDriver:
             raise WeChatApiUnavailableError(
                 f"微信 UIA 不可用：{probe.get('reason') or '未知原因'}"
             )
+        self._restore_if_minimized(probe.get("selected_window"))
+
+    @classmethod
+    def _restore_if_minimized(cls, window_info: Any) -> None:
+        """微信最小化时先恢复窗口，否则后面所有 UI 动作都会失败。
+
+        2026-08-12 真机实测：窗口最小化时 ``Application.connect(title="微信")`` 直接抛
+        ElementNotFoundError（报的是查找条件那个字典），pyweixin 那条路同样跑不动，
+        而 ``uia_probe`` 因为自己枚举窗口所以照样报「UIA 已暴露」——两边表现不一致，
+        最容易被误读成「微信没登录」。所以恢复必须发生在 connect 之前，且只能用 hwnd。
+
+        与 ``uia_probe`` 那条「只读、不启动/不解锁微信」的约束不冲突：那是探测的纪律，
+        这里是执行动作的前提，窗口本来就在、也已登录。
+        """
+        hwnd = cls._minimized_handle(window_info)
+        if hwnd is None:
+            return
+        try:
+            win32gui = __import__("win32gui")
+            win32con = __import__("win32con")
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            time.sleep(0.3)  # 给窗口一点时间真正显示出来，紧接着就要 connect
+            logger.info("window.restored", hwnd=hwnd)
+        except Exception as exc:  # noqa: BLE001 - 恢复失败不该盖住后面真正的定位错误
+            logger.warning("window.restore_failed", error=f"{type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _minimized_handle(window_info: Any) -> int | None:
+        """从探测结果里挑出「需要恢复」的窗口句柄；不需要恢复就返回 None。"""
+        if not isinstance(window_info, dict) or not window_info.get("is_iconic"):
+            return None
+        handle = window_info.get("handle")
+        try:
+            return int(handle) if handle else None
+        except (TypeError, ValueError):
+            return None
 
     def _pyweixin_class(self, name: str) -> Any:
         vendor = self.project_root / "third_party" / "pywechat"
@@ -1161,30 +1197,10 @@ class UiaWeChatDriver:
             Application = __import__("pywinauto", fromlist=["Application"]).Application
             app = Application(backend="uia").connect(title="微信")
             main_window = app.window(title="微信")
-            self._restore_if_minimized(main_window)
             main_window.wait("ready", timeout=5)
             return main_window
         except Exception as exc:
             raise WeChatApiError(f"无法定位当前微信主窗口：{exc}") from exc
-
-    @staticmethod
-    def _restore_if_minimized(window: Any) -> None:
-        """最小化的窗口在 pywinauto 眼里不算 ready，后面 ``wait("ready")`` 必然超时。
-
-        2026-08-12 真机实测：微信最小化时所有走本方法的动作（读会话/读可见消息/发消息）
-        一律报「无法定位当前微信主窗口」，而 ``uia_probe`` 因为是自己枚举窗口所以照样找得到
-        ——两边表现不一致最容易误判成「微信没登录」。恢复窗口是执行 UI 动作的前提，
-        与 ``uia_probe`` 那条「只读、不启动/不解锁微信」的约束无关：这里窗口本来就在。
-        """
-        try:
-            # 必须先拿到 wrapper：WindowSpecification 是「查找条件」不是窗口本身，
-            # 直接在它上面调 is_minimized/restore 不可靠。
-            wrapper = window.wrapper_object()
-            if wrapper.is_minimized():
-                wrapper.restore()
-                logger.info("window.restored", reason="窗口最小化，UI 动作前先恢复")
-        except Exception as exc:  # noqa: BLE001 - 恢复失败不该盖住后面真正的定位错误
-            logger.warning("window.restore_failed", error=f"{type(exc).__name__}: {exc}")
 
     def _current_window_score(self, window: Any) -> int:
         score = 0

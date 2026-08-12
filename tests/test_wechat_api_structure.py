@@ -34,44 +34,27 @@ class WeChatApiStructureTests(unittest.TestCase):
 
 
 class RestoreMinimizedWindowTests(unittest.TestCase):
-    """最小化的窗口必须先恢复，否则 pywinauto 的 wait("ready") 必然超时（2026-08-12 真机实测）。"""
+    """微信最小化时 connect 直接找不到窗口，动作前必须按 hwnd 恢复（2026-08-12 真机实测）。"""
 
-    class _Window:
-        def __init__(self, minimized: bool, restore_error: Exception | None = None) -> None:
-            self._minimized = minimized
-            self._restore_error = restore_error
-            self.restored = False
-
-        def wrapper_object(self) -> "RestoreMinimizedWindowTests._Window":
-            # pywinauto 的 WindowSpecification 只是查找条件，真窗口要 wrapper_object() 才拿得到
-            return self
-
-        def is_minimized(self) -> bool:
-            return self._minimized
-
-        def restore(self) -> None:
-            if self._restore_error is not None:
-                raise self._restore_error
-            self.restored = True
-
-    def test_minimized_window_is_restored(self) -> None:
-        window = self._Window(minimized=True)
-
-        UiaWeChatDriver._restore_if_minimized(window)
-
-        self.assertTrue(window.restored)
+    def test_minimized_window_yields_its_handle(self) -> None:
+        self.assertEqual(
+            UiaWeChatDriver._minimized_handle({"handle": 199668, "is_iconic": True}),
+            199668,
+        )
 
     def test_normal_window_is_left_alone(self) -> None:
-        window = self._Window(minimized=False)
+        self.assertIsNone(
+            UiaWeChatDriver._minimized_handle({"handle": 199668, "is_iconic": False})
+        )
 
-        UiaWeChatDriver._restore_if_minimized(window)
+    def test_missing_or_malformed_probe_result_is_tolerated(self) -> None:
+        for window_info in (None, {}, {"is_iconic": True}, {"is_iconic": True, "handle": "x"}):
+            with self.subTest(window_info=window_info):
+                self.assertIsNone(UiaWeChatDriver._minimized_handle(window_info))
 
-        self.assertFalse(window.restored)
-
-    def test_restore_failure_does_not_mask_the_real_error(self) -> None:
-        window = self._Window(minimized=True, restore_error=RuntimeError("boom"))
-
-        UiaWeChatDriver._restore_if_minimized(window)  # 不抛，交给后面的 wait 报真正的错
+    def test_restore_failure_does_not_raise(self) -> None:
+        # 非 Windows 上 win32gui 根本导不进来，走的正是「恢复失败」这条路：只留痕，不抛
+        UiaWeChatDriver._restore_if_minimized({"handle": 199668, "is_iconic": True})
 
 
 if __name__ == "__main__":
