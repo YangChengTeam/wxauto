@@ -33,9 +33,28 @@ _log = structlog.get_logger(__name__)
 SELF_SENDER = "我"
 
 
+def is_self_message(raw: dict[str, Any]) -> bool:
+    """这条是不是专员本人发的。
+
+    真机上权威字段是 ``is_self``（`uia.py` 按气泡左右位置判定，逐条都有）；``sender``
+    只有部分行会被标注（多数行根本没这个键），所以只能当兜底。
+    **判错的代价极大**：网关自己发出去的回复下一轮会被原样读回来，认不出是自己说的就会
+    当成新入站再回一轮 —— 自问自答刷屏。
+    """
+    flag = raw.get("is_self")
+    if isinstance(flag, bool):
+        return flag
+    return str(raw.get("sender") or "") == SELF_SENDER
+
+
+def is_timestamp_row(raw: dict[str, Any]) -> bool:
+    """聊天记录里夹的时间分隔行（「18:28」「昨天」），不是消息。"""
+    return bool(raw.get("is_timestamp"))
+
+
 def message_signature(raw: dict[str, Any]) -> str:
     """一条消息的签名。没有稳定 id，只能拿发送方 + 文本凑。"""
-    sender = str(raw.get("sender") or "")
+    sender = "self" if is_self_message(raw) else str(raw.get("sender") or "peer")
     text = str(raw.get("text") or "")
     return sha256(f"{sender}\x00{text}".encode()).hexdigest()[:32]
 
@@ -84,7 +103,7 @@ def to_inbound(
         msg_id=f"{peer_id}#{seq}",
         text=str(raw.get("text") or ""),
         at=at or datetime.now(timezone.utc),
-        from_self=str(raw.get("sender") or "") == SELF_SENDER,
+        from_self=is_self_message(raw),
         peer_name=peer_id,
     )
 
@@ -126,6 +145,9 @@ class QueueMessageSource:
             TaskType.READ_CHAT_HISTORY, {"friend": peer_id, "limit": self._history_limit}
         )
         raw_messages = ((history or {}).get("result") or {}).get("messages") or []
+        # 时间分隔行必须在切游标**之前**滤掉：它会被当成一条消息发给 AI，还会把游标钉在
+        # 一个随时间变化的字符串上（真机读回来过一行「18:28」）。
+        raw_messages = [raw for raw in raw_messages if not is_timestamp_row(raw)]
 
         last_signature, seq = self._store.get_cursor(account_id, peer_id)
         fresh, new_signature = split_new_messages(raw_messages, last_signature)

@@ -24,6 +24,7 @@ from wxclient.gateway import (
     GatewayStore,
     InboundMessage,
     LocalFileTicketProvider,
+    is_timestamp_row,
     message_signature,
     split_new_messages,
     to_inbound,
@@ -187,6 +188,39 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("[专员本人 · 14:02] 稍等我看下", text)
                 self.assertNotIn(PEER, text)          # 不泄露联系人标识
                 self.assertTrue(sent["data"]["wechat"]["operator_intervened"])
+            finally:
+                await runner.stop()
+
+    async def test_operator_only_batch_never_triggers_a_turn(self) -> None:
+        """★ 一批里全是专员本人说的话，绝不触发一轮。
+
+        网关自己发出去的回复，下一轮轮询会被原样读回来（带 is_self）。要是拿它触发一轮，
+        就是自己回自己、一直刷。这些话要留着并进对方下一次真回话的上下文里（§5.2）。
+        """
+        async with FakeAgentServer(
+            valid_tickets={"tkt-ok"}, turn_script=TurnScript(cards=[wechat_card(["好的"])])
+        ) as server:
+            source = ScriptedSource([
+                [inbound("我们这边还在招普工", msg_id="s1", at=T0, from_self=True)],
+                [],
+                [inbound("那我想问下工资", msg_id="m1", at=T0 + timedelta(minutes=1))],
+                [],
+            ])
+            sink = RecordingSink()
+            runner = self._runner(server, source, sink)
+            try:
+                await runner.tick()
+                self.assertEqual(await self._advance_and_tick(runner, 10), 0, "自己说的话不能触发一轮")
+                self.assertEqual(sink.sent, [])
+                self.assertFalse([f for f in server.received if f.get("op") == "message.send"])
+
+                await self._advance_and_tick(runner, 10)   # 对方真回话了
+                self.assertEqual(await self._advance_and_tick(runner, 10), 1)
+
+                sent = next(f for f in server.received if f.get("op") == "message.send")
+                text = sent["data"]["text"]
+                self.assertIn("我们这边还在招普工", text, "专员说过的话要并进上下文，别让 AI 重复问")
+                self.assertIn("那我想问下工资", text)
             finally:
                 await runner.stop()
 
@@ -452,6 +486,22 @@ class WeChatIoMappingTests(unittest.TestCase):
 
         other = to_inbound("acct", "peer", {"sender": "王建国", "text": "在吗"}, seq=2)
         self.assertFalse(other.from_self)
+
+    def test_is_self_flag_wins_over_missing_sender(self) -> None:
+        """★ 真机权威字段是 is_self；多数行根本没有 sender。
+
+        认错的代价是网关把自己刚发出去的回复当成入站，自己回自己。
+        """
+        mine = to_inbound("acct", "peer", {"is_self": True, "text": "我们这边还在招"}, seq=1)
+        self.assertTrue(mine.from_self)
+
+        theirs = to_inbound("acct", "peer", {"is_self": False, "text": "还招人吗"}, seq=2)
+        self.assertFalse(theirs.from_self)
+
+    def test_timestamp_rows_are_not_messages(self) -> None:
+        """聊天记录里夹的「18:28」这类时间分隔行不是消息，不能当入站、也不能钉游标。"""
+        self.assertTrue(is_timestamp_row({"text": "18:28", "is_timestamp": True}))
+        self.assertFalse(is_timestamp_row({"text": "还招人吗", "is_timestamp": False}))
 
     def test_identical_consecutive_messages_get_distinct_ids(self) -> None:
         """同一个人连发两条一模一样的话，两条都要能被处理。"""

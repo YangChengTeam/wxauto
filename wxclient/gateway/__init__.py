@@ -29,6 +29,8 @@ from .wechat_io import (
     QueueMessageSource,
     message_signature,
     split_new_messages,
+    is_self_message,
+    is_timestamp_row,
     to_inbound,
 )
 from .ticket import (
@@ -76,6 +78,8 @@ __all__ = [
     "message_signature",
     "parse_active_hours",
     "split_new_messages",
+    "is_self_message",
+    "is_timestamp_row",
     "to_inbound",
     "within_active_hours",
 ]

@@ -23,6 +23,10 @@ _log = structlog.get_logger(__name__)
 
 PeerKey = tuple[str, str]  # (account_id, peer_id)
 
+#: 只有专员本人说话时最多留几条当上下文。留着是为了下一轮别重复问他问过的，
+#: 但不能无上限攒——他自己聊一下午，缓冲和 prompt 都会被撑爆。
+_SELF_CONTEXT_LIMIT = 10
+
 
 @dataclass(frozen=True)
 class InboundMessage:
@@ -194,6 +198,13 @@ class InboundLoop:
                 # 这个联系人正在被回复——放回缓冲，等这一轮收口后再合并派发。
                 # 同一会话严格串行（AI 端也只允许一轮，抢跑会直接报错）。
                 self._debouncer.readd(key, messages, now)
+                continue
+
+            if not any(not message.from_self for message in messages):
+                # 一批里全是专员本人说的话（含网关自己刚发出去、下一轮被读回来的回复）：
+                # **不能拿它触发一轮**，否则就是自己回自己，会一直刷。留在缓冲里，等对方
+                # 真回话时并进那一轮的上下文（CLAUDE.md §5.2「人工接管优先」要的就是这个）。
+                self._debouncer.readd(key, list(messages)[-_SELF_CONTEXT_LIMIT:], now)
                 continue
 
             account_id, peer_id = key
