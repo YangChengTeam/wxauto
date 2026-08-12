@@ -60,11 +60,13 @@ class RestoreMinimizedWindowTests(unittest.TestCase):
         )
         self.assertIsNone(UiaWeChatDriver._minimized_handle({}, force=True))
 
-    def test_restore_failure_does_not_raise(self) -> None:
-        # 非 Windows 上 win32gui 根本导不进来，走的正是「恢复失败」这条路：只留痕，不抛，返回 False
-        self.assertFalse(
-            UiaWeChatDriver._restore_if_minimized({"handle": 199668, "is_iconic": True})
-        )
+    def test_restore_without_handle_is_a_noop(self) -> None:
+        # 探测结果里没有可用句柄 → 不动窗口、不抛、如实返回 False（不能骗调用方去复探）
+        # 故意不拿真句柄做用例：Windows 上跑测试会真的把那个窗口弹出来。
+        for window_info in (None, {}, {"is_iconic": True}, {"is_iconic": True, "handle": "x"}):
+            with self.subTest(window_info=window_info):
+                self.assertFalse(UiaWeChatDriver._restore_if_minimized(window_info))
+                self.assertFalse(UiaWeChatDriver._restore_if_minimized(window_info, force=True))
 
 
 if __name__ == "__main__":
