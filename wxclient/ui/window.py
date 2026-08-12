@@ -17,6 +17,7 @@ from typing import Any
 
 from . import logline, theme
 from .logbuffer import LogBuffer
+from .logtable import LogTable
 from .service import GatewayService, ServiceState
 
 _STATE_TEXT = {
@@ -33,13 +34,6 @@ _STATE_COLOR = {
     ServiceState.STOPPING: theme.ORANGE,
     ServiceState.STOPPED: theme.GRAY,
     ServiceState.FAILED: theme.RED,
-}
-
-_SEVERITY_COLOR = {
-    "info": theme.GREEN,
-    "warn": theme.ORANGE,
-    "error": theme.RED,
-    "debug": theme.GRAY,
 }
 
 _WECHAT_PROBE_SECONDS = 15
@@ -67,7 +61,6 @@ class MainWindow:
         self._log_pipeline = log_pipeline
         self._mode_text = mode_text
         self._unsubscribe: Any = None
-        self._row = 0
         self._wechat_status = ("未检测", theme.GRAY)
         self._probe_lock = threading.Lock()
 
@@ -81,7 +74,8 @@ class MainWindow:
         self._build_content()
 
         self._show_page("log")
-        self._append([logline.parse(line) for line in buffer.snapshot()])
+        # 只回放最后一屏多一点：每行都是真控件，开窗时铺两千行会卡住
+        self._append([logline.parse(line) for line in buffer.snapshot()[-200:]])
         self._unsubscribe = buffer.subscribe(self._on_log_line)
 
         self.refresh_state()
@@ -186,34 +180,8 @@ class MainWindow:
 
     def _build_log_page(self, parent: tk.Misc) -> tk.Frame:
         page = tk.Frame(parent, bg=theme.CONTENT_BG)
-        wrap = tk.Frame(page, bg=theme.ROW_LINE, padx=1, pady=1)
-        wrap.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 16))
-
-        self._text = tk.Text(
-            wrap,
-            wrap=tk.WORD,
-            font=theme.FONT_LOG,
-            bg=theme.CONTENT_BG,
-            fg=theme.TEXT,
-            relief=tk.FLAT,
-            padx=0,
-            pady=0,
-            spacing1=7,
-            spacing3=7,
-            tabs=("150p", "215p"),
-            state=tk.DISABLED,
-            cursor="arrow",
-        )
-        scroll = tk.Scrollbar(wrap, command=self._text.yview, width=12, relief=tk.FLAT)
-        self._text.configure(yscrollcommand=scroll.set)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self._text.tag_configure("row_odd", background=theme.ROW_ALT_BG)
-        self._text.tag_configure("time", foreground=theme.TEXT_MUTED)
-        self._text.tag_configure("message", foreground=theme.TEXT, lmargin2=215)
-        for severity, color in _SEVERITY_COLOR.items():
-            self._text.tag_configure(f"level_{severity}", foreground=color)
+        self._table = LogTable(page)
+        self._table.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 16))
         return page
 
     # ── 页面切换 ──────────────────────────────────────────────────
@@ -268,10 +236,7 @@ class MainWindow:
 
     def clear(self) -> None:
         self.buffer.clear()
-        self._text.configure(state=tk.NORMAL)
-        self._text.delete("1.0", tk.END)
-        self._text.configure(state=tk.DISABLED)
-        self._row = 0
+        self._table.clear()
 
     def open_data_dir(self) -> None:
         import subprocess
@@ -361,18 +326,4 @@ class MainWindow:
         self.root.after(0, lambda: self._append([logline.parse(line)]))
 
     def _append(self, lines: list[logline.LogLine]) -> None:
-        if not lines:
-            return
-        at_bottom = self._text.yview()[1] > 0.999  # 用户往回翻时不要把他拽回底部
-        self._text.configure(state=tk.NORMAL)
-        for item in lines:
-            row_tag = "row_odd" if self._row % 2 else "row_even"
-            self._row += 1
-            start = self._text.index(tk.END + "-1c")
-            self._text.insert(tk.END, f"{item.time}\t", ("time", row_tag))
-            self._text.insert(tk.END, f"{item.level}\t", (f"level_{item.severity}", row_tag))
-            self._text.insert(tk.END, f"{item.message}\n", ("message", row_tag))
-            self._text.tag_add(row_tag, start, tk.END + "-1c")
-        self._text.configure(state=tk.DISABLED)
-        if at_bottom:
-            self._text.see(tk.END)
+        self._table.append(lines)
