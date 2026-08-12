@@ -52,9 +52,19 @@ class RestoreMinimizedWindowTests(unittest.TestCase):
             with self.subTest(window_info=window_info):
                 self.assertIsNone(UiaWeChatDriver._minimized_handle(window_info))
 
+    def test_forced_restore_ignores_iconic_flag(self) -> None:
+        # UIA 子树塌掉时探测未必还报 is_iconic，但只要有句柄就该恢复一次再复探
+        self.assertEqual(
+            UiaWeChatDriver._minimized_handle({"handle": 199668, "is_iconic": False}, force=True),
+            199668,
+        )
+        self.assertIsNone(UiaWeChatDriver._minimized_handle({}, force=True))
+
     def test_restore_failure_does_not_raise(self) -> None:
-        # 非 Windows 上 win32gui 根本导不进来，走的正是「恢复失败」这条路：只留痕，不抛
-        UiaWeChatDriver._restore_if_minimized({"handle": 199668, "is_iconic": True})
+        # 非 Windows 上 win32gui 根本导不进来，走的正是「恢复失败」这条路：只留痕，不抛，返回 False
+        self.assertFalse(
+            UiaWeChatDriver._restore_if_minimized({"handle": 199668, "is_iconic": True})
+        )
 
 
 if __name__ == "__main__":

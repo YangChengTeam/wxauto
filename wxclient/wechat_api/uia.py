@@ -1123,6 +1123,22 @@ class UiaWeChatDriver:
             uia_exposed=bool(probe.get("uia_exposed")),
             reason=probe.get("reason"),
         )
+        # 死结：窗口最小化时微信把 UIA 子树收了（真机实测 descendant_count 掉到阈值以下），
+        # 探测就报「未暴露」——可这恰恰是**要靠恢复窗口来解**的状态。所以不能直接拒：
+        # 先按 hwnd 恢复一次再复探，复探还是不行才是真不可用（没登录 / 锁屏 / 微信没起）。
+        # 2026-08-12 真机：网关常驻轮询在这里连挂十几分钟，恢复后同一轮立刻通。
+        if not probe.get("uia_exposed") and self._restore_if_minimized(
+            probe.get("selected_window"), force=True
+        ):
+            probe = probe_wechat_uia(
+                max_depth=DEFAULT_UIA_PROBE_MAX_DEPTH,
+                max_nodes=DEFAULT_UIA_PROBE_MAX_NODES,
+            )
+            logger.info(
+                "uia.operation_probe.after_restore",
+                uia_exposed=bool(probe.get("uia_exposed")),
+                reason=probe.get("reason"),
+            )
         if not probe.get("uia_exposed"):
             raise WeChatApiUnavailableError(
                 f"微信 UIA 不可用：{probe.get('reason') or '未知原因'}"
@@ -1130,8 +1146,11 @@ class UiaWeChatDriver:
         self._restore_if_minimized(probe.get("selected_window"))
 
     @classmethod
-    def _restore_if_minimized(cls, window_info: Any) -> None:
-        """微信最小化时先恢复窗口，否则后面所有 UI 动作都会失败。
+    def _restore_if_minimized(cls, window_info: Any, *, force: bool = False) -> bool:
+        """微信最小化时先恢复窗口，否则后面所有 UI 动作都会失败。返回是否真的动了窗口。
+
+        ``force=True`` 用于「探测说未暴露」那条路：此时 UIA 子树已经塌了，``is_iconic``
+        不一定还看得见，但只要还找得到窗口句柄就值得恢复一次再复探——反正塌着也用不了。
 
         2026-08-12 真机实测：窗口最小化时 ``Application.connect(title="微信")`` 直接抛
         ElementNotFoundError（报的是查找条件那个字典），pyweixin 那条路同样跑不动，
@@ -1141,22 +1160,26 @@ class UiaWeChatDriver:
         与 ``uia_probe`` 那条「只读、不启动/不解锁微信」的约束不冲突：那是探测的纪律，
         这里是执行动作的前提，窗口本来就在、也已登录。
         """
-        hwnd = cls._minimized_handle(window_info)
+        hwnd = cls._minimized_handle(window_info, force=force)
         if hwnd is None:
-            return
+            return False
         try:
             win32gui = __import__("win32gui")
             win32con = __import__("win32con")
             win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            time.sleep(0.3)  # 给窗口一点时间真正显示出来，紧接着就要 connect
-            logger.info("window.restored", hwnd=hwnd)
+            time.sleep(0.5)  # 给窗口一点时间真正显示出来（UIA 子树也要重新长出来）
+            logger.info("window.restored", hwnd=hwnd, forced=force)
         except Exception as exc:  # noqa: BLE001 - 恢复失败不该盖住后面真正的定位错误
             logger.warning("window.restore_failed", error=f"{type(exc).__name__}: {exc}")
+            return False
+        return True
 
     @staticmethod
-    def _minimized_handle(window_info: Any) -> int | None:
+    def _minimized_handle(window_info: Any, *, force: bool = False) -> int | None:
         """从探测结果里挑出「需要恢复」的窗口句柄；不需要恢复就返回 None。"""
-        if not isinstance(window_info, dict) or not window_info.get("is_iconic"):
+        if not isinstance(window_info, dict):
+            return None
+        if not force and not window_info.get("is_iconic"):
             return None
         handle = window_info.get("handle")
         try:
