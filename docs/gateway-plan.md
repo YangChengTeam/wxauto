@@ -84,17 +84,34 @@ wxclient/gateway/
   **Checkpoint AB** ✅：候选人消息进 → 换票建连 → 建会话 → 一轮 → 卡片 → 逐段发出，整条打通。
   网关累计 75 条测试全绿，`ruff` 0 错误。
 
-### Phase C · 真机（需 Windows 通路）
+### Phase C · 真机（Windows 172.16.20.86，2026-08-12 首次实跑）
 
-> ⚠️ `wechat_io.py` 的字段映射来自对 `uia.py` 的静态阅读，**尚未在真机验证**。
-> C1 必须专门验这三条：① 连发两条一模一样的消息两条都要处理；② 网关首次上线不回复历史；
+> ⚠️ `wechat_io.py` 的字段映射来自对 `uia.py` 的静态阅读，**入站那半边仍未真机验证**。
+> 还欠这三条：① 连发两条一模一样的消息两条都要处理；② 网关首次上线不回复历史；
 > ③ 专员本人手打的消息 `sender == "我"` 要被标成 `from_self`。
 
-- [ ] C1. 真机装依赖、`uia_probe` 确认微信 UIA 可用
-- [ ] C2. 用 `WeChatRuntime` 手动验证底座：读消息、发一条消息（临时脚本，不落常驻入口）
-- [ ] C3. 网关模式接 Fake AI 端跑通（真微信 + 假 AI），验证入站轮询与出站发送
-- [ ] C4. 网关模式接真 AI 端端到端
+- [x] C1. 真机装依赖、`uia_probe` 确认微信 UIA 可用
+      ✅ 2026-08-12 16:10：`logged_in=true` `uia_exposed=true`，`Weixin.exe` 4.x（`mmui::MainWindow`）。
+      **必须在交互式桌面会话里跑**：SSH 进来是 Session 0，UIA 看不见 Session 1 的窗口，
+      要用「登录后的计划任务」（`schtasks /RU <user> /IT`）把进程放进 Session 1。
+- [x] C2. 用 `WeChatRuntime` 手动验证底座：读消息、发一条消息
+      ✅ 2026-08-12 16:11：授权闸两条负例被拒（未开 `--allow-real-actions` / 确认短语不对），
+      dry-run 走通队列，真读拿到 10 个会话；`send_message` / `send_files` 真发到「文件传输助手」成功。
+- [x] C3. 网关模式接 Fake AI 端跑通（真微信 + 假 AI）
+      ✅ 2026-08-12 17:26，脚本 `tests/e2e_windows_ws.py`：换票 → WS 建连 →
+      帧序列 `auth / session.start / message.send` → 卡片 2 段 → 两条消息真发到微信
+      （task `3a606859` / `18010203`，均 `succeeded`，全程约 10s），
+      随后 `read_chat_history` 读回 2 条自测消息取证。
+      ⚠️ 入站仍是脚本注入的，**真入站轮询没验**（见上面三条）。
+- [ ] C4. 网关模式接真 AI 端端到端（需 AI 端可达；目前只连过 Fake）
 - [ ] C5. 拒绝→停发、频次超限、专员插话三个场景的真机验证
+
+**真机踩到并已修的两处**（都不是本次改造引入的）：
+- 微信最小化时 `Application.connect(title="微信")` 直接抛 ElementNotFoundError，所有 UI 动作全废，
+  而 `uia_probe` 自己枚举窗口仍报「UIA 可用」——两边不一致极易误判成「微信没登录」。
+  已改为动作前按 hwnd 恢复窗口（`_ensure_ready`）。
+- 队列库里一条已删除的任务类型（本机遗留的 `reply_chat`）让 `TaskStore` 构造直接抛异常，
+  服务整个起不来。已改为迁移时作废这类行。
 
 ### Phase D · 接线（需业务端）
 
@@ -138,7 +155,12 @@ python -m wxclient.gateway --account wxid_zhangsan_work --allow-real-actions
 
 | 阻塞 | 影响 |
 |---|---|
-| Windows 主机 SSH 不通 | 只挡 Phase C |
-| 业务端签票接口未建 | 只挡 Phase D；Phase A/B 用 `LocalFileTicketProvider` |
+| ~~Windows 主机 SSH 不通~~ | 已解除：2026-08-12 打通 172.16.20.86，C1–C3 已实跑 |
+| AI 端不可达（只听 localhost） | 只挡 C4；C3 用 `tests/e2e_windows_ws.py` 里的 Fake AI 端 |
+| 业务端签票接口未建 | 只挡 Phase D；联调期用 `LocalFileTicketProvider` |
 
-**Phase A 与 B 不依赖任何外部条件，可立即开工。**
+**下一步优先级**：C5（拒绝/频次/插话三个真机场景）→ 入站轮询真机验证（那三条）→ C4。
+
+> ⚠️ 真机操作纪律：SSH 进去是 **Session 0**，UIA 够不着桌面，`taskkill` 也杀不到桌面里的进程。
+> 凡是要碰微信的，一律 `schtasks /create ... /RU <user> /IT` + `/run` 放进 Session 1 跑，把输出重定向到
+> 文件再读。另外网关跑起来后每次轮询都会把微信窗口拉到前台——**别在别人正在用的机器上长时间开着**。
