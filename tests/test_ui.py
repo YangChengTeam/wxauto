@@ -15,7 +15,7 @@ from pathlib import Path
 from wxclient.gateway.factory import normalize_accounts
 from wxclient.ui import logline
 from wxclient.ui import settings_store
-from wxclient.ui.logbuffer import LogBuffer, attach_to_root
+from wxclient.ui.logbuffer import LogBuffer, LogPipeline, attach_to_root
 from wxclient.ui.service import GatewayService, ServiceState
 
 
@@ -62,6 +62,33 @@ class LogBufferTests(unittest.TestCase):
             root.setLevel(previous_level)
 
         self.assertTrue(any("网关启动" in line for line in buffer.snapshot()))
+
+
+class LogPipelineTests(unittest.TestCase):
+    """pyweixin import 时会 fileConfig 掉整套 root handler，界面得能自己接回来。"""
+
+    def setUp(self) -> None:
+        self.root = logging.getLogger()
+        self.previous = list(self.root.handlers), self.root.level
+        self.root.setLevel(logging.INFO)
+
+    def tearDown(self) -> None:
+        handlers, level = self.previous
+        self.root.handlers = handlers
+        self.root.setLevel(level)
+
+    def test_reattaches_after_a_third_party_resets_logging(self) -> None:
+        buffer = LogBuffer()
+        pipeline = LogPipeline(buffer, lambda: self.root.setLevel(logging.INFO))
+        pipeline.install()
+
+        self.assertFalse(pipeline.ensure())  # 没被动过就不重装
+
+        self.root.handlers = []  # 模拟 pyweixin 的 logging.config.fileConfig
+        self.assertTrue(pipeline.ensure())
+
+        logging.getLogger("test.ui").info("重新接回后还能进缓冲")
+        self.assertTrue(any("还能进缓冲" in line for line in buffer.snapshot()))
 
 
 class _FakeRunner:
@@ -195,6 +222,20 @@ class SettingsStoreTests(unittest.TestCase):
         settings_store.apply_to_environ({"WXCLIENT_UI_ACCOUNTS": ""}, environ, force=True)
 
         self.assertEqual(environ["WXCLIENT_UI_ACCOUNTS"], "已有")
+
+    def test_effective_falls_back_to_environment(self) -> None:
+        # 命令行设的参数文件里没有，界面必须显示出来，否则保存时会把它抹掉
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+            settings_store.save(data_dir, {"WXCLIENT_UI_ACCOUNTS": "文件里的"})
+
+            values = settings_store.effective(
+                data_dir,
+                {"WXCLIENT_UI_ACCOUNTS": "环境里的", "WXCLIENT_GATEWAY_AI_WS_URL": "wss://env/v1/ws"},
+            )
+
+        self.assertEqual(values["WXCLIENT_UI_ACCOUNTS"], "文件里的")  # 文件有值就以文件为准
+        self.assertEqual(values["WXCLIENT_GATEWAY_AI_WS_URL"], "wss://env/v1/ws")
 
     def test_secret_field_is_declared_as_secret(self) -> None:
         # 内部 key 一旦当成普通字段就会明文显示在界面上

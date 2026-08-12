@@ -83,6 +83,40 @@ class LogBufferHandler(logging.Handler):
             self.handleError(record)
 
 
+class LogPipeline:
+    """把日志接到缓冲上，并在被第三方顶掉之后自动接回来。
+
+    2026-08-12 真机实测：``pyweixin`` 在 import 时会自己 ``logging.config.fileConfig()``
+    （它自带 ``logger/logging.conf``），把 root 上的 handler **整套换掉**——我们的轮转
+    文件 handler 和界面缓冲 handler 一起没了，界面从此再不刷新，日志文件也变了格式。
+    它是 vendored 的第三方库，改它不现实，所以这里定期查一眼、掉了就接回去。
+    """
+
+    def __init__(
+        self,
+        buffer: LogBuffer,
+        configure: Callable[[], None],
+        level: int = logging.INFO,
+    ) -> None:
+        self.buffer = buffer
+        self._configure = configure
+        self._level = level
+        self._handler: LogBufferHandler | None = None
+
+    def install(self) -> LogBufferHandler:
+        self._configure()
+        self._handler = attach_to_root(self.buffer, self._level)
+        return self._handler
+
+    def ensure(self) -> bool:
+        """handler 还在就什么都不做；被顶掉了就整套重装。返回是否重装过。"""
+        if self._handler is not None and self._handler in logging.getLogger().handlers:
+            return False
+        self.install()
+        logging.getLogger(__name__).info("日志通道被第三方重置，已重新接回界面")
+        return True
+
+
 def attach_to_root(buffer: LogBuffer, level: int = logging.INFO) -> LogBufferHandler:
     """把缓冲挂到 root logger 上，沿用已有 handler 的 formatter。
 

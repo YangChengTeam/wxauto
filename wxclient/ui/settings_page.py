@@ -28,7 +28,7 @@ class SettingsPage(tk.Frame):
         super().__init__(parent, bg=theme.CONTENT_BG)
         self.data_dir = Path(data_dir)
         self.on_saved = on_saved
-        self._values = settings_store.load(self.data_dir)
+        self._values = settings_store.effective(self.data_dir)
         self._vars: dict[str, tk.Variable] = {}
         self._secret_touched: dict[str, bool] = {}
 

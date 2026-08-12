@@ -18,7 +18,7 @@ from wxclient.logging_config import configure_logging
 
 from . import settings_store
 from .config import UiSettings
-from .logbuffer import LogBuffer, attach_to_root
+from .logbuffer import LogBuffer, LogPipeline
 from .service import GatewayService
 from .tray import Tray
 from .window import MainWindow
@@ -51,10 +51,12 @@ def main(argv: list[str] | None = None) -> int:
     settings_store.apply_to_environ(settings_store.load(wechat_settings.data_dir))
     settings = UiSettings()
 
-    configure_logging(log_file=wechat_settings.data_dir / "gateway.log")
-
     buffer = LogBuffer(capacity=settings.log_lines)
-    attach_to_root(buffer)
+    log_pipeline = LogPipeline(
+        buffer,
+        lambda: configure_logging(log_file=wechat_settings.data_dir / "gateway.log"),
+    )
+    log_pipeline.install()
 
     root = tk.Tk()
     root.withdraw()  # 先藏起来，是否露面由下面决定
@@ -90,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
         mode_text=_mode_text(args, settings),
         on_quit=lambda: shutdown(root, window, service, tray),
         on_settings_saved=on_settings_saved,
+        log_pipeline=log_pipeline,
     )
 
     tray = Tray(

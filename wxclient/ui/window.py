@@ -56,6 +56,7 @@ class MainWindow:
         mode_text: str,
         on_quit: Callable[[], None],
         on_settings_saved: Callable[[bool], None] | None = None,
+        log_pipeline: Any = None,
     ) -> None:
         self.root = root
         self.buffer = buffer
@@ -63,6 +64,7 @@ class MainWindow:
         self.data_dir = Path(data_dir)
         self._on_quit = on_quit
         self._settings_saved_callback = on_settings_saved
+        self._log_pipeline = log_pipeline
         self._mode_text = mode_text
         self._unsubscribe: Any = None
         self._row = 0
@@ -324,6 +326,8 @@ class MainWindow:
             hours, rest = divmod(int(seconds), 3600)
             minutes, secs = divmod(rest, 60)
             self._uptime_label.configure(text=f"已运行  {hours:02d}:{minutes:02d}:{secs:02d}")
+        if self._log_pipeline is not None:
+            self._log_pipeline.ensure()
         self.refresh_state()
         self.root.after(1000, self._tick)
 

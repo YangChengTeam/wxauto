@@ -89,6 +89,22 @@ def load(data_dir: Path) -> dict[str, str]:
     return parse_env_text(path.read_text(encoding="utf-8"))
 
 
+def effective(data_dir: Path, environ: dict[str, str] | None = None) -> dict[str, str]:
+    """界面要显示的是「当前实际生效的值」，不是「文件里存了什么」。
+
+    命令行 `set` 出来的参数在文件里没有，界面上却空着——用户会以为没配，
+    保存时再把空值写回去，等于悄悄把配置抹了。所以文件缺的键回落到环境变量。
+    """
+    target = os.environ if environ is None else environ
+    values = dict(load(data_dir))
+    for field in FIELDS:
+        if not values.get(field.key):
+            from_env = target.get(field.key, "")
+            if from_env:
+                values[field.key] = from_env
+    return values
+
+
 def save(data_dir: Path, values: dict[str, str]) -> Path:
     path = settings_path(data_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
