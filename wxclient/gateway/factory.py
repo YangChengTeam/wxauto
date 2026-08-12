@@ -87,7 +87,13 @@ def build_gateway(
         settings=gateway_settings,
         ticket_provider=build_ticket_provider(gateway_settings),
         store=store,
-        source=QueueMessageSource(runtime=runtime, store=store),
+        source=QueueMessageSource(
+            runtime=runtime,
+            store=store,
+            allow_groups=gateway_settings.allow_groups,
+            allowlist=normalize_accounts(gateway_settings.peer_allowlist),
+            denylist=normalize_accounts(gateway_settings.peer_denylist),
+        ),
         sink=QueueMessageSink(
             runtime=runtime,
             allow_real_actions=allow_real_actions,

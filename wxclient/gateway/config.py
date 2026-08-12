@@ -41,6 +41,18 @@ class GatewaySettings(BaseSettings):
     poll_interval_seconds: float = 5.0
     debounce_seconds: float = 3.0
 
+    # ── 处理范围：哪些会话才轮到网关管 ──
+    allow_groups: bool = False
+    """是否处理群聊。**默认不处理**——群里替人自动应答的误伤面比单聊大得多，
+    而且群消息的「对方」不是一个人。要开必须显式开。"""
+
+    peer_allowlist: str = ""
+    """只处理这些会话（微信里显示的名字，逗号分隔）。留空 = 不限制。
+    谨慎上线时先只放两三个人进来。"""
+
+    peer_denylist: str = ""
+    """永远不处理这些会话（逗号分隔）。优先级高于白名单。"""
+
     # ── 守门（Phase B 使用）──
     max_sends_per_hour: int = 30
     active_hours: str = "09:00-21:00"

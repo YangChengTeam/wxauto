@@ -121,12 +121,32 @@ class QueueMessageSource:
         runtime,  # WeChatRuntime 或任何提供 submit(TaskType, payload) 的对象
         store: GatewayStore,
         history_limit: int = 20,
+        allow_groups: bool = False,
+        allowlist: Sequence[str] = (),
+        denylist: Sequence[str] = (),
         clock=None,
     ) -> None:
         self._runtime = runtime
         self._store = store
         self._history_limit = history_limit
+        self._allow_groups = allow_groups
+        self._allowlist = {name.strip() for name in allowlist if str(name).strip()}
+        self._denylist = {name.strip() for name in denylist if str(name).strip()}
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def skip_reason(self, account_id: str, peer_id: str) -> str | None:
+        """这个会话该不该碰；返回不碰的理由，None 表示可以处理。
+
+        判定放在**打开会话之前**：打开一个聊天窗口本身就是打扰（窗口会弹到前台，
+        还会把未读清掉），不该为了判断该不该回而先去动它。
+        """
+        if peer_id in self._denylist:
+            return "在不处理名单里"
+        if self._allowlist and peer_id not in self._allowlist:
+            return "不在只处理名单里"
+        if not self._allow_groups and self._store.is_known_group(account_id, peer_id):
+            return "是群聊（默认不处理）"
+        return None
 
     async def fetch(self, account_id: str) -> list[InboundMessage]:
         unread = await self._runtime.submit(TaskType.GET_UNREAD_MESSAGES, {})
@@ -136,6 +156,10 @@ class QueueMessageSource:
         for session in sessions:
             name = str((session or {}).get("name") or "").strip()
             if not name:
+                continue
+            reason = self.skip_reason(account_id, name)
+            if reason is not None:
+                _log.debug("跳过该会话", account=account_id, reason=reason)
                 continue
             collected.extend(await self._fetch_peer(account_id, name))
         return collected
@@ -148,6 +172,19 @@ class QueueMessageSource:
         # 时间分隔行必须在切游标**之前**滤掉：它会被当成一条消息发给 AI，还会把游标钉在
         # 一个随时间变化的字符串上（真机读回来过一行「18:28」）。
         raw_messages = [raw for raw in raw_messages if not is_timestamp_row(raw)]
+
+        # 是不是群，只有打开会话读到消息才判得出来（未读列表里没有这个信息）。判出来就记下，
+        # 下一轮在 skip_reason 里直接拦掉，不用再开一次窗口。
+        if any(raw.get("is_group") for raw in raw_messages):
+            self._store.mark_peer_kind(account_id, peer_id, is_group=True)
+            if not self._allow_groups:
+                # 游标仍然对齐到最新：不处理不等于要在下次把这些当成新消息。
+                if raw_messages:
+                    self._store.set_cursor(
+                        account_id, peer_id, message_signature(raw_messages[-1]), 0
+                    )
+                _log.info("群聊消息不处理", account=account_id)
+                return []
 
         last_signature, seq = self._store.get_cursor(account_id, peer_id)
         fresh, new_signature = split_new_messages(raw_messages, last_signature)

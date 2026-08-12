@@ -45,6 +45,13 @@ CREATE TABLE IF NOT EXISTS gateway_cursors (
   updated_at     TEXT NOT NULL,
   PRIMARY KEY (account_id, peer_id)
 );
+CREATE TABLE IF NOT EXISTS gateway_peer_kinds (
+  account_id TEXT NOT NULL,
+  peer_id    TEXT NOT NULL,
+  is_group   INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (account_id, peer_id)
+);
 CREATE TABLE IF NOT EXISTS gateway_send_log (
   account_id TEXT NOT NULL,
   peer_id    TEXT NOT NULL,
@@ -145,6 +152,33 @@ class GatewayStore:
     # 每次读到聊天记录，找到该签名最后出现的位置，取它之后的才算新消息。
     # ★ 首次见到某个联系人时游标为空 —— 此时**一条都不处理**，只把游标对齐到最新，
     #   否则网关一上线就会对着几个月的历史记录逐条回复。
+
+    # ────────────────────────── 会话类型 ──────────────────────────
+    #
+    # 未读列表里读不出「这是不是群」——那个判断要打开会话才做得了。所以判过一次就记下来，
+    # 之后连开都不开：开群窗口本身就是打扰（窗口会弹到前台）。
+
+    def mark_peer_kind(self, account_id: str, peer_id: str, *, is_group: bool) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO gateway_peer_kinds (account_id, peer_id, is_group, updated_at)
+                VALUES (?,?,?,?)
+                ON CONFLICT(account_id, peer_id) DO UPDATE SET
+                  is_group=excluded.is_group,
+                  updated_at=excluded.updated_at
+                """,
+                (account_id, peer_id, 1 if is_group else 0, _utcnow().isoformat()),
+            )
+            conn.commit()
+
+    def is_known_group(self, account_id: str, peer_id: str) -> bool:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT is_group FROM gateway_peer_kinds WHERE account_id=? AND peer_id=?",
+                (account_id, peer_id),
+            ).fetchone()
+        return bool(row and row[0])
 
     def get_cursor(self, account_id: str, peer_id: str) -> tuple[str | None, int]:
         with closing(self._connect()) as conn:

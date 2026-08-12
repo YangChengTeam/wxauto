@@ -21,6 +21,8 @@ from wxclient.gateway import (
     looks_like_rejection,
     within_active_hours,
 )
+from wxclient.gateway.wechat_io import QueueMessageSource
+from wxclient.queue import TaskType
 
 T0 = datetime(2026, 8, 10, 14, 0, 0, tzinfo=timezone.utc)
 
@@ -565,6 +567,78 @@ class InboundLoopTests(StoreTestCase):
         await loop.drain()
         self.assertIn("[专员本人", transcripts[0])
         self.assertIn("[对方", transcripts[0])
+
+
+class FakeRuntime:
+    """只回放事先摆好的未读列表与聊天记录，并记下都调了什么。"""
+
+    def __init__(self, unread: list[dict], history: dict[str, list[dict]]) -> None:
+        self.unread = unread
+        self.history = history
+        self.calls: list[tuple[Any, Any]] = []
+
+    async def submit(self, task_type, payload=None, **_kw):
+        self.calls.append((task_type, payload))
+        if task_type is TaskType.GET_UNREAD_MESSAGES:
+            return {"result": {"unread_sessions": self.unread}}
+        friend = (payload or {}).get("friend")
+        return {"result": {"messages": self.history.get(friend, [])}}
+
+    def opened(self) -> list[str]:
+        """被真正打开读过历史的会话名。打开窗口本身就是打扰，所以要能断言。"""
+        return [
+            (payload or {}).get("friend")
+            for task_type, payload in self.calls
+            if task_type is TaskType.READ_CHAT_HISTORY
+        ]
+
+
+class InboundScopeTests(StoreTestCase):
+    """哪些会话轮得到网关管（2026-08-12：真机上有个群在闪未读，差点被自动回）。"""
+
+    GROUP = "某某招聘交流群"
+    PERSON = "候选人-王建国"
+
+    def _runtime(self) -> FakeRuntime:
+        return FakeRuntime(
+            unread=[{"name": self.GROUP, "unread_count": 3}, {"name": self.PERSON, "unread_count": 1}],
+            history={
+                self.GROUP: [{"text": "群里在聊天", "is_group": True, "is_self": False}],
+                self.PERSON: [{"text": "还招人吗", "is_group": False, "is_self": False}],
+            },
+        )
+
+    async def test_group_is_skipped_and_remembered(self) -> None:
+        runtime = self._runtime()
+        source = QueueMessageSource(runtime=runtime, store=self.store)
+
+        await source.fetch("acct-1")
+        self.assertTrue(self.store.is_known_group("acct-1", self.GROUP))
+        self.assertIn(self.GROUP, runtime.opened(), "第一次判群必须打开一次才知道")
+
+        runtime.calls.clear()
+        await source.fetch("acct-1")
+        self.assertNotIn(self.GROUP, runtime.opened(), "判过一次之后连开都不该再开")
+
+    async def test_group_allowed_when_explicitly_turned_on(self) -> None:
+        runtime = self._runtime()
+        source = QueueMessageSource(runtime=runtime, store=self.store, allow_groups=True)
+        await source.fetch("acct-1")          # 首次只对齐游标
+        messages = await source.fetch("acct-1")
+        self.assertEqual(messages, [], "首次对齐游标后没有新消息，但群没被拦下")
+        self.assertIn(self.GROUP, runtime.opened())
+
+    async def test_denylist_wins_and_never_opens_the_chat(self) -> None:
+        runtime = self._runtime()
+        source = QueueMessageSource(runtime=runtime, store=self.store, denylist=[self.PERSON])
+        await source.fetch("acct-1")
+        self.assertNotIn(self.PERSON, runtime.opened())
+
+    async def test_allowlist_limits_to_named_peers(self) -> None:
+        runtime = self._runtime()
+        source = QueueMessageSource(runtime=runtime, store=self.store, allowlist=[self.PERSON])
+        await source.fetch("acct-1")
+        self.assertEqual(runtime.opened(), [self.PERSON])
 
 
 if __name__ == "__main__":
