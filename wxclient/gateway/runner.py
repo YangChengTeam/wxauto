@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Any
 
@@ -27,6 +28,9 @@ from .ticket import TicketProvider
 from .wsclient import AgentWsClient, AgentWsError, Unauthorized
 
 _log = structlog.get_logger(__name__)
+
+#: 建连/保活的节拍。反代默认 60s 掐空闲 WS，取一半留足余量。
+KEEPALIVE_INTERVAL_SECONDS = 30.0
 
 
 class ConnectionPool:
@@ -71,6 +75,19 @@ class ConnectionPool:
         """当前有几条 AI 端连接是活的。只读，给状态展示用（可跨线程读）。"""
         return sum(1 for client in list(self._clients.values()) if client.connected)
 
+    async def heartbeat(self, account_id: str) -> None:
+        """没连就连上，连着就 ping 一下确认还活着。失败会抛，由调用方记账。"""
+        client = self._clients.get(account_id)
+        if client is None or not client.connected:
+            await self.acquire(account_id)
+            return
+        try:
+            await client.ping()
+        except Exception:
+            # ping 都不通说明这条连接已经废了，丢掉，下一轮 heartbeat 会重新换票建连。
+            await self.invalidate(account_id)
+            raise
+
     async def invalidate(self, account_id: str) -> None:
         """丢弃当前连接，下次 acquire 会重新换票建连。"""
         client = self._clients.pop(account_id, None)
@@ -107,6 +124,8 @@ class GatewayRunner:
     ) -> None:
         self._settings = settings
         self._store = store
+        self._accounts = tuple(accounts)
+        self._connect_error: str | None = None
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._pool = ConnectionPool(
             ws_url=settings.ai_ws_url,
@@ -228,8 +247,41 @@ class GatewayRunner:
         """活着的 AI 端连接数。只读，给桌面端状态栏用。"""
         return self._pool.connected_count()
 
+    @property
+    def connect_error(self) -> str | None:
+        """上一次建连/保活的失败原因；连上了就是 None。只读，给状态栏用。"""
+        return self._connect_error
+
+    async def ensure_connections(self) -> None:
+        """建连 + 保活。异常只记账不上抛——连不上 AI 端不该把入站轮询也带停。
+
+        为什么不等第一条入站消息再连（原来的懒建连）：
+        ① 界面得能立刻说清「通没通」，不然只能显示「连接中」干等；
+        ② 票据/鉴权坏了要在**启动时**就炸出来，而不是等第一个真候选人来了才发现；
+        ③ 反代 60s 掐空闲连接，本来就需要一个周期性的 ping。
+        """
+        for account_id in self._accounts:
+            try:
+                await self._pool.heartbeat(account_id)
+            except Exception as exc:  # noqa: BLE001 - 什么原因都要记下来给界面看
+                self._connect_error = f"{type(exc).__name__}: {exc}"
+                _log.warning("AI 端连接不可用", account=account_id, error=self._connect_error)
+            else:
+                self._connect_error = None
+
     async def run(self) -> None:
-        await self.loop.run()
+        keeper = asyncio.create_task(self._keepalive_loop(), name="gw-keepalive")
+        try:
+            await self.loop.run()
+        finally:
+            keeper.cancel()
+            with suppress(asyncio.CancelledError):
+                await keeper
+
+    async def _keepalive_loop(self) -> None:
+        while True:
+            await self.ensure_connections()
+            await asyncio.sleep(KEEPALIVE_INTERVAL_SECONDS)
 
     async def stop(self) -> None:
         self.loop.stop()

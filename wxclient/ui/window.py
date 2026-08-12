@@ -271,7 +271,12 @@ class MainWindow:
         if state is not ServiceState.RUNNING:
             self._rows["gateway"].configure(text="未启动", fg=theme.GRAY)
         elif connected <= 0:
-            self._rows["gateway"].configure(text="连接中", fg=theme.ORANGE)
+            # 连不上和还没连上是两回事：前者要红着让人去看日志，后者几秒后自己会变绿。
+            failed = self.service.connect_error()
+            self._rows["gateway"].configure(
+                text="连不上" if failed else "连接中",
+                fg=theme.RED if failed else theme.ORANGE,
+            )
         elif connected >= total:
             self._rows["gateway"].configure(text="已连接", fg=theme.GREEN)
         else:

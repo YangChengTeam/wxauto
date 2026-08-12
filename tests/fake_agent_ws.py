@@ -101,6 +101,11 @@ class FakeAgentServer:
                 })
                 continue
 
+            if op == "ping":
+                # 与真 AI 端一致：ping → pong（网关拿它保活，反代会掐空闲连接）
+                await self._emit(websocket, ack, "pong", {})
+                continue
+
             if op == "session.start":
                 session_id = str(uuid4())
                 self.sessions.add(session_id)

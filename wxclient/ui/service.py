@@ -126,6 +126,17 @@ class GatewayService:
         except Exception:  # noqa: BLE001 - 状态展示不该把服务拖下水
             return (0, len(gateway.accounts))
 
+    def connect_error(self) -> str | None:
+        """AI 端连不上的原因；连上了或没在跑就是 None。给状态栏区分「在连」与「连不上」。"""
+        with self._lock:
+            gateway = self._gateway
+        if gateway is None or self._state is not ServiceState.RUNNING:
+            return None
+        try:
+            return gateway.runner.connect_error
+        except Exception:  # noqa: BLE001 - 同上，只是展示
+            return None
+
     def wait_ready(self, timeout: float = 10.0) -> bool:
         """等到网关真的跑起来（或启动失败）。给启动脚本和测试用。"""
         return self._ready.wait(timeout)

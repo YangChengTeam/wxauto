@@ -372,6 +372,45 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 await runner.stop()
 
 
+    # ────────────────────────── 建连与保活 ──────────────────────────
+
+    async def test_connects_before_any_inbound_message(self) -> None:
+        """一条消息都没有也要连上：界面要能说清通没通，票据坏了要在启动时就炸。"""
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
+            runner = self._runner(server, ScriptedSource([[]]), RecordingSink())
+            try:
+                await runner.ensure_connections()
+                self.assertEqual(runner.connected_count(), 1)
+                self.assertIsNone(runner.connect_error)
+                self.assertEqual([f.get("op") for f in server.received], ["auth"])
+            finally:
+                await runner.stop()
+
+    async def test_keepalive_pings_the_live_connection(self) -> None:
+        """已经连着就只 ping，不重连——反代会掐空闲连接，ping 是用来续命的。"""
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
+            runner = self._runner(server, ScriptedSource([[]]), RecordingSink())
+            try:
+                await runner.ensure_connections()
+                await runner.ensure_connections()
+                ops = [f.get("op") for f in server.received]
+                self.assertEqual(ops, ["auth", "ping"], "第二次只该 ping，不该重新 auth")
+                self.assertEqual(runner.connected_count(), 1)
+            finally:
+                await runner.stop()
+
+    async def test_connect_failure_is_recorded_not_raised(self) -> None:
+        """连不上只记账：AI 端挂了不该把入站轮询也带停，但状态栏得看得见原因。"""
+        async with FakeAgentServer(valid_tickets={"别的票"}) as server:
+            runner = self._runner(server, ScriptedSource([[]]), RecordingSink())
+            try:
+                await runner.ensure_connections()  # 不抛
+                self.assertEqual(runner.connected_count(), 0)
+                self.assertIsNotNone(runner.connect_error)
+            finally:
+                await runner.stop()
+
+
 class WeChatIoMappingTests(unittest.TestCase):
     """微信侧字段映射的纯函数部分（真机验证前先把逻辑钉住）。"""
 

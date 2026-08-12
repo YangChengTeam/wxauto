@@ -202,6 +202,14 @@ class AgentWsClient:
 
     # ────────────────────────── 内部 ──────────────────────────
 
+    async def ping(self) -> None:
+        """保活：AI 端对 ``op=ping`` 回 ``pong``。
+
+        反代（线上是 nginx）默认 60s 就掐掉空闲的 WS，不定期 ping 的话连接会静悄悄地死，
+        等到真有候选人来消息时才发现——那时候要现重连，白等一次握手。
+        """
+        await self._request("ping", {})
+
     async def _send(self, op: str, data: dict[str, Any], *, ack: str | None = None) -> None:
         if self._ws is None:
             raise AgentWsError("尚未连接")
