@@ -71,6 +71,7 @@ class MainWindow:
         self._busy_frame = 0
 
         root.title("劳小智微信服务")
+        self._apply_window_icon()
         root.geometry("1180x720")
         root.minsize(900, 560)
         root.configure(bg=theme.CONTENT_BG)
@@ -87,6 +88,26 @@ class MainWindow:
         self.refresh_state()
         self._tick()
         self._schedule_wechat_probe()
+
+    def _apply_window_icon(self) -> None:
+        """标题栏 / Alt-Tab / 任务栏用同一个品牌图标（和托盘、快捷方式一致）。
+
+        图标是锦上添花，装歪了不该让窗口开不出来——所以整段包起来，失败就用默认图标。
+        """
+        from . import icons
+
+        try:
+            path = icons.ico_path()
+            if path:
+                self.root.iconbitmap(default=path)
+        except tk.TclError:
+            # 非 Windows 的 tk 不吃 .ico，退回 PNG
+            try:
+                if icons.PNG_PATH.exists():
+                    self._icon_image = tk.PhotoImage(file=str(icons.PNG_PATH))
+                    self.root.iconphoto(True, self._icon_image)
+            except tk.TclError:
+                pass
 
     # ── 左侧状态栏 ────────────────────────────────────────────────
 

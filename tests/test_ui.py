@@ -247,6 +247,40 @@ class GatewayServiceTests(unittest.TestCase):
         self.assertIs(service.state, ServiceState.STOPPED)
 
 
+class AppIconTests(unittest.TestCase):
+    """exe / 快捷方式 / 任务栏 / 托盘用同一份品牌图标（用户 2026-08-13 要求）。"""
+
+    def test_brand_assets_are_shipped(self) -> None:
+        from wxclient.ui import icons
+
+        self.assertTrue(icons.ICO_PATH.exists(), "app.ico 没打进包，exe 和快捷方式就没图标")
+        self.assertTrue(icons.PNG_PATH.exists(), "托盘要的是 PIL 图像，PNG 不能少")
+        self.assertEqual(icons.ico_path(), str(icons.ICO_PATH))
+
+    def test_ico_carries_the_sizes_windows_asks_for(self) -> None:
+        from PIL import Image
+
+        from wxclient.ui import icons
+
+        with Image.open(icons.ICO_PATH) as image:
+            sizes = {size[0] for size in image.ico.sizes()}
+        # 16 = 托盘/标题栏，32/48 = 桌面快捷方式，256 = 大图标视图
+        self.assertTrue({16, 32, 48, 256}.issubset(sizes), f"ico 尺寸不全：{sorted(sizes)}")
+
+    def test_tray_icon_keeps_the_brand_and_shows_state(self) -> None:
+        """托盘不能退化成一个纯色圆点：品牌图形要在，状态色也要在。"""
+        from wxclient.ui.icons import build_icon_image
+        from wxclient.ui.service import ServiceState
+
+        running = build_icon_image(ServiceState.RUNNING, 64)
+        stopped = build_icon_image(ServiceState.STOPPED, 64)
+        self.assertEqual(running.size, (64, 64))
+        # 右下角角标：跑着是绿的，停了是灰的
+        self.assertNotEqual(running.getpixel((56, 56)), stopped.getpixel((56, 56)))
+        # 左上角是品牌图形本身，不该被角标动到
+        self.assertEqual(running.getpixel((8, 8)), stopped.getpixel((8, 8)))
+
+
 class SettingsStoreTests(unittest.TestCase):
     def test_round_trip_keeps_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

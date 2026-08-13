@@ -10,30 +10,8 @@ import threading
 from collections.abc import Callable
 from typing import Any
 
+from .icons import build_icon_image
 from .service import GatewayService, ServiceState
-
-_DOT_RUNNING = (26, 127, 55)
-_DOT_STOPPED = (87, 96, 106)
-_DOT_FAILED = (207, 34, 46)
-
-
-def build_icon_image(state: ServiceState, size: int = 64) -> Any:
-    """画一个带状态色圆点的小图标，不依赖外部图片资源。"""
-    from PIL import Image, ImageDraw
-
-    if state is ServiceState.RUNNING:
-        color = _DOT_RUNNING
-    elif state is ServiceState.FAILED:
-        color = _DOT_FAILED
-    else:
-        color = _DOT_STOPPED
-
-    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    draw.ellipse((2, 2, size - 2, size - 2), fill=(13, 17, 23, 255))
-    margin = size // 4
-    draw.ellipse((margin, margin, size - margin, size - margin), fill=(*color, 255))
-    return image
 
 
 class Tray:

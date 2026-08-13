@@ -35,6 +35,22 @@ def _dry_run_notice(args: argparse.Namespace, settings: UiSettings) -> str:
     return "" if real else "⚠ 当前只走流程、不会真的发消息"
 
 
+#: Windows 任务栏用它给窗口分组、挑图标。不设的话我们只是「某个 python.exe」，
+#: 任务栏上顶着 Python 的图标，跟托盘、快捷方式对不上。
+APP_ID = "laoxiaozhi.wechat.gateway"
+
+
+def _claim_taskbar_identity() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except Exception as exc:  # noqa: BLE001 - 只影响任务栏图标，不该拦住启动
+        _log.debug("设置任务栏标识失败", error=str(exc))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wxclient-ui", description="劳小智微信网关（桌面版）")
     parser.add_argument("--config", help="微信运行参数配置文件")
@@ -61,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         lambda: configure_logging(log_file=wechat_settings.data_dir / "gateway.log"),
     )
     log_pipeline.install()
+
+    _claim_taskbar_identity()
 
     root = tk.Tk()
     root.withdraw()  # 先藏起来，是否露面由下面决定

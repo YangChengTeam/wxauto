@@ -48,7 +48,13 @@ python -m wxclient.gateway --account wxid_zhangsan_work --allow-real-actions   #
 ## 打包
 
 网关的单体 exe **尚未做**（`[build]` extra 里的 PyInstaller 是为它预留的）。
+配置已备好：`packaging/lxz-wechat-gateway.spec`（**未验证**，出包时要补依赖收集并在真机跑）。
 原先的 `scripts/build_mcp_onefile.py` 只打 MCP 入口，已随 MCP 一并删除。
+
+图标是**一份管到底**：`wxclient/ui/assets/app.ico`（劳小智正式图标套件，和网站后台同一个）
+供 exe / 桌面快捷方式 / 任务栏 / 窗口标题栏用；右下角托盘用 `app-256.png` 加一个状态色角标
+（绿=运行中、灰=已停止、红=启动失败）——角标不能省，它是唯一能一眼看出服务在不在跑的地方。
+换图标只改 `wxclient/ui/assets/`，别在代码里再画一个。
 做网关 exe 时注意两件 onefile 特有的事：数据目录（SQLite 队列 / 网关状态库 / 日志）
 必须落到 exe 外的固定路径，不能跟着临时解包目录走；凭证与 `--account` 走环境变量和
 命令行，不编进二进制。
