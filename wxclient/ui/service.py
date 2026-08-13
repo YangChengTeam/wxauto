@@ -11,14 +11,20 @@ import threading
 import time
 from collections.abc import Callable
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import structlog
 
-from wxclient.gateway.factory import Gateway
+if TYPE_CHECKING:  # 只为类型标注，别在这儿真 import
+    from wxclient.gateway.factory import Gateway
 
+# 为什么不在模块顶上 import：`wxclient.gateway.factory` 会连带把 SQLAlchemy、队列、
+# 微信驱动整套拉起来，真机实测 **2.7 秒**。这是桌面端「双击了半天不出窗口」的大头——
+# 那 2.7 秒全花在窗口出现之前。改成惰性 import 之后，这笔开销挪到网关线程里、跟启动
+# 服务一起花，界面先出来。
 _log = structlog.get_logger(__name__)
 
-GatewayBuilder = Callable[[], Gateway]
+GatewayBuilder = Callable[[], "Gateway"]
 
 
 class ServiceState(str, Enum):

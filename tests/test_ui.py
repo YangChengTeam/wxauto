@@ -16,6 +16,7 @@ from wxclient.gateway.factory import normalize_accounts
 from wxclient.ui import logline
 from wxclient.ui import settings_store
 from wxclient.ui.logbuffer import LogBuffer, LogPipeline, attach_to_root
+from wxclient.ui.logfeed import LogFeed
 from wxclient.ui.service import GatewayService, ServiceState
 
 
@@ -62,6 +63,67 @@ class LogBufferTests(unittest.TestCase):
             root.setLevel(previous_level)
 
         self.assertTrue(any("网关启动" in line for line in buffer.snapshot()))
+
+
+class LogFeedTests(unittest.TestCase):
+    """日志节拍器：攒一批画一批 + 没人看时不画。GUI 无关，所以能在 Linux 上跑。"""
+
+    def test_batches_instead_of_one_call_per_line(self) -> None:
+        feed = LogFeed()
+        feed.resume()
+        for i in range(200):
+            feed.push(f"line {i}")
+        # 200 行只换来一次 drain：界面就只重排一次，而不是 200 次
+        drained = feed.drain()
+        self.assertEqual(len(drained), 200)
+        self.assertEqual(drained[0], "line 0")
+        self.assertEqual(feed.drain(), [], "取过就该空了，别把同一批画两遍")
+
+    def test_paused_by_default_so_tray_start_draws_nothing(self) -> None:
+        # 常态是开机缩在托盘里（start_hidden），这时一行都不该画
+        feed = LogFeed()
+        self.assertTrue(feed.paused)
+        feed.push("在托盘里来的日志")
+        self.assertEqual(feed.drain(), [])
+
+    def test_resume_reports_missed_lines_so_window_replays(self) -> None:
+        feed = LogFeed()
+        feed.push("暂停期间来的")
+        self.assertTrue(feed.resume(), "暂停期间有日志 → 打开窗口时要整屏回放")
+        feed = LogFeed()
+        self.assertFalse(feed.resume(), "什么都没来就别白重画一屏")
+
+    def test_pause_drops_pending_because_buffer_still_has_them(self) -> None:
+        feed = LogFeed()
+        feed.resume()
+        feed.push("一行")
+        feed.pause()
+        self.assertEqual(feed.drain(), [])
+
+    def test_pending_is_capped_so_a_stuck_ui_cannot_grow_without_bound(self) -> None:
+        feed = LogFeed(pending_cap=10)
+        feed.resume()
+        for i in range(25):
+            feed.push(f"line {i}")
+        drained = feed.drain()
+        self.assertEqual(len(drained), 10)
+        self.assertEqual(drained[-1], "line 24", "丢的是最旧的，最新的必须留着")
+        self.assertEqual(feed.dropped, 15)
+
+    def test_push_is_safe_from_many_threads(self) -> None:
+        feed = LogFeed(pending_cap=10_000)
+        feed.resume()
+
+        def spam() -> None:
+            for i in range(500):
+                feed.push(str(i))
+
+        threads = [threading.Thread(target=spam) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(feed.drain()), 2000)
 
 
 class LogPipelineTests(unittest.TestCase):

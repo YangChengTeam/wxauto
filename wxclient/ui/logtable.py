@@ -30,6 +30,7 @@ class LogTable(tk.Frame):
         super().__init__(parent, bg=theme.ROW_LINE, padx=1, pady=1)
         self._max_rows = max_rows
         self._rows: list[tk.Frame] = []
+        self._scroll_pending = False
 
         self._canvas = tk.Canvas(self, bg=theme.CONTENT_BG, highlightthickness=0, bd=0)
         self._scroll = tk.Scrollbar(self, orient=tk.VERTICAL, command=self._canvas.yview, width=12)
@@ -63,40 +64,49 @@ class LogTable(tk.Frame):
     # -- 内容 ----------------------------------------------------------
 
     def append(self, lines: list[LogLine]) -> None:
+        """一次画一批。**别一行一次地调**——每次调用都要重排一遍，成串日志会把界面压死。"""
         if not lines:
             return
         stick = self._at_bottom()  # 用户往回翻时别把他拽回底部
+        # 一批里超过上限的部分连建都不用建：反正建出来立刻就要销毁。
+        if len(lines) > self._max_rows:
+            lines = lines[-self._max_rows:]
         for item in lines:
             self._rows.append(self._make_row(item))
         while len(self._rows) > self._max_rows:
             self._rows.pop(0).destroy()
-        if stick:
+        if stick and not self._scroll_pending:
+            self._scroll_pending = True
             self.after_idle(self._scroll_to_end)
 
     def clear(self) -> None:
         for row in self._rows:
             row.destroy()
         self._rows.clear()
+        self._scroll_pending = False
 
     def _scroll_to_end(self) -> None:
+        self._scroll_pending = False
         self._canvas.update_idletasks()
         self._canvas.configure(scrollregion=self._canvas.bbox("all"))
         self._canvas.yview_moveto(1.0)
 
     def _make_row(self, item: LogLine) -> tk.Frame:
-        row = tk.Frame(self._body, bg=theme.CONTENT_BG)
+        # 每多一个控件就多一份布局开销 × 行数上限。原来一行 5 个（行框 + 内层框 + 3 个
+        # Label + 分隔线），内层框只是用来加 padding 的——padding 直接挂到 Label 上，
+        # 一行省一个控件，满屏就是省 500 个。行框本身当分隔线：底色用线色、内容区留 1px。
+        row = tk.Frame(self._body, bg=theme.ROW_LINE)
         row.pack(fill=tk.X)
 
         line = tk.Frame(row, bg=theme.CONTENT_BG)
-        line.pack(fill=tk.X, padx=18, pady=7)
+        line.pack(fill=tk.X, pady=(0, 1))
 
         tk.Label(line, text=item.time, font=theme.FONT_LOG, bg=theme.CONTENT_BG,
-                 fg=theme.TEXT_MUTED, width=20, anchor="w").pack(side=tk.LEFT)
+                 fg=theme.TEXT_MUTED, width=20, anchor="w").pack(side=tk.LEFT, padx=(18, 0), pady=7)
         tk.Label(line, text=item.level, font=theme.FONT_LOG, bg=theme.CONTENT_BG,
                  fg=_SEVERITY_COLOR.get(item.severity, theme.TEXT_MUTED),
-                 width=6, anchor="w").pack(side=tk.LEFT)
+                 width=6, anchor="w").pack(side=tk.LEFT, pady=7)
         tk.Label(line, text=item.message, font=theme.FONT_BODY, bg=theme.CONTENT_BG,
-                 fg=theme.TEXT, anchor="w", justify=tk.LEFT).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        tk.Frame(row, bg=theme.ROW_LINE, height=1).pack(fill=tk.X)
+                 fg=theme.TEXT, anchor="w", justify=tk.LEFT).pack(
+                     side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 18), pady=7)
         return row
