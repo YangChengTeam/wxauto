@@ -6,11 +6,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from wxclient.gateway.factory import normalize_accounts
 from wxclient.ui import logline
@@ -63,6 +65,26 @@ class LogBufferTests(unittest.TestCase):
             root.setLevel(previous_level)
 
         self.assertTrue(any("网关启动" in line for line in buffer.snapshot()))
+
+
+class DataDirTests(unittest.TestCase):
+    """设置/日志/状态库放哪。打包成 exe 之后 cwd 不可信，见 _default_data_dir 的注释。"""
+
+    def test_source_run_keeps_the_relative_dot_wxclient(self) -> None:
+        from wxclient.config.settings import _default_data_dir
+
+        self.assertEqual(_default_data_dir(), Path(".wxclient"))
+
+    def test_frozen_build_anchors_to_a_fixed_per_user_dir(self) -> None:
+        import sys as _sys
+
+        from wxclient.config.settings import _default_data_dir
+
+        with mock.patch.object(_sys, "frozen", True, create=True), \
+                mock.patch.dict(os.environ, {"LOCALAPPDATA": os.path.join("X:", "AppData")}):
+            resolved = _default_data_dir()
+        self.assertTrue(resolved.is_absolute() or str(resolved).startswith("X:"))
+        self.assertNotEqual(resolved, Path(".wxclient"), "冻结态不能再用相对路径")
 
 
 class LogFeedTests(unittest.TestCase):
