@@ -13,6 +13,7 @@ op 不在白名单直接拒、写类动作过频次/时间窗/黑名单、真实
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -21,6 +22,7 @@ import structlog
 
 from wxclient.queue import TaskType
 
+from .download import DownloadError, FileRef
 from .guard import OutboundGuard
 
 _log = structlog.get_logger(__name__)
@@ -67,14 +69,20 @@ def _limit(args: dict[str, Any], default: int, cap: int) -> int:
     return max(1, min(value, cap))
 
 
-def _files(args: dict[str, Any]) -> list[str]:
+def _file_refs(args: dict[str, Any]) -> list[FileRef]:
+    """067：`files` 里是**文件描述符**（`{file_id, url}`），不是路径。
+
+    路径是 AI 端给不了的东西（服务端派生、客户端不可传），所以这里也不接受字符串——
+    真收到一串路径，那要么是老版本、要么是有人在试探，两种情况都该当场拒掉而不是照着发。
+    本机路径由 `FileFetcher` 下载后产生，见 `_run`。
+    """
     raw = args.get("files")
-    files = [str(f).strip() for f in raw if str(f).strip()] if isinstance(raw, list) else []
-    if not files:
-        raise CommandError("缺少必填参数 files")
-    if len(files) > 9:
+    refs = [ref for ref in (FileRef.parse(item) for item in raw) if ref] if isinstance(raw, list) else []
+    if not refs:
+        raise CommandError("缺少必填参数 files（要 {file_id, url} 描述符，不是文件路径）")
+    if len(refs) > 9:
         raise CommandError("一条指令最多带 9 个文件")
-    return files
+    return refs
 
 
 #: op 白名单。**只有这张表里的 op 会被执行**，其余一律 rejected。
@@ -88,10 +96,10 @@ COMMANDS: dict[str, CommandSpec] = {
         lambda a: {"friend": _req(a, "to", alias="friend"), "text": _req(a, "text")},
         lambda a: _req(a, "to", alias="friend"),
     ),
+    # files 不在这里填：那是下载完才有的本机路径（067，见 CommandExecutor._run）。
     "send_files": CommandSpec(
         TaskType.SEND_FILES, True,
-        lambda a: {"friend": _req(a, "to", alias="friend"), "files": _files(a),
-                   "text": str(a.get("text") or "")},
+        lambda a: {"friend": _req(a, "to", alias="friend"), "text": str(a.get("text") or "")},
         lambda a: _req(a, "to", alias="friend"),
     ),
     "add_friend": CommandSpec(
@@ -167,6 +175,7 @@ class CommandExecutor:
         account_id: str,
         allow_real_actions: bool = False,
         confirmation: str = "",
+        fetcher=None,      # FileFetcher | None：发文件时去 AI 端取产出物（067）。没配就发不了文件。
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._runtime = runtime
@@ -175,6 +184,7 @@ class CommandExecutor:
         self._account = account_id
         self._allow_real = allow_real_actions
         self._confirmation = confirmation
+        self._fetcher = fetcher
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     async def execute(self, data: dict[str, Any]) -> CommandResult:
@@ -208,8 +218,13 @@ class CommandExecutor:
         try:
             payload = spec.build(args)
             peer = spec.target(args)
+            # 发文件先把描述符解出来：形状不对要在动微信**之前**拒，别下载完才发现发不了。
+            refs = _file_refs(args) if op == "send_files" else []
         except CommandError as exc:
             return CommandResult(command_id, "rejected", str(exc))
+        if refs and self._fetcher is None:
+            _log.warning("收到发文件指令但没配下载通道", op=op)
+            return CommandResult(command_id, "rejected", "本机没有配取文件通道，发不了 AI 端产出的文件")
 
         now = self._clock()
         denial = self._gate(spec, peer, now)
@@ -222,20 +237,35 @@ class CommandExecutor:
         # 不碰微信也就永远查不到东西——AI 端会收到一条「已完成、什么都没有」的假回执。
         # 「要不要真动微信」这个开关仍然只有一个：`--allow-real-actions`。
         payload["dry_run"] = not self._allow_real
-        try:
-            raw = await self._runtime.submit(
-                spec.task_type, payload,
-                confirmation=self._confirmation if self._allow_real else "",
-            )
-        except Exception as exc:  # noqa: BLE001 —— 失败要能回给上游，不能只写日志
-            _log.warning("指令执行失败", op=op, error=str(exc))
-            return CommandResult(command_id, "failed", f"{type(exc).__name__}: {exc}")
+        # 取回来的文件只在这段 with 里活着：发完（或失败）立刻连临时目录一起删，
+        # 产出物不在这台电脑上留底（067）。
+        async with AsyncExitStack() as stack:
+            if refs:
+                try:
+                    paths = await stack.enter_async_context(
+                        self._fetcher.materialize(self._account, refs)
+                    )
+                except DownloadError as exc:
+                    _log.warning("取 AI 端产出文件失败", op=op, error=str(exc))
+                    return CommandResult(command_id, "failed", str(exc))
+                except Exception as exc:  # noqa: BLE001 —— 网络类异常也要回给上游
+                    _log.warning("取 AI 端产出文件失败", op=op, error=str(exc))
+                    return CommandResult(command_id, "failed", f"取文件失败：{exc}")
+                payload["files"] = [str(p) for p in paths]
+            try:
+                raw = await self._runtime.submit(
+                    spec.task_type, payload,
+                    confirmation=self._confirmation if self._allow_real else "",
+                )
+            except Exception as exc:  # noqa: BLE001 —— 失败要能回给上游，不能只写日志
+                _log.warning("指令执行失败", op=op, error=str(exc))
+                return CommandResult(command_id, "failed", f"{type(exc).__name__}: {exc}")
 
-        if spec.writes and peer:
-            # 主动发出去的也要计入频次——不然「被动回复限 20 条/时」会被主动触达绕开。
-            self._store.record_send(self._account, peer, now)
-        _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
-        return CommandResult(command_id, "done", result=(raw or {}).get("result") or {})
+            if spec.writes and peer:
+                # 主动发出去的也要计入频次——不然「被动回复限 20 条/时」会被主动触达绕开。
+                self._store.record_send(self._account, peer, now)
+            _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
+            return CommandResult(command_id, "done", result=(raw or {}).get("result") or {})
 
     def _gate(self, spec: CommandSpec, peer: str, now: datetime) -> str:
         """返回拒绝理由；空串 = 放行。

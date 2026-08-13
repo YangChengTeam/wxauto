@@ -7,11 +7,18 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from wxclient.gateway import CommandExecutor, GatewayStore, OutboundGuard
+from wxclient.gateway.download import (
+    DownloadError,
+    FileFetcher,
+    _name_from_headers,
+    http_base_from_ws,
+)
 from wxclient.queue import TaskType
 
 BEIJING = timezone(timedelta(hours=8))
@@ -230,3 +237,100 @@ class FailureTests(CommandTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SendFilesDownloadTestCase(CommandTestCase):
+    """067：send_files 收的是**文件描述符**，不是路径。
+
+    路径由网关自己下载后产生——AI 端给不了、也不许给（那是服务端派生的东西）。
+    """
+
+    def _fetcher(self, *, boom: str = "") -> Any:
+        outer = self
+
+        class FakeFetcher:
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+                self.cleaned = False
+
+            @asynccontextmanager
+            async def materialize(self, account_id, refs):
+                self.calls.append([r.file_id for r in refs])
+                if boom:
+                    raise DownloadError(boom)
+                paths = []
+                for ref in refs:
+                    p = Path(outer._tmp.name) / f"{ref.file_id}.png"
+                    p.write_bytes(b"png")
+                    paths.append(p)
+                try:
+                    yield paths
+                finally:
+                    self.cleaned = True
+
+        return FakeFetcher()
+
+    async def test_file_ids_下载后交本机路径给底座(self) -> None:
+        runtime, fetcher = FakeRuntime(), self._fetcher()
+        ex = self._executor(runtime, fetcher=fetcher)
+        result = await ex.execute({
+            "command_id": "c1", "op": "send_files",
+            "args": {"to": "张三", "files": [{"file_id": "f1", "url": "/v1/sessions/s1/files/f1"}]},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        task_type, payload, _conf = runtime.calls[0]
+        self.assertEqual(task_type, TaskType.SEND_FILES)
+        self.assertEqual(fetcher.calls, [["f1"]])
+        self.assertTrue(payload["files"][0].endswith("f1.png"), payload["files"])
+        self.assertTrue(fetcher.cleaned, "发完必须清掉临时文件")
+
+    async def test_下载失败回执说人话且不投任务(self) -> None:
+        runtime = FakeRuntime()
+        ex = self._executor(runtime, fetcher=self._fetcher(boom="这个文件在 AI 服务上找不到了"))
+        result = await ex.execute({
+            "command_id": "c2", "op": "send_files",
+            "args": {"to": "张三", "files": [{"file_id": "f1", "url": "/v1/sessions/s1/files/f1"}]},
+        })
+        self.assertEqual(result.status, "failed")
+        self.assertIn("找不到", result.reason)
+        self.assertEqual(runtime.calls, [], "没取到文件就绝不能去发")
+
+    async def test_没有下载器时明确拒绝而不是把描述符当路径发(self) -> None:
+        runtime = FakeRuntime()
+        ex = self._executor(runtime)   # 不带 fetcher
+        result = await ex.execute({
+            "command_id": "c3", "op": "send_files",
+            "args": {"to": "张三", "files": [{"file_id": "f1", "url": "/v1/sessions/s1/files/f1"}]},
+        })
+        self.assertEqual(result.status, "rejected")
+        self.assertEqual(runtime.calls, [])
+
+
+class DownloadUrlTestCase(unittest.TestCase):
+    """下载器的地址判定——这条线是防 SSRF 的，必须有回归护栏。"""
+
+    def _fetcher(self) -> Any:
+        return FileFetcher(ws_url="wss://ai.example.com/v1/ws", ticket_provider=None)
+
+    def test_ws_地址推导出_http_base(self) -> None:
+        self.assertEqual(http_base_from_ws("wss://ai.example.com/v1/ws"), "https://ai.example.com")
+        self.assertEqual(http_base_from_ws("ws://127.0.0.1:8137/v1/ws"), "http://127.0.0.1:8137")
+
+    def test_相对路径按自家_base_拼(self) -> None:
+        got = self._fetcher()._absolute("/v1/sessions/s1/files/f1")
+        self.assertEqual(got, "https://ai.example.com/v1/sessions/s1/files/f1")
+
+    def test_外部_host_一律拒(self) -> None:
+        for url in ("https://evil.example.com/v1/sessions/s1/files/f1", "http://169.254.169.254/latest/meta-data"):
+            with self.assertRaises(DownloadError):
+                self._fetcher()._absolute(url)
+
+    def test_同_host_但不是取会话文件的路径也拒(self) -> None:
+        for url in ("/metrics", "/v1/sessions/s1/files/f1/../../../etc/passwd", "https://ai.example.com/dev/raw"):
+            with self.assertRaises(DownloadError):
+                self._fetcher()._absolute(url)
+
+    def test_响应里的文件名不许带路径(self) -> None:
+        name = _name_from_headers({"content-disposition": 'attachment; filename="../../evil.png"'}, "x.bin")
+        self.assertNotIn("/", name)
+        self.assertNotIn("..", name.strip("._"))
