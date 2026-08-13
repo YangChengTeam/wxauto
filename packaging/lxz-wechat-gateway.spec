@@ -44,8 +44,9 @@ excludes = [
 # cryptography（_rust.pyd 9MB）也先留着：TLS 走的是标准库 ssl 不是它，但没实测过砍掉的
 # 影响，9MB 不值得拿线上连不上去换。
 
+# 入口是 launcher.py 不是 wxclient/ui/__main__.py——理由见 launcher.py 顶上的注释。
 a = Analysis(
-    ["../wxclient/ui/__main__.py"],
+    ["launcher.py"],
     pathex=["."],
     datas=[("../wxclient/ui/assets/app.ico", "wxclient/ui/assets"),
            ("../wxclient/ui/assets/app-256.png", "wxclient/ui/assets")],
