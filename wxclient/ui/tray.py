@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -65,7 +66,15 @@ class Tray:
         )
 
     def run_detached(self) -> None:
-        self._icon.run_detached()
+        """把托盘的消息循环放到**守护**线程里跑。
+
+        不用 pystray 自带的 ``run_detached()``：它起的是**非守护**线程
+        （``pystray/_win32.py:_run_detached``）。退出时只要那条线程没干净收场，
+        解释器就会一直等它——窗口没了、托盘图标没了，进程却还在，
+        用户看到的是「点了退出没反应，再点快捷方式也起不来」。
+        """
+        self._thread = threading.Thread(target=self._icon.run, name="wx-tray", daemon=True)
+        self._thread.start()
 
     def stop(self) -> None:
         self._icon.stop()

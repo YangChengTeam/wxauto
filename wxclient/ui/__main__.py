@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
+import time
 import tkinter as tk
 
 import structlog
@@ -155,8 +157,25 @@ def shutdown(root: tk.Tk, window: MainWindow, service: GatewayService, tray: Tra
             service.stop()
         finally:
             root.after(0, lambda: (window.destroy(), root.quit()))
+            _exit_backstop()
 
     threading.Thread(target=finish, name="wx-ui-shutdown", daemon=True).start()
+
+
+def _exit_backstop(seconds: float = 5.0) -> None:
+    """收完尾还没退干净就硬退。
+
+    正常路径（窗口销毁 → mainloop 返回 → main 返回）走完进程自己就没了，这条
+    守护线程也跟着消失。它只在「有第三方库留了个非守护线程」时才轮得到发言——
+    那种情况下用户看到的是「退出没反应」，比丢掉几行日志缓冲糟得多。
+    """
+
+    def bail() -> None:
+        time.sleep(seconds)
+        _log.warning("收尾超时，强制退出")
+        os._exit(0)
+
+    threading.Thread(target=bail, name="wx-ui-exit-backstop", daemon=True).start()
 
 
 if __name__ == "__main__":
