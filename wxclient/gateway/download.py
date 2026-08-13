@@ -1,175 +1,98 @@
-"""把 AI 端产出物（招聘海报图等）取到本机，再交给微信发出去（067）。
+"""把 AI 端随指令送来的产出物（招聘海报图等）落到本机，再交给微信发出去（067）。
 
-为什么要这一层：图落在 AI 服务那边的会话 `outbox/`，取图地址 ``/v1/sessions/{sid}/files/{fid}``
-**要鉴权、不是直链**；而 wxauto 发文件走的是 UIA 把文件从磁盘拖进微信——它只认**本机路径**。
-中间这一段就是本模块：带自己的票去下载 → 落临时目录 → 用完删掉。
+为什么是「随指令送字节」而不是「给个地址自己下载」（2026-08-13 真机走过一遍才定的）：
+本网关的票是 ``scope=wechat`` 的**受限票**，按 AI 端的归属鉴权它连那条会话都进不去（403）。
+要让它能下载，就得把作用域边界撬开——那等于「这台 Windows 上的票一旦泄露，
+该员工所有会话里的文件（简历 PII！）都能被拉走」。而推指令的那条 WS 本来就是这位员工
+已鉴权的连接、文件归属 AI 端刚核对过，直接把字节递过来**不新增任何权限**，
+也顺带没了「地址拼错拿回一张 index.html 当海报发出去」那类坑。
 
-守的几条线：
-- **只认自家 host**：地址从 ``ai_ws_url`` 推导，非本 origin 的一律拒。AI 端推来的东西一律当外部输入，
-  否则等于给「让网关去下载任意 URL」开了口子（SSRF + 把用户机器当下载器）。
-- **限体积**：边下边数，超了当场断，不给一个坏指令把磁盘塞满的机会。
-- **票是自己的**：用网关自己的 session_ticket 鉴权，不接受上游塞任何凭证过来。
+这里守的线：
+- **文件名只当名字用**：洗掉路径分隔符与上跳，永远落在自己的临时目录里。
+- **限体积**：一条指令的总字节有上限，坏指令撑不爆磁盘。
+- **用完就删**：产出物不在这台电脑上留底。
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
-from urllib.parse import unquote, urlsplit
 
-import httpx
 import structlog
 
 _log = structlog.get_logger(__name__)
 
-#: 单个文件上限。海报图是百 KB 级，20MB 已经宽得离谱——够用又不至于被一条指令拖垮。
-MAX_FILE_BYTES = 20 * 1024 * 1024
+#: 一条指令随行的字节总量上限（与 AI 端 MAX_INLINE_BYTES 同口径）。
+MAX_TOTAL_BYTES = 8 * 1024 * 1024
 
-#: WS 门的固定后缀；HTTP base = ws 地址去掉它（前缀留着）。
-_WS_SUFFIX = "/v1/ws"
-
-#: 只允许取会话文件这一条路径（比对的是**去掉反代前缀后**的那一段）。别的路径不给下。
-_ALLOWED_PATH = re.compile(r"^/v1/sessions/[^/]+/files/[^/]+$")
-
-#: 文件名里不许出现的东西——下下来的名字要用来在本机建文件，绝不能带路径。
+#: 文件名里不许出现的东西——它要用来在本机建文件，绝不能带路径。
 _UNSAFE_NAME = re.compile(r"[\\/:*?\"<>|\x00-\x1f]")
 
 
 class DownloadError(RuntimeError):
-    """取文件失败。回执里要说人话，所以消息直接面向用户。"""
+    """文件没能落地。回执里要说人话，所以消息直接面向用户。"""
 
 
-def http_base_from_ws(ws_url: str) -> str:
-    """``wss://host[/前缀]/v1/ws`` → ``https://host[/前缀]``。不新增配置项，跟着 WS 那一个地址走。
-
-    ★ **反代前缀必须留着**（2026-08-13 真机踩过）：线上是 ``wss://host/agent-ws/v1/ws``，
-    nginx 的 ``location /agent-ws/`` 才转到 AI 服务；只取 origin 会打到 ``https://host/v1/...``，
-    那儿是前端 SPA 的兜底 location —— **返回 200 + index.html**，于是「下载成功」，
-    两张 HTML 当成海报发进了微信。见 `_reject_html`。
-    """
-    parts = urlsplit(ws_url.strip())
-    if parts.scheme not in {"ws", "wss"} or not parts.netloc:
-        raise DownloadError(f"AI_WS_URL 不是合法的 ws 地址：{ws_url!r}")
-    scheme = "https" if parts.scheme == "wss" else "http"
-    prefix = parts.path
-    prefix = prefix[: -len(_WS_SUFFIX)] if prefix.endswith(_WS_SUFFIX) else ""
-    return f"{scheme}://{parts.netloc}{prefix.rstrip('/')}"
-
-
-def _safe_name(raw: str, fallback: str) -> str:
-    name = _UNSAFE_NAME.sub("_", unquote(raw or "").strip()).strip(". ")
+def safe_name(raw: str, fallback: str) -> str:
+    name = _UNSAFE_NAME.sub("_", str(raw or "").strip()).strip(". ")
     return name[:120] if name else fallback
-
-
-def _name_from_headers(headers: Any, fallback: str) -> str:
-    """文件名优先取响应的 Content-Disposition——**不让 AI 端报文件名**，少一处可被摆布的输入。"""
-    disposition = str(headers.get("content-disposition") or "")
-    hit = re.search(r"filename\*=UTF-8''([^;]+)", disposition) or re.search(
-        r'filename="?([^";]+)"?', disposition
-    )
-    return _safe_name(hit.group(1) if hit else "", fallback)
-
-
-def _reject_html(headers: Any) -> None:
-    """网页不是文件。
-
-    地址打偏时最坏的形态不是 404，而是**200 + 一张 HTML**（反代把没匹配上的路径兜给前端 SPA）：
-    那会被当成「下载成功」，把网页当海报发进微信。会话文件的 content-type 由服务端按扩展名给，
-    永远不会是 text/html —— 见到就是地址错了，当场停。
-    """
-    ctype = str(headers.get("content-type") or "").split(";")[0].strip().lower()
-    if ctype in {"text/html", "application/xhtml+xml"}:
-        raise DownloadError("取到的是网页不是文件（多半是 AI_WS_URL 的反代前缀不对），没有发送")
 
 
 @dataclass(frozen=True)
 class FileRef:
-    """AI 端下发的一个文件描述符。只有 ID 和地址，**没有路径**（路径服务端不给、也不该给）。"""
+    """AI 端随指令下发的一个文件：ID、原名、字节。**没有路径**（路径是本机才有的东西）。"""
 
     file_id: str
-    url: str
+    file_name: str
+    content_b64: str
 
     @staticmethod
     def parse(raw: Any) -> FileRef | None:
         if not isinstance(raw, dict):
             return None
-        url = str(raw.get("url") or "").strip()
+        content = str(raw.get("content_b64") or "")
+        if not content:
+            return None
         file_id = str(raw.get("file_id") or "").strip()
-        return FileRef(file_id, url) if url else None
+        return FileRef(file_id, safe_name(raw.get("file_name"), f"{file_id or 'file'}.bin"), content)
 
 
 class FileFetcher:
-    """带票去 AI 服务取会话文件，落到一次性的临时目录。"""
+    """把随指令来的字节写进一次性临时目录，交出本机路径。"""
 
-    def __init__(
-        self,
-        *,
-        ws_url: str,
-        ticket_provider,          # TicketProvider：mint(account_id) → session_ticket
-        max_bytes: int = MAX_FILE_BYTES,
-        timeout_seconds: float = 30.0,
-        client: httpx.AsyncClient | None = None,
-    ) -> None:
-        self._base = http_base_from_ws(ws_url)
-        self._tickets = ticket_provider
-        self._max_bytes = max_bytes
-        self._timeout = timeout_seconds
-        self._client = client
-
-    def _absolute(self, url: str) -> str:
-        """相对路径按自家 base 拼（base 含反代前缀）；绝对地址必须落在 base 之内，否则拒。"""
-        if url.startswith("/"):
-            path = urlsplit(url).path
-            if not _ALLOWED_PATH.match(path):
-                raise DownloadError(f"不允许的文件地址：{url}")
-            return f"{self._base}{url}"
-        if not url.startswith(f"{self._base}/"):
-            raise DownloadError("只允许从劳小智 AI 服务取文件，拒绝外部地址")
-        tail = urlsplit(url).path[len(urlsplit(self._base).path):]
-        if not _ALLOWED_PATH.match(tail):
-            raise DownloadError(f"不允许的文件地址：{url}")
-        return url
-
-    async def _fetch_one(self, client: httpx.AsyncClient, ref: FileRef, ticket: str, dest_dir: Path) -> Path:
-        url = self._absolute(ref.url)
-        headers = {"x-agent-session-ticket": ticket}
-        async with client.stream("GET", url, headers=headers, timeout=self._timeout) as resp:
-            if resp.status_code == 404:
-                raise DownloadError("这个文件在 AI 服务上找不到了（可能会话已经清理）")
-            if resp.status_code in (401, 403):
-                raise DownloadError("取文件被拒：票据无效或这份文件不归本账号")
-            if resp.status_code >= 400:
-                raise DownloadError(f"取文件失败（HTTP {resp.status_code}）")
-            _reject_html(resp.headers)
-            name = _name_from_headers(resp.headers, f"{ref.file_id or 'file'}.bin")
-            path = dest_dir / name
-            written = 0
-            with path.open("wb") as fh:
-                async for chunk in resp.aiter_bytes():
-                    written += len(chunk)
-                    if written > self._max_bytes:
-                        raise DownloadError(f"文件超过 {self._max_bytes // (1024 * 1024)}MB 上限，没有下载")
-                    fh.write(chunk)
-        _log.info("已取回 AI 端产出文件", file_id=ref.file_id, bytes=written, name=name)
-        return path
+    def __init__(self, *, max_total_bytes: int = MAX_TOTAL_BYTES) -> None:
+        self._max = max_total_bytes
 
     @asynccontextmanager
     async def materialize(self, account_id: str, refs: list[FileRef]):
-        """下载这批文件，交出本机路径；退出时**连临时目录一起删**（产出物不在这台机器上留底）。"""
+        """落盘这批文件；退出时**连临时目录一起删**。"""
         if not refs:
-            raise DownloadError("没有可下载的文件")
-        ticket = await self._tickets.mint(account_id)
+            raise DownloadError("没有可发送的文件")
+        total = 0
         with TemporaryDirectory(prefix="lxz_send_") as tmp:
             dest = Path(tmp)
-            client = self._client or httpx.AsyncClient()
-            owns = self._client is None
-            try:
-                paths = [await self._fetch_one(client, ref, ticket, dest) for ref in refs]
-                yield paths
-            finally:
-                if owns:
-                    await client.aclose()
+            paths: list[Path] = []
+            for index, ref in enumerate(refs):
+                try:
+                    content = base64.b64decode(ref.content_b64, validate=True)
+                except (binascii.Error, ValueError) as exc:
+                    raise DownloadError(f"文件「{ref.file_name}」内容损坏，没有发送") from exc
+                if not content:
+                    raise DownloadError(f"文件「{ref.file_name}」是空的，微信发不了空文件")
+                total += len(content)
+                if total > self._max:
+                    raise DownloadError(f"这批文件超过 {self._max // (1024 * 1024)}MB 上限，没有发送")
+                # 同名文件各自占一个子目录，免得后一个把前一个覆盖掉。
+                folder = dest / str(index)
+                folder.mkdir()
+                path = folder / ref.file_name
+                path.write_bytes(content)
+                paths.append(path)
+                _log.info("已落地待发送文件", file_id=ref.file_id, name=ref.file_name, bytes=len(content))
+            yield paths

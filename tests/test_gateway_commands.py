@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
@@ -13,13 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from wxclient.gateway import CommandExecutor, GatewayStore, OutboundGuard
-from wxclient.gateway.download import (
-    DownloadError,
-    FileFetcher,
-    _name_from_headers,
-    _reject_html,
-    http_base_from_ws,
-)
+from wxclient.gateway.download import DownloadError, FileFetcher, FileRef
 from wxclient.queue import TaskType
 
 BEIJING = timezone(timedelta(hours=8))
@@ -276,7 +271,7 @@ class SendFilesDownloadTestCase(CommandTestCase):
         ex = self._executor(runtime, fetcher=fetcher)
         result = await ex.execute({
             "command_id": "c1", "op": "send_files",
-            "args": {"to": "张三", "files": [{"file_id": "f1", "url": "/v1/sessions/s1/files/f1"}]},
+            "args": {"to": "张三", "files": [{"file_id": "f1", "file_name": "海报.jpg", "content_b64": "YQ=="}]},
         })
         self.assertEqual(result.status, "done", result.reason)
         task_type, payload, _conf = runtime.calls[0]
@@ -290,7 +285,7 @@ class SendFilesDownloadTestCase(CommandTestCase):
         ex = self._executor(runtime, fetcher=self._fetcher(boom="这个文件在 AI 服务上找不到了"))
         result = await ex.execute({
             "command_id": "c2", "op": "send_files",
-            "args": {"to": "张三", "files": [{"file_id": "f1", "url": "/v1/sessions/s1/files/f1"}]},
+            "args": {"to": "张三", "files": [{"file_id": "f1", "file_name": "海报.jpg", "content_b64": "YQ=="}]},
         })
         self.assertEqual(result.status, "failed")
         self.assertIn("找不到", result.reason)
@@ -301,64 +296,49 @@ class SendFilesDownloadTestCase(CommandTestCase):
         ex = self._executor(runtime)   # 不带 fetcher
         result = await ex.execute({
             "command_id": "c3", "op": "send_files",
-            "args": {"to": "张三", "files": [{"file_id": "f1", "url": "/v1/sessions/s1/files/f1"}]},
+            "args": {"to": "张三", "files": [{"file_id": "f1", "file_name": "海报.jpg", "content_b64": "YQ=="}]},
         })
         self.assertEqual(result.status, "rejected")
         self.assertEqual(runtime.calls, [])
 
 
-class DownloadUrlTestCase(unittest.TestCase):
-    """下载器的地址判定——这条线是防 SSRF 的，必须有回归护栏。"""
+class InlineFileTestCase(unittest.IsolatedAsyncioTestCase):
+    """字节随指令下发：落盘 → 交本机路径 → 用完删。"""
 
-    def _fetcher(self) -> Any:
-        return FileFetcher(ws_url="wss://ai.example.com/v1/ws", ticket_provider=None)
+    def _ref(self, name: str, data: bytes) -> FileRef:
+        return FileRef.parse({"file_id": "f1", "file_name": name, "content_b64": base64.b64encode(data).decode()})
 
-    def test_ws_地址推导出_http_base(self) -> None:
-        self.assertEqual(http_base_from_ws("wss://ai.example.com/v1/ws"), "https://ai.example.com")
-        self.assertEqual(http_base_from_ws("ws://127.0.0.1:8137/v1/ws"), "http://127.0.0.1:8137")
+    async def test_落盘后交出本机路径且内容一致(self) -> None:
+        ref = self._ref("招聘海报-1.jpg", b"\xff\xd8\xff\xe0")
+        async with FileFetcher().materialize("acc", [ref]) as paths:
+            self.assertEqual(paths[0].name, "招聘海报-1.jpg", "原名要带到微信上，不能退化成 .bin")
+            self.assertEqual(paths[0].read_bytes(), b"\xff\xd8\xff\xe0")
+            tmp_root = paths[0].parent.parent
+        self.assertFalse(tmp_root.exists(), "发完必须连临时目录一起删")
 
-    def test_反代前缀必须留着(self) -> None:
-        """线上就是这个形状；丢了前缀会打到前端 SPA 的兜底 location，拿回一张 index.html。"""
-        self.assertEqual(
-            http_base_from_ws("wss://worker.laoxiaozhi.cn/agent-ws/v1/ws"),
-            "https://worker.laoxiaozhi.cn/agent-ws",
-        )
-        fetcher = FileFetcher(ws_url="wss://worker.laoxiaozhi.cn/agent-ws/v1/ws", ticket_provider=None)
-        self.assertEqual(
-            fetcher._absolute("/v1/sessions/s1/files/f1"),
-            "https://worker.laoxiaozhi.cn/agent-ws/v1/sessions/s1/files/f1",
-        )
+    async def test_同名文件不互相覆盖(self) -> None:
+        refs = [self._ref("海报.jpg", b"a"), self._ref("海报.jpg", b"bb")]
+        async with FileFetcher().materialize("acc", refs) as paths:
+            self.assertEqual([p.read_bytes() for p in paths], [b"a", b"bb"])
 
-    def test_取回网页当场停不当成文件(self) -> None:
-        """200 + text/html = 地址打偏了。这一条比 404 更危险：它会被当成下载成功。"""
+    async def test_超总量上限就拒绝而不是硬写盘(self) -> None:
+        refs = [self._ref("大.bin", b"x" * 1024)]
         with self.assertRaises(DownloadError):
-            _reject_html({"content-type": "text/html; charset=utf-8"})
-        _reject_html({"content-type": "image/jpeg"})   # 正常图片不该被拦
+            async with FileFetcher(max_total_bytes=512).materialize("acc", refs):
+                pass
 
-    def test_带前缀时外部地址仍然拒(self) -> None:
-        fetcher = FileFetcher(ws_url="wss://worker.laoxiaozhi.cn/agent-ws/v1/ws", ticket_provider=None)
-        for url in (
-            "https://evil.example.com/agent-ws/v1/sessions/s1/files/f1",
-            "https://worker.laoxiaozhi.cn/v1/sessions/s1/files/f1",   # 少了前缀 = 打到 SPA
-        ):
+    async def test_空文件与坏_base64_明确报错(self) -> None:
+        # 空内容在 parse 阶段就不算文件；坏 base64 要在落盘前拦下。
+        self.assertIsNone(FileRef.parse({"file_id": "f1", "file_name": "空.jpg", "content_b64": ""}))
+        for ref in (FileRef("f1", "空.jpg", "  "), FileRef("f1", "坏.jpg", "!!!not-base64!!!")):
             with self.assertRaises(DownloadError):
-                fetcher._absolute(url)
+                async with FileFetcher().materialize("acc", [ref]):
+                    pass
 
-    def test_相对路径按自家_base_拼(self) -> None:
-        got = self._fetcher()._absolute("/v1/sessions/s1/files/f1")
-        self.assertEqual(got, "https://ai.example.com/v1/sessions/s1/files/f1")
+    def test_文件名不许带路径(self) -> None:
+        ref = FileRef.parse({"file_id": "f1", "file_name": "../../evil.png", "content_b64": "YQ=="})
+        self.assertNotIn("/", ref.file_name)
+        self.assertNotIn("..", ref.file_name.strip("._"))
 
-    def test_外部_host_一律拒(self) -> None:
-        for url in ("https://evil.example.com/v1/sessions/s1/files/f1", "http://169.254.169.254/latest/meta-data"):
-            with self.assertRaises(DownloadError):
-                self._fetcher()._absolute(url)
-
-    def test_同_host_但不是取会话文件的路径也拒(self) -> None:
-        for url in ("/metrics", "/v1/sessions/s1/files/f1/../../../etc/passwd", "https://ai.example.com/dev/raw"):
-            with self.assertRaises(DownloadError):
-                self._fetcher()._absolute(url)
-
-    def test_响应里的文件名不许带路径(self) -> None:
-        name = _name_from_headers({"content-disposition": 'attachment; filename="../../evil.png"'}, "x.bin")
-        self.assertNotIn("/", name)
-        self.assertNotIn("..", name.strip("._"))
+    def test_没有字节的描述符不算文件(self) -> None:
+        self.assertIsNone(FileRef.parse({"file_id": "f1", "url": "/v1/sessions/s/files/f1"}))

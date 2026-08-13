@@ -21,6 +21,14 @@ from websockets.asyncio.client import connect as ws_connect
 
 _log = structlog.get_logger(__name__)
 
+#: 单帧上限。websockets 默认 1MB，而 067 发文件时**字节随指令一起推下来**
+#: （两张海报 ≈ 0.7MB base64，已经贴着默认值）。给到 16MB，超限会直接断连很难查。
+MAX_FRAME_BYTES = 16 * 1024 * 1024
+
+
+async def _connect_with_limits(url: str):
+    return await ws_connect(url, max_size=MAX_FRAME_BYTES)
+
 # 一轮结束的两种信号：AI 端既可能发 ev=done，也可能发 status{state:done}。两者都要认。
 _TURN_DONE_EVENTS = frozenset({"done"})
 
@@ -100,7 +108,7 @@ class AgentWsClient:
         self._url = ws_url
         self._turn_timeout = turn_timeout_seconds
         self._op_timeout = op_timeout_seconds
-        self._connect = connect_factory or ws_connect
+        self._connect = connect_factory or _connect_with_limits
         self._on_push = on_push
 
         self._ws: Any = None
@@ -229,7 +237,7 @@ class AgentWsClient:
         frame: dict[str, Any] = {"v": 1, "id": ack or f"{op}-{next(self._ids)}", "op": op, "data": data}
         try:
             await self._ws.send(json.dumps(frame, ensure_ascii=False))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise AgentWsError(f"发送 {op} 失败: {exc}") from exc
 
     async def _request(self, op: str, data: dict[str, Any]) -> dict[str, Any]:

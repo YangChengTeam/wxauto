@@ -101,7 +101,6 @@ def build_gateway(
             friend_interval, MIN_FRIEND_INTERVAL_SECONDS, what="加好友检查间隔"
         )
 
-    # 一份票据来源两处用：WS 连接、以及发文件时去 AI 端取产出物（067）。
     ticket_provider = build_ticket_provider(gateway_settings)
 
     runner = GatewayRunner(
@@ -127,10 +126,7 @@ def build_gateway(
             account_id=resolved_accounts[0],
             allow_real_actions=allow_real_actions,
             confirmation=REAL_ACTION_CONFIRMATION,
-            fetcher=FileFetcher(
-                ws_url=gateway_settings.ai_ws_url,
-                ticket_provider=ticket_provider,
-            ),
+            fetcher=FileFetcher(),
         ),
         friend_watcher=FriendWatcher(
             accounts=resolved_accounts,
