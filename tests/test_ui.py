@@ -168,6 +168,15 @@ class LogFeedTests(unittest.TestCase):
         feed.pause()
         self.assertEqual(feed.drain(), [])
 
+    def test_pausing_with_pending_lines_still_asks_for_a_replay(self) -> None:
+        # 窗口切走的那一瞬间队列里正好有日志：丢可以，但不能忘了记「漏画过」，
+        # 否则下次打开窗口不整屏回放，这几行就永远上不了屏
+        feed = LogFeed()
+        feed.resume()
+        feed.push("切走前一刹那来的")
+        feed.pause()
+        self.assertTrue(feed.resume(), "丢掉待画的行之后必须要求整屏回放")
+
     def test_pending_is_capped_so_a_stuck_ui_cannot_grow_without_bound(self) -> None:
         feed = LogFeed(pending_cap=10)
         feed.resume()

@@ -81,7 +81,12 @@ class LogFeed:
     def pause(self) -> None:
         with self._lock:
             self._paused = True
-            self._pending.clear()  # 攒着的也不用画了，缓冲里有
+            if self._pending:
+                # 攒着还没画的这批要丢掉（缓冲里有全量），但**必须记一笔漏画**：
+                # 否则下次 resume() 会说「没漏什么」→ 不整屏回放 → 这几行就再也不上屏了。
+                # 窗口切走的那一瞬间正好有日志在队列里，这条路径就会踩到。
+                self._missed = True
+                self._pending.clear()
 
     def resume(self) -> bool:
         """恢复渲染。返回 True = 暂停期间有新日志，调用方需要整屏回放一次。"""
