@@ -79,7 +79,7 @@ def _file_refs(args: dict[str, Any]) -> list[FileRef]:
     raw = args.get("files")
     refs = [ref for ref in (FileRef.parse(item) for item in raw) if ref] if isinstance(raw, list) else []
     if not refs:
-        raise CommandError("缺少必填参数 files（要 {file_id, url} 描述符，不是文件路径）")
+        raise CommandError("这条发文件指令没带上任何文件（AI 端应随指令送来文件字节）")
     if len(refs) > 9:
         raise CommandError("一条指令最多带 9 个文件")
     return refs
