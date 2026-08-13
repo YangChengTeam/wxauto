@@ -386,6 +386,97 @@ class GatewayServiceTests(unittest.TestCase):
         self.assertIs(service.state, ServiceState.STOPPED)
 
 
+class StateCallbackIsolationTests(unittest.TestCase):
+    """★ 2026-08-13 真机：「保存并重启」→ 停机成功、再也没启动、界面全程卡死。
+
+    病根：状态回调原来是**同步**跑的，而 ``start()``/``stop()`` 是在 ``with self._lock:``
+    里调 ``_set_state`` 的（RLock 外层还持着）→ 回调跑在持锁状态下。回调里 ``tray.refresh()``
+    要从非托盘线程打 Win32 托盘接口，对面没就绪就干等，于是：
+      · 重启线程卡在回调里，永远走不到 ``start()``（日志停在「网关已停止」）；
+      · 主线程每秒读一次状态，被这把锁挡住 → 窗口不重绘 = 卡死。
+    这里钉死：**回调再怎么卡，都不许拖住谁。**
+    """
+
+    def test_a_hung_callback_does_not_block_start_stop_or_state_reads(self) -> None:
+        started = threading.Event()
+        gateway = _FakeGateway(started)
+        service = GatewayService(lambda: gateway)
+
+        wedged = threading.Event()  # 永不 set：模拟卡死在托盘更新里的回调
+        entered = threading.Event()
+
+        def hung_listener(_state: object, _error: object) -> None:
+            entered.set()
+            wedged.wait()
+
+        service.set_state_listener(hung_listener)
+
+        service.start()
+        self.assertTrue(entered.wait(timeout=5), "回调应当被调用（只是它卡住了）")
+        # 回调卡着，但服务照常起来、状态照常读得到（读状态是主线程每秒都要干的事）
+        self.assertTrue(service.wait_ready(timeout=5))
+        self.assertTrue(started.wait(timeout=5))
+        self.assertIs(service.state, ServiceState.RUNNING)
+        self.assertIsNone(service.error)
+        self.assertIsNotNone(service.uptime_seconds())
+
+        service.stop(timeout=5)
+        self.assertIs(service.state, ServiceState.STOPPED)
+        wedged.set()
+
+    def test_restart_reaches_start_even_if_the_callback_is_wedged(self) -> None:
+        """真机现象的正面复现：停了之后**必须**还能起来。"""
+        started = threading.Event()
+        gateway = _FakeGateway(started)
+        builds: list[int] = []
+
+        def build() -> _FakeGateway:
+            builds.append(1)
+            started.clear()
+            return gateway
+
+        service = GatewayService(build)
+        service.set_state_listener(lambda *_: threading.Event().wait())  # 每次通知都卡死
+
+        service.start()
+        self.assertTrue(started.wait(timeout=5))
+
+        started.clear()  # on_done 只保证 start() 调过了，装配跑在网关线程上——盯 started 才作数
+        done = threading.Event()
+        thread = service.restart_async(on_done=done.set, timeout=5)
+        self.assertIsNotNone(thread)
+        self.assertTrue(done.wait(timeout=20), "重启必须跑完——卡住的回调不该把它钉在半路")
+        self.assertTrue(started.wait(timeout=10), "★ 停完之后必须真的又起来了")
+        self.assertEqual(len(builds), 2)
+        self.assertIs(service.state, ServiceState.RUNNING)
+
+        service.stop(timeout=5)
+
+    def test_a_throwing_callback_does_not_kill_later_notifications(self) -> None:
+        started = threading.Event()
+        gateway = _FakeGateway(started)
+        service = GatewayService(lambda: gateway)
+
+        seen: list[ServiceState] = []
+        boom = [True]
+
+        def listener(state: ServiceState, _error: object) -> None:
+            if boom[0]:
+                boom[0] = False
+                raise RuntimeError("界面炸了")
+            seen.append(state)
+
+        service.set_state_listener(listener)
+        service.start()
+        self.assertTrue(started.wait(timeout=5))
+        service.stop(timeout=5)
+
+        deadline = time.monotonic() + 5
+        while ServiceState.STOPPED not in seen and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertIn(ServiceState.STOPPED, seen, "第一次抛异常之后，后面的通知还得照发")
+
+
 class AppIconTests(unittest.TestCase):
     """exe / 快捷方式 / 任务栏 / 托盘用同一份品牌图标（用户 2026-08-13 要求）。"""
 

@@ -7,6 +7,7 @@ UI 线程（tkinter）绝不能被 asyncio 阻塞，所以网关整体跑在自�
 from __future__ import annotations
 
 import asyncio
+import queue
 import threading
 import time
 from collections.abc import Callable
@@ -57,6 +58,15 @@ class GatewayService:
         self._lock = threading.RLock()
         self._state = ServiceState.STOPPED
         self._error: str | None = None
+        # ★ 状态快照（(state, error) 元组，整体替换）。界面每秒读好几次状态，**读它一律不拿锁**：
+        #   只要主线程会为这把锁等，任何一次「持锁的慢操作」都会变成窗口不重绘 = 卡死。
+        #   单次赋值在 CPython 下是原子的，读到的永远是某一时刻的完整快照。
+        self._snapshot: tuple[ServiceState, str | None] = (ServiceState.STOPPED, None)
+        # ★ 状态回调改成**异步单线程派发**（见 _notifier）。回调里要动托盘/界面，
+        #   在调用者线程上直接跑就等于把 UI 的毛病传染给网关线程。
+        self._events: queue.Queue[tuple[ServiceState, str | None]] = queue.Queue()
+        self._notifier = threading.Thread(target=self._pump_events, name="wx-svc-notify", daemon=True)
+        self._notifier.start()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._gateway: Gateway | None = None
@@ -74,13 +84,11 @@ class GatewayService:
 
     @property
     def state(self) -> ServiceState:
-        with self._lock:
-            return self._state
+        return self._snapshot[0]  # 无锁：见 __init__ 里 _snapshot 的说明
 
     @property
     def error(self) -> str | None:
-        with self._lock:
-            return self._error
+        return self._snapshot[1]
 
     @property
     def label(self) -> str:
@@ -269,6 +277,17 @@ class GatewayService:
         self._ready.set()
 
     def _set_state(self, state: ServiceState, error: str | None) -> None:
+        """改状态并**异步**通知。绝不在这里直接跑回调。
+
+        ★ 2026-08-13 真机：「保存并重启」点下去之后停机成功、却再也没有启动，界面全程卡死。
+        病根就在这一句原来是**同步调回调**的：`start()`/`stop()` 是在 `with self._lock:`
+        里调 `_set_state` 的（RLock，外层那圈还持着），于是回调跑在**持锁状态**下；
+        而回调里有一步是 `tray.refresh()`——从非托盘线程打 Win32 托盘接口，一旦对面没就绪
+        就干等。结果两头一起完蛋：
+          · 重启线程卡在回调里，永远走不到 `self.start()` → 日志停在「网关已停止」；
+          · 主线程每秒要读一次状态，被这把锁挡住 → 窗口不重绘 = 用户看到的「卡死」。
+        现在锁内只改字段，通知丢给单独一条线程发，谁都不等谁。
+        """
         with self._lock:
             self._state = state
             self._error = error
@@ -276,8 +295,16 @@ class GatewayService:
                 self._running_since = self._running_since or time.monotonic()
             elif state in {ServiceState.STOPPED, ServiceState.FAILED}:
                 self._running_since = None
+        self._snapshot = (state, error)  # 无锁读的那份，锁外更新
+        self._events.put((state, error))
+
+    def _pump_events(self) -> None:
+        """专职发状态通知的线程。回调再慢再卡，卡的也只是它自己。"""
+        while True:
+            state, error = self._events.get()
             callback = self._on_state_change
-        if callback is not None:
+            if callback is None:
+                continue
             try:
                 callback(state, error)
             except Exception:  # noqa: BLE001 - UI 抽风不该拖垮服务
