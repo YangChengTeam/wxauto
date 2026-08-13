@@ -27,9 +27,22 @@ excludes = [
     "PyQt5", "PyQt6", "PySide2", "PySide6", "wx",
     # 科学计算/绘图全家桶：没人 import，但一旦被误收就是几十上百 MB
     "matplotlib", "pandas", "scipy", "IPython", "jupyter", "notebook",
+    # OpenCV：**整包最大的一块，138 MB**（cv2.pyd 86MB + 两个 ffmpeg dll 52MB）。
+    # 谁把它拖进来的：pyautogui → pyscreeze，而 pyscreeze 只有在 `locateOnScreen(...,
+    # confidence=)` 这种模糊图像匹配时才需要 cv2。本仓 + third_party/pywechat 全文没有
+    # 一处 `import cv2`、也没有一处用 confidence=（找元素走的是 UIA 控件树，不是找图），
+    # 所以整块砍掉。**哪天真要做图像匹配，得先把这行删了再打包。**
+    "cv2",
+    # MySQL 驱动：队列库是 SQLite，SQLAlchemy 的 mysql 方言没人用，
+    # 但打包机上装着驱动就会被连 libmysql.dll(7MB) 一起收进来。
+    "pymysql", "MySQLdb", "mysql", "mysqlclient",
     # tkinter 自带的演示与测试
     "tkinter.test", "test",
 ]
+# 没往表里放但值得知道的：numpy（含 openblas 19MB）**必须留着**——
+# third_party/pywechat 的 `utils.py` 顶上就 `import soundfile`，而 soundfile 依赖 numpy。
+# cryptography（_rust.pyd 9MB）也先留着：TLS 走的是标准库 ssl 不是它，但没实测过砍掉的
+# 影响，9MB 不值得拿线上连不上去换。
 
 a = Analysis(
     ["../wxclient/ui/__main__.py"],
