@@ -71,9 +71,14 @@ def parse_active_hours(window: str) -> tuple[time, time]:
 
 
 def within_active_hours(now: datetime, window: str) -> bool:
-    """是否在允许发送的时间窗内。跨午夜（如 22:00-02:00）也支持。"""
+    """是否在允许动作的时间窗内。跨午夜（如 22:00-02:00）也支持。
+
+    ★ 比的是**本机墙上时间**。网关内部一律用 UTC 传时间，可「09:00-21:00」说的显然是
+    专员那台机器上的九点到九点——直接拿 UTC 的 `.time()` 比，东八区就成了 17:00–次日 05:00：
+    白天不发、半夜猛发，正好是风控最看不惯的样子。带时区的先换算到本地，naive 的按本地看待。
+    """
     start, end = parse_active_hours(window)
-    current = now.time()
+    current = (now.astimezone() if now.tzinfo is not None else now).time()
     if start <= end:
         return start <= current <= end
     return current >= start or current <= end

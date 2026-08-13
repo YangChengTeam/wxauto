@@ -11,6 +11,7 @@ from pathlib import Path
 from fake_agent_ws import FakeAgentServer, TurnScript
 
 from wxclient.gateway import (
+    PUSH_EVENT,
     AgentWsClient,
     AgentWsError,
     GatewaySettings,
@@ -30,6 +31,44 @@ WECHAT_CARD = {
         "actions": [],
     },
 }
+
+
+class ServerPushTests(unittest.IsolatedAsyncioTestCase):
+    """AI 端主动推来的、不属于任何一轮的事件（监听列表就走这条）。"""
+
+    async def test_unsolicited_event_reaches_on_push(self) -> None:
+        received: list[tuple[str, dict]] = []
+        payload = {"only": ["候选人-王建国"], "allow_groups": False}
+        async with FakeAgentServer(
+            valid_tickets={"tkt-ok"}, push_on_auth=(PUSH_EVENT, payload)
+        ) as server:
+            client = AgentWsClient(server.url, on_push=lambda ev, data: received.append((ev, data)))
+            await client.connect("tkt-ok")
+            try:
+                for _ in range(50):          # 推是异步到的，给读循环几拍
+                    if received:
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertEqual(received, [(PUSH_EVENT, payload)])
+            finally:
+                await client.close()
+
+    async def test_bad_push_handler_does_not_kill_the_connection(self) -> None:
+        """一个坏推送不该把整条连接的读循环掀翻——后面还要靠它跑对话。"""
+        def boom(_ev: str, _data: dict) -> None:
+            raise RuntimeError("处理推送时炸了")
+
+        async with FakeAgentServer(
+            valid_tickets={"tkt-ok"}, push_on_auth=(PUSH_EVENT, {"only": []})
+        ) as server:
+            client = AgentWsClient(server.url, on_push=boom)
+            await client.connect("tkt-ok")
+            try:
+                await asyncio.sleep(0.1)
+                self.assertTrue(client.connected)
+                self.assertTrue(await client.start_session("wechat_reply"))
+            finally:
+                await client.close()
 
 
 class WsClientTests(unittest.IsolatedAsyncioTestCase):

@@ -20,11 +20,14 @@ from typing import Any
 import structlog
 
 from .config import GatewaySettings
-from .guard import OutboundGuard
+from .friends import FriendWatcher
+from .guard import OutboundGuard, within_active_hours
 from .inbound import InboundLoop, InboundMessage, MessageSource
 from .outbound import DeliveryResult, MessageSink, OutboundSender
+from .pacing import MIN_READ_INTERVAL_SECONDS, clamp_interval
 from .sessions import GatewayStore
 from .ticket import TicketProvider
+from .watchlist import PUSH_EVENT, Watchlist
 from .wsclient import AgentWsClient, AgentWsError, Unauthorized
 
 _log = structlog.get_logger(__name__)
@@ -47,11 +50,13 @@ class ConnectionPool:
         ticket_provider: TicketProvider,
         turn_timeout_seconds: float = 180.0,
         client_factory: Callable[..., AgentWsClient] | None = None,
+        on_push: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._ws_url = ws_url
         self._tickets = ticket_provider
         self._turn_timeout = turn_timeout_seconds
         self._factory = client_factory or AgentWsClient
+        self._on_push = on_push
         self._clients: dict[str, AgentWsClient] = {}
         self._resumed: dict[str, set[str]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
@@ -68,7 +73,11 @@ class ConnectionPool:
 
             # 票 60s 即过期，所以每次建连都现换——绝不缓存复用。
             ticket = await self._tickets.mint(account_id)
-            client = self._factory(self._ws_url, turn_timeout_seconds=self._turn_timeout)
+            client = self._factory(
+                self._ws_url,
+                turn_timeout_seconds=self._turn_timeout,
+                on_push=self._on_push,
+            )
             await client.connect(ticket)
             self._clients[account_id] = client
             self._resumed[account_id] = set()
@@ -123,6 +132,8 @@ class GatewayRunner:
         source: MessageSource,
         sink: MessageSink,
         accounts: Sequence[str],
+        watchlist: Watchlist | None = None,
+        friend_watcher: FriendWatcher | None = None,
         client_factory: Callable[..., AgentWsClient] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -131,11 +142,14 @@ class GatewayRunner:
         self._accounts = tuple(accounts)
         self._connect_error: str | None = None
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._watchlist = watchlist
+        self._friends = friend_watcher
         self._pool = ConnectionPool(
             ws_url=settings.ai_ws_url,
             ticket_provider=ticket_provider,
             turn_timeout_seconds=settings.turn_timeout_seconds,
             client_factory=client_factory,
+            on_push=self._on_push,
         )
         self._sender = OutboundSender(
             sink=sink,
@@ -153,9 +167,27 @@ class GatewayRunner:
             store=store,
             handler=self.handle_turn,
             debounce_seconds=settings.debounce_seconds,
-            poll_interval_seconds=settings.poll_interval_seconds,
+            poll_interval_seconds=clamp_interval(
+                settings.poll_interval_seconds, MIN_READ_INTERVAL_SECONDS, what="读消息间隔"
+            ),
+            is_active=self.is_active,
             clock=self._clock,
         )
+
+    def is_active(self, now: datetime) -> bool:
+        """现在允不允许动微信。读消息、查好友、发送共用同一个「工作时间窗」。"""
+        return within_active_hours(now, self._settings.active_hours)
+
+    def _on_push(self, ev: str, data: dict[str, Any]) -> None:
+        """AI 端主动推来的事件（不属于任何一轮对话）。
+
+        目前只有一件事：更新监听列表。收到未知事件只记一条 debug，绝不因此断连——
+        AI 端将来加别的推送，旧网关必须还能照跑。
+        """
+        if ev == PUSH_EVENT and self._watchlist is not None:
+            self._watchlist.apply_push(data)
+            return
+        _log.debug("收到未处理的推送事件", ev=ev)
 
     # ────────────────────────── 一轮 ──────────────────────────
 
@@ -274,13 +306,19 @@ class GatewayRunner:
                 self._connect_error = None
 
     async def run(self) -> None:
-        keeper = asyncio.create_task(self._keepalive_loop(), name="gw-keepalive")
+        # 三条常驻循环各走各的节拍：保活 30s、读消息 ~1min、查好友申请 ~15min。
+        # 谁也不等谁——把它们串成一个循环就等于让最慢的那件事决定所有事的频率。
+        side_tasks = [asyncio.create_task(self._keepalive_loop(), name="gw-keepalive")]
+        if self._friends is not None:
+            side_tasks.append(asyncio.create_task(self._friends.run(), name="gw-friends"))
         try:
             await self.loop.run()
         finally:
-            keeper.cancel()
-            with suppress(asyncio.CancelledError):
-                await keeper
+            for task in side_tasks:
+                task.cancel()
+            for task in side_tasks:
+                with suppress(asyncio.CancelledError):
+                    await task
 
     async def _keepalive_loop(self) -> None:
         while True:
@@ -289,6 +327,8 @@ class GatewayRunner:
 
     async def stop(self) -> None:
         self.loop.stop()
+        if self._friends is not None:
+            self._friends.stop()
         # 收口给个上限：正常情况下几十毫秒就完了，但如果正卡在一轮对话里，drain 会一直等到
         # turn_timeout（默认 180s）——人已经点了退出，不能让他对着一个不动的窗口干等。
         try:

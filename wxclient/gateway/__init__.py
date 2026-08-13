@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from .config import GatewaySettings
+from .friends import FriendWatcher
 from .guard import (
     GuardDecision,
     OutboundGuard,
@@ -22,8 +23,10 @@ from .inbound import (
     format_transcript,
 )
 from .outbound import DeliveryResult, MessageSink, OutboundSender, extract_reply
+from .pacing import clamp_interval, jittered
 from .runner import ConnectionPool, GatewayRunner
 from .sessions import GatewayStore
+from .watchlist import PUSH_EVENT, WatchScope, Watchlist
 from .wechat_io import (
     QueueMessageSink,
     QueueMessageSource,
@@ -48,12 +51,14 @@ from .wsclient import (
 )
 
 __all__ = [
+    "PUSH_EVENT",
     "AgentWsClient",
     "AgentWsError",
     "BusinessTicketProvider",
     "ConnectionPool",
     "Debouncer",
     "DeliveryResult",
+    "FriendWatcher",
     "GatewayRunner",
     "GatewaySettings",
     "GatewayStore",
@@ -72,8 +77,12 @@ __all__ = [
     "TurnResult",
     "TurnTimeout",
     "Unauthorized",
+    "WatchScope",
+    "Watchlist",
+    "clamp_interval",
     "extract_reply",
     "format_transcript",
+    "jittered",
     "looks_like_rejection",
     "message_signature",
     "parse_active_hours",

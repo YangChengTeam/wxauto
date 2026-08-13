@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ from typing import Protocol
 import structlog
 
 from .guard import looks_like_rejection
+from .pacing import jittered
 
 _log = structlog.get_logger(__name__)
 
@@ -124,7 +126,9 @@ class InboundLoop:
         handler: TurnHandler,
         debounce_seconds: float = 3.0,
         poll_interval_seconds: float = 5.0,
+        is_active: Callable[[datetime], bool] | None = None,
         clock: Callable[[], datetime] | None = None,
+        rng: random.Random | None = None,
     ) -> None:
         self._accounts = list(accounts)
         self._source = source
@@ -132,15 +136,32 @@ class InboundLoop:
         self._handler = handler
         self._poll_interval = poll_interval_seconds
         self._debouncer = Debouncer(debounce_seconds)
+        self._is_active = is_active or (lambda _now: True)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._rng = rng
+        self._sleeping = False
         self._inflight: dict[PeerKey, asyncio.Task[None]] = {}
         self._stopped = asyncio.Event()
 
     # ────────────────────────── 单步 ──────────────────────────
 
     async def tick(self) -> int:
-        """跑一趟：取消息 → 去重 → 去抖 → 派发。返回本趟派发的批次数。"""
+        """跑一趟：取消息 → 去重 → 去抖 → 派发。返回本趟派发的批次数。
+
+        非工作时段**一个微信动作都不做**（连读都不读）。原来只在发送那一步拦，可入站轮询
+        是 24 小时不停的——凌晨三点还在一秒不差地翻聊天列表，正是风控要找的那种账号
+        （2026-08-12 真机自动退登事故）。夜里攒下的消息不会丢：微信里还是未读，
+        第二天进工作时段第一趟就读到。
+        """
         now = self._clock()
+        if not self._is_active(now):
+            if not self._sleeping:
+                self._sleeping = True
+                _log.info("不在工作时间窗，暂停轮询微信")
+            return 0
+        if self._sleeping:
+            self._sleeping = False
+            _log.info("进入工作时间窗，恢复轮询微信")
         await self._collect(now)
         return self._dispatch_due(now)
 
@@ -242,8 +263,11 @@ class InboundLoop:
         self._stopped.clear()
         while not self._stopped.is_set():
             await self.tick()
+            # 抖动而不是定时：每 60 秒整点动一次微信，是「这不是人在用」最明显的指纹。
             try:
-                await asyncio.wait_for(self._stopped.wait(), timeout=self._poll_interval)
+                await asyncio.wait_for(
+                    self._stopped.wait(), timeout=jittered(self._poll_interval, rng=self._rng)
+                )
             except TimeoutError:
                 continue
         await self.drain()

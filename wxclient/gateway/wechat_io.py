@@ -27,6 +27,7 @@ from wxclient.queue import TaskType
 
 from .inbound import InboundMessage
 from .sessions import GatewayStore
+from .watchlist import Watchlist
 
 _log = structlog.get_logger(__name__)
 
@@ -120,33 +121,30 @@ class QueueMessageSource:
         *,
         runtime,  # WeChatRuntime 或任何提供 submit(TaskType, payload) 的对象
         store: GatewayStore,
+        watchlist: Watchlist | None = None,
         history_limit: int = 20,
-        allow_groups: bool = False,
-        allowlist: Sequence[str] = (),
-        denylist: Sequence[str] = (),
         clock=None,
     ) -> None:
         self._runtime = runtime
         self._store = store
+        self._watchlist = watchlist or Watchlist()
         self._history_limit = history_limit
-        self._allow_groups = allow_groups
-        self._allowlist = {name.strip() for name in allowlist if str(name).strip()}
-        self._denylist = {name.strip() for name in denylist if str(name).strip()}
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def skip_reason(self, account_id: str, peer_id: str) -> str | None:
         """这个会话该不该碰；返回不碰的理由，None 表示可以处理。
 
         判定放在**打开会话之前**：打开一个聊天窗口本身就是打扰（窗口会弹到前台，
-        还会把未读清掉），不该为了判断该不该回而先去动它。
+        还会把未读清掉），不该为了判断该不该回而先去动它。名单本身由 AI 端推下来
+        （``watchlist.py``），这里只负责照办。
         """
-        if peer_id in self._denylist:
-            return "在不处理名单里"
-        if self._allowlist and peer_id not in self._allowlist:
-            return "不在只处理名单里"
-        if not self._allow_groups and self._store.is_known_group(account_id, peer_id):
-            return "是群聊（默认不处理）"
-        return None
+        return self._watchlist.reason(
+            peer_id, is_group=self._store.is_known_group(account_id, peer_id)
+        )
+
+    @property
+    def allow_groups(self) -> bool:
+        return self._watchlist.scope.allow_groups
 
     async def fetch(self, account_id: str) -> list[InboundMessage]:
         unread = await self._runtime.submit(TaskType.GET_UNREAD_MESSAGES, {})
@@ -177,7 +175,7 @@ class QueueMessageSource:
         # 下一轮在 skip_reason 里直接拦掉，不用再开一次窗口。
         if any(raw.get("is_group") for raw in raw_messages):
             self._store.mark_peer_kind(account_id, peer_id, is_group=True)
-            if not self._allow_groups:
+            if not self.allow_groups:
                 # 游标仍然对齐到最新：不处理不等于要在下次把这些当成新消息。
                 if raw_messages:
                     self._store.set_cursor(

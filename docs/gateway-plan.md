@@ -152,12 +152,42 @@ WXCLIENT_GATEWAY_BUSINESS_API_URL      https://<business-host>
 WXCLIENT_GATEWAY_INTERNAL_KEY          <网关专用 internal key>   ← 网关唯一持有的秘密
 WXCLIENT_GATEWAY_LOCAL_TICKET_FILE     联调用本地票据文件（与上面两项互斥，生产留空）
 WXCLIENT_GATEWAY_TASK_TYPE             默认 wechat_reply
-WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS 入站轮询间隔
+WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS 读消息间隔，默认 60，下限 30
+WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS  查新好友间隔，默认 900，下限 300，0=不查
 WXCLIENT_GATEWAY_DEBOUNCE_SECONDS      去抖窗口
 WXCLIENT_GATEWAY_TURN_TIMEOUT_SECONDS  一轮上限，默认 180
 WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR    每号每小时发送上限
-WXCLIENT_GATEWAY_ACTIVE_HOURS          工作时间窗，如 09:00-21:00
+WXCLIENT_GATEWAY_ACTIVE_HOURS          工作时间窗，如 09:00-21:00（窗外一概不动微信）
+WXCLIENT_GATEWAY_ALLOW_GROUPS          应急开关：连群聊也回，默认关
+WXCLIENT_GATEWAY_PEER_ALLOWLIST        应急开关：只处理这几个会话
+WXCLIENT_GATEWAY_PEER_DENYLIST         应急开关：永不处理这几个会话
 ```
+
+桌面端「参数设置」只摆前 9 项里必须由人定的那些；三个应急开关和有正确默认值的项
+（task_type / 去抖 / 单轮上限）只留环境变量，手工写进 `gateway.env` 依然生效。
+
+### 4.1 节拍与风控（2026-08-12 事故后定的）
+
+真机上跑了一天之后**微信自己退了登录**，判定触发风控。UI 自动化最像机器的两点是
+「节拍精确到秒」和「半夜也在动」，所以节拍层（`gateway/pacing.py`）定死三条：
+
+| 规则 | 值 | 为什么 |
+|---|---|---|
+| 读消息间隔下限 | 30s（默认 60s） | 原来 5s/15s 一趟，一天几千次翻聊天列表 |
+| 查新好友间隔下限 | 300s（默认 900s） | 加好友是风控最敏感的一类动作，节拍要慢一个量级 |
+| 每次间隔带随机抖动 | ±30% | 整点动作是「这不是人在用」最明显的指纹 |
+
+外加：**工作时间窗之外一个微信动作都不做**（原来只拦发送，轮询是 24 小时不停的），
+且时间窗比的是**本机墙上时间**——原来拿 UTC 比，在东八区等于「白天不发、半夜猛发」。
+
+### 4.2 监听列表由 AI 端推
+
+该盯哪些候选人是业务侧才知道的事，不该在桌面端手抄。AI 端连上后可随时推
+`ev: "wechat.watchlist"`，`data: {only:[…], never:[…], allow_groups:bool}`，
+网关整体替换即时生效（`gateway/watchlist.py`）。缺字段沿用现值、坏数据不换
+（名单被坏帧清空 = 开始回本不该回的人）。**网关侧收帧已实现并有测试；AI 端还没有
+发这个事件的地方**——在那之前用本地兜底：所有单聊都管、群聊一概不管。
+
 
 启动：
 

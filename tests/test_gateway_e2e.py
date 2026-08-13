@@ -95,6 +95,8 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
             "local_ticket_file": self.tickets_file,
             "debounce_seconds": 3.0,
             "turn_timeout_seconds": 10.0,
+            # 时间窗给满：T0 是 UTC，换算到跑测试那台机器的本地时间是几点，不该影响这些用例。
+            "active_hours": "00:00-23:59",
         }
         base.update(overrides)
         return GatewaySettings(**base)

@@ -40,8 +40,11 @@ class FakeAgentServer:
         *,
         valid_tickets: set[str] | None = None,
         turn_script: TurnScript | Callable[[str, str], TurnScript] | None = None,
+        push_on_auth: tuple[str, dict[str, Any]] | None = None,
     ) -> None:
         self._valid_tickets = valid_tickets
+        self._push_on_auth = push_on_auth
+        """鉴权成功后主动推一帧（不带 ack），用来模拟 AI 端下发监听列表。"""
         self._turn_script = turn_script or TurnScript(
             deltas=["你好", "，还在招人"],
             cards=[{"type": "info", "body": {"kind": "wechat_reply", "reply_segments": ["你好"]}}],
@@ -92,6 +95,9 @@ class FakeAgentServer:
                     return
                 authenticated = True
                 await self._emit(websocket, ack, "status", {"state": "authenticated"})
+                if self._push_on_auth is not None:
+                    push_ev, push_data = self._push_on_auth
+                    await self._emit(websocket, None, push_ev, push_data)
                 continue
 
             if not authenticated:

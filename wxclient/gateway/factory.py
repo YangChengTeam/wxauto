@@ -16,9 +16,12 @@ from wxclient.config import load_settings
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
 from .config import GatewaySettings
+from .friends import FriendWatcher
+from .pacing import MIN_FRIEND_INTERVAL_SECONDS, clamp_interval
 from .runner import GatewayRunner
 from .sessions import GatewayStore
 from .ticket import BusinessTicketProvider, LocalFileTicketProvider, TicketProvider
+from .watchlist import Watchlist
 from .wechat_io import QueueMessageSink, QueueMessageSource
 
 _log = structlog.get_logger(__name__)
@@ -83,23 +86,36 @@ def build_gateway(
     database_path = Path(gateway_db) if gateway_db else wechat_settings.data_dir / "gateway.db"
     store = GatewayStore(database_path)
 
+    # 监听范围的权威在 AI 端（连上后由 WS 推下来覆盖）；这里装的是推之前的本地兜底。
+    watchlist = Watchlist.from_local(
+        only=normalize_accounts(gateway_settings.peer_allowlist),
+        never=normalize_accounts(gateway_settings.peer_denylist),
+        allow_groups=gateway_settings.allow_groups,
+    )
+    friend_interval = gateway_settings.friend_check_interval_seconds
+    if friend_interval > 0:
+        friend_interval = clamp_interval(
+            friend_interval, MIN_FRIEND_INTERVAL_SECONDS, what="加好友检查间隔"
+        )
+
     runner = GatewayRunner(
         settings=gateway_settings,
         ticket_provider=build_ticket_provider(gateway_settings),
         store=store,
-        source=QueueMessageSource(
-            runtime=runtime,
-            store=store,
-            allow_groups=gateway_settings.allow_groups,
-            allowlist=normalize_accounts(gateway_settings.peer_allowlist),
-            denylist=normalize_accounts(gateway_settings.peer_denylist),
-        ),
+        source=QueueMessageSource(runtime=runtime, store=store, watchlist=watchlist),
         sink=QueueMessageSink(
             runtime=runtime,
             allow_real_actions=allow_real_actions,
             confirmation=REAL_ACTION_CONFIRMATION,
         ),
         accounts=list(resolved_accounts),
+        watchlist=watchlist,
+        friend_watcher=FriendWatcher(
+            accounts=resolved_accounts,
+            runtime=runtime,
+            interval_seconds=friend_interval,
+            active_hours=gateway_settings.active_hours,
+        ),
     )
     return Gateway(
         runtime=runtime,

@@ -25,21 +25,26 @@ class Field:
     kind: str = "text"  # text | bool
 
 
+#: 界面上只放**必须由这台机器的人来定**的参数（用户 2026-08-13：「配置简洁一点，不用搞一堆」）。
+#:
+#: 刻意不放的三类：
+#:   ① 有正确默认值、改了只会更糟的（任务类型、去抖窗口、单轮上限）；
+#:   ② 监听哪些会话——权威在 AI 端，由 WS 推下来（``gateway/watchlist.py``），不该在这里手抄；
+#:   ③ 群聊开关等应急项——留作环境变量，出事时手工加一行，不占日常界面。
+#: 这些键手工写进 gateway.env 依然生效（``render_env_text`` 会原样保留、``apply_to_environ``
+#: 会照灌），只是不再摆在人人都会点的界面上。
 FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_UI_ACCOUNTS", "微信号", "要接管的微信号，多个用逗号分隔"),
     Field("WXCLIENT_GATEWAY_AI_WS_URL", "AI 端地址", "wss://<ai-host>/v1/ws"),
     Field("WXCLIENT_GATEWAY_BUSINESS_API_URL", "业务端地址", "https://<business-host>，用于换票"),
     Field("WXCLIENT_GATEWAY_INTERNAL_KEY", "内部 key", "网关唯一持有的凭证", secret=True),
     Field("WXCLIENT_GATEWAY_LOCAL_TICKET_FILE", "本地票据文件", "仅联调用，与业务端地址二选一"),
-    Field("WXCLIENT_GATEWAY_TASK_TYPE", "任务类型", "默认 wechat_reply"),
-    Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "轮询间隔（秒）"),
-    Field("WXCLIENT_GATEWAY_DEBOUNCE_SECONDS", "去抖窗口（秒）", "对方连发多条时合并成一轮"),
-    Field("WXCLIENT_GATEWAY_TURN_TIMEOUT_SECONDS", "单轮上限（秒）"),
+    Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔（秒）",
+          "多久看一次未读。太密会被微信当异常，下限 30 秒"),
+    Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔（秒）",
+          "单独的节拍，比读消息慢得多；0=不查。查到也不会自动通过"),
+    Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "如 09:00-21:00；窗外一概不动微信"),
     Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "每小时发送上限"),
-    Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "如 09:00-21:00，可跨午夜"),
-    Field("WXCLIENT_GATEWAY_PEER_ALLOWLIST", "只处理这些会话", "留空=不限制；填了就只回名单里的人"),
-    Field("WXCLIENT_GATEWAY_PEER_DENYLIST", "永不处理这些会话", "优先级最高，逗号分隔"),
-    Field("WXCLIENT_GATEWAY_ALLOW_GROUPS", "连群聊也回", "默认关：群里自动应答误伤面太大", kind="bool"),
     Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", kind="bool"),
     Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", kind="bool"),
 )

@@ -95,11 +95,13 @@ class AgentWsClient:
         turn_timeout_seconds: float = 180.0,
         op_timeout_seconds: float = 30.0,
         connect_factory: Callable[..., Any] | None = None,
+        on_push: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._url = ws_url
         self._turn_timeout = turn_timeout_seconds
         self._op_timeout = op_timeout_seconds
         self._connect = connect_factory or ws_connect
+        self._on_push = on_push
 
         self._ws: Any = None
         self._reader: asyncio.Task[None] | None = None
@@ -282,6 +284,15 @@ class AgentWsClient:
         if ev == "error" and len(self._turns) == 1:
             only = next(iter(self._turns.values()))
             only.finish(error=self._error_payload(data))
+            return
+
+        # 4) AI 端主动推来的、不属于任何一轮的事件（如监听列表下发）。
+        #    回调里出任何差错都只记一条日志——一个坏推送不该把整条连接的读循环掀翻。
+        if isinstance(ev, str) and self._on_push is not None:
+            try:
+                self._on_push(ev, data)
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("处理推送事件失败", ev=ev, error=str(exc))
             return
 
         _log.debug("未归位的事件", ev=ev)

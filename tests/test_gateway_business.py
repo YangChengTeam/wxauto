@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -11,13 +12,17 @@ from typing import Any
 
 from wxclient.gateway import (
     Debouncer,
+    FriendWatcher,
     GatewayStore,
     InboundLoop,
     InboundMessage,
     OutboundGuard,
     OutboundSender,
+    Watchlist,
+    clamp_interval,
     extract_reply,
     format_transcript,
+    jittered,
     looks_like_rejection,
     within_active_hours,
 )
@@ -245,7 +250,8 @@ class GuardTests(StoreTestCase):
 
     async def test_blocks_over_rate_limit(self) -> None:
         now = datetime(2026, 8, 10, 14, 0, tzinfo=timezone.utc)
-        guard = self._guard(max_sends_per_hour=2)
+        # 时间窗给满 24 小时：这条测的是频次上限，不该因为 14:00 UTC 在本机是几点而飘。
+        guard = self._guard(max_sends_per_hour=2, active_hours="00:00-23:59")
         self.store.record_send("a", "p", now - timedelta(minutes=1))
         self.store.record_send("a", "p", now - timedelta(minutes=2))
         decision = guard.check("a", "p", now=now)
@@ -290,6 +296,8 @@ class ExtractReplyTests(unittest.TestCase):
 class OutboundSenderTests(StoreTestCase):
     def _sender(self, sink: FakeSink, **guard_kwargs: Any) -> OutboundSender:
         now = datetime(2026, 8, 10, 14, 0, tzinfo=timezone.utc)
+        # 时间窗默认给满：这些用例测的是出站本身，T0 换算到本机是几点不该左右结论。
+        guard_kwargs.setdefault("active_hours", "00:00-23:59")
         return OutboundSender(
             sink=sink,
             guard=OutboundGuard(self.store, **guard_kwargs),
@@ -622,7 +630,9 @@ class InboundScopeTests(StoreTestCase):
 
     async def test_group_allowed_when_explicitly_turned_on(self) -> None:
         runtime = self._runtime()
-        source = QueueMessageSource(runtime=runtime, store=self.store, allow_groups=True)
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(allow_groups=True)
+        )
         await source.fetch("acct-1")          # 首次只对齐游标
         messages = await source.fetch("acct-1")
         self.assertEqual(messages, [], "首次对齐游标后没有新消息，但群没被拦下")
@@ -630,15 +640,135 @@ class InboundScopeTests(StoreTestCase):
 
     async def test_denylist_wins_and_never_opens_the_chat(self) -> None:
         runtime = self._runtime()
-        source = QueueMessageSource(runtime=runtime, store=self.store, denylist=[self.PERSON])
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(never=[self.PERSON])
+        )
         await source.fetch("acct-1")
         self.assertNotIn(self.PERSON, runtime.opened())
 
-    async def test_allowlist_limits_to_named_peers(self) -> None:
+    async def test_watchlist_limits_to_named_peers(self) -> None:
         runtime = self._runtime()
-        source = QueueMessageSource(runtime=runtime, store=self.store, allowlist=[self.PERSON])
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[self.PERSON])
+        )
         await source.fetch("acct-1")
         self.assertEqual(runtime.opened(), [self.PERSON])
+
+    async def test_push_replaces_watchlist_live(self) -> None:
+        """AI 端推一份名单下来，下一趟就该照新名单走——不用重启网关。"""
+        runtime = self._runtime()
+        watchlist = Watchlist.from_local(only=[self.PERSON])
+        source = QueueMessageSource(runtime=runtime, store=self.store, watchlist=watchlist)
+        await source.fetch("acct-1")
+        self.assertEqual(runtime.opened(), [self.PERSON])
+
+        self.assertTrue(watchlist.apply_push({"only": [], "never": [self.PERSON]}))
+        runtime.calls.clear()
+        await source.fetch("acct-1")
+        self.assertNotIn(self.PERSON, runtime.opened())
+
+    async def test_push_ignores_garbage_and_keeps_current_scope(self) -> None:
+        """坏帧不能把名单清空——清空 = 网关开始回它本不该回的人。"""
+        watchlist = Watchlist.from_local(only=[self.PERSON])
+        self.assertFalse(watchlist.apply_push({"only": "王建国"}))
+        self.assertFalse(watchlist.apply_push({}))
+        self.assertEqual(watchlist.scope.only, frozenset({self.PERSON}))
+        self.assertIsNone(watchlist.reason(self.PERSON, is_group=False))
+        self.assertIsNotNone(watchlist.reason("路人甲", is_group=False))
+
+
+# ────────────────────────── 节拍（防风控）──────────────────────────
+
+
+class PacingTests(unittest.TestCase):
+    """2026-08-12 真机事故：跑了一天后微信自己退了登录，判定触发风控。"""
+
+    def test_interval_clamped_to_floor(self) -> None:
+        self.assertEqual(clamp_interval(5.0, 30.0, what="读消息间隔"), 30.0)
+        self.assertEqual(clamp_interval(60.0, 30.0, what="读消息间隔"), 60.0)
+
+    def test_jitter_is_bounded_and_not_a_metronome(self) -> None:
+        rng = random.Random(7)
+        values = [jittered(60.0, rng=rng) for _ in range(50)]
+        self.assertTrue(all(41.9 <= v <= 78.1 for v in values), values[:3])
+        self.assertGreater(len(set(values)), 40, "间隔还是整齐的，等于没抖")
+
+
+class QuietHoursTests(StoreTestCase):
+    """非工作时段**一个微信动作都不做**——连读都不读，不只是不发。"""
+
+    async def test_loop_does_not_touch_wechat_when_inactive(self) -> None:
+        source = FakeSource([[msg("在吗", msg_id="m1", at=T0)]])
+
+        async def handler(*_args: Any) -> None:
+            raise AssertionError("非工作时段不该派发任何一轮")
+
+        loop = InboundLoop(
+            accounts=["acct-1"],
+            source=source,
+            store=self.store,
+            handler=handler,
+            is_active=lambda _now: False,
+            clock=lambda: T0,
+        )
+        self.assertEqual(await loop.tick(), 0)
+        self.assertEqual(source.calls, 0, "非工作时段还去读了微信")
+
+    async def test_uses_local_wall_clock_not_utc(self) -> None:
+        """时间窗说的是专员那台机器上的九点到九点。
+
+        原来直接拿 UTC 的 .time() 比，东八区就成了 17:00–次日 05:00：白天不发、半夜猛发。
+        """
+        beijing = timezone(timedelta(hours=8))
+        noon = datetime(2026, 8, 10, 12, 0, tzinfo=beijing)      # 北京中午 = 04:00 UTC
+        midnight = datetime(2026, 8, 10, 3, 0, tzinfo=beijing)   # 北京凌晨三点 = 19:00 UTC
+        self.assertTrue(within_active_hours(noon, "09:00-21:00"))
+        self.assertFalse(within_active_hours(midnight, "09:00-21:00"))
+
+
+class FriendWatcherTests(unittest.IsolatedAsyncioTestCase):
+    """加好友走自己的节拍，且只看不通过（用户 2026-08-13 要求）。"""
+
+    class Runtime:
+        def __init__(self, items: list[str] | None = None) -> None:
+            self.calls: list[tuple[Any, dict]] = []
+            self._items = items or []
+
+        async def submit(self, task_type, payload=None, **_kw):
+            self.calls.append((task_type, payload or {}))
+            return {"result": {"items": list(self._items)}}
+
+    def _watcher(self, runtime, **kwargs: Any) -> FriendWatcher:
+        kwargs.setdefault("interval_seconds", 900.0)
+        return FriendWatcher(accounts=["acct-1"], runtime=runtime, **kwargs)
+
+    async def test_checks_but_never_auto_accepts(self) -> None:
+        runtime = self.Runtime(["王建国 申请加你为好友"])
+        self.assertEqual(await self._watcher(runtime).tick(), 1)
+        task_type, _payload = runtime.calls[-1]
+        self.assertIs(task_type, TaskType.CHECK_NEW_FRIENDS)
+        self.assertNotIn(
+            TaskType.ACCEPT_NEW_FRIENDS,
+            [t for t, _ in runtime.calls],
+            "自动通过好友申请是最容易招风控的动作，不该在这里发生",
+        )
+
+    async def test_zero_interval_disables_it_entirely(self) -> None:
+        runtime = self.Runtime(["有人加你"])
+        watcher = self._watcher(runtime, interval_seconds=0)
+        self.assertFalse(watcher.enabled)
+        self.assertEqual(await watcher.tick(), 0)
+        self.assertEqual(runtime.calls, [])
+
+    async def test_quiet_hours_skip_the_check(self) -> None:
+        runtime = self.Runtime(["有人加你"])
+        watcher = self._watcher(
+            runtime,
+            active_hours="09:00-21:00",
+            clock=lambda: datetime(2026, 8, 10, 3, 0, tzinfo=timezone(timedelta(hours=8))),
+        )
+        self.assertEqual(await watcher.tick(), 0)
+        self.assertEqual(runtime.calls, [], "凌晨三点自动查好友申请，正是风控在找的样子")
 
 
 if __name__ == "__main__":
