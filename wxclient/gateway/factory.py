@@ -129,6 +129,8 @@ def build_gateway(
             runtime=runtime,
             interval_seconds=friend_interval,
             active_hours=gateway_settings.active_hours,
+            allow_real_actions=allow_real_actions,
+            confirmation=REAL_ACTION_CONFIRMATION,
         ),
     )
     return Gateway(

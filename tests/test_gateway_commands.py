@@ -101,6 +101,22 @@ class WhitelistTests(CommandTestCase):
         self.assertIn("text", result.reason)
         self.assertEqual(runtime.calls, [])
 
+    async def test_read_op_runs_for_real_not_as_a_stub(self) -> None:
+        """读类也要显式关 dry_run。
+
+        底座的 dry_run 默认是 True，`check_new_friends` / `read_recent_moments` 在
+        dry-run 下压根不碰微信、直接回一个空壳（`wechat_api/uia.py`）——AI 端拿到的
+        会是「已完成、什么都没有」的假回执，比报错还难查。
+        """
+        runtime = FakeRuntime()
+        result = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "check_new_friends", "args": {},
+        })
+        self.assertEqual(result.status, "done")
+        task_type, payload, _confirmation = runtime.calls[-1]
+        self.assertIs(task_type, TaskType.CHECK_NEW_FRIENDS)
+        self.assertFalse(payload["dry_run"])
+
     async def test_dry_run_when_real_actions_are_off(self) -> None:
         runtime = FakeRuntime()
         executor = self._executor(runtime, allow_real_actions=False)

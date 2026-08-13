@@ -217,12 +217,15 @@ class CommandExecutor:
             _log.info("指令被守门拦下", op=op, reason=denial)
             return CommandResult(command_id, "rejected", denial)
 
-        if spec.writes:
-            payload["dry_run"] = not self._allow_real
+        # 读类也必须显式关掉 dry_run：底座的 dry_run 默认是 True，`check_new_friends`
+        # / `read_recent_moments` 在 dry-run 下直接返回空壳（`wechat_api/uia.py`），
+        # 不碰微信也就永远查不到东西——AI 端会收到一条「已完成、什么都没有」的假回执。
+        # 「要不要真动微信」这个开关仍然只有一个：`--allow-real-actions`。
+        payload["dry_run"] = not self._allow_real
         try:
             raw = await self._runtime.submit(
                 spec.task_type, payload,
-                confirmation=self._confirmation if (spec.writes and self._allow_real) else "",
+                confirmation=self._confirmation if self._allow_real else "",
             )
         except Exception as exc:  # noqa: BLE001 —— 失败要能回给上游，不能只写日志
             _log.warning("指令执行失败", op=op, error=str(exc))

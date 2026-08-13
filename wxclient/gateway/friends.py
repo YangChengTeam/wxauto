@@ -36,6 +36,8 @@ class FriendWatcher:
         runtime,  # WeChatRuntime，或任何提供 submit(TaskType, payload) 的对象
         interval_seconds: float,
         active_hours: str = "",
+        allow_real_actions: bool = False,
+        confirmation: str = "",
         clock: Callable[[], datetime] | None = None,
         rng: random.Random | None = None,
     ) -> None:
@@ -43,6 +45,8 @@ class FriendWatcher:
         self._runtime = runtime
         self._interval = float(interval_seconds)
         self._active_hours = active_hours
+        self._allow_real = allow_real_actions
+        self._confirmation = confirmation
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._rng = rng
         self._pending: dict[str, int] = {}
@@ -70,8 +74,13 @@ class FriendWatcher:
         total = 0
         for account_id in self._accounts:
             try:
+                # dry_run 必须显式给：底座默认 True，dry-run 下 `check_new_friends`
+                # 返回的是空壳（`wechat_api/uia.py`），查了等于没查。真动微信仍需
+                # `--allow-real-actions` + 确认短语（`CLAUDE.md` §5.1）。
                 result = await self._runtime.submit(
-                    TaskType.CHECK_NEW_FRIENDS, {"limit": 8, "dry_run": False}
+                    TaskType.CHECK_NEW_FRIENDS,
+                    {"limit": 8, "dry_run": not self._allow_real},
+                    confirmation=self._confirmation if self._allow_real else "",
                 )
             except Exception as exc:  # noqa: BLE001 —— 查失败不该拖垮循环
                 _log.warning("查新好友申请失败", account=account_id, error=str(exc))

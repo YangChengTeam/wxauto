@@ -734,24 +734,36 @@ class FriendWatcherTests(unittest.IsolatedAsyncioTestCase):
             self.calls: list[tuple[Any, dict]] = []
             self._items = items or []
 
-        async def submit(self, task_type, payload=None, **_kw):
-            self.calls.append((task_type, payload or {}))
+        async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
+            self.calls.append((task_type, payload or {}, confirmation))
             return {"result": {"items": list(self._items)}}
 
     def _watcher(self, runtime, **kwargs: Any) -> FriendWatcher:
         kwargs.setdefault("interval_seconds", 900.0)
+        kwargs.setdefault("allow_real_actions", True)
+        kwargs.setdefault("confirmation", "确认")
         return FriendWatcher(accounts=["acct-1"], runtime=runtime, **kwargs)
 
     async def test_checks_but_never_auto_accepts(self) -> None:
         runtime = self.Runtime(["王建国 申请加你为好友"])
         self.assertEqual(await self._watcher(runtime).tick(), 1)
-        task_type, _payload = runtime.calls[-1]
+        task_type, payload, confirmation = runtime.calls[-1]
         self.assertIs(task_type, TaskType.CHECK_NEW_FRIENDS)
         self.assertNotIn(
             TaskType.ACCEPT_NEW_FRIENDS,
-            [t for t, _ in runtime.calls],
+            [t for t, _, _ in runtime.calls],
             "自动通过好友申请是最容易招风控的动作，不该在这里发生",
         )
+        # dry-run 下底座直接回空壳，查了等于没查——真开了才谈得上「查到几个」。
+        self.assertFalse(payload["dry_run"])
+        self.assertEqual(confirmation, "确认")
+
+    async def test_stays_dry_when_real_actions_are_off(self) -> None:
+        runtime = self.Runtime(["有人加你"])
+        await self._watcher(runtime, allow_real_actions=False).tick()
+        _task_type, payload, confirmation = runtime.calls[-1]
+        self.assertTrue(payload["dry_run"])
+        self.assertEqual(confirmation, "", "没开真实动作就不该带确认短语")
 
     async def test_zero_interval_disables_it_entirely(self) -> None:
         runtime = self.Runtime(["有人加你"])
