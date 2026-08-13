@@ -19,6 +19,7 @@ from typing import Any
 
 import structlog
 
+from .commands import COMMAND_EVENT, RESULT_OP, CommandExecutor, parse_commands
 from .config import GatewaySettings
 from .friends import FriendWatcher
 from .guard import OutboundGuard, within_active_hours
@@ -50,7 +51,7 @@ class ConnectionPool:
         ticket_provider: TicketProvider,
         turn_timeout_seconds: float = 180.0,
         client_factory: Callable[..., AgentWsClient] | None = None,
-        on_push: Callable[[str, dict[str, Any]], None] | None = None,
+        on_push: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._ws_url = ws_url
         self._tickets = ticket_provider
@@ -73,10 +74,13 @@ class ConnectionPool:
 
             # 票 60s 即过期，所以每次建连都现换——绝不缓存复用。
             ticket = await self._tickets.mint(account_id)
+            # 推送回调要带上是**哪个账号**收到的：连接是一账号一条，事件本身不带账号。
+            handler = self._on_push
             client = self._factory(
                 self._ws_url,
                 turn_timeout_seconds=self._turn_timeout,
-                on_push=self._on_push,
+                on_push=(lambda ev, data, a=account_id: handler(a, ev, data))
+                if handler is not None else None,
             )
             await client.connect(ticket)
             self._clients[account_id] = client
@@ -134,6 +138,7 @@ class GatewayRunner:
         accounts: Sequence[str],
         watchlist: Watchlist | None = None,
         friend_watcher: FriendWatcher | None = None,
+        command_executor: CommandExecutor | None = None,
         client_factory: Callable[..., AgentWsClient] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -144,6 +149,8 @@ class GatewayRunner:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._watchlist = watchlist
         self._friends = friend_watcher
+        self._commands = command_executor
+        self._command_tasks: set[asyncio.Task[None]] = set()
         self._pool = ConnectionPool(
             ws_url=settings.ai_ws_url,
             ticket_provider=ticket_provider,
@@ -178,16 +185,49 @@ class GatewayRunner:
         """现在允不允许动微信。读消息、查好友、发送共用同一个「工作时间窗」。"""
         return within_active_hours(now, self._settings.active_hours)
 
-    def _on_push(self, ev: str, data: dict[str, Any]) -> None:
-        """AI 端主动推来的事件（不属于任何一轮对话）。
+    def _on_push(self, account_id: str, ev: str, data: dict[str, Any]) -> None:
+        """AI 端主动推来的事件（不属于任何一轮对话）：更新监听列表、下发能力指令。
 
-        目前只有一件事：更新监听列表。收到未知事件只记一条 debug，绝不因此断连——
-        AI 端将来加别的推送，旧网关必须还能照跑。
+        收到未知事件只记一条 debug，绝不因此断连——AI 端将来加别的推送，旧网关必须还能照跑。
         """
         if ev == PUSH_EVENT and self._watchlist is not None:
             self._watchlist.apply_push(data)
             return
+        if ev == COMMAND_EVENT:
+            self._dispatch_commands(account_id, data)
+            return
         _log.debug("收到未处理的推送事件", ev=ev)
+
+    def _dispatch_commands(self, account_id: str, data: dict[str, Any]) -> None:
+        """指令**不在读循环里执行**：一条指令要动微信、可能跑十几秒，卡在读循环里
+        期间连 ping 都收不到，整条连接会被判死。所以只登记任务，交给事件循环去跑。
+        """
+        if self._commands is None:
+            _log.warning("收到微信指令但没有执行器，已忽略")
+            return
+        for command in parse_commands(data):
+            task = asyncio.create_task(self._run_command(account_id, command))
+            self._command_tasks.add(task)
+            task.add_done_callback(self._command_tasks.discard)
+
+    async def _run_command(self, account_id: str, command: dict[str, Any]) -> None:
+        assert self._commands is not None
+        try:
+            result = await self._commands.execute(command)
+        except Exception as exc:  # noqa: BLE001 —— 执行器炸了也要给上游一个交代
+            _log.warning("指令执行器异常", error=str(exc))
+            result = None
+        payload = (
+            result.to_frame_data()
+            if result is not None
+            else {"command_id": str(command.get("command_id") or ""), "status": "failed",
+                  "reason": "网关内部错误"}
+        )
+        try:
+            client = await self._pool.acquire(account_id)
+            await client.notify(RESULT_OP, payload)
+        except Exception as exc:  # noqa: BLE001 —— 回执发不出去不该影响已完成的动作
+            _log.warning("指令回执发送失败", error=str(exc), status=payload.get("status"))
 
     # ────────────────────────── 一轮 ──────────────────────────
 

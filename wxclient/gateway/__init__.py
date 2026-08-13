@@ -6,6 +6,14 @@
 
 from __future__ import annotations
 
+from .commands import (
+    COMMAND_EVENT,
+    COMMANDS,
+    RESULT_OP,
+    CommandError,
+    CommandExecutor,
+    CommandResult,
+)
 from .config import GatewaySettings
 from .friends import FriendWatcher
 from .guard import (
@@ -26,21 +34,21 @@ from .outbound import DeliveryResult, MessageSink, OutboundSender, extract_reply
 from .pacing import clamp_interval, jittered
 from .runner import ConnectionPool, GatewayRunner
 from .sessions import GatewayStore
-from .watchlist import PUSH_EVENT, WatchScope, Watchlist
-from .wechat_io import (
-    QueueMessageSink,
-    QueueMessageSource,
-    message_signature,
-    split_new_messages,
-    is_self_message,
-    is_timestamp_row,
-    to_inbound,
-)
 from .ticket import (
     BusinessTicketProvider,
     LocalFileTicketProvider,
     TicketError,
     TicketProvider,
+)
+from .watchlist import PUSH_EVENT, Watchlist, WatchScope
+from .wechat_io import (
+    QueueMessageSink,
+    QueueMessageSource,
+    is_self_message,
+    is_timestamp_row,
+    message_signature,
+    split_new_messages,
+    to_inbound,
 )
 from .wsclient import (
     AgentWsClient,
@@ -51,10 +59,16 @@ from .wsclient import (
 )
 
 __all__ = [
+    "COMMANDS",
+    "COMMAND_EVENT",
     "PUSH_EVENT",
+    "RESULT_OP",
     "AgentWsClient",
     "AgentWsError",
     "BusinessTicketProvider",
+    "CommandError",
+    "CommandExecutor",
+    "CommandResult",
     "ConnectionPool",
     "Debouncer",
     "DeliveryResult",
@@ -82,13 +96,13 @@ __all__ = [
     "clamp_interval",
     "extract_reply",
     "format_transcript",
+    "is_self_message",
+    "is_timestamp_row",
     "jittered",
     "looks_like_rejection",
     "message_signature",
     "parse_active_hours",
     "split_new_messages",
-    "is_self_message",
-    "is_timestamp_row",
     "to_inbound",
     "within_active_hours",
 ]

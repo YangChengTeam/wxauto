@@ -15,8 +15,10 @@ import structlog
 from wxclient.config import load_settings
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
+from .commands import CommandExecutor
 from .config import GatewaySettings
 from .friends import FriendWatcher
+from .guard import OutboundGuard
 from .pacing import MIN_FRIEND_INTERVAL_SECONDS, clamp_interval
 from .runner import GatewayRunner
 from .sessions import GatewayStore
@@ -110,6 +112,18 @@ def build_gateway(
         ),
         accounts=list(resolved_accounts),
         watchlist=watchlist,
+        command_executor=CommandExecutor(
+            runtime=runtime,
+            store=store,
+            guard=OutboundGuard(
+                store,
+                max_sends_per_hour=gateway_settings.max_sends_per_hour,
+                active_hours=gateway_settings.active_hours,
+            ),
+            account_id=resolved_accounts[0],
+            allow_real_actions=allow_real_actions,
+            confirmation=REAL_ACTION_CONFIRMATION,
+        ),
         friend_watcher=FriendWatcher(
             accounts=resolved_accounts,
             runtime=runtime,

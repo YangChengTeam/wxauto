@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -510,6 +511,86 @@ class WeChatIoMappingTests(unittest.TestCase):
         first = to_inbound("acct", "peer", {"sender": "对方", "text": "在吗"}, seq=1)
         second = to_inbound("acct", "peer", {"sender": "对方", "text": "在吗"}, seq=2)
         self.assertNotEqual(first.msg_id, second.msg_id)
+
+
+class CommandChannelTests(unittest.IsolatedAsyncioTestCase):
+    """AI 端推一条能力指令 → 网关执行 → 回执（066 design §3）。
+
+    不继承 GatewayEndToEndTests：那会把父类十几条用例再跑一遍，白花一倍时间。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.store = GatewayStore(root / "gateway.db")
+        self.tickets_file = root / "tickets.json"
+        self.tickets_file.write_text(json.dumps({ACCOUNT: "tkt-ok"}), encoding="utf-8")
+        self.now = T0
+
+    async def asyncTearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _runner(self, server: FakeAgentServer) -> GatewayRunner:
+        return GatewayRunner(
+            settings=GatewaySettings(
+                ai_ws_url=server.url, local_ticket_file=self.tickets_file,
+                turn_timeout_seconds=10.0, active_hours="00:00-23:59",
+            ),
+            ticket_provider=LocalFileTicketProvider(self.tickets_file),
+            store=self.store,
+            source=ScriptedSource([[]]),
+            sink=RecordingSink(),
+            accounts=[ACCOUNT],
+            clock=lambda: self.now,
+        )
+
+    async def test_push_command_executes_and_reports_back(self) -> None:
+        from wxclient.gateway import CommandExecutor, OutboundGuard
+        from wxclient.gateway.commands import COMMAND_EVENT
+        from wxclient.queue import TaskType
+
+        class Runtime:
+            def __init__(self) -> None:
+                self.calls: list[tuple] = []
+
+            async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
+                self.calls.append((task_type, dict(payload or {})))
+                return {"result": {"ok": True}}
+
+        runtime = Runtime()
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
+            runner = self._runner(server)
+            runner._commands = CommandExecutor(
+                runtime=runtime,
+                store=self.store,
+                guard=OutboundGuard(self.store, active_hours="00:00-23:59"),
+                account_id=ACCOUNT,
+                allow_real_actions=True,
+                confirmation="确认",
+                clock=lambda: self.now,
+            )
+            try:
+                await runner.ensure_connections()          # 先有连接才收得到推送
+                runner._on_push(ACCOUNT, COMMAND_EVENT, {
+                    "command_id": "cmd-1", "op": "send_message",
+                    "args": {"to": "张三", "text": "面试改到明天下午三点"},
+                })
+                for _ in range(100):                        # 指令是丢给事件循环跑的
+                    if runtime.calls:
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertEqual(len(runtime.calls), 1)
+                self.assertIs(runtime.calls[0][0], TaskType.SEND_MESSAGE)
+
+                for _ in range(100):                        # 回执是 client → server 的 op 帧
+                    receipts = [f for f in server.received if f.get("op") == "wechat.result"]
+                    if receipts:
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertEqual(receipts[0]["data"]["command_id"], "cmd-1")
+                self.assertEqual(receipts[0]["data"]["status"], "done")
+            finally:
+                await runner.stop()
 
 
 if __name__ == "__main__":

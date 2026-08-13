@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterable
 from contextlib import closing
@@ -51,6 +52,15 @@ CREATE TABLE IF NOT EXISTS gateway_peer_kinds (
   is_group   INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (account_id, peer_id)
+);
+CREATE TABLE IF NOT EXISTS gateway_commands (
+  account_id TEXT NOT NULL,
+  command_id TEXT NOT NULL,
+  status     TEXT NOT NULL,
+  reason     TEXT NOT NULL DEFAULT '',
+  result     TEXT,
+  done_at    TEXT NOT NULL,
+  PRIMARY KEY (account_id, command_id)
 );
 CREATE TABLE IF NOT EXISTS gateway_send_log (
   account_id TEXT NOT NULL,
@@ -219,6 +229,46 @@ class GatewayStore:
                 "INSERT OR REPLACE INTO gateway_blacklist "
                 "(account_id, peer_id, reason, created_at) VALUES (?,?,?,?)",
                 (account_id, peer_id, reason, _utcnow().isoformat()),
+            )
+            conn.commit()
+
+    # ────────────────────────── 指令幂等（066）──────────────────────────
+    #
+    # AI 端重推同一条指令（网络重试、网关重连后补推）**不能再发一遍消息**。
+    # 结果落库而不是只放内存：进程重启后重推的那条，仍要认得出是老指令。
+
+    def get_command_result(self, account_id: str, command_id: str) -> dict | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT status, reason, result FROM gateway_commands "
+                "WHERE account_id=? AND command_id=?",
+                (account_id, command_id),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "status": row[0],
+            "reason": row[1],
+            "result": json.loads(row[2]) if row[2] else None,
+        }
+
+    def put_command_result(self, account_id: str, command_id: str, outcome: dict) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO gateway_commands (account_id, command_id, status, reason, result, done_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(account_id, command_id) DO UPDATE SET
+                  status=excluded.status, reason=excluded.reason,
+                  result=excluded.result, done_at=excluded.done_at
+                """,
+                (
+                    account_id, command_id,
+                    str(outcome.get("status") or ""), str(outcome.get("reason") or ""),
+                    json.dumps(outcome.get("result"), ensure_ascii=False)
+                    if outcome.get("result") is not None else None,
+                    _utcnow().isoformat(),
+                ),
             )
             conn.commit()
 

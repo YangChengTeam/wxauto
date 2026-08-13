@@ -199,6 +199,14 @@ class AgentWsClient:
         finally:
             self._turns.pop(session_id, None)
 
+    async def notify(self, op: str, data: dict[str, Any]) -> None:
+        """发一个**不等回应**的 op（指令回执走这条）。
+
+        回执不能用 `_request`：它要等服务端回一帧，而回执本身就是「我这边办完了」的
+        单向通知，等回来只会把读循环和执行循环缠在一起。
+        """
+        await self._send(op, data)
+
     async def interrupt(self, session_id: str) -> None:
         await self._send("message.interrupt", {"session_id": session_id})
 
