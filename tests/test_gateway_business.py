@@ -26,7 +26,12 @@ from wxclient.gateway import (
     looks_like_rejection,
     within_active_hours,
 )
-from wxclient.gateway.wechat_io import QueueMessageSource
+from wxclient.gateway.wechat_io import (
+    QueueMessageSource,
+    legacy_message_signature,
+    message_signature,
+    split_new_messages,
+)
 from wxclient.queue import TaskType
 
 T0 = datetime(2026, 8, 10, 14, 0, 0, tzinfo=timezone.utc)
@@ -785,3 +790,44 @@ class FriendWatcherTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class CursorSignatureStabilityTests(unittest.TestCase):
+    """★ 2026-08-13 真机：自动回复**一次都没触发过**，日志反复报「游标已滚出读取窗口」。
+
+    病根：`uia.py::read_current_chat` 只给**最后一条**消息补 `is_self`/`sender`（预览文案 +
+    右键菜单探测），其余行没有。游标存的正是最后一条的签名——下一轮它不再是最后一条、
+    不再被补字段，同一条消息就算出另一个哈希，游标永远对不回来，`fresh` 永远是空。
+    实证：`gateway_cursors.seq` 一直 0、`gateway_sessions` 一条没有。
+    """
+
+    def test_same_message_hashes_the_same_with_or_without_the_latest_row_enrichment(self) -> None:
+        bare = {"text": "在吗"}
+        enriched = {"text": "在吗", "is_self": True, "sender": "我"}  # 它当过"最后一条"时的样子
+        self.assertEqual(
+            message_signature(bare),
+            message_signature(enriched),
+            "★ 签名不许依赖只给最后一行补的字段，否则游标永远找不回来",
+        )
+
+    def test_cursor_is_found_on_the_next_read_after_it_stops_being_latest(self) -> None:
+        # 第一轮：末条被补了字段，游标按它存下
+        first = [{"text": "你好"}, {"text": "在吗", "is_self": True, "sender": "我"}]
+        _, cursor = split_new_messages(first, None)
+        # 第二轮：同一条不再是末条 → 没人补字段；后面来了一条新的
+        second = [{"text": "你好"}, {"text": "在吗"}, {"text": "有个岗位想问下"}]
+        fresh, _ = split_new_messages(second, cursor)
+        self.assertEqual([m["text"] for m in fresh], ["有个岗位想问下"])
+
+    def test_old_style_cursor_still_matches_once(self) -> None:
+        """换算法不该让当天每个会话白丢一条消息。"""
+        row = {"text": "在吗", "is_self": True, "sender": "我"}
+        old_cursor = legacy_message_signature(row)
+        fresh, _ = split_new_messages([row, {"text": "新消息"}], old_cursor)
+        self.assertEqual([m["text"] for m in fresh], ["新消息"])
+
+    def test_old_cursor_written_while_the_row_was_enriched_still_matches(self) -> None:
+        """★ 真实的老游标就是这么来的：存的时候它被补过字段，再读到时字段没了。"""
+        old_cursor = legacy_message_signature({"text": "在吗", "is_self": True, "sender": "我"})
+        bare = {"text": "在吗"}  # 下一轮读到的样子
+        fresh, _ = split_new_messages([bare, {"text": "新消息"}], old_cursor)
+        self.assertEqual([m["text"] for m in fresh], ["新消息"], "老游标必须还认得出来")

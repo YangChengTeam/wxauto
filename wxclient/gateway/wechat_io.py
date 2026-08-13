@@ -54,10 +54,44 @@ def is_timestamp_row(raw: dict[str, Any]) -> bool:
 
 
 def message_signature(raw: dict[str, Any]) -> str:
-    """一条消息的签名。没有稳定 id，只能拿发送方 + 文本凑。"""
+    """一条消息的签名（游标用）。没有稳定 id，只能拿文本凑。
+
+    ★ **绝不能把 `sender` / `is_self` 算进来**（2026-08-13 真机血的教训）：
+    `uia.py::read_current_chat` 只给**最后一条**消息补这两个字段（靠会话预览文案 +
+    右键菜单探测），其余行压根没有。而游标存的正是最后一条的签名——下一轮它不再是
+    最后一条、不再被补字段，同一条消息就算出**另一个**哈希：
+
+        21:25 存游标 aeea6b8f…（那时它是最后一条，sender 被补成「我」）
+        21:31 同一条消息再读 → 没人补字段 → 算出别的哈希 → 「游标已滚出读取窗口」
+
+    于是游标**永远**对不回来，`fresh` 永远是空，**自动回复一次都触发不了**
+    （真机实证：`gateway_cursors.seq` 一直是 0、`gateway_sessions` 一条没有）。
+    文本是唯一两次读取都稳定的字段，就只拿它。同文重复的代价是定位到最后一次出现，
+    比"永远定位不到"轻得多。
+    """
+    return sha256(str(raw.get("text") or "").encode()).hexdigest()[:32]
+
+
+def legacy_message_signature(raw: dict[str, Any]) -> str:
+    """旧签名（含 sender/is_self）。**只用于匹配**库里已有的老游标，不再写入。"""
     sender = "self" if is_self_message(raw) else str(raw.get("sender") or "peer")
     text = str(raw.get("text") or "")
     return sha256(f"{sender}\x00{text}".encode()).hexdigest()[:32]
+
+
+def cursor_candidates(raw: dict[str, Any]) -> set[str]:
+    """这一行**可能**被记成游标的所有签名形态。
+
+    老游标是在「它当过最后一条、被补了 `sender='我'` / `is_self=True`」的那一刻算的，
+    而现在再读到它时那些字段没了——所以光按当前字段算旧签名也认不回来，
+    得把「当作自己发的」那一版也一并认掉。否则换算法当天每个会话都要先白丢一条消息。
+    """
+    text = str(raw.get("text") or "")
+    return {
+        message_signature(raw),
+        legacy_message_signature(raw),
+        sha256(f"self\x00{text}".encode()).hexdigest()[:32],
+    }
 
 
 def split_new_messages(
@@ -76,15 +110,21 @@ def split_new_messages(
     if last_signature is None:
         return [], latest_signature
 
-    # 从后往前找游标最后一次出现的位置。
+    # 从后往前找游标最后一次出现的位置（老游标按旧算法也认一次，见 legacy_message_signature）。
     cursor_index = -1
     for index in range(len(raw_messages) - 1, -1, -1):
-        if message_signature(raw_messages[index]) == last_signature:
+        if last_signature in cursor_candidates(raw_messages[index]):
             cursor_index = index
             break
 
     if cursor_index < 0:
-        _log.info("游标已滚出读取窗口，跳过回溯只对齐游标")
+        # 这条**不是**日常噪音：正常情况下游标就在刚读到的这批里。连着出现 =
+        # 签名不稳定或读取窗口太小，后果是自动回复永远不触发（2026-08-13 真机踩过），
+        # 所以报警告级别，别让它混在 info 里没人看见。
+        _log.warning(
+            "游标在刚读到的记录里找不到，只对齐游标不回溯；连着出现说明游标机制失效了",
+            已读到=len(raw_messages),
+        )
         return [], latest_signature
 
     return list(raw_messages[cursor_index + 1:]), latest_signature
