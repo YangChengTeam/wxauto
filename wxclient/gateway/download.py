@@ -29,7 +29,10 @@ _log = structlog.get_logger(__name__)
 #: 单个文件上限。海报图是百 KB 级，20MB 已经宽得离谱——够用又不至于被一条指令拖垮。
 MAX_FILE_BYTES = 20 * 1024 * 1024
 
-#: 只允许取会话文件这一条路径。别的路径（哪怕同 host）不给下。
+#: WS 门的固定后缀；HTTP base = ws 地址去掉它（前缀留着）。
+_WS_SUFFIX = "/v1/ws"
+
+#: 只允许取会话文件这一条路径（比对的是**去掉反代前缀后**的那一段）。别的路径不给下。
 _ALLOWED_PATH = re.compile(r"^/v1/sessions/[^/]+/files/[^/]+$")
 
 #: 文件名里不许出现的东西——下下来的名字要用来在本机建文件，绝不能带路径。
@@ -41,12 +44,20 @@ class DownloadError(RuntimeError):
 
 
 def http_base_from_ws(ws_url: str) -> str:
-    """``wss://host/v1/ws`` → ``https://host``。不新增配置项，就跟着 WS 那一个地址走。"""
+    """``wss://host[/前缀]/v1/ws`` → ``https://host[/前缀]``。不新增配置项，跟着 WS 那一个地址走。
+
+    ★ **反代前缀必须留着**（2026-08-13 真机踩过）：线上是 ``wss://host/agent-ws/v1/ws``，
+    nginx 的 ``location /agent-ws/`` 才转到 AI 服务；只取 origin 会打到 ``https://host/v1/...``，
+    那儿是前端 SPA 的兜底 location —— **返回 200 + index.html**，于是「下载成功」，
+    两张 HTML 当成海报发进了微信。见 `_reject_html`。
+    """
     parts = urlsplit(ws_url.strip())
     if parts.scheme not in {"ws", "wss"} or not parts.netloc:
         raise DownloadError(f"AI_WS_URL 不是合法的 ws 地址：{ws_url!r}")
     scheme = "https" if parts.scheme == "wss" else "http"
-    return f"{scheme}://{parts.netloc}"
+    prefix = parts.path
+    prefix = prefix[: -len(_WS_SUFFIX)] if prefix.endswith(_WS_SUFFIX) else ""
+    return f"{scheme}://{parts.netloc}{prefix.rstrip('/')}"
 
 
 def _safe_name(raw: str, fallback: str) -> str:
@@ -61,6 +72,18 @@ def _name_from_headers(headers: Any, fallback: str) -> str:
         r'filename="?([^";]+)"?', disposition
     )
     return _safe_name(hit.group(1) if hit else "", fallback)
+
+
+def _reject_html(headers: Any) -> None:
+    """网页不是文件。
+
+    地址打偏时最坏的形态不是 404，而是**200 + 一张 HTML**（反代把没匹配上的路径兜给前端 SPA）：
+    那会被当成「下载成功」，把网页当海报发进微信。会话文件的 content-type 由服务端按扩展名给，
+    永远不会是 text/html —— 见到就是地址错了，当场停。
+    """
+    ctype = str(headers.get("content-type") or "").split(";")[0].strip().lower()
+    if ctype in {"text/html", "application/xhtml+xml"}:
+        raise DownloadError("取到的是网页不是文件（多半是 AI_WS_URL 的反代前缀不对），没有发送")
 
 
 @dataclass(frozen=True)
@@ -98,16 +121,16 @@ class FileFetcher:
         self._client = client
 
     def _absolute(self, url: str) -> str:
-        """相对路径按自家 base 拼；绝对地址必须同 origin，否则拒。"""
+        """相对路径按自家 base 拼（base 含反代前缀）；绝对地址必须落在 base 之内，否则拒。"""
         if url.startswith("/"):
             path = urlsplit(url).path
             if not _ALLOWED_PATH.match(path):
                 raise DownloadError(f"不允许的文件地址：{url}")
             return f"{self._base}{url}"
-        parts = urlsplit(url)
-        if f"{parts.scheme}://{parts.netloc}" != self._base:
+        if not url.startswith(f"{self._base}/"):
             raise DownloadError("只允许从劳小智 AI 服务取文件，拒绝外部地址")
-        if not _ALLOWED_PATH.match(parts.path):
+        tail = urlsplit(url).path[len(urlsplit(self._base).path):]
+        if not _ALLOWED_PATH.match(tail):
             raise DownloadError(f"不允许的文件地址：{url}")
         return url
 
@@ -121,6 +144,7 @@ class FileFetcher:
                 raise DownloadError("取文件被拒：票据无效或这份文件不归本账号")
             if resp.status_code >= 400:
                 raise DownloadError(f"取文件失败（HTTP {resp.status_code}）")
+            _reject_html(resp.headers)
             name = _name_from_headers(resp.headers, f"{ref.file_id or 'file'}.bin")
             path = dest_dir / name
             written = 0

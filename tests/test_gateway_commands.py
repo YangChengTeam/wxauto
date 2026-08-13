@@ -17,6 +17,7 @@ from wxclient.gateway.download import (
     DownloadError,
     FileFetcher,
     _name_from_headers,
+    _reject_html,
     http_base_from_ws,
 )
 from wxclient.queue import TaskType
@@ -315,6 +316,33 @@ class DownloadUrlTestCase(unittest.TestCase):
     def test_ws_地址推导出_http_base(self) -> None:
         self.assertEqual(http_base_from_ws("wss://ai.example.com/v1/ws"), "https://ai.example.com")
         self.assertEqual(http_base_from_ws("ws://127.0.0.1:8137/v1/ws"), "http://127.0.0.1:8137")
+
+    def test_反代前缀必须留着(self) -> None:
+        """线上就是这个形状；丢了前缀会打到前端 SPA 的兜底 location，拿回一张 index.html。"""
+        self.assertEqual(
+            http_base_from_ws("wss://worker.laoxiaozhi.cn/agent-ws/v1/ws"),
+            "https://worker.laoxiaozhi.cn/agent-ws",
+        )
+        fetcher = FileFetcher(ws_url="wss://worker.laoxiaozhi.cn/agent-ws/v1/ws", ticket_provider=None)
+        self.assertEqual(
+            fetcher._absolute("/v1/sessions/s1/files/f1"),
+            "https://worker.laoxiaozhi.cn/agent-ws/v1/sessions/s1/files/f1",
+        )
+
+    def test_取回网页当场停不当成文件(self) -> None:
+        """200 + text/html = 地址打偏了。这一条比 404 更危险：它会被当成下载成功。"""
+        with self.assertRaises(DownloadError):
+            _reject_html({"content-type": "text/html; charset=utf-8"})
+        _reject_html({"content-type": "image/jpeg"})   # 正常图片不该被拦
+
+    def test_带前缀时外部地址仍然拒(self) -> None:
+        fetcher = FileFetcher(ws_url="wss://worker.laoxiaozhi.cn/agent-ws/v1/ws", ticket_provider=None)
+        for url in (
+            "https://evil.example.com/agent-ws/v1/sessions/s1/files/f1",
+            "https://worker.laoxiaozhi.cn/v1/sessions/s1/files/f1",   # 少了前缀 = 打到 SPA
+        ):
+            with self.assertRaises(DownloadError):
+                fetcher._absolute(url)
 
     def test_相对路径按自家_base_拼(self) -> None:
         got = self._fetcher()._absolute("/v1/sessions/s1/files/f1")
