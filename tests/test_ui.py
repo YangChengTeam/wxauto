@@ -173,6 +173,72 @@ class GatewayServiceTests(unittest.TestCase):
 
         self.assertEqual(len(builds), 1)
 
+    def test_stop_async_returns_immediately(self) -> None:
+        """界面上点「停止服务」不能被 join 钉住——那 15 秒窗口一次都不重绘。"""
+        started = threading.Event()
+        gateway = _FakeGateway(started)
+        service = GatewayService(lambda: gateway)
+        service.start()
+        self.assertTrue(service.wait_ready(timeout=5))
+
+        done = threading.Event()
+        began = time.monotonic()
+        thread = service.stop_async(on_done=done.set, timeout=5)
+        self.assertLess(time.monotonic() - began, 0.5, "stop_async 不该在调用方线程上等")
+
+        self.assertTrue(done.wait(timeout=10))
+        thread.join(timeout=5)
+        self.assertIs(service.state, ServiceState.STOPPED)
+
+    def test_restart_async_stops_then_applies_params_then_starts(self) -> None:
+        """参数必须在「停干净之后、起来之前」灌进去，否则新参数会被旧实例读走。"""
+        started = threading.Event()
+        order: list[str] = []
+
+        def builder() -> _FakeGateway:
+            order.append("build")
+            started.clear()
+            return _FakeGateway(started)
+
+        service = GatewayService(builder)
+        service.start()
+        self.assertTrue(service.wait_ready(timeout=5))
+
+        done = threading.Event()
+        thread = service.restart_async(
+            before_start=lambda: order.append("apply-params"),
+            on_done=done.set,
+            timeout=5,
+        )
+        self.assertIsNotNone(thread)
+        self.assertTrue(done.wait(timeout=15))
+        # on_done 只保证「start() 已调用」——起来是另一条线程的事，等 ready 才算数
+        self.assertTrue(service.wait_ready(timeout=5))
+        self.assertIs(service.state, ServiceState.RUNNING)
+        self.assertEqual(order, ["build", "apply-params", "build"])
+
+        service.stop(timeout=5)
+
+    def test_second_restart_while_restarting_is_ignored(self) -> None:
+        """连点两下「保存并重启」不该起两条网关。"""
+        started = threading.Event()
+        service = GatewayService(lambda: _FakeGateway(started))
+        service.start()
+        self.assertTrue(service.wait_ready(timeout=5))
+
+        release = threading.Event()
+        done = threading.Event()
+        first = service.restart_async(
+            before_start=lambda: release.wait(timeout=5), on_done=done.set, timeout=5
+        )
+        self.assertIsNotNone(first)
+        self.assertIsNone(service.restart_async(timeout=5), "重启期间再点一次应被忽略")
+        release.set()
+        self.assertTrue(done.wait(timeout=15))
+        self.assertFalse(service.restarting)
+
+        service.stop(timeout=5)
+
     def test_stop_before_start_is_harmless(self) -> None:
         service = GatewayService(lambda: _FakeGateway(threading.Event()))
 

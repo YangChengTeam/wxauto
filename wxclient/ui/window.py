@@ -38,6 +38,9 @@ _STATE_COLOR = {
 
 _WECHAT_PROBE_SECONDS = 15
 
+#: 转圈用的帧。每秒换一帧（跟着 _tick 走），够看出「还活着」。
+_SPINNER = ("◐", "◓", "◑", "◒")
+
 
 class MainWindow:
     def __init__(
@@ -64,6 +67,8 @@ class MainWindow:
         self._wechat_status = ("未检测", theme.GRAY)
         self._probe_lock = threading.Lock()
         self._shutting_down = False
+        self._busy_text = ""
+        self._busy_frame = 0
 
         root.title("劳小智微信服务")
         root.geometry("1180x720")
@@ -97,6 +102,11 @@ class MainWindow:
         self._status_label = tk.Label(bar, text="", font=theme.FONT_STATUS,
                                       bg=theme.SIDEBAR_BG, fg=theme.GREEN)
         self._status_label.pack(anchor="w", padx=28, pady=(6, 20))
+
+        # 停机/重启要几秒到十几秒，这几秒必须有东西在动。静止的「停止中」和卡死长得一样。
+        self._busy_label = tk.Label(bar, text="", font=theme.FONT_SMALL,
+                                    bg=theme.SIDEBAR_BG, fg=theme.ORANGE,
+                                    anchor="w", justify=tk.LEFT, wraplength=244)
 
         self._divider(bar)
 
@@ -241,7 +251,27 @@ class MainWindow:
         self._shutting_down = True
         self._status_label.configure(text="正在停止…", fg=theme.ORANGE)
         self._live_dot.configure(fg=theme.ORANGE)
+        self.set_busy("正在停止服务，请稍候")
         return True
+
+    def set_busy(self, text: str) -> None:
+        """显示/清除「正在忙」的转圈提示。传空字符串 = 忙完了。
+
+        可从任意线程调？**不可以**——它动控件，调用方必须已经在 tk 线程上
+        （后台线程请用 ``root.after(0, ...)`` 丢回来）。
+        """
+        self._busy_text = text
+        if not text:
+            self._busy_label.pack_forget()
+            return
+        self._busy_label.pack(anchor="w", padx=28, pady=(0, 12))
+        self._render_busy()
+
+    def _render_busy(self) -> None:
+        if not self._busy_text:
+            return
+        self._busy_frame = (self._busy_frame + 1) % len(_SPINNER)
+        self._busy_label.configure(text=f"{_SPINNER[self._busy_frame]}  {self._busy_text}")
 
     def destroy(self) -> None:
         if self._unsubscribe is not None:
@@ -327,6 +357,7 @@ class MainWindow:
         if self._log_pipeline is not None:
             self._log_pipeline.ensure()
         self.refresh_state()
+        self._render_busy()
         self.root.after(1000, self._tick)
 
     def _schedule_wechat_probe(self) -> None:

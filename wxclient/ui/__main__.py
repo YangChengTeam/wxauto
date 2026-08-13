@@ -78,13 +78,24 @@ def main(argv: list[str] | None = None) -> int:
     def on_settings_saved(restart: bool) -> None:
         if not restart:
             return
-        # 保存后立刻按新参数重启：让「改完到底生效没有」不留悬念
-        service.stop()
-        settings_store.apply_to_environ(
-            settings_store.load(wechat_settings.data_dir), force=True
-        )
-        window.set_dry_run_notice(_dry_run_notice(args, UiSettings()))
-        service.start()
+
+        # 保存后立刻按新参数重启：让「改完到底生效没有」不留悬念。
+        # 但停机要等网关线程收口（最长 15s），**绝不能在 tk 主线程上等**——
+        # 那 15 秒里窗口一次都不重绘，用户看到的就是「点了保存，程序死了」。
+        def before_start() -> None:
+            settings_store.apply_to_environ(
+                settings_store.load(wechat_settings.data_dir), force=True
+            )
+
+        def done() -> None:
+            # 回调在后台线程上，动界面必须先回 tk 线程
+            root.after(0, lambda: (
+                window.set_busy(""),
+                window.set_dry_run_notice(_dry_run_notice(args, UiSettings())),
+            ))
+
+        if service.restart_async(before_start=before_start, on_done=done) is not None:
+            window.set_busy("正在按新参数重启服务")
 
     window = MainWindow(
         root,

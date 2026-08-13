@@ -153,6 +153,11 @@ class SettingsPage(tk.Frame):
             self.on_saved(restart)
         messagebox.showinfo(
             "已保存",
-            f"参数已写入：\n{path}\n\n" + ("服务正在按新参数重启。" if restart else "下次启动服务时生效。"),
+            f"参数已写入：\n{path}\n\n"
+            + (
+                "服务正在后台按新参数重启，左侧状态栏会一路转到「运行中」。"
+                if restart
+                else "下次启动服务时生效。"
+            ),
             parent=self,
         )

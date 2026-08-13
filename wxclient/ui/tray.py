@@ -92,7 +92,9 @@ class Tray:
         self._service.start()
 
     def _stop(self, *_args: Any) -> None:
-        self._service.stop()
+        # 停机要等网关线程收口（最长 15s）。在托盘线程上等 = 这段时间菜单点不动、
+        # 图标也不刷新，和卡死一样。丢后台，状态照旧靠 state 回调刷出来。
+        self._service.stop_async()
 
     def _settings(self, *_args: Any) -> None:
         self._on_settings()

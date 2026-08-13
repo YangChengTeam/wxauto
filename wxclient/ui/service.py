@@ -57,6 +57,7 @@ class GatewayService:
         self._ready = threading.Event()
         self._stop_requested = False
         self._running_since: float | None = None
+        self._restarting = False
 
     def set_state_listener(
         self, listener: Callable[[ServiceState, str | None], None] | None
@@ -108,6 +109,72 @@ class GatewayService:
                 self._thread = None
                 self._loop = None
                 self._set_state(ServiceState.STOPPED, None)
+
+    # ── 异步版本：给界面用 ────────────────────────────────────────
+    #
+    # ``stop()`` 里那个 ``thread.join(timeout=15)`` 谁调谁被钉住 15 秒。tkinter 主线程
+    # 被钉住 = 窗口连重绘都不做，看起来就是死了；托盘线程被钉住 = 菜单点不动。
+    # 所以凡是从界面（主窗口 / 托盘 / 参数页）来的停机与重启，一律走下面这两个。
+
+    def stop_async(
+        self, *, on_done: Callable[[], None] | None = None, timeout: float = 15.0
+    ) -> threading.Thread:
+        """后台停机，立刻返回。``on_done`` 在后台线程上回调（要动界面自己 after 回去）。"""
+        return self._in_background("wx-gateway-stop", lambda: self.stop(timeout=timeout), on_done)
+
+    def restart_async(
+        self,
+        *,
+        before_start: Callable[[], None] | None = None,
+        on_done: Callable[[], None] | None = None,
+        timeout: float = 15.0,
+    ) -> threading.Thread | None:
+        """后台「停 → （改参数）→ 起」。正在重启时再点一次直接忽略，返回 ``None``。
+
+        ``before_start`` 跑在停机之后、启动之前——参数要在这一刻才灌进环境变量，
+        否则新参数会被还没停干净的旧实例读走。
+        """
+        with self._lock:
+            if self._restarting:
+                _log.info("已经在重启了，忽略这次请求")
+                return None
+            self._restarting = True
+
+        def work() -> None:
+            try:
+                self.stop(timeout=timeout)
+                if before_start is not None:
+                    before_start()
+                self.start()
+            finally:
+                with self._lock:
+                    self._restarting = False
+
+        return self._in_background("wx-gateway-restart", work, on_done)
+
+    @property
+    def restarting(self) -> bool:
+        with self._lock:
+            return self._restarting
+
+    def _in_background(
+        self, name: str, work: Callable[[], None], on_done: Callable[[], None] | None
+    ) -> threading.Thread:
+        def run() -> None:
+            try:
+                work()
+            except Exception as exc:  # noqa: BLE001 - 后台线程里抛出去没人接，只会静默消失
+                _log.error("后台操作失败", op=name, error=str(exc))
+            finally:
+                if on_done is not None:
+                    try:
+                        on_done()
+                    except Exception as exc:  # noqa: BLE001 - 收尾回调失败不该盖住上面的原因
+                        _log.warning("后台操作收尾回调失败", op=name, error=str(exc))
+
+        thread = threading.Thread(target=run, name=name, daemon=True)
+        thread.start()
+        return thread
 
     def uptime_seconds(self) -> float | None:
         """服务已经跑了多久；没在跑返回 None。"""
