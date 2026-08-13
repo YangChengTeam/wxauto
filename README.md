@@ -47,17 +47,37 @@ python -m wxclient.gateway --account wxid_zhangsan_work --allow-real-actions   #
 
 ## 打包
 
-网关的单体 exe **尚未做**（`[build]` extra 里的 PyInstaller 是为它预留的）。
-配置已备好：`packaging/lxz-wechat-gateway.spec`（**未验证**，出包时要补依赖收集并在真机跑）。
+```bat
+pip install -e .[build]
+pyinstaller --noconfirm packaging\lxz-wechat-gateway.spec
+:: 产物：dist\劳小智微信助手\劳小智微信助手.exe
+```
+
+**onedir 不是 onefile。** onefile 每次双击都要把整包解压到 `%TEMP%` 再跑，冷启动白等
+好几秒（杀软扫这个解压过程尤其慢）。要「一个文件发给客户」就打安装包或压缩包，别让
+用户天天付解压的钱。
+
+包大小 **120 MB**（2026-08-13 真机实测）。原始收集是 265 MB，一半以上是 OpenCV——
+`pyautogui → pyscreeze` 把它拖进来，而 pyscreeze 只有做模糊图像匹配（`confidence=`）
+时才用得上；本仓找元素走 UIA 控件树，全文没有一处 `import cv2`，所以在 spec 的
+`excludes` 里砍掉了。**哪天真要做图像匹配，得先把那行删掉再打包。**
+
+两个真机踩过的坑，都已在仓库里修好，别再踩回去：
+
+1. **入口必须是 `packaging/launcher.py`**，不能直接把 `wxclient/ui/__main__.py` 喂给
+   PyInstaller——那样它以顶层脚本身份跑，相对 import 全废；而 windowed 构建里这条
+   报错弹在**看不见的对话框**上，现象是「进程在、窗口永远不出来、日志一个字不写」。
+2. **数据目录不能跟着 cwd 走**。冻结态已锚到 `%LOCALAPPDATA%\劳小智微信助手`
+   （`wxclient/config/settings.py` 的 `_default_data_dir`）。之前的相对 `.wxclient`
+   在真机上把日志写去了映射的网络盘 `Z:\`，装到 `Program Files` 下更是直接不可写。
+
+凭证与 `--account` 走环境变量和命令行，不编进二进制。
 原先的 `scripts/build_mcp_onefile.py` 只打 MCP 入口，已随 MCP 一并删除。
 
 图标是**一份管到底**：`wxclient/ui/assets/app.ico`（劳小智正式图标套件，和网站后台同一个）
 供 exe / 桌面快捷方式 / 任务栏 / 窗口标题栏用；右下角托盘用 `app-256.png` 加一个状态色角标
 （绿=运行中、灰=已停止、红=启动失败）——角标不能省，它是唯一能一眼看出服务在不在跑的地方。
 换图标只改 `wxclient/ui/assets/`，别在代码里再画一个。
-做网关 exe 时注意两件 onefile 特有的事：数据目录（SQLite 队列 / 网关状态库 / 日志）
-必须落到 exe 外的固定路径，不能跟着临时解包目录走；凭证与 `--account` 走环境变量和
-命令行，不编进二进制。
 
 ## 架构边界
 
