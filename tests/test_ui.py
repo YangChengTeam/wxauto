@@ -18,7 +18,7 @@ from wxclient.gateway.factory import normalize_accounts
 from wxclient.ui import logline
 from wxclient.ui import settings_store
 from wxclient.ui.logbuffer import LogBuffer, LogPipeline, attach_to_root
-from wxclient.ui.logfeed import LogFeed
+from wxclient.ui.logfeed import LogFeed, is_log_on_screen
 from wxclient.ui.service import GatewayService, ServiceState
 
 
@@ -85,6 +85,29 @@ class DataDirTests(unittest.TestCase):
             resolved = _default_data_dir()
         self.assertTrue(resolved.is_absolute() or str(resolved).startswith("X:"))
         self.assertNotEqual(resolved, Path(".wxclient"), "冻结态不能再用相对路径")
+
+
+class LogVisibilityTests(unittest.TestCase):
+    """判断「日志在不在人眼前」。2026-08-13 的「实时日志没有了」就死在这个判据上。"""
+
+    def test_maximized_window_counts_as_on_screen(self) -> None:
+        # 回归护栏：判据曾写成 state == "normal"，用户一最大化就被判成看不见
+        self.assertTrue(is_log_on_screen("log", "zoomed"))
+
+    def test_normal_window_on_log_page_is_on_screen(self) -> None:
+        self.assertTrue(is_log_on_screen("log", "normal"))
+
+    def test_tray_and_minimized_are_off_screen(self) -> None:
+        self.assertFalse(is_log_on_screen("log", "withdrawn"))
+        self.assertFalse(is_log_on_screen("log", "iconic"))
+
+    def test_settings_page_is_off_screen_even_when_window_shows(self) -> None:
+        self.assertFalse(is_log_on_screen("settings", "normal"))
+        self.assertFalse(is_log_on_screen("settings", "zoomed"))
+
+    def test_unknown_states_default_to_on_screen(self) -> None:
+        # 宁可多画也别再漏画：认不出的状态一律当「露着」
+        self.assertTrue(is_log_on_screen("log", "somethingnew"))
 
 
 class LogFilterTests(unittest.TestCase):

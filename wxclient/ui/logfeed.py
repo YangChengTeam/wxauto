@@ -28,6 +28,20 @@ FLUSH_MS = 120
 PENDING_CAP = 2000
 
 
+#: tk 里「窗口没在屏幕上」的两种状态。除此之外都算露着——**注意 "zoomed"（最大化）也算**，
+#: 早先把判据写成 ``state() == "normal"``，用户一最大化就被判成看不见，日志就此不再刷新。
+HIDDEN_WINDOW_STATES = frozenset({"withdrawn", "iconic"})
+
+
+def is_log_on_screen(page: str, window_state: str) -> bool:
+    """日志表这会儿有没有真的在人眼前。
+
+    抽成纯函数是为了能在没有图形环境的机器上测——它正是 2026-08-13 那次「实时日志没有了」
+    的判据所在，而窗口真不真的映射出来，在 CI/SSH 环境里根本模拟不了。
+    """
+    return page == "log" and window_state not in HIDDEN_WINDOW_STATES
+
+
 class LogFeed:
     """一个线程安全的小队列 + 「现在有没有人在看」的开关。"""
 

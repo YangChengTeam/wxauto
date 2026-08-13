@@ -17,7 +17,7 @@ from typing import Any
 
 from . import logline, theme
 from .logbuffer import LogBuffer
-from .logfeed import FLUSH_MS, LogFeed
+from .logfeed import FLUSH_MS, LogFeed, is_log_on_screen
 from .logtable import LEVEL_FILTERS, LogTable
 from .service import GatewayService, ServiceState
 
@@ -448,7 +448,7 @@ class MainWindow:
         现在按 120ms 的节拍现场问一次 tk，漏不掉也不会跑偏，代价只是一次状态查询。
         """
         try:
-            return self._page == "log" and self.root.state() not in {"withdrawn", "iconic"}
+            return is_log_on_screen(self._page, self.root.state())
         except tk.TclError:
             return False  # 窗口正在销毁
 
