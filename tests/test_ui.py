@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import os
 import tempfile
@@ -15,8 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from wxclient.gateway.factory import normalize_accounts
-from wxclient.ui import logline
-from wxclient.ui import settings_store
+from wxclient.ui import logline, settings_store
 from wxclient.ui.logbuffer import LogBuffer, LogPipeline, attach_to_root
 from wxclient.ui.logfeed import LogFeed, is_log_on_screen
 from wxclient.ui.service import GatewayService, ServiceState
@@ -119,13 +119,12 @@ class LogFilterTests(unittest.TestCase):
         names = [name for name, _ in LEVEL_FILTERS]
         self.assertEqual(names[0], "全部")
         sets = [allowed for _, allowed in LEVEL_FILTERS]
-        for looser, stricter in zip(sets, sets[1:]):
+        for looser, stricter in itertools.pairwise(sets):
             self.assertTrue(stricter < looser, "越靠后的档位必须更严格")
         self.assertIn("error", sets[-1], "最严格的档位也不能把错误滤掉")
 
     def test_every_severity_is_covered_by_the_loosest_filter(self) -> None:
-        from wxclient.ui.logline import LogLine
-        from wxclient.ui.logline import LEVEL_FILTERS
+        from wxclient.ui.logline import LEVEL_FILTERS, LogLine
 
         everything = LEVEL_FILTERS[0][1]
         for level in ("DEBUG", "INFO", "WARN", "ERROR", "FATAL", ""):
