@@ -186,6 +186,16 @@ class QueueMessageSource:
 
         last_signature, seq = self._store.get_cursor(account_id, peer_id)
         fresh, new_signature = split_new_messages(raw_messages, last_signature)
+        if last_signature is None and raw_messages:
+            # 首次见到这个会话：按设计只对齐游标、不回溯（否则网关一上线就照着几个月历史
+            # 逐条回复）。但**必须说出来**——不然日志上就是「读完了 N 条」然后再无下文，
+            # 看的人只会以为回复功能坏了（2026-08-13 真机，用户就是这么问的）。
+            _log.info(
+                "首次见到这个会话，只对齐游标不回溯；下一条新消息才会触发回复",
+                account=account_id,
+                peer=peer_id,
+                已读到=len(raw_messages),
+            )
         if new_signature is not None:
             self._store.set_cursor(account_id, peer_id, new_signature, seq + len(fresh))
 
