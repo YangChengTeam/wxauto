@@ -441,11 +441,15 @@ class UiaWeChatDriver:
         # 底座默认只等 0.2s 就按 Alt+S：**两张图还没在输入框里渲染完，这一下就被吞掉**，
         # 结果是文件躺在输入框里、回执却报成功（2026-08-13 真机实况）。按份数放宽等待。
         send_delay = min(6.0, max(1.5, 1.0 + 0.8 * len(normalized_files)))
+        # 先量一次「空输入框」是什么样：不同版本的输入框天生就带子元素，
+        # 拿绝对数当「有残留」会误报。基线一减，判据就只剩「这次粘进去的东西还在不在」。
+        baseline = self._chat_input_leftover(normalized_friend)
         logger.info(
             "files.send.start",
             friend=normalized_friend,
             file_count=len(normalized_files),
             send_delay=send_delay,
+            baseline=baseline,
         )
         try:
             Files.send_files_to_friend(
@@ -461,7 +465,7 @@ class UiaWeChatDriver:
             )
         except Exception as exc:
             raise WeChatApiError(f"发送文件失败：{exc}") from exc
-        leftover = self._flush_chat_input(normalized_friend)
+        leftover = self._flush_chat_input(normalized_friend, baseline)
         if leftover:
             # 宁可报失败也不报「已发送」：躺在输入框里 = 对方根本没收到，
             # 谎报成功比失败更糟（AI 会照着回执告诉用户「已经发过去了」）。
@@ -470,16 +474,21 @@ class UiaWeChatDriver:
         result["text_sent"] = bool(text)
         return result
 
+    def _chat_input_area(self, friend: str) -> Any | None:
+        """拿到当前会话的输入框控件。拿不到返回 None（判不了，不当作失败）。"""
+        Navigator = self._pyweixin_class("Navigator")
+        Uielements = self._pyweixin_submodule("Uielements")
+        main_window = Navigator.open_dialog_window(friend=friend, is_maximize=False)
+        if isinstance(main_window, tuple):     # 不同版本返回 (window, ...) 的情况
+            main_window = main_window[0]
+        edit_area = main_window.child_window(**Uielements.Edits.CurrentChatEdit)
+        return edit_area if edit_area.exists(timeout=1) else None
+
     def _chat_input_leftover(self, friend: str) -> int:
-        """输入框里还剩多少东西。0 = 空（已发出去）；-1 = 看不出来（不当作失败）。"""
+        """输入框里现在有多少东西（文本字数 + 子元素个数）。-1 = 看不出来。"""
         try:
-            Navigator = self._pyweixin_class("Navigator")
-            Uielements = self._pyweixin_submodule("Uielements")
-            main_window = Navigator.open_dialog_window(friend=friend, is_maximize=False)
-            if isinstance(main_window, tuple):     # 不同版本返回 (window, ...) 的情况
-                main_window = main_window[0]
-            edit_area = main_window.child_window(**Uielements.Edits.CurrentChatEdit)
-            if not edit_area.exists(timeout=1):
+            edit_area = self._chat_input_area(friend)
+            if edit_area is None:
                 return -1
             text_left = len(str(edit_area.window_text() or "").strip())
             children_left = len(edit_area.children())
@@ -489,17 +498,35 @@ class UiaWeChatDriver:
             logger.warning("files.send.input_probe_failed", error=str(exc))
             return -1
 
-    def _flush_chat_input(self, friend: str) -> bool:
-        """确认输入框已清空；没清空就再补一次 Alt+S。返回 True = 仍有残留（= 没发出去）。"""
+    def _flush_chat_input(self, friend: str, baseline: int) -> bool:
+        """确认粘进去的东西已经发走；没发走就补按发送键。返回 True = 仍有残留（= 没发出去）。
+
+        判据是**跟基线比**：输入框空着时本来就可能有子元素，只有比空态多出来的才算残留。
+        基线量不到（-1）时不做判定——宁可不报错，也不凭猜把成功说成失败。
+        """
         time.sleep(1.2)
-        leftover = self._chat_input_leftover(friend)
-        if leftover <= 0:
+        if baseline < 0:
             return False
-        logger.warning("files.send.retry_send", leftover=leftover)
-        pyautogui = __import__("pyautogui")
-        pyautogui.hotkey("alt", "s", _pause=False)
-        time.sleep(1.5)
-        return self._chat_input_leftover(friend) > 0
+        for attempt, key in enumerate(("enter", "alt+s")):
+            if self._chat_input_leftover(friend) <= baseline:
+                return False
+            logger.warning("files.send.retry_send", attempt=attempt, key=key)
+            try:
+                edit_area = self._chat_input_area(friend)
+                if edit_area is None:
+                    return False
+                edit_area.click_input()   # 焦点必须先回到输入框：不然按下的键会落到别处
+                time.sleep(0.3)
+                pyautogui = __import__("pyautogui")
+                if key == "enter":
+                    pyautogui.press("enter")
+                else:
+                    pyautogui.hotkey("alt", "s", _pause=False)
+            except Exception as exc:  # noqa: BLE001 —— 补发失败就按「没发出去」处理
+                logger.warning("files.send.retry_failed", error=str(exc))
+                return True
+            time.sleep(1.5)
+        return self._chat_input_leftover(friend) > baseline
 
     def open_chat(
         self,
