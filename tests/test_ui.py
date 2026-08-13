@@ -87,6 +87,29 @@ class DataDirTests(unittest.TestCase):
         self.assertNotEqual(resolved, Path(".wxclient"), "冻结态不能再用相对路径")
 
 
+class LogFilterTests(unittest.TestCase):
+    """日志级别过滤档位。不碰 GUI，所以能在 Linux 上跑。"""
+
+    def test_filters_are_nested_from_loose_to_strict(self) -> None:
+        from wxclient.ui.logline import LEVEL_FILTERS
+
+        names = [name for name, _ in LEVEL_FILTERS]
+        self.assertEqual(names[0], "全部")
+        sets = [allowed for _, allowed in LEVEL_FILTERS]
+        for looser, stricter in zip(sets, sets[1:]):
+            self.assertTrue(stricter < looser, "越靠后的档位必须更严格")
+        self.assertIn("error", sets[-1], "最严格的档位也不能把错误滤掉")
+
+    def test_every_severity_is_covered_by_the_loosest_filter(self) -> None:
+        from wxclient.ui.logline import LogLine
+        from wxclient.ui.logline import LEVEL_FILTERS
+
+        everything = LEVEL_FILTERS[0][1]
+        for level in ("DEBUG", "INFO", "WARN", "ERROR", "FATAL", ""):
+            severity = LogLine(time="", level=level, message="x").severity
+            self.assertIn(severity, everything, f"{level} 会被「全部」挡掉")
+
+
 class LogFeedTests(unittest.TestCase):
     """日志节拍器：攒一批画一批 + 没人看时不画。GUI 无关，所以能在 Linux 上跑。"""
 

@@ -27,6 +27,15 @@ _LEVELS = {
 }
 
 
+#: 界面上的级别过滤档位：显示名 → 放行的严重程度。放这儿而不是放视图里，
+#: 是因为它描述的是「严重程度怎么分档」，跟用什么控件画无关（也就能在无 GUI 的机器上测）。
+LEVEL_FILTERS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("全部", frozenset({"debug", "info", "warn", "error"})),
+    ("警告", frozenset({"warn", "error"})),
+    ("错误", frozenset({"error"})),
+)
+
+
 @dataclass(frozen=True)
 class LogLine:
     time: str

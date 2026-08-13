@@ -18,7 +18,7 @@ from typing import Any
 from . import logline, theme
 from .logbuffer import LogBuffer
 from .logfeed import FLUSH_MS, LogFeed
-from .logtable import LogTable
+from .logtable import LEVEL_FILTERS, LogTable
 from .service import GatewayService, ServiceState
 
 _STATE_TEXT = {
@@ -39,8 +39,8 @@ _STATE_COLOR = {
 
 _WECHAT_PROBE_SECONDS = 15
 
-#: 窗口重新打开时从缓冲回放多少行。每行都是真控件，铺满两千行会卡住。
-_REPLAY_LINES = 200
+#: 窗口重新打开时从缓冲回放多少行。视图是单个 Text，几百行的重画是一次性的、不心疼。
+_REPLAY_LINES = 800
 
 #: 转圈用的帧。每秒换一帧（跟着 _tick 走），够看出「还活着」。
 _SPINNER = ("◐", "◓", "◑", "◒")
@@ -75,7 +75,8 @@ class MainWindow:
         self._busy_frame = 0
         self._feed = LogFeed()
         self._destroyed = False
-        self._log_visible = False  # 「日志页正开着 且 窗口没缩起来」才为真
+        self._log_visible = False  # 由 _sync_log_visibility() 每拍现场核对，别手动改
+        self._page = "log"
 
         root.title("劳小智微信服务")
         self._apply_window_icon()
@@ -198,6 +199,20 @@ class MainWindow:
         self._action("打开目录", self.open_data_dir)
         self._action("清空", self.clear)
 
+        # 级别过滤。排障时最常问的一句是「有没有报错」，让人自己在几千行里翻不合适。
+        self._filter_bar = tk.Frame(header, bg=theme.CONTENT_BG)
+        self._filter_bar.pack(side=tk.RIGHT, padx=(0, 18))
+        self._filters: dict[str, tk.Label] = {}
+        for name, allowed in LEVEL_FILTERS:
+            chip = tk.Label(self._filter_bar, text=name, font=theme.FONT_SMALL,
+                            bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED,
+                            padx=10, pady=3, cursor="hand2")
+            chip.pack(side=tk.LEFT, padx=2)
+            chip.bind("<Button-1>", lambda _e, n=name, a=allowed: self._set_level_filter(n, a))
+            self._filters[name] = chip
+        self._active_filter = LEVEL_FILTERS[0][0]
+        self._render_filter_chips()
+
         self._pages = tk.Frame(content, bg=theme.CONTENT_BG)
         self._pages.pack(fill=tk.BOTH, expand=True)
 
@@ -231,6 +246,7 @@ class MainWindow:
     # ── 页面切换 ──────────────────────────────────────────────────
 
     def _show_page(self, page: str) -> None:
+        self._page = page
         for child in self._pages.winfo_children():
             child.pack_forget()
         for key, item in self._nav.items():
@@ -243,22 +259,19 @@ class MainWindow:
             self._heading.configure(text="参数设置")
             self._live_dot.pack_forget()
             self._live_text.pack_forget()
+            self._filter_bar.pack_forget()
             for widget in self._header_actions.winfo_children():
                 widget.pack_forget()
             settings_page = SettingsPage(self._pages, self.data_dir, on_saved=self._on_settings_saved)
             settings_page.pack(fill=tk.BOTH, expand=True)
-            self._set_log_visible(False)
         else:
             self._heading.configure(text="实时日志")
             self._live_dot.pack(side=tk.LEFT, padx=(12, 4))
             self._live_text.pack(side=tk.LEFT)
             for widget in self._header_actions.winfo_children():
                 widget.pack(side=tk.RIGHT, padx=10)
+            self._filter_bar.pack(side=tk.RIGHT, padx=(0, 18))
             self._log_page.pack(fill=tk.BOTH, expand=True)
-            # 构造期间 self._feed 已就绪，但窗口还没 show；可见性交给 show()/hide() 决定，
-            # 这里只在「窗口本来就露着」时才恢复，免得从设置页切回来时把托盘态点亮。
-            if self.root.state() == "normal":
-                self._set_log_visible(True)
 
     def _on_settings_saved(self, restart: bool) -> None:
         if self._settings_saved_callback is not None:
@@ -271,11 +284,9 @@ class MainWindow:
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
-        self._set_log_visible(True)
 
     def hide(self) -> None:
         self.root.withdraw()
-        self._set_log_visible(False)
 
     def begin_shutdown(self) -> bool:
         """进入退出中：立刻把界面切成「正在停止…」。已经在退了返回 False。
@@ -323,6 +334,7 @@ class MainWindow:
         self.buffer.clear()
         self._feed.drain()  # 攒着还没画的也一起扔，不然刚清完又被旧行填回来
         self._table.clear()
+        self._render_live_hint()
 
     def open_data_dir(self) -> None:
         import subprocess
@@ -426,27 +438,60 @@ class MainWindow:
 
     # ── 日志 ──────────────────────────────────────────────────────
 
-    def _set_log_visible(self, visible: bool) -> None:
-        """日志表在不在人眼前。不在 = 一行都不画（缩在托盘里是常态，别白烧 CPU）。"""
+    def _log_is_on_screen(self) -> bool:
+        """日志表这会儿有没有真的在人眼前。
+
+        **每次都现问，不留状态。** 早先是靠 show()/hide()/切页去记一个布尔量，结果漏掉了
+        一堆让窗口重新露面的路径——从任务栏还原、从最小化恢复，都不经过 show()；而窗口
+        最大化时 ``state()`` 返回的是 "zoomed" 不是 "normal"。任何一条漏掉，标志位就和
+        现实对不上，日志从此不再刷新（2026-08-13 真机反馈「实时日志没有了」就是这么来的）。
+        现在按 120ms 的节拍现场问一次 tk，漏不掉也不会跑偏，代价只是一次状态查询。
+        """
+        try:
+            return self._page == "log" and self.root.state() not in {"withdrawn", "iconic"}
+        except tk.TclError:
+            return False  # 窗口正在销毁
+
+    def _sync_log_visibility(self) -> None:
+        visible = self._log_is_on_screen()
         if visible == self._log_visible:
             return
         self._log_visible = visible
         if not visible:
             self._feed.pause()
-            return
-        if self._feed.resume():
+        elif self._feed.resume():
             self._replay()  # 暂停期间攒下的没画，从缓冲整屏补上
+
+    def _set_level_filter(self, name: str, allowed: frozenset[str]) -> None:
+        self._active_filter = name
+        self._render_filter_chips()
+        self._table.set_level_filter(allowed)
+        self._render_live_hint()
+
+    def _render_filter_chips(self) -> None:
+        for name, chip in self._filters.items():
+            active = name == self._active_filter
+            chip.configure(bg=theme.ROW_LINE if active else theme.CONTENT_BG,
+                           fg=theme.TEXT if active else theme.TEXT_MUTED)
+
+    def _render_live_hint(self) -> None:
+        """标题旁边报一下收了多少行——「它到底还在不在动」一眼可见。"""
+        count = self._table.line_count
+        self._live_text.configure(text=f"实时更新 · {count:,} 行" if count else "实时更新")
 
     def _replay(self) -> None:
         """从缓冲重画最后一屏。每行都是真控件，铺两千行会卡住，所以只取最后一截。"""
         self._table.clear()
         self._table.append([logline.parse(line) for line in self.buffer.snapshot()[-_REPLAY_LINES:]])
+        self._render_live_hint()
 
     def _pump_logs(self) -> None:
         """tk 线程按节拍取一批日志画一次。空转的那次只有一次取锁，几乎不要钱。"""
+        self._sync_log_visibility()
         lines = self._feed.drain()
         if lines:
             self._table.append([logline.parse(line) for line in lines])
+            self._render_live_hint()
         if not self._destroyed:
             self.root.after(FLUSH_MS, self._pump_logs)
 

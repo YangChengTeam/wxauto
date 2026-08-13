@@ -1,112 +1,139 @@
-"""日志表格：时间 / 级别 / 正文 三列，行间细分隔线（照 ``docs/wxui.png``）。
+"""实时日志视图：一个只读的 ``tk.Text`` 控制台，按 时间 / 级别 / 正文 三段着色。
 
-为什么不用 ``tk.Text``：Text 只能整行上色，做不出「时间灰、级别绿、正文黑」的分列着色，
-更做不出行间那条 1px 分隔线。所以用 Canvas 里放一串行 Frame——每行三个 Label 加一条
-分隔线，颜色随便配。
+**为什么不再用「一行一堆控件」。** 早先这里是 Canvas 里塞一串行 Frame，每行三个 Label
+加一条 1px 分隔线。做出来是好看，代价有三条：
+  · 每行 5 个真控件，满屏 500 行就是两千多个控件，tk 的布局器扛不住，日志一多就发卡；
+  · 文字选不中、复制不出来——排障时想把一行日志贴给别人都做不到；
+  · 行数一封顶就得销毁最旧的控件，滚动和重排的成本全压在日志最忙的时候。
 
-代价是每行都是真控件，所以**有行数上限**：超了就把最旧的行销毁。上限外的日志仍然在
-``LogBuffer`` 和日志文件里，只是界面不再画它——界面卡死比少显示几屏旧日志严重得多。
+换成单个 Text 之后：整个视图就一个控件，几千行也不喘；``tag_config`` 能给任意字符区间
+上色，所以「时间灰、级别按严重程度着色、正文黑」照样做得到，还白捡了选中/复制/查找。
+行与行之间用 ``spacing`` 拉开，比 1px 硬线更耐看，也不会在高分屏上糊成一团。
+
+警告和错误整行铺一层浅底色——扫一眼就知道哪儿不对，不用逐行读级别列。
 """
 
 from __future__ import annotations
 
 import tkinter as tk
+from collections import deque
+from collections.abc import Iterable
 
 from . import theme
-from .logline import LogLine
+from .logline import LEVEL_FILTERS, LogLine
 
-MAX_ROWS = 500
+#: 视图里最多留多少行。Text 撑得住，但内存和滚动条精度没必要无限扩张；
+#: 超出的部分仍在 LogBuffer 和日志文件里，只是界面不再显示。
+MAX_LINES = 3000
 
-_SEVERITY_COLOR = {
-    "info": theme.GREEN,
-    "warn": theme.ORANGE,
-    "error": theme.RED,
-    "debug": theme.GRAY,
+#: 级别列宽（字符）。定宽才能让正文对齐成一列，不定宽的日志看着就是乱的。
+_LEVEL_WIDTH = 5
+
+#: 严重程度 → (级别字颜色, 整行底色)。底色 None = 不铺。
+_SEVERITY_STYLE = {
+    "info": (theme.GREEN, None),
+    "warn": (theme.ORANGE, "#fff8ec"),
+    "error": (theme.RED, "#fef2f2"),
+    "debug": (theme.GRAY, None),
 }
 
 
 class LogTable(tk.Frame):
-    def __init__(self, parent: tk.Misc, max_rows: int = MAX_ROWS) -> None:
+    def __init__(self, parent: tk.Misc, max_lines: int = MAX_LINES) -> None:
         super().__init__(parent, bg=theme.ROW_LINE, padx=1, pady=1)
-        self._max_rows = max_rows
-        self._rows: list[tk.Frame] = []
-        self._scroll_pending = False
+        self._max_lines = max_lines
+        # 留一份数据：换过滤档位时要按新条件重画，不能指望从 Text 里把结构化字段抠回来。
+        self._lines: deque[LogLine] = deque(maxlen=max_lines)
+        self._allowed = LEVEL_FILTERS[0][1]
 
-        self._canvas = tk.Canvas(self, bg=theme.CONTENT_BG, highlightthickness=0, bd=0)
-        self._scroll = tk.Scrollbar(self, orient=tk.VERTICAL, command=self._canvas.yview, width=12)
-        self._canvas.configure(yscrollcommand=self._scroll.set)
+        self._text = tk.Text(
+            self, bg=theme.CONTENT_BG, fg=theme.TEXT, font=theme.FONT_LOG,
+            wrap=tk.WORD, relief=tk.FLAT, highlightthickness=0, bd=0,
+            padx=18, pady=10, spacing1=3, spacing3=5, cursor="arrow",
+            # 正文缩进到级别列右边：一条日志换行之后仍然对齐，不会跑到时间列底下去
+            tabs=("150p", "205p"), insertwidth=0,
+        )
+        self._scroll = tk.Scrollbar(self, orient=tk.VERTICAL, command=self._text.yview, width=12)
+        self._text.configure(yscrollcommand=self._scroll.set)
         self._scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self._body = tk.Frame(self._canvas, bg=theme.CONTENT_BG)
-        self._window = self._canvas.create_window((0, 0), window=self._body, anchor="nw")
+        self._text.tag_configure("time", foreground=theme.TEXT_MUTED)
+        self._text.tag_configure("msg", foreground=theme.TEXT, font=theme.FONT_BODY)
+        for severity, (color, row_bg) in _SEVERITY_STYLE.items():
+            self._text.tag_configure(f"level_{severity}", foreground=color, font=(theme.MONO, 9, "bold"))
+            if row_bg:
+                self._text.tag_configure(f"row_{severity}", background=row_bg)
+        # 只读，但要留着选中和 Ctrl+C——排障时能把日志贴给别人是刚需。
+        self._text.configure(state=tk.DISABLED)
+        self._text.bind("<Key>", self._swallow_keys)
 
-        self._body.bind("<Configure>", self._on_body_resize)
-        self._canvas.bind("<Configure>", self._on_canvas_resize)
-        self._canvas.bind_all("<MouseWheel>", self._on_wheel)
+    # -- 只读但可复制 ----------------------------------------------------
 
-    # -- 布局 ----------------------------------------------------------
+    def _swallow_keys(self, event: tk.Event) -> str | None:
+        """吞掉编辑类按键，放行复制/全选/翻页。"""
+        allowed = {"c", "C", "a", "A"}
+        if event.state & 0x4 and event.keysym in allowed:  # Ctrl+C / Ctrl+A
+            return None
+        if event.keysym in {"Up", "Down", "Left", "Right", "Prior", "Next", "Home", "End"}:
+            return None
+        return "break"
 
-    def _on_body_resize(self, _event: tk.Event) -> None:
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
-
-    def _on_canvas_resize(self, event: tk.Event) -> None:
-        self._canvas.itemconfigure(self._window, width=event.width)
-
-    def _on_wheel(self, event: tk.Event) -> None:
-        if self._canvas.winfo_ismapped():
-            self._canvas.yview_scroll(int(-event.delta / 120), "units")
-
-    def _at_bottom(self) -> bool:
-        top, bottom = self._scroll.get()
-        return bottom > 0.999 or top == bottom  # 内容没占满时也算在底部
-
-    # -- 内容 ----------------------------------------------------------
+    # -- 内容 ------------------------------------------------------------
 
     def append(self, lines: list[LogLine]) -> None:
-        """一次画一批。**别一行一次地调**——每次调用都要重排一遍，成串日志会把界面压死。"""
+        """一次画一批。**别一行一次地调**——成串日志会把界面压死。"""
         if not lines:
             return
-        stick = self._at_bottom()  # 用户往回翻时别把他拽回底部
-        # 一批里超过上限的部分连建都不用建：反正建出来立刻就要销毁。
-        if len(lines) > self._max_rows:
-            lines = lines[-self._max_rows:]
-        for item in lines:
-            self._rows.append(self._make_row(item))
-        while len(self._rows) > self._max_rows:
-            self._rows.pop(0).destroy()
-        if stick and not self._scroll_pending:
-            self._scroll_pending = True
-            self.after_idle(self._scroll_to_end)
+        self._lines.extend(lines)
+        visible = [item for item in lines if item.severity in self._allowed]
+        if visible:
+            self._write(visible)
 
     def clear(self) -> None:
-        for row in self._rows:
-            row.destroy()
-        self._rows.clear()
-        self._scroll_pending = False
+        self._lines.clear()
+        self._text.configure(state=tk.NORMAL)
+        self._text.delete("1.0", tk.END)
+        self._text.configure(state=tk.DISABLED)
 
-    def _scroll_to_end(self) -> None:
-        self._scroll_pending = False
-        self._canvas.update_idletasks()
-        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
-        self._canvas.yview_moveto(1.0)
+    def set_level_filter(self, allowed: frozenset[str]) -> None:
+        """换过滤档位，按新条件整屏重画。"""
+        if allowed == self._allowed:
+            return
+        self._allowed = allowed
+        self._text.configure(state=tk.NORMAL)
+        self._text.delete("1.0", tk.END)
+        self._text.configure(state=tk.DISABLED)
+        self._write([item for item in self._lines if item.severity in self._allowed])
 
-    def _make_row(self, item: LogLine) -> tk.Frame:
-        # 每多一个控件就多一份布局开销 × 行数上限。原来一行 5 个（行框 + 内层框 + 3 个
-        # Label + 分隔线），内层框只是用来加 padding 的——padding 直接挂到 Label 上，
-        # 一行省一个控件，满屏就是省 500 个。行框本身当分隔线：底色用线色、内容区留 1px。
-        row = tk.Frame(self._body, bg=theme.ROW_LINE)
-        row.pack(fill=tk.X)
+    @property
+    def line_count(self) -> int:
+        return len(self._lines)
 
-        line = tk.Frame(row, bg=theme.CONTENT_BG)
-        line.pack(fill=tk.X, pady=(0, 1))
+    # -- 渲染 ------------------------------------------------------------
 
-        tk.Label(line, text=item.time, font=theme.FONT_LOG, bg=theme.CONTENT_BG,
-                 fg=theme.TEXT_MUTED, width=20, anchor="w").pack(side=tk.LEFT, padx=(18, 0), pady=7)
-        tk.Label(line, text=item.level, font=theme.FONT_LOG, bg=theme.CONTENT_BG,
-                 fg=_SEVERITY_COLOR.get(item.severity, theme.TEXT_MUTED),
-                 width=6, anchor="w").pack(side=tk.LEFT, pady=7)
-        tk.Label(line, text=item.message, font=theme.FONT_BODY, bg=theme.CONTENT_BG,
-                 fg=theme.TEXT, anchor="w", justify=tk.LEFT).pack(
-                     side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 18), pady=7)
-        return row
+    def _write(self, items: Iterable[LogLine]) -> None:
+        stick = self._at_bottom()  # 用户往回翻时别把他拽回底部
+        self._text.configure(state=tk.NORMAL)
+        for item in items:
+            start = self._text.index("end-1c")
+            severity = item.severity
+            self._text.insert(tk.END, f"{item.time or '':<19}\t", ("time",))
+            self._text.insert(tk.END, f"{item.level or '':<{_LEVEL_WIDTH}}\t", (f"level_{severity}",))
+            self._text.insert(tk.END, f"{item.message}\n", ("msg",))
+            if _SEVERITY_STYLE.get(severity, (None, None))[1]:
+                self._text.tag_add(f"row_{severity}", start, self._text.index("end-1c"))
+        self._trim()
+        self._text.configure(state=tk.DISABLED)
+        if stick:
+            self._text.see(tk.END)
+
+    def _trim(self) -> None:
+        """行数封顶。Text 里 delete 整段比逐行销毁控件便宜得多。"""
+        overflow = int(self._text.index("end-1c").split(".")[0]) - self._max_lines
+        if overflow > 0:
+            self._text.delete("1.0", f"{overflow + 1}.0")
+
+    def _at_bottom(self) -> bool:
+        top, bottom = self._text.yview()
+        return bottom > 0.999 or top == bottom  # 内容没占满时也算在底部
