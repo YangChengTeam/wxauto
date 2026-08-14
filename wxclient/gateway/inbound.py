@@ -163,7 +163,16 @@ class InboundLoop:
             self._sleeping = False
             _log.info("进入工作时间窗，恢复轮询微信")
         await self._collect(now)
-        return self._dispatch_due(now)
+        # ★ 派发要用**读完之后**的时钟，不能复用上面那个 now（2026-08-14 真机实测）：
+        # 消息是在 `_collect` 里按 `now` 入的缓冲，而去抖要求「静默满 debounce 秒」。
+        # 拿同一个 now 去问「够久了吗」，答案恒为 0 秒 —— 本趟收到的消息**必然**判不够，
+        # 只能推到下一趟。轮询间隔 240s，于是每条回复白等一个完整周期（真机：21:25:39
+        # 收到，21:26:43 和 21:27:58 两趟都没派发）。而 `_collect` 自己就要跑 5~15 秒
+        # （逐个会话开窗读记录），读完再看表，去抖窗口通常已经自然满足。
+        #
+        # 这**不是**把节拍调快：轮询间隔、发送频次上限、工作时间窗一个都没动，
+        # 微信动作总量不变，只是不再凭空空转一趟。
+        return self._dispatch_due(self._clock())
 
     async def _collect(self, now: datetime) -> None:
         for account_id in self._accounts:

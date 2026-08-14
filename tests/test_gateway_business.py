@@ -385,6 +385,65 @@ class InboundLoopTests(StoreTestCase):
         self.assertIn("在吗", seen[0])
         self.assertIn("还招人吗", seen[0])
 
+    async def test_reading_takes_time_so_the_same_tick_can_dispatch(self) -> None:
+        """★ 读消息本身要花好几秒，读完就该派发，不许白等下一趟轮询。
+
+        真机上 `_collect` 逐个会话开窗读记录，一趟 5~15 秒；去抖窗口只有 3 秒。
+        原来 `tick()` 拿**读之前**取的 now 去问「静默够久了吗」，答案恒为 0 秒，
+        于是本趟收到的消息必然被推到下一趟——轮询间隔 240s，每条回复白等一个周期
+        （2026-08-13 真机：21:25:39 收到，21:26:43 / 21:27:58 两趟都没派发）。
+        """
+        seen: list[str] = []
+
+        async def handler(_a: str, _p: str, transcript: str, _m) -> None:
+            seen.append(transcript)
+
+        class SlowSource:
+            """模拟真机：读一趟微信要花 8 秒（逐个会话开窗读记录）。"""
+
+            def __init__(self, advance) -> None:
+                self._advance = advance
+                self._done = False
+
+            async def fetch(self, account_id: str) -> list[InboundMessage]:
+                self._advance(8)
+                if self._done:
+                    return []
+                self._done = True
+                return [msg("在吗", msg_id="m1")]
+
+        def advance(seconds: int) -> None:
+            self._now = self._now + timedelta(seconds=seconds)
+
+        loop = self._loop(SlowSource(advance), handler, now=T0)
+        # 读完已经过去 8 秒 > 去抖窗口 3 秒 → **本趟**就该派发，而不是等下一趟。
+        self.assertEqual(await loop.tick(), 1)
+        await loop.drain()
+        self.assertEqual(len(seen), 1)
+
+    async def test_debounce_still_holds_a_burst_together(self) -> None:
+        """上面那条不许把去抖弄失效：读得快的时候，连发的消息仍要合成一轮。"""
+        seen: list[str] = []
+
+        async def handler(_a: str, _p: str, transcript: str, _m) -> None:
+            seen.append(transcript)
+
+        source = FakeSource([
+            [msg("在吗", msg_id="m1")],
+            [msg("还招人吗", msg_id="m2")],
+            [],
+        ])
+        loop = self._loop(source, handler, now=T0)
+        self.assertEqual(await loop.tick(), 0)        # 读得快（时钟没走）→ 还在窗口内
+        self._now = T0 + timedelta(seconds=1)
+        self.assertEqual(await loop.tick(), 0)        # 第二条又把窗口顶开
+        self._now = T0 + timedelta(seconds=10)
+        self.assertEqual(await loop.tick(), 1)        # 静默够久 → 合成一轮
+        await loop.drain()
+        self.assertEqual(len(seen), 1)
+        self.assertIn("在吗", seen[0])
+        self.assertIn("还招人吗", seen[0])
+
     async def test_cancel_inflight_gives_up_the_running_turn(self) -> None:
         """★ 退出时不能被一轮没跑完的对话拖住——那一轮最长能占 180s。"""
         started = asyncio.Event()
