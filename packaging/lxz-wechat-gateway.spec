@@ -38,11 +38,29 @@ excludes = [
     "pymysql", "MySQLdb", "mysql", "mysqlclient",
     # tkinter 自带的演示与测试
     "tkinter.test", "test",
+    # ── 以下 2026-08-14 一批：真机 dist 逐目录量过体积，确认没有一处 import ──
+    # numpy + openblas 共 28 MB，整包第二大。原来必须留着是因为 third_party/pywechat
+    # 的 utils.py / WinSettings.py 在**模块顶上** import soundfile/sounddevice；这两个库
+    # 只服务语音消息（本仓一处都不调），已改成用到时再 import，所以这三块一起砍。
+    # ⚠️ 哪天要做语音消息，先把 utils.py 那两行改回顶层 import，再删这三个名字。
+    "numpy", "soundfile", "sounddevice",
+    # cryptography（_rust.pyd 9.2MB）：TLS 走标准库 ssl，全仓无一处 import。
+    "cryptography",
+    # HTTP/3 全家桶：httpx 用的是 h11/httpcore 那条路，aioquic 没人 import。
+    "aioquic", "pylsqpack",
+    # Pythonwin（win32ui.pyd + mfc140u.dll 共 6.7MB）：pywin32 的 GUI 部分，我们只用
+    # win32api/win32gui/win32clipboard 那几个模块。
+    "Pythonwin", "win32ui", "win32uiole",
+    # 打包机 env 里装着、被顺手收进来的：类型检查器、另一套 HTTP 栈、.NET 桥、
+    # httpx 的可选压缩后端（缺了它只是不宣告 br/zstd，功能不受影响）。
+    "mypy", "aiohttp", "pythonnet", "clr", "zstandard", "brotli", "bcrypt",
 ]
-# 没往表里放但值得知道的：numpy（含 openblas 19MB）**必须留着**——
-# third_party/pywechat 的 `utils.py` 顶上就 `import soundfile`，而 soundfile 依赖 numpy。
-# cryptography（_rust.pyd 9MB）也先留着：TLS 走的是标准库 ssl 不是它，但没实测过砍掉的
-# 影响，9MB 不值得拿线上连不上去换。
+
+# 模块级 excludes 管不到的：包本身要留，只是里面某个大插件从来用不上。
+# PIL 要留（托盘图标 + pywechat 用），但 AVIF 编解码器一个人就 7.8 MB，我们只画 PNG/ICO。
+DEAD_BINARIES = ("PIL\\_avif", "PIL/_avif")
+# 没砍、也砍不得的几块：pydantic_core(5.4MB，配置模型要用)、PIL 主体(托盘图标)、
+# tcl/tk(界面本体)、libcrypto/libssl(标准库 ssl 靠它连 wss)、pywin32_system32(COM)。
 
 # 入口是 launcher.py 不是 wxclient/ui/__main__.py——理由见 launcher.py 顶上的注释。
 a = Analysis(
@@ -54,6 +72,8 @@ a = Analysis(
     excludes=excludes,
     noarchive=False,
 )
+a.binaries = [item for item in a.binaries if not any(dead in item[0] for dead in DEAD_BINARIES)]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

@@ -3,8 +3,10 @@ import os
 import time
 import emoji
 import pyautogui
-import soundfile as sf
-import sounddevice as sd
+# ★ soundfile / sounddevice 改成用到时再 import（劳小智改动，2026-08-14）。
+# 它们只服务语音消息（send_audios_to_friend / process_audios），本仓一处都不调；
+# 而顶上这两行 import 会把 numpy + openblas 拖进 PyInstaller 包 —— 28 MB，
+# 占整包两成多。用到时再 import，打包就能把它们整块砍掉（见 packaging/*.spec）。
 from packaging import version
 from pywinauto import WindowSpecification,Desktop,mouse
 from pywinauto.controls.uia_controls import ListItemWrapper,ListViewWrapper
@@ -483,6 +485,7 @@ class Messages():
         if version.parse(current_version)>=version.parse('4.1.9'):
             audios=process_audios(audios=audios,audio_length=audio_length)
             if audios:
+                import sounddevice as sd  # 劳小智改动：语音功能才需要，见文件头
                 sd.default.device=SystemSettings.get_default_output()
                 edit_area=main_window.child_window(**Edits.CurrentChatEdit)
                 if not edit_area.exists(timeout=0.1):
@@ -904,6 +907,7 @@ def process_audios(audios:list[str],audio_length:int=60):
     #soundfile库支持的格式
     supported_formats={'.WAV', '.AIFF', '.AU', '.RAW', '.PAF', '.SVX', '.NIST', '.VOC', '.IRCAM', '.W64', '.MAT4', '.MAT5', '.PVF', '.XI', 
     '.HTK', '.SDS', '.AVR', '.WAVEX', '.SD2', '.FLAC', '.CAF', '.WVE', '.OGG', '.MPC2K', '.RF64', '.MP3'}
+    import soundfile as sf  # 劳小智改动：语音功能才需要，见文件头
     processed_audios=[]
     for audio_file in audios: 
         #路径存在且文件后缀在支持的音频格式内

@@ -36,7 +36,8 @@ import ctypes
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-import sounddevice as sd 
+# ★ sounddevice 改成用到时再 import（劳小智改动，2026-08-14）：只有 get_default_output
+# 用得上，而它顶在这里会把 numpy 拖进打包体积。理由同 utils.py 文件头。
 #常量
 ES_DISPLAY_REQUIRED=0x00000002
 ES_CONTINUOUS=0x80000000
@@ -67,6 +68,7 @@ class SystemSettings():
 
     @staticmethod
     def get_default_output()->int:
+        import sounddevice as sd  # 劳小智改动：语音功能才需要，见文件头
         output_devives=sd.default.device#可能有多个
         default_output=output_devives[0]#默认第一个
         for device in output_devives:
