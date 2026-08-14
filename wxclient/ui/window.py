@@ -53,6 +53,9 @@ _log = structlog.get_logger(__name__)
 #: 界面卡多久算「卡了一下」，要记一笔。心跳本身是 1 秒一次，留 0.6 秒余量给正常抖动。
 _STALL_WARN_SECONDS = 0.6
 
+#: 启动多久之后偷偷把参数页建好。要等过启动最忙的那一段，又要赶在用户去点之前。
+_SETTINGS_PREBUILD_MS = 3000
+
 #: 转场态（服务正在起/正在停）的提示语。这几秒里任何「再点一下」都只会把事情搞乱，
 #: 所以界面自己进入 busy：侧栏转圈说明在干什么，参数页盖住不给改。
 _TRANSITION_TEXT = {
@@ -136,6 +139,10 @@ class MainWindow:
         self._tick()
         self._pump_logs()
         self._schedule_wechat_probe()
+        # 参数页提前建好：建控件是「很多次小 Tcl 调用」，正是主线程抢不到 GIL 时最吃亏的活。
+        # 真机实测空闲时也要 9ms，网关忙着读聊天记录时点下去就是肉眼可见的一顿。
+        # 排在启动之后的空闲档期建，用户点的时候只剩 pack/unpack。
+        self._later(_SETTINGS_PREBUILD_MS, self._prebuild_settings_page)
 
     def _apply_window_icon(self) -> None:
         """标题栏 / Alt-Tab / 任务栏用同一个品牌图标（和托盘、快捷方式一致）。
@@ -338,6 +345,15 @@ class MainWindow:
             self._filter_bar.pack(side=tk.RIGHT, padx=(0, 18))
             self._log_page.pack(fill=tk.BOTH, expand=True)
         self._render_overlay()  # 两个分支都要摆一次：切走了就得把遮罩收掉
+
+    def _prebuild_settings_page(self) -> None:
+        """空闲时把参数页建出来（不显示）。失败无所谓——真点的时候还会再建一次。"""
+        if self._destroyed or self._settings_page is not None:
+            return
+        try:
+            self._ensure_settings_page()
+        except tk.TclError:
+            pass
 
     def _ensure_settings_page(self) -> Any:
         """设置页只建一次，之后每次进页重读磁盘上的值。

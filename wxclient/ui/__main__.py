@@ -12,27 +12,34 @@ import sys
 import threading
 import time
 import tkinter as tk
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-import structlog
-
-from wxclient.config import load_settings
-from wxclient.heavy_import import HEAVY_IMPORT_LOCK
-from wxclient.logging_config import configure_logging
-
-from . import icons, settings_store
-from .config import UiSettings
-from .logbuffer import LogBuffer, LogPipeline
-from .service import GatewayService, ServiceState
-from .single_instance import SingleInstance, raise_existing_window
+# ★ 模块级只留「把启动动画画出来」必需的这几样。**别在这儿 import 业务模块**——
+# `python -m wxclient.ui` 会先把它们全跑一遍，而在它们回来之前屏幕上一片空白。
+# 真机实测（源码模式，冷启动）：到看见启动动画 5.8 秒，其中 4.7 秒花在 import 上
+# （pydantic_settings + structlog + rich + asyncio）。这些东西**动画出来之后再要也不迟**。
+from . import icons
 from .splash import Splash
-from .tray import Tray
-from .window import WINDOW_TITLE, MainWindow
 
-if TYPE_CHECKING:
+if TYPE_CHECKING:  # 只为类型标注——`from __future__ import annotations` 让它们不在运行时求值
     from wxclient.gateway.factory import Gateway
 
-_log = structlog.get_logger(__name__)
+    from .config import UiSettings
+    from .service import GatewayService
+    from .tray import Tray
+    from .window import MainWindow
+
+
+class _LazyLogger:
+    """structlog 也得等动画出来再拉。它连着 rich，冷启动上不便宜。"""
+
+    def __getattr__(self, name: str) -> Any:
+        import structlog
+
+        return getattr(structlog.get_logger("wxclient.ui.__main__"), name)
+
+
+_log = _LazyLogger()
 
 
 def _dry_run_notice(args: argparse.Namespace, settings: UiSettings) -> str:
@@ -76,6 +83,34 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
+    # ── 第一件事：把启动动画画出来 ────────────────────────────────
+    # 下面那一堆 import 要花几秒（冷启动更久），在它们回来之前屏幕上必须已经有东西。
+    _claim_taskbar_identity()
+    root = tk.Tk()
+    root.withdraw()  # 主窗口先藏着，是否露面由后面决定
+    splash = Splash(root, icon_png=icons.PNG_PATH)
+    splash.stage("正在加载…")
+
+    # ★ 让界面在网关忙的时候还能动。真机实测（主线程 mainloop + 一条后台线程狂跑纯 Python）：
+    # 默认 5ms 时界面只跑到 37% 的心跳、迟到中位 40ms 最慢 86ms；调到 0.5ms 回到 66%
+    # （= 完全无干扰时的水平）、迟到中位 10ms，代价是后台吞吐 -4%。
+    # ⚠️ 这个代价只在「同时只有一条线程在啃 CPU」时才这么便宜：四条一起啃时吞吐会掉 97%。
+    # 本进程正是前者（网关一条线程），哪天真要跑多线程 CPU 活，先把这行删了重测。
+    sys.setswitchinterval(0.0005)
+
+    from wxclient.config import load_settings
+    from wxclient.heavy_import import HEAVY_IMPORT_LOCK
+    from wxclient.logging_config import configure_logging
+
+    from . import settings_store
+    from .config import UiSettings
+    from .logbuffer import LogBuffer, LogPipeline
+    from .service import GatewayService, ServiceState
+    from .single_instance import SingleInstance, raise_existing_window
+    from .tray import Tray
+    from .window import WINDOW_TITLE, MainWindow
+
+    splash.stage("正在读取配置…")
     wechat_settings = load_settings(args.config)
     # 先把上次在「参数设置」里填的值灌进环境变量，再读配置——真实环境变量优先
     settings_store.apply_to_environ(settings_store.load(wechat_settings.data_dir))
@@ -87,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     instance_guard = SingleInstance(wechat_settings.data_dir)
     if not instance_guard.acquire():
         # 默默退出会让人以为「双击了没反应」，所以尽力把已有窗口拽到前台。
+        splash.close()
+        root.update()  # 动画得真的消失：这条路径不进 mainloop，没人替它重绘
         raise_existing_window(WINDOW_TITLE)
         print("劳小智微信服务已经在运行了（同一台机器只能开一个）。", file=sys.stderr)
         return 0
@@ -97,15 +134,6 @@ def main(argv: list[str] | None = None) -> int:
         lambda: configure_logging(log_file=wechat_settings.data_dir / "gateway.log"),
     )
     log_pipeline.install()
-
-    _claim_taskbar_identity()
-
-    root = tk.Tk()
-    root.withdraw()  # 先藏起来，是否露面由下面决定
-
-    # ★ 启动动画先出来：从这里到主窗口露面还要建界面、起托盘、装配网关，冻结包实测
-    # 好几秒。这几秒里屏幕上一片空白，用户只会以为「双击了没反应」再点一次。
-    splash = Splash(root, icon_png=icons.PNG_PATH)
 
     def build() -> Gateway:
         # 惰性 import：build() 只在网关线程上跑，把 factory 那 2.7 秒（SQLAlchemy + 队列 +

@@ -709,6 +709,39 @@ class SplashTests(unittest.TestCase):
         self.assertIn('"-alpha", OPACITY * left / FADE_STEPS', source)
 
 
+class ColdStartTests(unittest.TestCase):
+    """双击到「看见启动动画」之间不许横着一堵 import 墙。"""
+
+    def test_importing_the_ui_package_does_not_drag_in_the_heavy_stack(self) -> None:
+        """★ `python -m wxclient.ui` 先跑包 __init__；它一 import 重家伙，动画就得等。
+
+        真机实测：`import wxclient.ui` 冷启动 4.7 秒（pydantic_settings + structlog
+        + rich + asyncio），那几秒屏幕上一片空白 = 用户眼里的「点了没反应」。
+        所以包 __init__ 改成 PEP 562 懒加载，这条用例把它钉住。
+        """
+        probe = (
+            "import sys, wxclient.ui;"
+            "print(int(any(m.split('.')[0] in {'pydantic', 'pydantic_settings', 'structlog', 'rich'}"
+            " for m in sys.modules)))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=Path(__file__).resolve().parent.parent,
+            capture_output=True, text=True, check=True,
+        )
+
+        self.assertEqual(result.stdout.strip(), "0", "包 __init__ 又把重家伙拉进来了")
+
+    def test_the_public_api_still_works_after_going_lazy(self) -> None:
+        """懒加载不能把公开 API 弄丢——别人还在 `from wxclient.ui import GatewayService`。"""
+        import wxclient.ui as package
+
+        for name in package.__all__:
+            self.assertTrue(hasattr(package, name), f"{name} 取不到了")
+        with self.assertRaises(AttributeError):
+            package.没有这个东西  # noqa: B018
+
+
 class PackagingTests(unittest.TestCase):
     """打包产物的硬约束。跑不了 pyinstaller 也要能守住的那几条，全在 spec 文本里。"""
 

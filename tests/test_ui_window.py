@@ -119,6 +119,21 @@ class WindowAdversarialTests(unittest.TestCase):
         self.window._render_overlay()
         self.assertEqual(self.window._overlay.winfo_manager(), "", "解锁后遮罩要收起")
 
+    def test_the_settings_page_is_prebuilt_so_the_first_click_is_cheap(self) -> None:
+        """★ 建控件是「很多次小 Tcl 调用」，网关忙着操作微信时主线程抢不到 GIL，最吃亏。
+
+        所以启动后趁空闲先建好，用户点下去只剩 pack/unpack。
+        """
+        self.assertIsNone(self.window._settings_page, "刚起来时还没建")
+
+        self.window._prebuild_settings_page()
+
+        page = self.window._settings_page
+        self.assertIsNotNone(page, "预热之后就该有了")
+        self.assertEqual(page.winfo_manager(), "", "预热只建不显示")
+        self.window.open_settings()
+        self.assertIs(self.window._settings_page, page, "真点的时候直接用预热那个")
+
     def test_locked_nav_refuses_the_settings_page(self) -> None:
         """转场期间「参数设置」点不动——托盘那条路也一样。"""
         self.window._locked = True
