@@ -12,7 +12,7 @@ op 不在白名单直接拒、写类动作过频次/时间窗/黑名单、真实
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,6 +38,16 @@ COMMAND_EVENT = "wechat.command"
 
 #: 网关回执用的 op（网关 → server，走客户端帧格式）。
 RESULT_OP = "wechat.result"
+
+
+#: 阶段性回执（073，需求文档 §12.4）。前两个是**中间态**——AI 端收到后只刷新卡，
+#: 不销账；只有终态才结束这条指令的生命周期。
+#:
+#: 为什么要有中间态：原来只有 done/failed/rejected，卡上写完「已下发」就再无下文，
+#: 十几秒里分不清「在跑」还是「丢了」——排查时先怀疑的永远是丢了。
+STAGE_RECEIVED = "received"   # 网关收到了，排队中
+STAGE_STARTED = "started"     # 过了守门，开始真动微信
+TERMINAL_STATUSES = frozenset({"done", "failed", "rejected"})
 
 
 class CommandError(ValueError):
@@ -202,7 +212,12 @@ class CommandExecutor:
         self._fetcher = fetcher
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
-    async def execute(self, data: dict[str, Any]) -> CommandResult:
+    async def execute(
+        self,
+        data: dict[str, Any],
+        on_stage: Callable[[str], Awaitable[None]] | None = None,
+    ) -> CommandResult:
+        """``on_stage`` 收中间态（073）。**重推的老指令不报中间态**——它没有在跑。"""
         command_id = str((data or {}).get("command_id") or "").strip()
         op = str((data or {}).get("op") or "").strip()
         if not command_id:
@@ -215,14 +230,20 @@ class CommandExecutor:
             return CommandResult(command_id, str(cached.get("status") or "done"),
                                  str(cached.get("reason") or ""), cached.get("result"))
 
-        result = await self._run(command_id, op, data)
+        result = await self._run(command_id, op, data, on_stage)
         self._store.put_command_result(
             self._account, command_id,
             {"status": result.status, "reason": result.reason, "result": result.result},
         )
         return result
 
-    async def _run(self, command_id: str, op: str, data: dict[str, Any]) -> CommandResult:
+    async def _run(
+        self,
+        command_id: str,
+        op: str,
+        data: dict[str, Any],
+        on_stage: Callable[[str], Awaitable[None]] | None = None,
+    ) -> CommandResult:
         spec = COMMANDS.get(op)
         if spec is None:
             _log.warning("收到不支持的微信指令", op=op)
@@ -247,6 +268,11 @@ class CommandExecutor:
         if denial:
             _log.info("指令被守门拦下", op=op, reason=denial)
             return CommandResult(command_id, "rejected", denial)
+
+        # 到这里参数齐了、守门也过了，接下来就要真动微信（发文件还要先取字节）。
+        # 报一声「开始了」——这段可能跑十几秒，中间没有任何信号的话没法跟「丢了」区分。
+        if on_stage is not None:
+            await on_stage(STAGE_STARTED)
 
         # 读类也必须显式关掉 dry_run：底座的 dry_run 默认是 True，`check_new_friends`
         # / `read_recent_moments` 在 dry-run 下直接返回空壳（`wechat_api/uia.py`），

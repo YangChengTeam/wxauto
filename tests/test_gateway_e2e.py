@@ -582,13 +582,19 @@ class CommandChannelTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(runtime.calls), 1)
                 self.assertIs(runtime.calls[0][0], TaskType.SEND_MESSAGE)
 
+                # 073：回执是**一串阶段**（接收 → 开始 → 终态），不是一锤子。
+                # 只有终态才算这条指令结束；前两个是让人看见「在跑」而不是「丢了」。
                 for _ in range(100):                        # 回执是 client → server 的 op 帧
                     receipts = [f for f in server.received if f.get("op") == "wechat.result"]
-                    if receipts:
+                    if any(r["data"]["status"] == "done" for r in receipts):
                         break
                     await asyncio.sleep(0.02)
-                self.assertEqual(receipts[0]["data"]["command_id"], "cmd-1")
-                self.assertEqual(receipts[0]["data"]["status"], "done")
+                self.assertTrue(all(r["data"]["command_id"] == "cmd-1" for r in receipts))
+                self.assertEqual(
+                    [r["data"]["status"] for r in receipts],
+                    ["received", "started", "done"],
+                    "阶段序列不对：需求文档 §12.4 要 接收/开始/成功",
+                )
             finally:
                 await runner.stop()
 

@@ -19,7 +19,13 @@ from typing import Any
 
 import structlog
 
-from .commands import COMMAND_EVENT, RESULT_OP, CommandExecutor, parse_commands
+from .commands import (
+    COMMAND_EVENT,
+    RESULT_OP,
+    STAGE_RECEIVED,
+    CommandExecutor,
+    parse_commands,
+)
 from .config import GatewaySettings
 from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from, within_active_hours
@@ -213,22 +219,31 @@ class GatewayRunner:
 
     async def _run_command(self, account_id: str, command: dict[str, Any]) -> None:
         assert self._commands is not None
+        command_id = str(command.get("command_id") or "")
+
+        async def report(status: str, **extra: Any) -> None:
+            """把一个阶段报回 AI 端。报不出去只记账——回执发不掉不该影响已做完的动作。"""
+            try:
+                client = await self._pool.acquire(account_id)
+                await client.notify(RESULT_OP, {"command_id": command_id, "status": status, **extra})
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("指令回执发送失败", error=str(exc), status=status)
+
+        # 073：先报「收到了」。一条指令要动微信、可能跑十几秒，中间一点信号都没有的话，
+        # 卡上就停在「已下发」——分不清在跑还是丢了（需求文档 §12.4 要 接收/开始/成功/失败）。
+        await report(STAGE_RECEIVED)
         try:
-            result = await self._commands.execute(command)
+            result = await self._commands.execute(command, on_stage=report)
         except Exception as exc:  # noqa: BLE001 —— 执行器炸了也要给上游一个交代
             _log.warning("指令执行器异常", error=str(exc))
             result = None
         payload = (
             result.to_frame_data()
             if result is not None
-            else {"command_id": str(command.get("command_id") or ""), "status": "failed",
-                  "reason": "网关内部错误"}
+            else {"command_id": command_id, "status": "failed", "reason": "网关内部错误"}
         )
-        try:
-            client = await self._pool.acquire(account_id)
-            await client.notify(RESULT_OP, payload)
-        except Exception as exc:  # noqa: BLE001 —— 回执发不出去不该影响已完成的动作
-            _log.warning("指令回执发送失败", error=str(exc), status=payload.get("status"))
+        await report(str(payload.pop("status")), **{k: v for k, v in payload.items()
+                                                    if k != "command_id"})
 
     # ────────────────────────── 一轮 ──────────────────────────
 
