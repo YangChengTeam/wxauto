@@ -20,6 +20,7 @@ from wxclient.gateway import (
     InboundMessage,
     OutboundGuard,
     OutboundSender,
+    RateLimit,
     Watchlist,
     WatchScope,
     clamp_interval,
@@ -28,6 +29,12 @@ from wxclient.gateway import (
     jittered,
     looks_like_rejection,
     within_active_hours,
+)
+from wxclient.gateway.guard import (
+    ACTION_FRIEND,
+    ACTION_GROUP,
+    ACTION_MESSAGE,
+    ACTION_MOMENTS,
 )
 from wxclient.gateway.inbound import PENDING_MAX_AGE_HOURS, PENDING_MAX_ATTEMPTS
 from wxclient.gateway.wechat_io import (
@@ -269,6 +276,77 @@ class GuardTests(StoreTestCase):
 
 
 # ────────────────────────── 出站 ──────────────────────────
+
+
+class ActionRateLimitTests(StoreTestCase):
+    """★ 分动作频次（072，需求文档 §13.3）。
+
+    原来只有一个 `max_sends_per_hour` 总闸管所有写操作，于是「今天一条消息没发」
+    就能换来「连加 30 个好友」——而加好友恰恰是风控最敏感的动作（2026-08-12 自动退登）。
+    """
+
+    def _guard(self, **kw) -> OutboundGuard:
+        limits = {
+            ACTION_MESSAGE: RateLimit(3, 3600.0),
+            ACTION_GROUP: RateLimit(1, 3600.0),
+            ACTION_FRIEND: RateLimit(2, 3600.0),
+            ACTION_MOMENTS: RateLimit(1, 86400.0),
+        }
+        return OutboundGuard(
+            self.store, active_hours="00:00-23:59", action_limits=limits, **kw
+        )
+
+    async def test_each_action_has_its_own_budget(self) -> None:
+        """★ 加好友的额度用完，不该因为「消息还没发几条」就放行。"""
+        guard = self._guard(max_sends_per_hour=100)
+        for _ in range(2):
+            self.store.record_send("a", "p", T0, action=ACTION_FRIEND)
+
+        friend = guard.check("a", "p", now=T0, action=ACTION_FRIEND)
+        self.assertFalse(friend.allowed)
+        self.assertIn("加好友", friend.reason)
+        # 另一档一点都没被消耗。
+        self.assertTrue(guard.check("a", "p", now=T0, action=ACTION_MESSAGE).allowed)
+
+    async def test_group_is_stricter_than_one_on_one(self) -> None:
+        """群的误伤面比单聊大，配额单独且更紧。"""
+        guard = self._guard(max_sends_per_hour=100)
+        self.store.record_send("a", "某某招聘群", T0, action=ACTION_GROUP)
+        self.assertFalse(guard.check("a", "某某招聘群", now=T0, action=ACTION_GROUP).allowed)
+        self.assertTrue(guard.check("a", "王建国", now=T0, action=ACTION_MESSAGE).allowed)
+
+    async def test_moments_budget_is_per_day_not_per_hour(self) -> None:
+        """一小时发 3 条和一天发 3 条完全是两回事。"""
+        guard = self._guard(max_sends_per_hour=100)
+        self.store.record_send("a", "", T0, action=ACTION_MOMENTS)
+        self.assertFalse(guard.check("a", "", now=T0 + timedelta(hours=5), action=ACTION_MOMENTS).allowed)
+        self.assertTrue(guard.check("a", "", now=T0 + timedelta(hours=25), action=ACTION_MOMENTS).allowed)
+
+    async def test_overall_cap_still_applies(self) -> None:
+        """★ 分档各自没超，加起来也不能没边——两道闸都要过。"""
+        guard = self._guard(max_sends_per_hour=2)
+        self.store.record_send("a", "p", T0, action=ACTION_FRIEND)
+        self.store.record_send("a", "p", T0, action=ACTION_MESSAGE)
+        decision = guard.check("a", "p", now=T0, action=ACTION_MESSAGE)
+        self.assertFalse(decision.allowed)
+        self.assertIn("上限", decision.reason)
+
+    async def test_zero_budget_forbids_the_action_outright(self) -> None:
+        """配额配成 0 = 本机不开放这类动作，而不是「无限」。"""
+        guard = OutboundGuard(
+            self.store, active_hours="00:00-23:59",
+            action_limits={ACTION_MOMENTS: RateLimit(0, 86400.0)},
+        )
+        decision = guard.check("a", "", now=T0, action=ACTION_MOMENTS)
+        self.assertFalse(decision.allowed)
+        self.assertIn("朋友圈", decision.reason)
+
+    async def test_legacy_rows_count_as_private_messages(self) -> None:
+        """老库补列后，历史那些没有 action 的行按「私聊」算——不能凭空清零谁的额度。"""
+        self.store.record_send("a", "p", T0)          # 不带 action，走默认
+        self.assertEqual(
+            self.store.sends_since("a", T0 - timedelta(hours=1), action=ACTION_MESSAGE), 1
+        )
 
 
 class ExtractReplyTests(unittest.TestCase):

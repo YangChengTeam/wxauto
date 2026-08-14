@@ -19,7 +19,7 @@ from .commands import CommandExecutor
 from .config import GatewaySettings
 from .download import FileFetcher
 from .friends import FriendWatcher
-from .guard import OutboundGuard
+from .guard import OutboundGuard, action_limits_from
 from .pacing import MIN_FRIEND_INTERVAL_SECONDS, clamp_interval
 from .runner import GatewayRunner
 from .sessions import GatewayStore
@@ -135,6 +135,7 @@ def build_gateway(
                 store,
                 max_sends_per_hour=gateway_settings.max_sends_per_hour,
                 active_hours=gateway_settings.active_hours,
+                action_limits=action_limits_from(gateway_settings),
             ),
             account_id=resolved_accounts[0],
             allow_real_actions=allow_real_actions,

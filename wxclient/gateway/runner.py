@@ -22,7 +22,7 @@ import structlog
 from .commands import COMMAND_EVENT, RESULT_OP, CommandExecutor, parse_commands
 from .config import GatewaySettings
 from .friends import FriendWatcher
-from .guard import OutboundGuard, within_active_hours
+from .guard import OutboundGuard, action_limits_from, within_active_hours
 from .inbound import InboundLoop, InboundMessage, MessageSource
 from .outbound import DeliveryResult, MessageSink, OutboundSender
 from .pacing import MIN_READ_INTERVAL_SECONDS, clamp_interval
@@ -164,6 +164,7 @@ class GatewayRunner:
                 store,
                 max_sends_per_hour=settings.max_sends_per_hour,
                 active_hours=settings.active_hours,
+                action_limits=action_limits_from(settings),
             ),
             store=store,
             clock=self._clock,

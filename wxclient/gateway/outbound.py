@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 import structlog
 
-from .guard import GuardDecision, OutboundGuard
+from .guard import ACTION_GROUP, ACTION_MESSAGE, GuardDecision, OutboundGuard
 
 _log = structlog.get_logger(__name__)
 
@@ -101,7 +101,9 @@ class OutboundSender:
             return DeliveryResult(skipped_reason=no_reply_reason, actions=actions)
 
         now = self._clock()
-        decision: GuardDecision = self._guard.check(account_id, peer_id, now=now)
+        # 回到群里和回给一个人是两档配额（072）：群的误伤面大得多。
+        action = ACTION_GROUP if self._store.is_known_group(account_id, peer_id) else ACTION_MESSAGE
+        decision: GuardDecision = self._guard.check(account_id, peer_id, now=now, action=action)
         if not decision.allowed:
             _log.info("出站被守门拦下", account=account_id, reason=decision.reason)
             return DeliveryResult(skipped_reason=decision.reason, actions=actions)
@@ -109,7 +111,7 @@ class OutboundSender:
         task_ids: list[str] = []
         for segment in segments:
             task_id = await self._sink.send(account_id, peer_id, segment)
-            self._store.record_send(account_id, peer_id, self._clock())
+            self._store.record_send(account_id, peer_id, self._clock(), action=action)
             task_ids.append(task_id)
         _log.info("已投递回复", account=account_id, segments=len(task_ids))
         return DeliveryResult(sent=task_ids, actions=actions)

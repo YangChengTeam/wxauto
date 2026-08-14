@@ -81,7 +81,8 @@ CREATE INDEX IF NOT EXISTS idx_pending_inbound_account
 CREATE TABLE IF NOT EXISTS gateway_send_log (
   account_id TEXT NOT NULL,
   peer_id    TEXT NOT NULL,
-  sent_at    TEXT NOT NULL
+  sent_at    TEXT NOT NULL,
+  action     TEXT NOT NULL DEFAULT 'message'
 );
 CREATE INDEX IF NOT EXISTS idx_send_log_account_time
   ON gateway_send_log (account_id, sent_at);
@@ -92,6 +93,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """幂等加列。SQLite 的 ADD COLUMN 不动既有数据，只给老行填默认值。"""
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 class GatewayStore:
     """网关本地状态存储。所有方法同步——SQLite 本来就快，别为它引入异步复杂度。"""
 
@@ -100,6 +108,9 @@ class GatewayStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as conn:
             conn.executescript(_SCHEMA)
+            # 老库补列：CREATE TABLE IF NOT EXISTS 不会动既有表，不补的话
+            # 分动作频控（072）在升级过的机器上会直接 "no such column" 崩掉。
+            _ensure_column(conn, "gateway_send_log", "action", "TEXT NOT NULL DEFAULT 'message'")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -423,20 +434,31 @@ class GatewayStore:
 
     # ────────────────────────── 发送计数（频次守门）──────────────────────────
 
-    def record_send(self, account_id: str, peer_id: str, at: datetime | None = None) -> None:
+    def record_send(
+        self,
+        account_id: str,
+        peer_id: str,
+        at: datetime | None = None,
+        action: str = "message",
+    ) -> None:
+        """记一次写动作。``action`` 决定它计进哪一档配额（072）。"""
         with closing(self._connect()) as conn:
             conn.execute(
-                "INSERT INTO gateway_send_log (account_id, peer_id, sent_at) VALUES (?,?,?)",
-                (account_id, peer_id, (at or _utcnow()).isoformat()),
+                "INSERT INTO gateway_send_log (account_id, peer_id, sent_at, action) "
+                "VALUES (?,?,?,?)",
+                (account_id, peer_id, (at or _utcnow()).isoformat(), action),
             )
             conn.commit()
 
-    def sends_since(self, account_id: str, since: datetime) -> int:
+    def sends_since(self, account_id: str, since: datetime, action: str | None = None) -> int:
+        """``action=None`` = 所有写动作（总闸）；给了就只数那一档。"""
+        sql = "SELECT COUNT(*) FROM gateway_send_log WHERE account_id=? AND sent_at>=?"
+        params: tuple = (account_id, since.isoformat())
+        if action is not None:
+            sql += " AND action=?"
+            params = (*params, action)
         with closing(self._connect()) as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM gateway_send_log WHERE account_id=? AND sent_at>=?",
-                (account_id, since.isoformat()),
-            ).fetchone()
+            row = conn.execute(sql, params).fetchone()
         return int(row[0]) if row else 0
 
     def sends_in_last_hour(self, account_id: str, now: datetime | None = None) -> int:

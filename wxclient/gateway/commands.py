@@ -23,7 +23,13 @@ import structlog
 from wxclient.queue import TaskType
 
 from .download import DownloadError, FileRef
-from .guard import OutboundGuard
+from .guard import (
+    ACTION_FRIEND,
+    ACTION_GROUP,
+    ACTION_MESSAGE,
+    ACTION_MOMENTS,
+    OutboundGuard,
+)
 
 _log = structlog.get_logger(__name__)
 
@@ -49,6 +55,12 @@ class CommandSpec:
     """args → 队列 payload。缺必填参数就抛 CommandError，**绝不用默认值糊弄**。"""
     target: Callable[[dict[str, Any]], str] = lambda _args: ""
     """这条指令打扰的是谁（黑名单与发送计数按它记）。没有具体对象就返回空串。"""
+
+    action: str = ACTION_MESSAGE
+    """走哪一档频次配额（072，需求文档 §13.3）。读类不计数，这个字段用不上。
+
+    私聊 / 群消息是同一个 op 的两种形态（发到群里误伤面更大），所以群那一档
+    不写在这里，由 `_action_for` 按对方是不是群现算。"""
 
 
 def _req(args: dict[str, Any], key: str, *, alias: str = "") -> str:
@@ -107,14 +119,17 @@ COMMANDS: dict[str, CommandSpec] = {
         lambda a: {"number": _req(a, "number"), "greetings": str(a.get("greetings") or "你好"),
                    "remark": a.get("remark")},
         lambda a: _req(a, "number"),
+        action=ACTION_FRIEND,
     ),
     "accept_new_friends": CommandSpec(
         TaskType.ACCEPT_NEW_FRIENDS, True,
         lambda a: {"limit": _limit(a, 1, 5)},
+        action=ACTION_FRIEND,
     ),
     "post_moments": CommandSpec(
         TaskType.POST_MOMENTS, True,
         lambda a: {"text": _req(a, "text"), "medias": list(a.get("medias") or [])},
+        action=ACTION_MOMENTS,
     ),
     # ── 读类 ──
     "search_contacts": CommandSpec(
@@ -227,7 +242,8 @@ class CommandExecutor:
             return CommandResult(command_id, "rejected", "本机没有配取文件通道，发不了 AI 端产出的文件")
 
         now = self._clock()
-        denial = self._gate(spec, peer, now)
+        action = self._action_for(spec, peer)
+        denial = self._gate(spec, peer, now, action)
         if denial:
             _log.info("指令被守门拦下", op=op, reason=denial)
             return CommandResult(command_id, "rejected", denial)
@@ -261,18 +277,28 @@ class CommandExecutor:
                 _log.warning("指令执行失败", op=op, error=str(exc))
                 return CommandResult(command_id, "failed", f"{type(exc).__name__}: {exc}")
 
-            if spec.writes and peer:
+            if spec.writes:
                 # 主动发出去的也要计入频次——不然「被动回复限 20 条/时」会被主动触达绕开。
-                self._store.record_send(self._account, peer, now)
+                # ★ 没有具体对象的写动作（发朋友圈）同样要记账（072）：它照样是一次
+                #   平台看得见的动作，不记就等于朋友圈那一档配额永远用不满、形同虚设。
+                self._store.record_send(self._account, peer, now, action=action)
             _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
             return CommandResult(command_id, "done", result=(raw or {}).get("result") or {})
 
-    def _gate(self, spec: CommandSpec, peer: str, now: datetime) -> str:
+    def _action_for(self, spec: CommandSpec, peer: str) -> str:
+        """这条指令算哪一档配额。发到群里的消息单独算——群的误伤面比单聊大得多。"""
+        if spec.action == ACTION_MESSAGE and peer and self._store.is_known_group(
+            self._account, peer
+        ):
+            return ACTION_GROUP
+        return spec.action
+
+    def _gate(self, spec: CommandSpec, peer: str, now: datetime, action: str) -> str:
         """返回拒绝理由；空串 = 放行。
 
         读类只受时间窗约束（半夜翻联系人一样是「机器在跑」）；写类走完整守门。
         """
-        decision = self._guard.check(self._account, peer, now=now)
+        decision = self._guard.check(self._account, peer, now=now, action=action)
         if decision.allowed:
             return ""
         if not spec.writes and "时间窗" not in decision.reason:

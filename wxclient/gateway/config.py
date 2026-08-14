@@ -63,6 +63,22 @@ class GatewaySettings(BaseSettings):
 
     # ── 守门（Phase B 使用）──
     max_sends_per_hour: int = 30
+    """所有写动作合计的总闸。分档各自没超，加起来也不能没边。"""
+
+    # 分动作配额（072，需求文档 §13.3）。只有一个总闸的话，「今天一条消息没发」
+    # 就能换来「连加 30 个好友」——而加好友恰恰是风控最敏感的动作。
+    max_messages_per_hour: int = 20
+    """私聊一个人，每小时上限。"""
+
+    max_group_messages_per_hour: int = 6
+    """发到群里，每小时上限。比私聊严——群的误伤面大得多。"""
+
+    max_friend_actions_per_hour: int = 5
+    """加好友 + 通过好友申请，每小时上限。最招风控的一类，5 个已经不算保守。"""
+
+    max_moments_per_day: int = 3
+    """发朋友圈，每 **天** 上限——一小时发 3 条和一天发 3 条完全是两回事。"""
+
     active_hours: str = "09:00-21:00"
 
     allow_insecure_transport: bool = False

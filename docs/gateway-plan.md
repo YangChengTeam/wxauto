@@ -156,15 +156,26 @@ WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS 读消息间隔，默认 60，下限 30
 WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS  查新好友间隔，默认 900，下限 300，0=不查
 WXCLIENT_GATEWAY_DEBOUNCE_SECONDS      去抖窗口
 WXCLIENT_GATEWAY_TURN_TIMEOUT_SECONDS  一轮上限，默认 180
-WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR    每号每小时发送上限
+WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR    所有写动作合计的总闸，默认 30
 WXCLIENT_GATEWAY_ACTIVE_HOURS          工作时间窗，如 09:00-21:00（窗外一概不动微信）
-WXCLIENT_GATEWAY_ALLOW_GROUPS          应急开关：连群聊也回，默认关
 WXCLIENT_GATEWAY_PEER_ALLOWLIST        应急开关：只处理这几个会话
 WXCLIENT_GATEWAY_PEER_DENYLIST         应急开关：永不处理这几个会话
 ```
 
-桌面端「参数设置」只摆前 9 项里必须由人定的那些；三个应急开关和有正确默认值的项
-（task_type / 去抖 / 单轮上限）只留环境变量，手工写进 `gateway.env` 依然生效。
+分动作配额（072，需求文档 §13.3。总闸与分档**两道都要过**）：
+
+```
+WXCLIENT_GATEWAY_MAX_MESSAGES_PER_HOUR        私聊，每小时，默认 20
+WXCLIENT_GATEWAY_MAX_GROUP_MESSAGES_PER_HOUR  群消息，每小时，默认 6（比私聊严：误伤面大）
+WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR  加好友+通过申请，每小时，默认 5（最招风控）
+WXCLIENT_GATEWAY_MAX_MOMENTS_PER_DAY          朋友圈，每**天**，默认 3
+```
+
+只有一个总闸的时候，「今天一条消息没发」就能换来「连着加 30 个好友」——而加好友
+恰恰是风控最敏感的动作。配成 `0` = 本机不开放该类动作（不是「无限」）。
+
+桌面端「参数设置」只摆必须由人定的那些；应急开关和有正确默认值的项
+（task_type / 去抖 / 单轮上限 / 各档配额）只留环境变量，手工写进 `gateway.env` 依然生效。
 
 ### 4.1 节拍与风控（2026-08-12 事故后定的）
 
@@ -180,13 +191,25 @@ WXCLIENT_GATEWAY_PEER_DENYLIST         应急开关：永不处理这几个会�
 外加：**工作时间窗之外一个微信动作都不做**（原来只拦发送，轮询是 24 小时不停的），
 且时间窗比的是**本机墙上时间**——原来拿 UTC 比，在东八区等于「白天不发、半夜猛发」。
 
-### 4.2 监听列表由 AI 端推
+### 4.2 监听列表由 AI 端推（069）
 
-该盯哪些候选人是业务侧才知道的事，不该在桌面端手抄。AI 端连上后可随时推
-`ev: "wechat.watchlist"`，`data: {only:[…], never:[…], allow_groups:bool}`，
-网关整体替换即时生效（`gateway/watchlist.py`）。缺字段沿用现值、坏数据不换
-（名单被坏帧清空 = 开始回本不该回的人）。**网关侧收帧已实现并有测试；AI 端还没有
-发这个事件的地方**——在那之前用本地兜底：所有单聊都管、群聊一概不管。
+该盯哪些候选人是业务侧才知道的事，不该在桌面端手抄。AI 端在网关登记那一刻推一次、
+名单变了立刻重推：`ev: "wechat.watchlist"`，`data: {only:[…], never:[…]}`，
+网关整体替换即时生效（`gateway/watchlist.py`）并落盘（重启不至于全哑）。
+缺字段沿用现值、坏数据不换。
+
+两条硬规矩（用户裁决 2026-08-14）：
+
+- **群和单聊一视同仁**，都只看名单。要不要管一个群是业务判断，不是类型判断。
+  原来写死「群聊一概不管」，「把某个招聘群纳入自动化」在网关侧根本做不到。
+- **白名单语义，没在名单上就不管**。空名单 = 一个都不管，**不是**「不限制」。
+  原来「留空 = 所有单聊都管」意味着装上就自动回复任何人，包括专员的家人朋友
+  （违反需求文档 §13.1「对象必须在 HR 数据权限范围内」）。名单为空时会 warn 一次。
+
+名单在 AI 端怎么来（`lxz_agent_backend` 仓 `src/ws/wechatWatchlist.ts`）：
+① 专员在对话里点名（`watch_add` / `watch_remove`）；
+② **主动联系过谁就自动收录**——分身给谁发过消息、加过谁好友，对方自动进名单，
+   不然「加了好友却不会自动回复他」会变成每次都要手工补一遍的苦役。
 
 
 启动：
