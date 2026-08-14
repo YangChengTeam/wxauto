@@ -26,9 +26,22 @@ _log = structlog.get_logger(__name__)
 LOCK_FILENAME = "ui.lock"
 
 
+#: 被锁住的那一个字节的偏移量。文件里从第 1 字节起写 PID，第 0 字节只作锁位。
+LOCK_OFFSET = 0
+
+
 def _lock_exclusive(handle) -> bool:
-    """给已打开的文件加**非阻塞**独占锁。拿不到返回 False（说明别人占着）。"""
+    """给已打开的文件加**非阻塞**独占锁。拿不到返回 False（说明别人占着）。
+
+    ★ Windows 上 `msvcrt.locking` 锁的是「**从当前读写位置**起的 N 个字节」，
+      不是整个文件（Linux 的 flock 才是整份）。所以加锁前必须先 `seek` 到同一个
+      偏移量上——2026-08-14 真机实测：原来用 `open("a+")` 打开，Windows 的追加模式
+      把位置放在文件末尾，第一个实例（空文件）锁的是第 0 字节、写完 PID 后文件变长，
+      第二个实例开出来位置在 EOF、锁的是第 5 个字节——**两把锁根本不重叠，谁都拿得到**，
+      于是这个守卫在真正要用它的那个平台上等于不存在（Linux 上却一路绿灯）。
+    """
     try:
+        handle.seek(LOCK_OFFSET)
         if sys.platform == "win32":
             import msvcrt
 
@@ -63,7 +76,9 @@ class SingleInstance:
         """返回 True = 我是唯一的那个；False = 已经有一个在跑了。"""
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            handle = self.path.open("a+")
+            # 二进制 + 读写（不截断已有文件）。**不能用 "a+"**：Windows 的追加模式
+            # 会把写入强行落到 EOF、开局位置也在 EOF，锁位就跟着漂（见 _lock_exclusive）。
+            handle = os.fdopen(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600), "r+b")
         except Exception as exc:  # noqa: BLE001 —— 见下：什么原因都不该拦住启动
             # 锁文件建不出来（目录只读、盘满、路径本身就不合法）——这时候**放行**：
             # 为了一个防重复的机制把**唯一**一个实例也拦在门外，比偶尔重复更糟。
@@ -77,9 +92,10 @@ class SingleInstance:
 
         self._handle = handle
         try:
-            handle.seek(0)
-            handle.truncate()
-            handle.write(str(os.getpid()))
+            pid = str(os.getpid()).encode()
+            handle.seek(LOCK_OFFSET + 1)   # 第 0 字节是锁位，别去动它
+            handle.write(pid)
+            handle.truncate(LOCK_OFFSET + 1 + len(pid))
             handle.flush()
         except OSError:
             pass       # PID 只是给人看的，写不进去不影响锁本身
