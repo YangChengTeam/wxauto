@@ -29,6 +29,10 @@ MIN_FRIEND_INTERVAL_SECONDS = 300.0
 #: 抖动幅度：实际间隔在 [1-r, 1+r] 之间随机取。0.3 已经足够打散「整点」特征。
 JITTER_RATIO = 0.3
 
+#: AI 端下发节拍用的推送事件。业务比网关更清楚「现在该盯紧还是放松」——正等对方回话
+#: 就调快，聊完/转人工就放慢。**下限仍由网关这边把住**，下发方只能在允许范围内表达意愿。
+PACING_EVENT = "wechat.pacing"
+
 
 def clamp_interval(seconds: float, minimum: float, *, what: str) -> float:
     """低于下限就抬到下限并留一条警告。

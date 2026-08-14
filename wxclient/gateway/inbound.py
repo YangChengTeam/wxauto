@@ -194,6 +194,8 @@ class InboundLoop:
         handler: TurnHandler,
         debounce_seconds: float = 3.0,
         poll_interval_seconds: float = 5.0,
+        active_poll_interval_seconds: float | None = None,
+        hot_window_seconds: float = 600.0,
         is_active: Callable[[datetime], bool] | None = None,
         clock: Callable[[], datetime] | None = None,
         rng: random.Random | None = None,
@@ -203,6 +205,12 @@ class InboundLoop:
         self._store = store
         self._handler = handler
         self._poll_interval = poll_interval_seconds
+        self._active_interval = (
+            poll_interval_seconds if active_poll_interval_seconds is None
+            else min(active_poll_interval_seconds, poll_interval_seconds)
+        )
+        self._hot_window = max(0.0, hot_window_seconds)
+        self._last_activity: datetime | None = None
         self._debouncer = Debouncer(debounce_seconds)
         self._is_active = is_active or (lambda _now: True)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -279,6 +287,10 @@ class InboundLoop:
         if not fresh:
             return
         self._store.mark_seen(account_id, peer_id, [m.msg_id for m in fresh])
+
+        # 对方真说话了 = 这个会话正热着 → 接下来几分钟读得勤一点（见 `_interval_for`）。
+        if any(not message.from_self for message in fresh):
+            self._last_activity = now
 
         # ★ 确定性拒绝闸（第一道，不依赖模型）：对方说了「别联系我」类的话 →
         #   立即拉黑，且**不派发任何一轮**。连告别语都不发——对方要的是别再被联系，
@@ -438,6 +450,52 @@ class InboundLoop:
 
     # ────────────────────────── 常驻 ──────────────────────────
 
+    def _interval_for(self, now: datetime) -> float:
+        """这一觉睡多久：**聊着的时候勤一点，没人说话就慢下来。**
+
+        原来是一个固定值（线上 300 秒）：对方问一句要等最多 5 分钟才被看见，回得像台机器；
+        而没人说话时又照样每 5 分钟翻一次微信，白动。人的节奏本来就是这样——正在聊就
+        盯着，聊完就放下。
+
+        ⚠️ **快也只快到下限为止**：`_active_interval` 在装配处已经被 `clamp_interval` 抬到
+        `MIN_READ_INTERVAL_SECONDS`（30 秒）以上，抖动、工作时间窗、发送频次上限一个没动。
+        这不是把节拍整体调快，是「热的时候借用已经允许的那一档」。
+        """
+        if self._last_activity is None or self._hot_window <= 0:
+            return self._poll_interval
+        if (now - self._last_activity).total_seconds() <= self._hot_window:
+            return self._active_interval
+        return self._poll_interval
+
+    def set_pace(
+        self,
+        *,
+        idle_seconds: float | None = None,
+        active_seconds: float | None = None,
+        hot_window_seconds: float | None = None,
+        floor: float,
+    ) -> dict[str, float]:
+        """运行期改节拍（AI 端下发用）。返回改完之后的三个值。
+
+        **下限由这里把住，不信下发方**：AI 端一句「盯紧点」不该能把读消息间隔压到 5 秒。
+        低于 `floor` 一律抬到 `floor`，热窗最长 1 小时——热窗无限长等于永远按快档跑。
+        """
+        if idle_seconds is not None:
+            self._poll_interval = max(float(idle_seconds), floor)
+        if active_seconds is not None:
+            self._active_interval = max(float(active_seconds), floor)
+        if hot_window_seconds is not None:
+            self._hot_window = max(0.0, min(float(hot_window_seconds), 3600.0))
+        # 快档不该比慢档还慢——两个值一起下发时顺手保证这条。
+        self._active_interval = min(self._active_interval, self._poll_interval)
+        pace = {
+            "idle_seconds": self._poll_interval,
+            "active_seconds": self._active_interval,
+            "hot_window_seconds": self._hot_window,
+        }
+        _log.info("节拍已更新（AI 端下发）", **pace)
+        return pace
+
     async def run(self) -> None:
         self._stopped.clear()
         while not self._stopped.is_set():
@@ -445,7 +503,8 @@ class InboundLoop:
             # 抖动而不是定时：每 60 秒整点动一次微信，是「这不是人在用」最明显的指纹。
             try:
                 await asyncio.wait_for(
-                    self._stopped.wait(), timeout=jittered(self._poll_interval, rng=self._rng)
+                    self._stopped.wait(),
+                    timeout=jittered(self._interval_for(self._clock()), rng=self._rng),
                 )
             except TimeoutError:
                 continue

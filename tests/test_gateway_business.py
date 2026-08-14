@@ -1319,6 +1319,72 @@ class FriendWatcherTests(unittest.IsolatedAsyncioTestCase):
 if __name__ == "__main__":
     unittest.main()
 
+class AdaptivePaceTests(StoreTestCase):
+    """★ 聊着的时候读得勤一点，聊完自动慢下来（用户 2026-08-14）。
+
+    固定 300 秒两头不讨好：对方问一句最多干等 5 分钟，回得像台机器；没人说话时又照样
+    每 5 分钟翻一次微信，白动。**但快也只快到下限为止** —— 30 秒的地板、抖动、工作时间窗
+    一个都没动，热的时候只是借用已经允许的那一档。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._now = T0
+
+    def _loop(self, **kw) -> InboundLoop:
+        async def handler(_a: str, _p: str, _t: str, _m) -> None:
+            return None
+
+        return InboundLoop(
+            accounts=["acct-1"],
+            source=FakeSource([[], [], []]),
+            store=self.store,
+            handler=handler,
+            clock=lambda: self._now,
+            poll_interval_seconds=300.0,
+            active_poll_interval_seconds=60.0,
+            hot_window_seconds=600.0,
+            **kw,
+        )
+
+    async def test_idle_by_default(self) -> None:
+        loop = self._loop()
+        self.assertEqual(loop._interval_for(T0), 300.0)
+
+    async def test_peer_talking_switches_to_the_fast_lane(self) -> None:
+        loop = self._loop()
+        loop._source = FakeSource([[msg("在吗", msg_id="m1")], []])
+        await loop.tick()
+        self.assertEqual(loop._interval_for(self._now), 60.0)
+
+    async def test_my_own_message_does_not_heat_it_up(self) -> None:
+        """自己发的不算「聊着」——否则网关自己回一句就把自己吵醒一轮。"""
+        loop = self._loop()
+        loop._source = FakeSource([[msg("我先问问他", msg_id="m1", from_self=True)], []])
+        await loop.tick()
+        self.assertEqual(loop._interval_for(self._now), 300.0)
+
+    async def test_cools_down_after_the_hot_window(self) -> None:
+        loop = self._loop()
+        loop._source = FakeSource([[msg("在吗", msg_id="m1")], []])
+        await loop.tick()
+        self.assertEqual(loop._interval_for(self._now + timedelta(seconds=599)), 60.0)
+        self.assertEqual(loop._interval_for(self._now + timedelta(seconds=601)), 300.0)
+
+    async def test_ai_can_change_the_pace_but_not_below_the_floor(self) -> None:
+        """★ 节拍是防风控红线：AI 端一句「盯紧点」不能把它压到 5 秒。"""
+        loop = self._loop()
+        pace = loop.set_pace(idle_seconds=120, active_seconds=5, hot_window_seconds=99999, floor=30.0)
+        self.assertEqual(pace["idle_seconds"], 120.0)
+        self.assertEqual(pace["active_seconds"], 30.0, "低于下限必须被抬上来")
+        self.assertEqual(pace["hot_window_seconds"], 3600.0, "热窗不许无限长")
+
+    async def test_fast_lane_never_slower_than_the_idle_one(self) -> None:
+        loop = self._loop()
+        pace = loop.set_pace(idle_seconds=45, floor=30.0)
+        self.assertEqual(pace["active_seconds"], 45.0)
+
+
 class FirstSightTests(unittest.TestCase):
     """★ 第一次读一个会话时，该处理哪些消息（用户裁决 2026-08-14：「没有首次见到这一说」）。
 

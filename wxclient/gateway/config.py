@@ -42,6 +42,15 @@ class GatewaySettings(BaseSettings):
     """多久读一次未读消息。默认 1 分钟——原来的 5 秒是「一秒不差地翻聊天列表」，
     正是 2026-08-12 那次自动退登（判定触发风控）的可疑行为之一。实际间隔还会带随机抖动。"""
 
+    active_poll_interval_seconds: float = 60.0
+    """**正聊着的时候**多久读一次。对方刚说过话 → 接下来 ``hot_window_seconds`` 内按这个
+    节拍读，聊完自动回到 ``poll_interval_seconds``。人的节奏本来就是「在聊就盯着，聊完放下」，
+    固定 5 分钟既让对方干等，又在没人说话时白翻微信。
+    ⚠️ 仍然被 ``pacing.MIN_READ_INTERVAL_SECONDS``（30 秒）把住下限，抖动和工作时间窗不变。"""
+
+    hot_window_seconds: float = 600.0
+    """对方最后一次说话之后，还按快档读多久。0 = 关掉自适应，永远用 ``poll_interval_seconds``。"""
+
     friend_check_interval_seconds: float = 900.0
     """多久查一次新好友申请。加好友是风控最敏感的一类动作，节拍要比读消息慢一个量级。
     ``0`` = 完全不查。**查到也不会自动通过**（见 ``friends.py``）。"""

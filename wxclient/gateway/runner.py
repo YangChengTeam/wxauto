@@ -32,7 +32,7 @@ from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from, within_active_hours
 from .inbound import InboundLoop, InboundMessage, MessageSource
 from .outbound import DeliveryResult, MessageSink, OutboundSender
-from .pacing import MIN_READ_INTERVAL_SECONDS, clamp_interval
+from .pacing import MIN_READ_INTERVAL_SECONDS, PACING_EVENT, clamp_interval
 from .schedule import ScheduleLoop, parse_schedule_at
 from .sessions import GatewayStore
 from .ticket import TicketProvider
@@ -198,6 +198,12 @@ class GatewayRunner:
             poll_interval_seconds=clamp_interval(
                 settings.poll_interval_seconds, MIN_READ_INTERVAL_SECONDS, what="读消息间隔"
             ),
+            active_poll_interval_seconds=clamp_interval(
+                settings.active_poll_interval_seconds,
+                MIN_READ_INTERVAL_SECONDS,
+                what="聊着时的读消息间隔",
+            ),
+            hot_window_seconds=settings.hot_window_seconds,
             is_active=self.is_active,
             clock=self._clock,
         )
@@ -217,7 +223,28 @@ class GatewayRunner:
         if ev == COMMAND_EVENT:
             self._dispatch_commands(account_id, data)
             return
+        if ev == PACING_EVENT:
+            self._apply_pacing(data)
+            return
         _log.debug("收到未处理的推送事件", ev=ev)
+
+    def _apply_pacing(self, data: dict[str, Any]) -> None:
+        """AI 端下发节拍（``wechat.pacing``）：让它按业务状态调快慢。
+
+        典型用法：这轮回完、正等对方回话 → 下发快档；聊完/转人工 → 回到慢档。
+        **下限仍在网关这边把住**（``InboundLoop.set_pace`` 的 ``floor``）——节拍是防风控的
+        红线，不能由对端说了算；下发方只能在允许的范围内表达「盯紧点/放松点」。
+        """
+        def number(key: str) -> float | None:
+            value = data.get(key)
+            return float(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+        self.loop.set_pace(
+            idle_seconds=number("idle_seconds"),
+            active_seconds=number("active_seconds"),
+            hot_window_seconds=number("hot_window_seconds"),
+            floor=MIN_READ_INTERVAL_SECONDS,
+        )
 
     def _dispatch_commands(self, account_id: str, data: dict[str, Any]) -> None:
         """指令**不在读循环里执行**：一条指令要动微信、可能跑十几秒，卡在读循环里

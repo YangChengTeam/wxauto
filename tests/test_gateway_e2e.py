@@ -662,6 +662,26 @@ class CommandChannelTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.stop()
 
+    async def test_ai_pushed_pace_reaches_the_loop_and_is_clamped(self) -> None:
+        """★ AI 端下发节拍（`wechat.pacing`）：能调，但调不穿地板。
+
+        业务比网关清楚「现在该盯紧还是放松」（正等对方回话 vs 聊完转人工），所以让它下发；
+        可节拍是防风控红线，下限必须留在网关这边，不能由对端说了算。
+        """
+        from wxclient.gateway.pacing import PACING_EVENT
+
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
+            runner = self._runner(server)
+            try:
+                runner._on_push(ACCOUNT, PACING_EVENT, {"idle_seconds": 120, "active_seconds": 5})
+                self.assertEqual(runner.loop._poll_interval, 120.0)
+                self.assertEqual(runner.loop._active_interval, 30.0, "5 秒必须被抬到下限")
+                # 不认识的字段忽略即可，绝不能因此断连（旧网关要能扛住新推送）。
+                runner._on_push(ACCOUNT, PACING_EVENT, {"没听过的字段": 1})
+                self.assertEqual(runner.loop._poll_interval, 120.0)
+            finally:
+                await runner.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

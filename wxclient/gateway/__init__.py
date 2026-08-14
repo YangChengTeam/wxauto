@@ -42,6 +42,7 @@ from .ticket import (
     TicketError,
     TicketProvider,
 )
+from .pacing import PACING_EVENT
 from .watchlist import PUSH_EVENT, Watchlist, WatchScope
 from .wechat_io import (
     QueueMessageSink,
@@ -63,6 +64,7 @@ from .wsclient import (
 __all__ = [
     "COMMANDS",
     "COMMAND_EVENT",
+    "PACING_EVENT",
     "PUSH_EVENT",
     "RESULT_OP",
     "AgentWsClient",
