@@ -15,8 +15,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from wxclient.heavy_import import HEAVY_IMPORT_LOCK
+
 from . import logline, theme
-from .heavy_import import HEAVY_IMPORT_LOCK
 from .logbuffer import LogBuffer
 from .logfeed import FLUSH_MS, LogFeed, is_log_on_screen
 from .logtable import LEVEL_FILTERS, LogTable
@@ -347,7 +348,7 @@ class MainWindow:
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
         if sys.platform == "win32":
-            subprocess.Popen(["explorer", str(self.data_dir)])  # noqa: S603,S607
+            subprocess.Popen(["explorer", str(self.data_dir)])
 
     def open_settings(self) -> None:
         self._show_page("settings")

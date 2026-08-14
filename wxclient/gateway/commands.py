@@ -22,6 +22,7 @@ import structlog
 
 from wxclient.queue import TaskType
 
+from .capabilities import capability_of
 from .download import DownloadError, FileRef
 from .guard import (
     ACTION_FRIEND,
@@ -202,7 +203,10 @@ class CommandExecutor:
         confirmation: str = "",
         fetcher=None,      # FileFetcher | None：发文件时去 AI 端取产出物（067）。没配就发不了文件。
         clock: Callable[[], datetime] | None = None,
+        capabilities: Callable[[], dict] | None = None,
     ) -> None:
+        """``capabilities`` 是个**取当下能力表**的函数（074），不是一份快照——
+        微信随时可能被关掉、掉线，执行前这一刻算的才作数。"""
         self._runtime = runtime
         self._store = store
         self._guard = guard
@@ -211,6 +215,7 @@ class CommandExecutor:
         self._confirmation = confirmation
         self._fetcher = fetcher
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._capabilities = capabilities
 
     async def execute(
         self,
@@ -262,6 +267,15 @@ class CommandExecutor:
             _log.warning("收到发文件指令但没配下载通道", op=op)
             return CommandResult(command_id, "rejected", "本机没有配取文件通道，发不了 AI 端产出的文件")
 
+        # ★ 074：先问「能不能做」，再问「让不让做」。两者原因不同，给用户的话完全两样：
+        #   做不了 = 去修环境（微信没登、只走流程不真发、没配取文件通道）；
+        #   不让做 = 规则挡的（频次配额、工作时间窗、黑名单）。
+        #   原来所有「做不了」都要执行到一半才发现，用户看到的是一条不知所云的失败。
+        blocked = self._capability_blocker(op, peer)
+        if blocked:
+            _log.info("这台电脑现在做不了这个动作", op=op, reason=blocked)
+            return CommandResult(command_id, "rejected", blocked)
+
         now = self._clock()
         action = self._action_for(spec, peer)
         denial = self._gate(spec, peer, now, action)
@@ -310,6 +324,18 @@ class CommandExecutor:
                 self._store.record_send(self._account, peer, now, action=action)
             _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
             return CommandResult(command_id, "done", result=(raw or {}).get("result") or {})
+
+    def _capability_blocker(self, op: str, peer: str) -> str:
+        """这台机器现在做不做得了这个 op；返回人话理由，空串 = 做得了。"""
+        if self._capabilities is None:
+            return ""      # 没接能力探测（测试/老装配）→ 不拦，维持原行为
+        key = capability_of(
+            op, to_group=bool(peer) and self._store.is_known_group(self._account, peer)
+        )
+        cap = self._capabilities().get(key)
+        if cap is None or cap.available:
+            return ""
+        return cap.reason or f"这台电脑现在做不了「{cap.label}」"
 
     def _action_for(self, spec: CommandSpec, peer: str) -> str:
         """这条指令算哪一档配额。发到群里的消息单独算——群的误伤面比单聊大得多。"""

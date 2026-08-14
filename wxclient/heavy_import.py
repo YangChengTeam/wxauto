@@ -14,6 +14,9 @@
 所以凡是**在后台线程上第一次 import 重型模块**的地方，都必须先拿这把闸。
 串行化只是把并发的首次加载排成队，第二次之后模块已在 `sys.modules` 里，
 `import` 直接命中缓存、几乎不花时间——代价可以忽略。
+
+放在**包根**而不是 `ui/` 下：拿这把闸的既有桌面端（探测线程），也有网关装配
+（`gateway/factory.py` 的能力探测）。让 gateway 反过来 import ui 是层次颠倒。
 """
 
 from __future__ import annotations

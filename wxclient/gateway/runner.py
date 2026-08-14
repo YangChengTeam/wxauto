@@ -19,6 +19,7 @@ from typing import Any
 
 import structlog
 
+from .capabilities import CAPABILITIES_OP, Capability, capabilities_frame
 from .commands import (
     COMMAND_EVENT,
     RESULT_OP,
@@ -148,6 +149,7 @@ class GatewayRunner:
         command_executor: CommandExecutor | None = None,
         client_factory: Callable[..., AgentWsClient] | None = None,
         clock: Callable[[], datetime] | None = None,
+        capabilities: Callable[[], dict[str, Capability]] | None = None,
     ) -> None:
         self._settings = settings
         self._store = store
@@ -157,6 +159,8 @@ class GatewayRunner:
         self._watchlist = watchlist
         self._friends = friend_watcher
         self._commands = command_executor
+        self._capabilities = capabilities
+        self._reported_capabilities: dict[str, dict[str, Any]] | None = None
         self._command_tasks: set[asyncio.Task[None]] = set()
         self._pool = ConnectionPool(
             ws_url=settings.ai_ws_url,
@@ -433,6 +437,7 @@ class GatewayRunner:
                 _log.warning("AI 端连接不可用", account=account_id, error=self._connect_error)
             else:
                 self._connect_error = None
+                await self._report_capabilities(account_id)
 
     async def run(self) -> None:
         # 四条常驻循环各走各的节拍：保活 30s、读消息 ~1min、查好友申请 ~15min、
@@ -452,6 +457,34 @@ class GatewayRunner:
             for task in side_tasks:
                 with suppress(asyncio.CancelledError):
                     await task
+
+    async def _report_capabilities(self, account_id: str) -> None:
+        """把「这台机器现在能做哪几件事」报给 AI 端（074）。**变了才报**。
+
+        为什么挂在保活上而不是只在建连时报一次：微信随时可能被关掉、掉线、缩回托盘，
+        能力表跟着变。只报一次的话，AI 端手里那份很快就是假的——而假的能力表比没有更糟，
+        它会让 AI 理直气壮地承诺做不到的事。
+        """
+        if self._capabilities is None:
+            return
+        try:
+            frame = capabilities_frame(self._capabilities())
+        except Exception as exc:  # noqa: BLE001 —— 探测失败不该把保活带停
+            _log.warning("能力探测失败", error=str(exc))
+            return
+        if frame["capabilities"] == self._reported_capabilities:
+            return
+        try:
+            client = await self._pool.acquire(account_id)
+            await client.notify(CAPABILITIES_OP, frame)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("能力上报失败", error=str(exc))
+            return
+        self._reported_capabilities = frame["capabilities"]
+        unavailable = [
+            cap["label"] for cap in frame["capabilities"].values() if not cap["available"]
+        ]
+        _log.info("已上报本机能力", 做不了=unavailable or "无")
 
     async def _keepalive_loop(self) -> None:
         while True:

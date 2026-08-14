@@ -16,6 +16,15 @@ from typing import Any
 from structlog.testing import capture_logs
 
 from wxclient.gateway import CommandExecutor, GatewayStore, OutboundGuard
+from wxclient.gateway.capabilities import (
+    CAP_GROUP_MESSAGE,
+    CAP_MOMENTS,
+    CAP_PRIVATE_MESSAGE,
+    CAP_READ,
+    CAP_SEND_FILES,
+    capability_of,
+    probe_capabilities,
+)
 from wxclient.gateway.download import DownloadError, FileFetcher, FileRef
 from wxclient.gateway.schedule import MAX_LATE_HOURS, ScheduleLoop, parse_schedule_at
 from wxclient.queue import TaskType
@@ -443,3 +452,107 @@ class ScheduleLoopTests(unittest.IsolatedAsyncioTestCase):
             any(e["log_level"] == "warning" and "迟到" in e["event"] for e in logs), logs
         )
 
+
+
+# ────────────────────────── 逐能力探测（074）──────────────────────────
+
+
+class CapabilityProbeTests(unittest.TestCase):
+    """★ 074：原来只有一个总开关「UIA 可用/不可用」，所有「做不了」长一个样，
+    而且要**执行到一半**才发现（需求文档 §12.2 要逐能力上报 + 执行前校验）。
+    """
+
+    LIVE = {"logged_in": True, "uia_exposed": True}
+
+    def _caps(self, **kw):
+        base = {"uia": self.LIVE, "allow_real_actions": True, "has_file_channel": True}
+        base.update(kw)
+        return probe_capabilities(**base)
+
+    def test_everything_works_when_wechat_is_live(self) -> None:
+        caps = self._caps()
+        self.assertTrue(all(c.available for c in caps.values()), caps)
+
+    def test_login_screen_blocks_everything_with_a_human_reason(self) -> None:
+        caps = self._caps(uia={"logged_in": False, "login_window": True})
+        self.assertFalse(caps[CAP_PRIVATE_MESSAGE].available)
+        self.assertIn("扫码登录", caps[CAP_PRIVATE_MESSAGE].reason)
+
+    def test_no_probe_result_is_reported_as_unavailable_not_available(self) -> None:
+        """★ 探不出来 = 不知道 = 按做不了报。猜出来的能力表比没有更糟——
+        它会让 AI 端理直气壮地承诺做不到的事。"""
+        caps = self._caps(uia=None)
+        self.assertFalse(caps[CAP_PRIVATE_MESSAGE].available)
+
+    def test_dry_run_mode_says_writes_do_not_work(self) -> None:
+        """★ 只走流程时每条写指令都回 done，AI 端会照着告诉用户「已经发过去了」。"""
+        caps = self._caps(allow_real_actions=False)
+        self.assertFalse(caps[CAP_PRIVATE_MESSAGE].available)
+        self.assertFalse(caps[CAP_MOMENTS].available)
+        self.assertTrue(caps[CAP_READ].available, "读类不受影响")
+
+    def test_missing_file_channel_only_blocks_files(self) -> None:
+        caps = self._caps(has_file_channel=False)
+        self.assertFalse(caps[CAP_SEND_FILES].available)
+        self.assertIn("文件", caps[CAP_SEND_FILES].reason)
+        self.assertTrue(caps[CAP_PRIVATE_MESSAGE].available)
+
+    def test_unsupported_op_is_reported_as_such(self) -> None:
+        caps = self._caps(supported_ops={"send_message"})
+        self.assertTrue(caps[CAP_PRIVATE_MESSAGE].available)
+        self.assertFalse(caps[CAP_MOMENTS].available)
+
+    def test_group_message_is_its_own_capability(self) -> None:
+        self.assertEqual(capability_of("send_message"), CAP_PRIVATE_MESSAGE)
+        self.assertEqual(capability_of("send_message", to_group=True), CAP_GROUP_MESSAGE)
+
+
+class CapabilityGateTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = GatewayStore(Path(self._tmp.name) / "gateway.db")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _executor(self, caps, runtime) -> CommandExecutor:
+        return CommandExecutor(
+            runtime=runtime,
+            store=self.store,
+            guard=OutboundGuard(self.store, active_hours="00:00-23:59"),
+            account_id=ACCOUNT,
+            allow_real_actions=True,
+            confirmation="确认",
+            clock=lambda: WORKDAY,
+            capabilities=lambda: caps,
+        )
+
+    async def test_unavailable_capability_is_refused_before_touching_wechat(self) -> None:
+        """★ 做不了就当场说清楚，别一路走到取字节那步才拒。"""
+        runtime = FakeRuntime()
+        caps = probe_capabilities(
+            uia={"logged_in": True, "uia_exposed": True},
+            allow_real_actions=True,
+            has_file_channel=False,          # 没配取文件通道
+        )
+        result = await self._executor(caps, runtime).execute({
+            "command_id": "c1", "op": "send_files",
+            "args": {"to": "王建国", "files": [{"file_id": "f1", "content_b64": "eA=="}]},
+        })
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("文件", result.reason)
+        self.assertEqual(runtime.calls, [], "一条微信动作都不该发生")
+
+    async def test_available_capability_still_goes_through(self) -> None:
+        runtime = FakeRuntime()
+        caps = probe_capabilities(
+            uia={"logged_in": True, "uia_exposed": True},
+            allow_real_actions=True,
+            has_file_channel=True,
+        )
+        result = await self._executor(caps, runtime).execute({
+            "command_id": "c2", "op": "send_message",
+            "args": {"to": "王建国", "text": "您好"},
+        })
+        self.assertEqual(result.status, "done")
+        self.assertEqual(len(runtime.calls), 1)

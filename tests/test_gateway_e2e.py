@@ -346,7 +346,7 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 session_id = self.store.get_session(ACCOUNT, PEER)
 
                 # 模拟断线：把连接踢掉
-                await runner._pool.invalidate(ACCOUNT)  # noqa: SLF001
+                await runner._pool.invalidate(ACCOUNT)
 
                 await self._advance_and_tick(runner, 10)
                 await self._advance_and_tick(runner, 10)

@@ -17,11 +17,11 @@ from typing import TYPE_CHECKING
 import structlog
 
 from wxclient.config import load_settings
+from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.logging_config import configure_logging
 
 from . import settings_store
 from .config import UiSettings
-from .heavy_import import HEAVY_IMPORT_LOCK
 from .logbuffer import LogBuffer, LogPipeline
 from .service import GatewayService
 from .single_instance import SingleInstance, raise_existing_window
@@ -98,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     root = tk.Tk()
     root.withdraw()  # 先藏起来，是否露面由下面决定
 
-    def build() -> "Gateway":
+    def build() -> Gateway:
         # 惰性 import：build() 只在网关线程上跑，把 factory 那 2.7 秒（SQLAlchemy + 队列 +
         # 微信驱动）从「窗口出现之前」挪到「服务启动过程中」。顶上 import 的话，双击到
         # 看见窗口要等近 4 秒，而那几秒里屏幕上什么都没有，像是没点着。

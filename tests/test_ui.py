@@ -492,19 +492,27 @@ class HeavyImportSerializationTests(unittest.TestCase):
 
     def test_both_lazy_import_sites_take_the_same_lock(self) -> None:
         # 读源码而不是 import：这台跑测试的 Linux 上没有 tkinter，import 不进来。
-        ui_dir = Path(__file__).resolve().parent.parent / "wxclient" / "ui"
-        for filename, needle in (("__main__.py", "build_gateway"), ("window.py", "probe_wechat_uia")):
-            source = (ui_dir / filename).read_text(encoding="utf-8")
+        root = Path(__file__).resolve().parent.parent / "wxclient"
+        # 每一处「在后台线程上首次 import 重型 C 扩展」的地方都要在这张表里。
+        # 074 的能力探测是新增的一处：它在保活线程上 import pywinauto，
+        # 跟网关装配线程撞上就是 2026-08-14 那个死锁。
+        targets = (
+            ("ui/__main__.py", "build_gateway"),
+            ("ui/window.py", "probe_wechat_uia"),
+            ("gateway/factory.py", "probe_wechat_uia"),
+        )
+        for relpath, needle in targets:
+            source = (root / relpath).read_text(encoding="utf-8")
             head = source[: source.index(f"import {needle}")]
             self.assertIn(
                 "with HEAVY_IMPORT_LOCK:",
                 head[-400:],
-                f"{filename} 里那处惰性 import 必须先拿重型 import 闸",
+                f"{relpath} 里那处惰性 import 必须先拿重型 import 闸",
             )
             self.assertIn(
-                "from .heavy_import import HEAVY_IMPORT_LOCK",
+                "from wxclient.heavy_import import HEAVY_IMPORT_LOCK",
                 source,
-                f"{filename} 必须用同一把闸（heavy_import.HEAVY_IMPORT_LOCK），不许各造一把",
+                f"{relpath} 必须用同一把闸（heavy_import.HEAVY_IMPORT_LOCK），不许各造一把",
             )
 
 

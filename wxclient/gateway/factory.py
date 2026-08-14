@@ -13,9 +13,11 @@ from pathlib import Path
 import structlog
 
 from wxclient.config import load_settings
+from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
-from .commands import CommandExecutor
+from .capabilities import Capability, probe_capabilities
+from .commands import COMMANDS, CommandExecutor
 from .config import GatewaySettings
 from .download import FileFetcher
 from .friends import FriendWatcher
@@ -116,6 +118,26 @@ def build_gateway(
 
     ticket_provider = build_ticket_provider(gateway_settings)
 
+    file_fetcher = FileFetcher()
+
+    #: 074：能力表按**当下**算，不是启动时拍一张快照——微信随时可能被关掉、掉线、
+    #: 缩回托盘。探测本身要跟重型 import 串行（Windows 加载器锁，见 heavy_import.py），
+    #: 探不出来就当「还没探到微信」处理，宁可说做不了也不要假装能做。
+    def current_capabilities() -> dict[str, Capability]:
+        try:
+            with HEAVY_IMPORT_LOCK:
+                from wxclient.uia_probe import probe_wechat_uia
+            uia = probe_wechat_uia()
+        except Exception as exc:  # noqa: BLE001 —— 探测失败 = 不知道 = 按做不了报
+            _log.warning("能力探测时 UIA 探测失败", error=str(exc))
+            uia = None
+        return probe_capabilities(
+            uia=uia,
+            allow_real_actions=allow_real_actions,
+            has_file_channel=file_fetcher is not None,
+            supported_ops=set(COMMANDS),
+        )
+
     runner = GatewayRunner(
         settings=gateway_settings,
         ticket_provider=ticket_provider,
@@ -128,6 +150,7 @@ def build_gateway(
         ),
         accounts=list(resolved_accounts),
         watchlist=watchlist,
+        capabilities=current_capabilities,
         command_executor=CommandExecutor(
             runtime=runtime,
             store=store,
@@ -140,7 +163,8 @@ def build_gateway(
             account_id=resolved_accounts[0],
             allow_real_actions=allow_real_actions,
             confirmation=REAL_ACTION_CONFIRMATION,
-            fetcher=FileFetcher(),
+            fetcher=file_fetcher,
+            capabilities=current_capabilities,
         ),
         friend_watcher=FriendWatcher(
             accounts=resolved_accounts,
