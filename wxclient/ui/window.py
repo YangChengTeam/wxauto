@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from . import logline, theme
+from .heavy_import import HEAVY_IMPORT_LOCK
 from .logbuffer import LogBuffer
 from .logfeed import FLUSH_MS, LogFeed, is_log_on_screen
 from .logtable import LEVEL_FILTERS, LogTable
@@ -421,7 +422,10 @@ class MainWindow:
         if not self._probe_lock.acquire(blocking=False):
             return  # 上一次还没探完，跳过这轮，别堆线程
         try:
-            from wxclient.uia_probe import probe_wechat_uia
+            # 首次 import 会拉起 pywinauto 那套 C 扩展；必须和网关装配串行，否则两个线程
+            # 同时 LoadLibrary 会卡死在 Windows 加载器锁上（见 heavy_import.py）。
+            with HEAVY_IMPORT_LOCK:
+                from wxclient.uia_probe import probe_wechat_uia
 
             probe = probe_wechat_uia()
             if probe.get("logged_in"):

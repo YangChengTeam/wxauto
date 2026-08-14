@@ -476,6 +476,35 @@ class StateCallbackIsolationTests(unittest.TestCase):
         self.assertIn(ServiceState.STOPPED, seen, "第一次抛异常之后，后面的通知还得照发")
 
 
+class HeavyImportSerializationTests(unittest.TestCase):
+    """★ 2026-08-14 真机死锁：界面起来了、网关**永远起不来**（没有「网关启动」那行）。
+
+    py-spy 连抓两次、相隔两分钟栈一模一样：
+        wx-gateway  → create_module ← 正在 LoadLibrary SQLAlchemy 的 Cython 扩展
+        wx-ui-probe → create_module ← 正在 LoadLibrary pywinauto 的 C 扩展
+    两个后台线程同时首次 import 重型 C 扩展 = 同时 LoadLibrary，撞上 Windows
+    进程级加载器锁。这里只钉「两处惰性 import 都排在同一把闸后面」——
+    真正的死锁在 Linux 上复现不出来（没有那把加载器锁）。
+    """
+
+    def test_both_lazy_import_sites_take_the_same_lock(self) -> None:
+        # 读源码而不是 import：这台跑测试的 Linux 上没有 tkinter，import 不进来。
+        ui_dir = Path(__file__).resolve().parent.parent / "wxclient" / "ui"
+        for filename, needle in (("__main__.py", "build_gateway"), ("window.py", "probe_wechat_uia")):
+            source = (ui_dir / filename).read_text(encoding="utf-8")
+            head = source[: source.index(f"import {needle}")]
+            self.assertIn(
+                "with HEAVY_IMPORT_LOCK:",
+                head[-400:],
+                f"{filename} 里那处惰性 import 必须先拿重型 import 闸",
+            )
+            self.assertIn(
+                "from .heavy_import import HEAVY_IMPORT_LOCK",
+                source,
+                f"{filename} 必须用同一把闸（heavy_import.HEAVY_IMPORT_LOCK），不许各造一把",
+            )
+
+
 class AppIconTests(unittest.TestCase):
     """exe / 快捷方式 / 任务栏 / 托盘用同一份品牌图标（用户 2026-08-13 要求）。"""
 

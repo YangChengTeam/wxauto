@@ -21,6 +21,7 @@ from wxclient.logging_config import configure_logging
 
 from . import settings_store
 from .config import UiSettings
+from .heavy_import import HEAVY_IMPORT_LOCK
 from .logbuffer import LogBuffer, LogPipeline
 from .service import GatewayService
 from .tray import Tray
@@ -90,7 +91,10 @@ def main(argv: list[str] | None = None) -> int:
         # 惰性 import：build() 只在网关线程上跑，把 factory 那 2.7 秒（SQLAlchemy + 队列 +
         # 微信驱动）从「窗口出现之前」挪到「服务启动过程中」。顶上 import 的话，双击到
         # 看见窗口要等近 4 秒，而那几秒里屏幕上什么都没有，像是没点着。
-        from wxclient.gateway.factory import build_gateway
+        # 和微信探测线程串行：两个后台线程同时首次 import 重型 C 扩展会卡死在
+        # Windows 加载器锁上（真机实证，见 heavy_import.py）。
+        with HEAVY_IMPORT_LOCK:
+            from wxclient.gateway.factory import build_gateway
 
         # 每次启动都重读一遍 UiSettings：界面上改完参数点「保存并重启」才真的按新值跑
         current = UiSettings()
