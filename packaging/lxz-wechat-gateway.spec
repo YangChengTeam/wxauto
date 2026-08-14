@@ -84,7 +84,8 @@ splash = Splash(
     "../wxclient/ui/assets/splash.png",
     binaries=a.binaries,
     datas=a.datas,
-    text_pos=(190, 182),
+    # 左对齐（PyInstaller 不给居中），所以 x 要自己往左挪半个文案的宽度才对得上中线
+    text_pos=(155, 176),
     text_size=9,
     text_color="#8b8b8b",
     text_default="正在启动…",

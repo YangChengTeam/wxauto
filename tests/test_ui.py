@@ -587,6 +587,30 @@ class SplashTests(unittest.TestCase):
         with Image.open(png) as image:
             self.assertEqual(image.size, (WIDTH, HEIGHT))
 
+    def test_splash_survives_until_the_gateway_is_assembled(self) -> None:
+        """★ 动画得撑到网关装配完——那几秒正是启动里最长的一段。
+
+        第一版是「主窗口一建好就关」，于是动画只闪一下，真正在等的那几秒又回到空白。
+        这里读源码钉住：收尾走 `reveal()`，由服务状态（不再是 STARTING）或兜底超时触发。
+        """
+        source = (
+            Path(__file__).resolve().parent.parent / "wxclient/ui/__main__.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("SPLASH_MAX_MS", source, "必须有兜底超时，否则装配卡住就一直挡着")
+        self.assertIn("service.state is not ServiceState.STARTING", source)
+        self.assertIn("root.after(SPLASH_MAX_MS, reveal)", source)
+
+    def test_splash_paints_before_the_mainloop_starts(self) -> None:
+        """★ 建完控件必须自己催一次重绘：那会儿 mainloop 还没跑，Tk 一个像素都不画。
+
+        真机实测过：少了这句，屏幕上只有 PyInstaller 那张静态图，会动的那个根本不出现。
+        """
+        source = (
+            Path(__file__).resolve().parent.parent / "wxclient/ui/splash.py"
+        ).read_text(encoding="utf-8")
+        head = source[: source.index("_close_frozen_splash()\n\n")]
+        self.assertIn("self._pump()", head)
+
     def test_animated_splash_closes_the_frozen_one(self) -> None:
         """会动的那个一接手就必须关掉静态首屏，否则两张图叠在一起。"""
         source = (

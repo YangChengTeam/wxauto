@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import threading
 import tkinter as tk
 from pathlib import Path
 
@@ -105,13 +106,25 @@ class Splash:
             fill=theme.SIDEBAR_MUTED, font=theme.FONT_SMALL,
         )
         self._tick()
+        # ★ 必须自己催一次重绘：这时 `root.mainloop()` 还没开始跑，Tk 只建了控件、
+        # 一个像素都没画。少了这句，启动动画在「界面构建完、进 mainloop」之前
+        # 根本不出现——真机实测就是这样，屏幕上只有 PyInstaller 那张静态图（2026-08-14）。
+        self._pump()
         _close_frozen_splash()
 
     # ────────────────────────── 对外 ──────────────────────────
 
     def stage(self, text: str) -> None:
-        """换一行阶段提示（「正在装配网关…」）。已经关掉了就当没说。"""
+        """换一行阶段提示（「正在装配网关…」）。已经关掉了就当没说。
+
+        主线程上直接改并重绘（那会儿 mainloop 可能还没起来，排 `after` 等于不显示）；
+        其它线程上照规矩排回 tk 线程。
+        """
         if self._closed:
+            return
+        if self._on_tk_thread():
+            self._set_stage(text)
+            self._pump()
             return
         self._root.after(0, lambda: self._set_stage(text))
 
@@ -143,6 +156,16 @@ class Splash:
             self._canvas.create_image(cx, cy, image=self._photo)
         except tk.TclError:
             self._photo = None
+
+    def _on_tk_thread(self) -> bool:
+        return threading.current_thread() is threading.main_thread()
+
+    def _pump(self) -> None:
+        """催 Tk 立刻把已经排下的活画出来。mainloop 没起来时这是唯一的出路。"""
+        try:
+            self._win.update()
+        except tk.TclError:
+            pass
 
     def _set_stage(self, text: str) -> None:
         try:

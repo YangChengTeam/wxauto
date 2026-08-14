@@ -23,7 +23,7 @@ from wxclient.logging_config import configure_logging
 from . import icons, settings_store
 from .config import UiSettings
 from .logbuffer import LogBuffer, LogPipeline
-from .service import GatewayService
+from .service import GatewayService, ServiceState
 from .single_instance import SingleInstance, raise_existing_window
 from .splash import Splash
 from .tray import Tray
@@ -44,6 +44,10 @@ def _dry_run_notice(args: argparse.Namespace, settings: UiSettings) -> str:
 #: Windows 任务栏用它给窗口分组、挑图标。不设的话我们只是「某个 python.exe」，
 #: 任务栏上顶着 Python 的图标，跟托盘、快捷方式对不上。
 APP_ID = "laoxiaozhi.wechat.gateway"
+
+#: 启动动画最多挡多久（毫秒）。网关装配正常就一两秒；这条只在「微信没登录、UIA 起不来」
+#: 那种卡住的情况下兜底——界面该露面还得露面，剩下的由状态栏自己说。
+SPLASH_MAX_MS = 12_000
 
 
 def _claim_taskbar_identity() -> None:
@@ -164,10 +168,26 @@ def main(argv: list[str] | None = None) -> int:
         on_quit=lambda: root.after(0, lambda: shutdown(root, window, service, tray)),
     )
 
+    show_window = args.show or not settings.start_hidden
+    revealed = False
+
+    def reveal() -> None:
+        """启动动画收尾、主窗口接手。多路会喊它（服务就绪 / 兜底超时），只认第一次。"""
+        nonlocal revealed
+        if revealed:
+            return
+        revealed = True
+        if show_window:
+            window.show()
+        splash.close()
+
     def on_state_change(*_args: object) -> None:
         # 状态回调来自网关线程：界面回 tk 线程刷，托盘图标 pystray 自己是线程安全的
         root.after(0, window.refresh_state)
         tray.refresh()
+        # 网关装配完（成了或没成）就该把界面交出去——这一段正是启动里最长的那几秒。
+        if service.state is not ServiceState.STARTING:
+            root.after(0, reveal)
 
     service.set_state_listener(on_state_change)
 
@@ -178,11 +198,10 @@ def main(argv: list[str] | None = None) -> int:
     if autostart:
         splash.stage("正在装配网关…")
         service.start()
-    if args.show or not settings.start_hidden:
-        window.show()
-    # 主窗口（或托盘）已经接手，动画功成身退。网关还在后台线程上装配，那一段由状态栏
-    # 自己说话——启动动画只负责「双击到界面出现」这一段，别赖着不走。
-    splash.close()
+    else:
+        root.after(0, reveal)
+    # 兜底：装配卡住（微信没登录、UIA 不可用）也不能让启动动画一直挡在屏幕中间。
+    root.after(SPLASH_MAX_MS, reveal)
 
     _log.info("桌面端已启动", real_actions=(args.allow_real_actions or settings.allow_real_actions), autostart=autostart)
     try:
