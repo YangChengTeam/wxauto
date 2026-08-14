@@ -76,8 +76,23 @@ a.binaries = [item for item in a.binaries if not any(dead in item[0] for dead in
 
 pyz = PYZ(a.pure)
 
+# 冻结包的第一屏。**双击到 Python 起来那 1~2 秒 tkinter 还不存在**，只有 PyInstaller
+# 自带的这个 Splash 顶得上；Python 一起来，`wxclient/ui/splash.py` 那个会动的启动窗
+# 立刻接手并把它关掉（`pyi_splash.close()`）。两张图长得一样，看上去是同一个东西在动。
+# 图由 `packaging/make_splash.py` 按 theme.py 生成，别手改 PNG。
+splash = Splash(
+    "../wxclient/ui/assets/splash.png",
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=(190, 182),
+    text_size=9,
+    text_color="#8b8b8b",
+    text_default="正在启动…",
+    always_on_top=True,
+)
+
 exe = EXE(
-    pyz, a.scripts, [],
+    pyz, a.scripts, splash, splash.binaries, [],
     exclude_binaries=True,          # onedir：二进制留在目录里，不塞进 exe
     name="劳小智微信助手",
     icon="../wxclient/ui/assets/app.ico",

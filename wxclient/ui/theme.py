@@ -21,6 +21,10 @@ TEXT = "#333333"
 TEXT_MUTED = "#6b7280"
 FOOTER_BG = "#f7f7f7"
 
+# 品牌色：取自 app 图标那颗橙（`assets/app-256.png`）。启动动画的转环用它——
+# 用状态绿会让人以为「已经在跑了」，而那一刻服务其实还没起来。
+BRAND = "#f97316"
+
 # 状态色
 GREEN = "#22c55e"
 ORANGE = "#f59e0b"

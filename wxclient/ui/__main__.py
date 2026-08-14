@@ -20,11 +20,12 @@ from wxclient.config import load_settings
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.logging_config import configure_logging
 
-from . import settings_store
+from . import icons, settings_store
 from .config import UiSettings
 from .logbuffer import LogBuffer, LogPipeline
 from .service import GatewayService
 from .single_instance import SingleInstance, raise_existing_window
+from .splash import Splash
 from .tray import Tray
 from .window import WINDOW_TITLE, MainWindow
 
@@ -98,6 +99,10 @@ def main(argv: list[str] | None = None) -> int:
     root = tk.Tk()
     root.withdraw()  # 先藏起来，是否露面由下面决定
 
+    # ★ 启动动画先出来：从这里到主窗口露面还要建界面、起托盘、装配网关，冻结包实测
+    # 好几秒。这几秒里屏幕上一片空白，用户只会以为「双击了没反应」再点一次。
+    splash = Splash(root, icon_png=icons.PNG_PATH)
+
     def build() -> Gateway:
         # 惰性 import：build() 只在网关线程上跑，把 factory 那 2.7 秒（SQLAlchemy + 队列 +
         # 微信驱动）从「窗口出现之前」挪到「服务启动过程中」。顶上 import 的话，双击到
@@ -140,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         if service.restart_async(before_start=before_start, on_done=done) is not None:
             window.set_busy("正在按新参数重启服务")
 
+    splash.stage("正在准备界面…")
     window = MainWindow(
         root,
         buffer,
@@ -165,13 +171,18 @@ def main(argv: list[str] | None = None) -> int:
 
     service.set_state_listener(on_state_change)
 
+    splash.stage("正在启动托盘…")
     tray.run_detached()
 
     autostart = settings.autostart and not args.no_autostart
     if autostart:
+        splash.stage("正在装配网关…")
         service.start()
     if args.show or not settings.start_hidden:
         window.show()
+    # 主窗口（或托盘）已经接手，动画功成身退。网关还在后台线程上装配，那一段由状态栏
+    # 自己说话——启动动画只负责「双击到界面出现」这一段，别赖着不走。
+    splash.close()
 
     _log.info("桌面端已启动", real_actions=(args.allow_real_actions or settings.allow_real_actions), autostart=autostart)
     try:

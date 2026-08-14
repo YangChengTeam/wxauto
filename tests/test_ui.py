@@ -550,6 +550,52 @@ class AppIconTests(unittest.TestCase):
         self.assertEqual(running.getpixel((8, 8)), stopped.getpixel((8, 8)))
 
 
+class SplashTests(unittest.TestCase):
+    """启动动画。窗口本身只能在真机看，这里钉的是配色/几何和「两段接力」的结构。
+
+    ⚠️ 不能 import `wxclient.ui.splash`——它顶上就 `import tkinter`，而跑测试这台
+    Linux 上没有 tkinter。纯逻辑都放在 `splash_style.py`（这也是把它分出来的原因）。
+    """
+
+    def test_comet_fades_from_the_background_to_the_brand_colour(self) -> None:
+        from wxclient.ui import theme
+        from wxclient.ui.splash_style import blend, comet_colors
+
+        colors = comet_colors(12)
+        self.assertEqual(len(colors), 12)
+        self.assertEqual(colors[-1], theme.BRAND, "彗头必须是品牌色")
+        self.assertEqual(colors[0], theme.SIDEBAR_ACTIVE_BG, "彗尾必须化进底色")
+        self.assertEqual(blend("#000000", "#ffffff", 0.5), "#808080")
+        # 越界的比例不许算出非法颜色（动画里 ratio 是算出来的，不是写死的）
+        self.assertEqual(blend("#000000", "#ffffff", 2), "#ffffff")
+        self.assertEqual(blend("#000000", "#ffffff", -1), "#000000")
+
+    def test_logo_fits_inside_the_ring(self) -> None:
+        """图标比环的内径还大就把环压没了（第一版就是这样，看不见转的那圈）。"""
+        from wxclient.ui.splash_style import LOGO_PX, RING_RADIUS, RING_WIDTH
+
+        self.assertLess(LOGO_PX, 2 * (RING_RADIUS - RING_WIDTH))
+
+    def test_frozen_first_frame_is_shipped_and_matches_the_animated_one(self) -> None:
+        """冻结包那张静态首屏要在，且和会动的那个同尺寸——否则接力时会「跳一下」。"""
+        from PIL import Image
+
+        from wxclient.ui.splash_style import HEIGHT, WIDTH
+
+        png = Path(__file__).resolve().parent.parent / "wxclient/ui/assets/splash.png"
+        self.assertTrue(png.exists(), "splash.png 没生成：跑 packaging/make_splash.py")
+        with Image.open(png) as image:
+            self.assertEqual(image.size, (WIDTH, HEIGHT))
+
+    def test_animated_splash_closes_the_frozen_one(self) -> None:
+        """会动的那个一接手就必须关掉静态首屏，否则两张图叠在一起。"""
+        source = (
+            Path(__file__).resolve().parent.parent / "wxclient/ui/splash.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("pyi_splash", source)
+        self.assertIn("_close_frozen_splash()", source)
+
+
 class SettingsStoreTests(unittest.TestCase):
     def test_round_trip_keeps_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
