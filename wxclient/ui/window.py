@@ -30,6 +30,10 @@ _STATE_TEXT = {
     ServiceState.FAILED: "启动失败",
 }
 
+#: 窗口标题。抽成常量是因为单实例守卫要靠它把已有窗口拽到前台
+#: （`single_instance.raise_existing_window`）——两处写死迟早对不上。
+WINDOW_TITLE = "劳小智微信服务"
+
 _STATE_COLOR = {
     ServiceState.RUNNING: theme.GREEN,
     ServiceState.STARTING: theme.ORANGE,
@@ -79,7 +83,7 @@ class MainWindow:
         self._log_visible = False  # 由 _sync_log_visibility() 每拍现场核对，别手动改
         self._page = "log"
 
-        root.title("劳小智微信服务")
+        root.title(WINDOW_TITLE)
         self._apply_window_icon()
         root.geometry("1180x720")
         root.minsize(900, 560)

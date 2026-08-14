@@ -24,8 +24,9 @@ from .config import UiSettings
 from .heavy_import import HEAVY_IMPORT_LOCK
 from .logbuffer import LogBuffer, LogPipeline
 from .service import GatewayService
+from .single_instance import SingleInstance, raise_existing_window
 from .tray import Tray
-from .window import MainWindow
+from .window import WINDOW_TITLE, MainWindow
 
 if TYPE_CHECKING:
     from wxclient.gateway.factory import Gateway
@@ -74,6 +75,16 @@ def main(argv: list[str] | None = None) -> int:
     # 先把上次在「参数设置」里填的值灌进环境变量，再读配置——真实环境变量优先
     settings_store.apply_to_environ(settings_store.load(wechat_settings.data_dir))
     settings = UiSettings()
+
+    # ★ 单实例：两个进程同时驱动同一个微信 = 同一条消息读两遍、回两遍，两边还各按各的
+    # 节拍动窗口——风控最不喜欢的形状（2026-08-13 真机出过一次）。守卫要活到进程结束，
+    # 所以挂在这里而不是 with 块里：文件一关，锁就没了。
+    instance_guard = SingleInstance(wechat_settings.data_dir)
+    if not instance_guard.acquire():
+        # 默默退出会让人以为「双击了没反应」，所以尽力把已有窗口拽到前台。
+        raise_existing_window(WINDOW_TITLE)
+        print("劳小智微信服务已经在运行了（同一台机器只能开一个）。", file=sys.stderr)
+        return 0
 
     buffer = LogBuffer(capacity=settings.log_lines)
     log_pipeline = LogPipeline(

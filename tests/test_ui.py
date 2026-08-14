@@ -8,6 +8,8 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,6 +22,7 @@ from wxclient.ui import logline, settings_store
 from wxclient.ui.logbuffer import LogBuffer, LogPipeline, attach_to_root
 from wxclient.ui.logfeed import LogFeed, is_log_on_screen
 from wxclient.ui.service import GatewayService, ServiceState
+from wxclient.ui.single_instance import SingleInstance
 
 
 class LogBufferTests(unittest.TestCase):
@@ -636,3 +639,70 @@ class AccountNormalizationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SingleInstanceTests(unittest.TestCase):
+    """★ 076 单实例：绝不允许两个进程同时驱动同一个微信。
+
+    2026-08-13 真机出过一次（重启点了两下）：同一条消息被读两遍、回两遍，
+    两边还各按各的节拍动窗口——风控最不喜欢的形状，账号状态机也彻底失去意义。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_first_one_wins_second_one_is_told_no(self) -> None:
+        first = SingleInstance(self.data_dir)
+        second = SingleInstance(self.data_dir)
+        self.assertTrue(first.acquire())
+        self.assertFalse(second.acquire(), "第二个实例必须被挡住")
+        first.release()
+        self.assertTrue(second.acquire(), "前一个退出后，位置要让出来")
+        second.release()
+
+    def test_lock_is_released_when_the_process_dies(self) -> None:
+        """★ 锁必须跟着**进程**走：被强杀、蓝屏之后不能留下一把要人工清理的死锁。
+
+        用真子进程验，不是 mock —— 这条的全部价值就在于「操作系统会不会替我们放锁」。
+        """
+        script = (
+            "import sys, time;"
+            f"sys.path.insert(0, {str(Path.cwd())!r});"
+            "from wxclient.ui.single_instance import SingleInstance;"
+            f"g = SingleInstance({str(self.data_dir)!r});"
+            "print('OK' if g.acquire() else 'NO', flush=True);"
+            "time.sleep(60)"
+        )
+        child = subprocess.Popen(
+            [sys.executable, "-c", script], stdout=subprocess.PIPE, text=True
+        )
+        try:
+            self.assertEqual(child.stdout.readline().strip(), "OK")
+            self.assertFalse(
+                SingleInstance(self.data_dir).acquire(), "子进程占着锁，这边不该拿到"
+            )
+        finally:
+            child.kill()          # 模拟强杀：没有任何清理机会
+            child.wait(timeout=10)
+        self.assertTrue(
+            SingleInstance(self.data_dir).acquire(), "进程没了，锁必须由操作系统自动放掉"
+        )
+
+    def test_unusable_data_dir_lets_the_app_start_anyway(self) -> None:
+        """★ 锁文件建不出来就放行：为了防重复把**唯一**一个实例也拦在门外，比偶尔重复更糟。
+
+        造一个「父路径是个文件」的数据目录——mkdir 必然失败，且不挑运行身份（root 也一样）。
+        """
+        blocker = self.data_dir / "not-a-dir"
+        blocker.write_text("x")
+        self.assertTrue(SingleInstance(blocker / "sub").acquire())
+
+    def test_context_manager_releases(self) -> None:
+        with SingleInstance(self.data_dir) as acquired:
+            self.assertTrue(acquired)
+            self.assertFalse(SingleInstance(self.data_dir).acquire())
+        self.assertTrue(SingleInstance(self.data_dir).acquire())
