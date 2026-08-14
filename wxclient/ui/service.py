@@ -218,6 +218,17 @@ class GatewayService:
         except Exception:  # noqa: BLE001 - 状态展示不该把服务拖下水
             return 0
 
+    def scheduled_count(self) -> int:
+        """排着的定时指令条数；没在跑就是 0。"""
+        with self._lock:
+            gateway = self._gateway
+        if gateway is None or self._state is not ServiceState.RUNNING:
+            return 0
+        try:
+            return gateway.runner.scheduled_count()
+        except Exception:  # noqa: BLE001 - 状态展示不该把服务拖下水
+            return 0
+
     def connect_error(self) -> str | None:
         """AI 端连不上的原因；连上了或没在跑就是 None。给状态栏区分「在连」与「连不上」。"""
         with self._lock:

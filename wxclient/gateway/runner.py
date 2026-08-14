@@ -32,6 +32,7 @@ from .guard import OutboundGuard, action_limits_from, within_active_hours
 from .inbound import InboundLoop, InboundMessage, MessageSource
 from .outbound import DeliveryResult, MessageSink, OutboundSender
 from .pacing import MIN_READ_INTERVAL_SECONDS, clamp_interval
+from .schedule import ScheduleLoop, parse_schedule_at
 from .sessions import GatewayStore
 from .ticket import TicketProvider
 from .watchlist import PUSH_EVENT, Watchlist
@@ -175,6 +176,15 @@ class GatewayRunner:
             store=store,
             clock=self._clock,
         )
+        # 077：定时指令自己一条循环。它压根不动微信（只翻自己的表），所以节拍跟
+        # 读消息/查好友无关；到点之后的执行仍走 _run_command，幂等与守门一并复用。
+        self.schedule = ScheduleLoop(
+            accounts=list(accounts),
+            store=store,
+            run_command=self._run_command,
+            is_active=self.is_active,
+            clock=self._clock,
+        )
         self.loop = InboundLoop(
             accounts=accounts,
             source=source,
@@ -213,21 +223,53 @@ class GatewayRunner:
             _log.warning("收到微信指令但没有执行器，已忽略")
             return
         for command in parse_commands(data):
+            if self._defer_if_scheduled(account_id, command):
+                continue
             task = asyncio.create_task(self._run_command(account_id, command))
             self._command_tasks.add(task)
             task.add_done_callback(self._command_tasks.discard)
+
+    def _defer_if_scheduled(self, account_id: str, command: dict[str, Any]) -> bool:
+        """带 ``schedule_at`` 且时点在将来 → 落表等着，返回 True（本轮不执行）。
+
+        077：原来 `schedule_at` 只是透传到网关就没人管了，「明天上午九点提醒他」
+        会被**当场**发出去——比不做还糟。
+
+        解析不了的时点不当定时处理，照常立即执行：宁可早发，也不要因为一个格式问题
+        把用户交代的事悄悄咽掉。
+        """
+        due = parse_schedule_at(command.get("schedule_at"))
+        now = self._clock()
+        if due is None or due <= now:
+            return False
+        command_id = str(command.get("command_id") or "")
+        if not command_id:
+            return False
+        self._store.put_scheduled_command(account_id, command_id, command, due, at=now)
+        _log.info("指令已排期", op=command.get("op"), 到点=due.isoformat())
+        # 报一声「排上了」——不报的话卡上停在「已下发」，而它其实一小时后才动
+        # （073 的阶段回执，`scheduled` 是中间态，AI 端收到只刷卡不销账）。
+        task = asyncio.create_task(
+            self._report(account_id, command_id, "scheduled", scheduled_for=due.isoformat())
+        )
+        self._command_tasks.add(task)
+        task.add_done_callback(self._command_tasks.discard)
+        return True
+
+    async def _report(self, account_id: str, command_id: str, status: str, **extra: Any) -> None:
+        """把一个阶段报回 AI 端。报不出去只记账——回执发不掉不该影响已做完的动作。"""
+        try:
+            client = await self._pool.acquire(account_id)
+            await client.notify(RESULT_OP, {"command_id": command_id, "status": status, **extra})
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("指令回执发送失败", error=str(exc), status=status)
 
     async def _run_command(self, account_id: str, command: dict[str, Any]) -> None:
         assert self._commands is not None
         command_id = str(command.get("command_id") or "")
 
         async def report(status: str, **extra: Any) -> None:
-            """把一个阶段报回 AI 端。报不出去只记账——回执发不掉不该影响已做完的动作。"""
-            try:
-                client = await self._pool.acquire(account_id)
-                await client.notify(RESULT_OP, {"command_id": command_id, "status": status, **extra})
-            except Exception as exc:  # noqa: BLE001
-                _log.warning("指令回执发送失败", error=str(exc), status=status)
+            await self._report(account_id, command_id, status, **extra)
 
         # 073：先报「收到了」。一条指令要动微信、可能跑十几秒，中间一点信号都没有的话，
         # 卡上就停在「已下发」——分不清在跑还是丢了（需求文档 §12.4 要 接收/开始/成功/失败）。
@@ -358,6 +400,10 @@ class GatewayRunner:
         """活着的 AI 端连接数。只读，给桌面端状态栏用。"""
         return self._pool.connected_count()
 
+    def scheduled_count(self) -> int:
+        """还排着几条定时指令（077）。只读，给状态栏用。"""
+        return self._store.count_scheduled_commands()
+
     def pending_backlog(self) -> int:
         """入站待处理队列里还欠着几批（070）。只读，给状态栏用。
 
@@ -389,9 +435,13 @@ class GatewayRunner:
                 self._connect_error = None
 
     async def run(self) -> None:
-        # 三条常驻循环各走各的节拍：保活 30s、读消息 ~1min、查好友申请 ~15min。
+        # 四条常驻循环各走各的节拍：保活 30s、读消息 ~1min、查好友申请 ~15min、
+        # 定时指令 30s（它不动微信，只翻自己的表）。
         # 谁也不等谁——把它们串成一个循环就等于让最慢的那件事决定所有事的频率。
-        side_tasks = [asyncio.create_task(self._keepalive_loop(), name="gw-keepalive")]
+        side_tasks = [
+            asyncio.create_task(self._keepalive_loop(), name="gw-keepalive"),
+            asyncio.create_task(self.schedule.run(), name="gw-schedule"),
+        ]
         if self._friends is not None:
             side_tasks.append(asyncio.create_task(self._friends.run(), name="gw-friends"))
         try:
@@ -410,6 +460,7 @@ class GatewayRunner:
 
     async def stop(self) -> None:
         self.loop.stop()
+        self.schedule.stop()
         if self._friends is not None:
             self._friends.stop()
         # 收口给个上限：正常情况下几十毫秒就完了，但如果正卡在一轮对话里，drain 会一直等到

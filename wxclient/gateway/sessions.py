@@ -62,6 +62,14 @@ CREATE TABLE IF NOT EXISTS gateway_commands (
   done_at    TEXT NOT NULL,
   PRIMARY KEY (account_id, command_id)
 );
+CREATE TABLE IF NOT EXISTS gateway_scheduled_commands (
+  command_id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  payload    TEXT NOT NULL,
+  due_at     TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_due ON gateway_scheduled_commands (due_at);
 CREATE TABLE IF NOT EXISTS gateway_watchlist (
   id         INTEGER PRIMARY KEY CHECK (id = 1),
   payload    TEXT NOT NULL,
@@ -298,6 +306,65 @@ class GatewayStore:
                 ),
             )
             conn.commit()
+
+    # ────────────────────────── 定时指令（077）──────────────────────────
+    #
+    # `schedule_at` 早就在契约里透传到网关了，但一直没人落表执行——于是需求文档 §6.19
+    # 的定时/周期/条件触发全都不可用，面试前提醒、未回复跟进、内容日历都无从谈起。
+    #
+    # 到点执行仍走 `CommandExecutor`，幂等（gateway_commands）和守门（频次/时间窗/黑名单）
+    # 一并复用，不另开一套。
+
+    def put_scheduled_command(
+        self, account_id: str, command_id: str, payload: dict, due_at: datetime,
+        at: datetime | None = None,
+    ) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO gateway_scheduled_commands
+                  (command_id, account_id, payload, due_at, created_at)
+                VALUES (?,?,?,?,?)
+                ON CONFLICT(command_id) DO UPDATE SET
+                  payload=excluded.payload, due_at=excluded.due_at
+                """,
+                (
+                    command_id, account_id,
+                    json.dumps(payload, ensure_ascii=False),
+                    due_at.isoformat(), (at or _utcnow()).isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def due_scheduled_commands(self, account_id: str, now: datetime) -> list[dict]:
+        """已经到点的那些，最早的排前面。"""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT command_id, payload, due_at FROM gateway_scheduled_commands "
+                "WHERE account_id=? AND due_at<=? ORDER BY due_at",
+                (account_id, now.isoformat()),
+            ).fetchall()
+        out = []
+        for row in rows:
+            try:
+                payload = json.loads(row[1])
+            except ValueError:
+                continue
+            out.append({"command_id": row[0], "payload": payload, "due_at": row[2]})
+        return out
+
+    def drop_scheduled_command(self, command_id: str) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "DELETE FROM gateway_scheduled_commands WHERE command_id=?", (command_id,)
+            )
+            conn.commit()
+
+    def count_scheduled_commands(self) -> int:
+        """还排着几条。界面每秒都要问一次，走 COUNT。"""
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM gateway_scheduled_commands").fetchone()
+        return int(row[0]) if row else 0
 
     # ────────────────────────── 监听名单（069）──────────────────────────
     #

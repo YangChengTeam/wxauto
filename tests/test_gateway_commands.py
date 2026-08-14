@@ -13,8 +13,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from structlog.testing import capture_logs
+
 from wxclient.gateway import CommandExecutor, GatewayStore, OutboundGuard
 from wxclient.gateway.download import DownloadError, FileFetcher, FileRef
+from wxclient.gateway.schedule import MAX_LATE_HOURS, ScheduleLoop, parse_schedule_at
 from wxclient.queue import TaskType
 
 BEIJING = timezone(timedelta(hours=8))
@@ -342,3 +345,101 @@ class InlineFileTestCase(unittest.IsolatedAsyncioTestCase):
 
     def test_没有字节的描述符不算文件(self) -> None:
         self.assertIsNone(FileRef.parse({"file_id": "f1", "url": "/v1/sessions/s/files/f1"}))
+
+
+# ────────────────────────── 定时指令（077）──────────────────────────
+
+
+class ScheduleParsingTests(unittest.TestCase):
+    def test_parses_iso_with_zone(self) -> None:
+        due = parse_schedule_at("2026-08-15T09:00:00+08:00")
+        self.assertIsNotNone(due)
+        self.assertEqual(due.utcoffset(), timedelta(hours=8))
+
+    def test_naive_time_is_read_as_local_not_utc(self) -> None:
+        """★ 用户说「明天上午九点」指的是他那台电脑上的九点。
+
+        当成 UTC 的话在东八区差八小时——`within_active_hours` 踩过一模一样的坑。
+        """
+        due = parse_schedule_at("2026-08-15T09:00:00")
+        self.assertIsNotNone(due)
+        self.assertIsNotNone(due.tzinfo)
+
+    def test_garbage_is_not_a_schedule(self) -> None:
+        for raw in ("", "   ", "明天九点", None, 123, "2026-13-45"):
+            self.assertIsNone(parse_schedule_at(raw))
+
+
+class ScheduleLoopTests(unittest.IsolatedAsyncioTestCase):
+    """★ 077：`schedule_at` 原来只是透传到网关就没人管了，「明天上午九点提醒他」
+    会被**当场**发出去——比不做还糟。需求文档 §6.19 的定时触发就卡在这里。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = GatewayStore(Path(self._tmp.name) / "gateway.db")
+        self.now = WORKDAY
+        self.fired: list[dict] = []
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _loop(self, *, active: bool = True) -> ScheduleLoop:
+        async def run_command(_account: str, payload: dict) -> None:
+            self.fired.append(payload)
+
+        return ScheduleLoop(
+            accounts=[ACCOUNT],
+            store=self.store,
+            run_command=run_command,
+            is_active=lambda _now: active,
+            clock=lambda: self.now,
+        )
+
+    def _schedule(self, due: datetime, command_id: str = "cmd-1") -> None:
+        self.store.put_scheduled_command(
+            ACCOUNT, command_id,
+            {"command_id": command_id, "op": "send_message",
+             "args": {"to": "王建国", "text": "提醒您明天面试"}},
+            due, at=self.now,
+        )
+
+    async def test_not_due_yet_stays_put(self) -> None:
+        self._schedule(WORKDAY + timedelta(hours=2))
+        self.assertEqual(await self._loop().tick(), 0)
+        self.assertEqual(self.fired, [])
+        self.assertEqual(self.store.count_scheduled_commands(), 1)
+
+    async def test_due_fires_once_and_is_cleared(self) -> None:
+        self._schedule(WORKDAY - timedelta(minutes=5))
+        self.assertEqual(await self._loop().tick(), 1)
+        self.assertEqual(len(self.fired), 1)
+        self.assertEqual(self.fired[0]["args"]["to"], "王建国")
+        # 销账了：下一趟不会再放一遍。
+        self.assertEqual(self.store.count_scheduled_commands(), 0)
+        self.assertEqual(await self._loop().tick(), 0)
+
+    async def test_nothing_fires_outside_working_hours(self) -> None:
+        """★ 半夜三点准时发一条「提醒您明天面试」正是风控要找的那种账号。
+
+        不是丢掉——在表里等着，第二天进时间窗第一趟放出去。
+        """
+        self._schedule(WORKDAY - timedelta(minutes=5))
+        self.assertEqual(await self._loop(active=False).tick(), 0)
+        self.assertEqual(self.fired, [])
+        self.assertEqual(self.store.count_scheduled_commands(), 1)
+
+        self.assertEqual(await self._loop(active=True).tick(), 1)
+        self.assertEqual(len(self.fired), 1)
+
+    async def test_way_too_late_is_dropped_with_a_trace(self) -> None:
+        """机器关了一夜再开机，昨天的排期不该突然全放出来——面试都结束了。"""
+        self._schedule(WORKDAY - timedelta(hours=MAX_LATE_HOURS + 1))
+        with capture_logs() as logs:
+            self.assertEqual(await self._loop().tick(), 0)
+        self.assertEqual(self.fired, [])
+        self.assertEqual(self.store.count_scheduled_commands(), 0)
+        self.assertTrue(
+            any(e["log_level"] == "warning" and "迟到" in e["event"] for e in logs), logs
+        )
+

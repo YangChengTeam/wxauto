@@ -513,6 +513,17 @@ class WeChatIoMappingTests(unittest.TestCase):
         self.assertNotEqual(first.msg_id, second.msg_id)
 
 
+class CommandRuntime:
+    """假底座：只记「投了什么任务」，不碰真微信。两条指令测试共用。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
+        self.calls.append((task_type, dict(payload or {})))
+        return {"result": {"ok": True}}
+
+
 class CommandChannelTests(unittest.IsolatedAsyncioTestCase):
     """AI 端推一条能力指令 → 网关执行 → 回执（066 design §3）。
 
@@ -549,15 +560,7 @@ class CommandChannelTests(unittest.IsolatedAsyncioTestCase):
         from wxclient.gateway.commands import COMMAND_EVENT
         from wxclient.queue import TaskType
 
-        class Runtime:
-            def __init__(self) -> None:
-                self.calls: list[tuple] = []
-
-            async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
-                self.calls.append((task_type, dict(payload or {})))
-                return {"result": {"ok": True}}
-
-        runtime = Runtime()
+        runtime = CommandRuntime()
         async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
             runner = self._runner(server)
             runner._commands = CommandExecutor(
@@ -595,6 +598,61 @@ class CommandChannelTests(unittest.IsolatedAsyncioTestCase):
                     ["received", "started", "done"],
                     "阶段序列不对：需求文档 §12.4 要 接收/开始/成功",
                 )
+            finally:
+                await runner.stop()
+
+
+    async def test_scheduled_command_is_parked_not_fired_now(self) -> None:
+        """★ 077：带 schedule_at 的指令不许当场发出去。
+
+        「明天上午九点提醒他」原来会被**立刻**执行——比不做还糟。
+        """
+        from wxclient.gateway import CommandExecutor, OutboundGuard
+        from wxclient.gateway.commands import COMMAND_EVENT
+        from wxclient.queue import TaskType
+
+        runtime = CommandRuntime()
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
+            runner = self._runner(server)
+            runner._commands = CommandExecutor(
+                runtime=runtime,
+                store=self.store,
+                guard=OutboundGuard(self.store, active_hours="00:00-23:59"),
+                account_id=ACCOUNT,
+                allow_real_actions=True,
+                confirmation="确认",
+                clock=lambda: self.now,
+            )
+            try:
+                await runner.ensure_connections()
+                later = (self.now + timedelta(hours=18)).isoformat()
+                runner._on_push(ACCOUNT, COMMAND_EVENT, {
+                    "command_id": "cmd-later", "op": "send_message",
+                    "args": {"to": "张三", "text": "提醒您明天面试"},
+                    "schedule_at": later,
+                })
+                for _ in range(50):
+                    receipts = [f for f in server.received if f.get("op") == "wechat.result"]
+                    if receipts:
+                        break
+                    await asyncio.sleep(0.02)
+
+                self.assertEqual(runtime.calls, [], "定时指令不该当场执行")
+                self.assertEqual(self.store.count_scheduled_commands(), 1)
+                # 报「排上了」，否则卡上停在「已下发」，而它其实十八小时后才动。
+                self.assertEqual(receipts[0]["data"]["status"], "scheduled")
+                self.assertEqual(receipts[0]["data"]["scheduled_for"], later)
+
+                # 到点之后由 schedule 循环放出去，走的还是同一条执行路径。
+                self.now = self.now + timedelta(hours=18, minutes=1)
+                self.assertEqual(await runner.schedule.tick(), 1)
+                for _ in range(50):
+                    if runtime.calls:
+                        break
+                    await asyncio.sleep(0.02)
+                self.assertEqual(len(runtime.calls), 1)
+                self.assertIs(runtime.calls[0][0], TaskType.SEND_MESSAGE)
+                self.assertEqual(self.store.count_scheduled_commands(), 0)
             finally:
                 await runner.stop()
 
