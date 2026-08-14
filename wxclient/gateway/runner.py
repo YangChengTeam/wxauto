@@ -238,9 +238,28 @@ class GatewayRunner:
         transcript: str,
         messages: Sequence[InboundMessage],
     ) -> DeliveryResult:
-        """入站一批 → 一轮对话 → 出站。异常向上抛给 InboundLoop 记录，不吞。"""
+        """入站一批 → 一轮对话 → 出站。
+
+        ★ 异常处理**分两段**（070 + 需求文档 §12.4）：
+
+        - **对话轮失败**（AI 端断线、票据过期、超时）→ 向上抛。这时一条微信都还没发出去，
+          `InboundLoop` 会把这批消息留在待处理队列里，恢复之后原样重投。
+
+        - **投递阶段失败**（已经开始往微信发了）→ **只记账，不上抛**。这里重投的代价是
+          「已经发出去的那几段再发一遍」——候选人收到重复消息，且撤不回来。
+          需求文档 §12.4 的原话是「结果未知先查询或转人工，不能盲目重发」，
+          所以这一批就此销账，宁可少一条回复，也不赌那一下。
+        """
         card = await self._run_dialog_turn(account_id, peer_id, transcript, messages)
-        return await self._sender.deliver(account_id, peer_id, card)
+        try:
+            return await self._sender.deliver(account_id, peer_id, card)
+        except Exception as exc:  # noqa: BLE001 —— 见上：投递阶段不允许触发重投
+            _log.warning(
+                "投递回复时出错，本批不再重投（可能已经发出去一部分，重投会重复骚扰对方）",
+                account=account_id,
+                error=str(exc),
+            )
+            return DeliveryResult(skipped_reason=f"投递失败：{exc}")
 
     async def _run_dialog_turn(
         self,
@@ -322,6 +341,14 @@ class GatewayRunner:
     def connected_count(self) -> int:
         """活着的 AI 端连接数。只读，给桌面端状态栏用。"""
         return self._pool.connected_count()
+
+    def pending_backlog(self) -> int:
+        """入站待处理队列里还欠着几批（070）。只读，给状态栏用。
+
+        平时恒为 0。持续 > 0 说明 AI 端那头不通、消息正在攒着——这必须让专员看见，
+        否则「微信显示已读、可是没人回」只会被当成功能坏了。
+        """
+        return self.loop.pending_batches
 
     @property
     def connect_error(self) -> str | None:

@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import asyncio
 import random
+import uuid
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 import structlog
@@ -28,6 +29,14 @@ PeerKey = tuple[str, str]  # (account_id, peer_id)
 #: 只有专员本人说话时最多留几条当上下文。留着是为了下一轮别重复问他问过的，
 #: 但不能无上限攒——他自己聊一下午，缓冲和 prompt 都会被撑爆。
 _SELF_CONTEXT_LIMIT = 10
+
+#: 待处理批次最多重投几次。AI 端长时间不可用时不该无限重试同一批，但也不能几分钟就放弃：
+#: 轮询间隔是分钟级，20 次差不多覆盖一两个小时的中断。
+PENDING_MAX_ATTEMPTS = 20
+
+#: 待处理批次的保鲜期。队列是**短期**的（需求文档 §2.4）——隔了一天再回过去更奇怪。
+#: 取 24h 是为了覆盖「晚上快下班时收到、失败了、第二天进工作时间窗才补上」这条真实路径。
+PENDING_MAX_AGE_HOURS = 24
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,34 @@ class InboundMessage:
     @property
     def key(self) -> PeerKey:
         return (self.account_id, self.peer_id)
+
+
+def message_to_row(message: InboundMessage) -> dict:
+    """落盘用的最小形态（``account_id``/``peer_id`` 存在行上，不重复写进 payload）。"""
+    return {
+        "msg_id": message.msg_id,
+        "text": message.text,
+        "at": message.at.isoformat(),
+        "from_self": message.from_self,
+        "peer_name": message.peer_name,
+    }
+
+
+def message_from_row(account_id: str, peer_id: str, row: dict) -> InboundMessage:
+    at_raw = str(row.get("at") or "")
+    try:
+        at = datetime.fromisoformat(at_raw)
+    except ValueError:
+        at = datetime.now(timezone.utc)
+    return InboundMessage(
+        account_id=account_id,
+        peer_id=peer_id,
+        msg_id=str(row.get("msg_id") or ""),
+        text=str(row.get("text") or ""),
+        at=at,
+        from_self=bool(row.get("from_self")),
+        peer_name=str(row.get("peer_name") or peer_id),
+    )
 
 
 class MessageSource(Protocol):
@@ -75,6 +112,11 @@ def format_transcript(messages: Iterable[InboundMessage]) -> str:
 class _Buffer:
     messages: list[InboundMessage] = field(default_factory=list)
     last_at: datetime | None = None
+    batch_ids: set[str] = field(default_factory=set)
+    """这些消息落盘时用的批次号（070）。派发成功后按它销账，失败按它记重试。
+
+    一次去抖可能横跨好几趟轮询，于是一个缓冲里会攒着多个批次——所以是集合不是单值。
+    """
 
 
 class Debouncer:
@@ -87,25 +129,42 @@ class Debouncer:
         self._window = window_seconds
         self._buffers: dict[PeerKey, _Buffer] = {}
 
-    def add(self, message: InboundMessage, now: datetime) -> None:
+    def add(self, message: InboundMessage, now: datetime, batch_id: str | None = None) -> None:
         buffer = self._buffers.setdefault(message.key, _Buffer())
         buffer.messages.append(message)
         buffer.last_at = now
+        if batch_id:
+            buffer.batch_ids.add(batch_id)
 
-    def readd(self, key: PeerKey, messages: Sequence[InboundMessage], now: datetime) -> None:
-        """把没能派发的一批放回缓冲（对方正在被回复时用）。"""
+    def readd(
+        self,
+        key: PeerKey,
+        messages: Sequence[InboundMessage],
+        now: datetime,
+        batch_ids: Iterable[str] = (),
+    ) -> None:
+        """把没能派发的一批放回缓冲（对方正在被回复时用）。
+
+        ★ 批次号必须一起放回来：不放回去就等于「这批还没处理，但账已经销了」，
+        下一轮成功时找不到该删哪一行，队列里会留下永远清不掉的残渣。
+        """
         buffer = self._buffers.setdefault(key, _Buffer())
         buffer.messages = [*messages, *buffer.messages]
         buffer.last_at = now
+        buffer.batch_ids.update(batch_ids)
 
-    def take_due(self, now: datetime) -> list[tuple[PeerKey, list[InboundMessage]]]:
+    def has_batch(self, batch_id: str) -> bool:
+        """这个批次是不是已经在缓冲里了（重投时用来防重复装载）。"""
+        return any(batch_id in buffer.batch_ids for buffer in self._buffers.values())
+
+    def take_due(self, now: datetime) -> list[tuple[PeerKey, list[InboundMessage], set[str]]]:
         """取走已经静默够久的批次，并从缓冲里清掉。"""
-        due: list[tuple[PeerKey, list[InboundMessage]]] = []
+        due: list[tuple[PeerKey, list[InboundMessage], set[str]]] = []
         for key, buffer in list(self._buffers.items()):
             if not buffer.messages or buffer.last_at is None:
                 continue
             if (now - buffer.last_at).total_seconds() >= self._window:
-                due.append((key, buffer.messages))
+                due.append((key, buffer.messages, set(buffer.batch_ids)))
                 del self._buffers[key]
         return due
 
@@ -141,6 +200,7 @@ class InboundLoop:
         self._rng = rng
         self._sleeping = False
         self._inflight: dict[PeerKey, asyncio.Task[None]] = {}
+        self._pending_loaded: set[str] = set()
         self._stopped = asyncio.Event()
 
     # ────────────────────────── 单步 ──────────────────────────
@@ -162,6 +222,8 @@ class InboundLoop:
         if self._sleeping:
             self._sleeping = False
             _log.info("进入工作时间窗，恢复轮询微信")
+        # 补投欠账要排在读新消息**之前**：先来的先回，别让重试一直被新消息插队。
+        self._reload_pending(now)
         await self._collect(now)
         # ★ 派发要用**读完之后**的时钟，不能复用上面那个 now（2026-08-14 真机实测）：
         # 消息是在 `_collect` 里按 `now` 入的缓冲，而去抖要求「静默满 debounce 秒」。
@@ -217,30 +279,36 @@ class InboundLoop:
                 _log.info("命中拒绝表达，已拉黑并停止自动化", account=account_id)
                 return
 
+        # ★ 落盘再入缓冲（070）：游标在读到消息那一刻就推进了，从这里到「AI 端跑完一轮」
+        # 之间断掉任何一环，这批消息就同时满足「游标翻过去了」和「谁也没处理」。
+        batch_id = f"pi_{uuid.uuid4().hex}"
+        self._store.put_pending_inbound(
+            account_id, peer_id, batch_id, [message_to_row(m) for m in fresh], at=now
+        )
         for message in fresh:
-            self._debouncer.add(message, now)
+            self._debouncer.add(message, now, batch_id)
 
     def _dispatch_due(self, now: datetime) -> int:
         dispatched = 0
-        for key, messages in self._debouncer.take_due(now):
+        for key, messages, batch_ids in self._debouncer.take_due(now):
             task = self._inflight.get(key)
             if task is not None and not task.done():
                 # 这个联系人正在被回复——放回缓冲，等这一轮收口后再合并派发。
                 # 同一会话严格串行（AI 端也只允许一轮，抢跑会直接报错）。
-                self._debouncer.readd(key, messages, now)
+                self._debouncer.readd(key, messages, now, batch_ids)
                 continue
 
             if not any(not message.from_self for message in messages):
                 # 一批里全是专员本人说的话（含网关自己刚发出去、下一轮被读回来的回复）：
                 # **不能拿它触发一轮**，否则就是自己回自己，会一直刷。留在缓冲里，等对方
                 # 真回话时并进那一轮的上下文（CLAUDE.md §5.2「人工接管优先」要的就是这个）。
-                self._debouncer.readd(key, list(messages)[-_SELF_CONTEXT_LIMIT:], now)
+                self._debouncer.readd(key, list(messages)[-_SELF_CONTEXT_LIMIT:], now, batch_ids)
                 continue
 
             account_id, peer_id = key
             transcript = format_transcript(messages)
             self._inflight[key] = asyncio.create_task(
-                self._run_handler(account_id, peer_id, transcript, messages)
+                self._run_handler(account_id, peer_id, transcript, messages, batch_ids)
             )
             dispatched += 1
         return dispatched
@@ -251,11 +319,79 @@ class InboundLoop:
         peer_id: str,
         transcript: str,
         messages: Sequence[InboundMessage],
+        batch_ids: set[str] | None = None,
     ) -> None:
         try:
             await self._handler(account_id, peer_id, transcript, messages)
         except Exception as exc:  # noqa: BLE001 —— 一个联系人处理失败不该拖垮循环
-            _log.warning("处理入站消息失败", account=account_id, error=str(exc))
+            # ★ 失败**不销账**：批次留在待处理表里，下一趟 tick 会重投（070）。
+            # 原来这里只记一条 warning 就把消息吞了——AI 端一断线，候选人就永远等不到回复。
+            attempts = 0
+            for batch_id in batch_ids or ():
+                attempts = max(attempts, self._store.bump_pending_attempts(batch_id))
+            self._pending_loaded.difference_update(batch_ids or ())
+            _log.warning(
+                "处理入站消息失败，已留在待处理队列等下一趟重投",
+                account=account_id,
+                error=str(exc),
+                已重试=attempts,
+            )
+            return
+        # 成功才销账。
+        for batch_id in batch_ids or ():
+            self._store.drop_pending_inbound(batch_id)
+            self._pending_loaded.discard(batch_id)
+
+    # ────────────────────────── 欠账重投（070）──────────────────────────
+
+    def _reload_pending(self, now: datetime) -> int:
+        """把待处理表里还没送出去的批次装回缓冲。返回装载了几批。
+
+        进程重启、AI 端断线恢复之后靠这一步把欠的账补上。幂等由 ``gateway_seen_messages``
+        保证——重投的还是同一批 msg_id，不会二次触发别的规则。
+        """
+        cutoff = now - timedelta(hours=PENDING_MAX_AGE_HOURS)
+        for row in self._store.purge_pending_inbound_before(cutoff):
+            self._pending_loaded.discard(row["batch_id"])
+            _log.warning(
+                "待处理消息超过保鲜期，已丢弃（这时候再回过去反而更奇怪）",
+                account=row["account_id"],
+                条数=len(row["payload"]),
+                收到于=row["created_at"],
+            )
+
+        loaded = 0
+        for row in self._store.list_pending_inbound():
+            batch_id = row["batch_id"]
+            if batch_id in self._pending_loaded or self._debouncer.has_batch(batch_id):
+                continue
+            if row["attempts"] >= PENDING_MAX_ATTEMPTS:
+                self._store.drop_pending_inbound(batch_id)
+                _log.warning(
+                    "待处理消息重投多次仍失败，已放弃",
+                    account=row["account_id"],
+                    条数=len(row["payload"]),
+                    已重试=row["attempts"],
+                )
+                continue
+            account_id, peer_id = row["account_id"], row["peer_id"]
+            messages = [message_from_row(account_id, peer_id, item) for item in row["payload"]]
+            if not messages:
+                self._store.drop_pending_inbound(batch_id)
+                continue
+            # last_at 用 messages 的原始时间：重投的批次早就静默够久了，不该再等一个去抖窗口。
+            for message in messages:
+                self._debouncer.add(message, messages[-1].at, batch_id)
+            self._pending_loaded.add(batch_id)
+            loaded += 1
+        if loaded:
+            _log.info("从待处理队列补投", 批次=loaded)
+        return loaded
+
+    @property
+    def pending_batches(self) -> int:
+        """待处理表里还欠着几批。只读，给状态栏/诊断用。"""
+        return self._store.count_pending_inbound()
 
     async def drain(self) -> None:
         """等所有在途的一轮收口（测试与优雅退出用）。"""

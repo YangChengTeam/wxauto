@@ -62,6 +62,17 @@ CREATE TABLE IF NOT EXISTS gateway_commands (
   done_at    TEXT NOT NULL,
   PRIMARY KEY (account_id, command_id)
 );
+CREATE TABLE IF NOT EXISTS gateway_pending_inbound (
+  batch_id   TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  peer_id    TEXT NOT NULL,
+  payload    TEXT NOT NULL,
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_inbound_account
+  ON gateway_pending_inbound (account_id, created_at);
 CREATE TABLE IF NOT EXISTS gateway_send_log (
   account_id TEXT NOT NULL,
   peer_id    TEXT NOT NULL,
@@ -271,6 +282,112 @@ class GatewayStore:
                 ),
             )
             conn.commit()
+
+    # ────────────────────────── 入站待处理队列（070）──────────────────────────
+    #
+    # ★ 为什么必须落盘：游标是在**读到消息的那一刻**推进的（`wechat_io._fetch_peer`），
+    #   而这批消息要经过去抖缓冲、再交给 AI 端跑一轮才算处理完。中间任何一步断掉——
+    #   AI 端连不上、票据过期、进程被关——这批消息就**同时**满足「游标已经翻过去了」
+    #   和「谁也没处理」，于是候选人永远等不到回复，日志上只有一行 warning
+    #   （2026-08-13 真机：票据过期那段窗口就是这么静悄悄丢掉的）。
+    #
+    #   所以：入缓冲的同时落一行，处理成功才删。进程重启、AI 端恢复之后照原样重投。
+    #   这就是需求文档 §2.4 要的「网络中断保留短期加密队列，恢复后幂等回传」——
+    #   幂等由 `gateway_seen_messages` 保证（重投的还是同一批 msg_id）。
+
+    def put_pending_inbound(
+        self,
+        account_id: str,
+        peer_id: str,
+        batch_id: str,
+        payload: list[dict],
+        at: datetime | None = None,
+    ) -> None:
+        """``at`` 由调用方传入循环自己的时钟——保鲜期是拿同一个时钟量的，
+        用 `_utcnow()` 会让两个时钟对不上（测试里立刻暴露，生产上则是悄悄失准）。"""
+        now = (at or _utcnow()).isoformat()
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO gateway_pending_inbound
+                  (batch_id, account_id, peer_id, payload, attempts, created_at, updated_at)
+                VALUES (?,?,?,?,0,?,?)
+                ON CONFLICT(batch_id) DO UPDATE SET
+                  payload=excluded.payload, updated_at=excluded.updated_at
+                """,
+                (batch_id, account_id, peer_id, json.dumps(payload, ensure_ascii=False), now, now),
+            )
+            conn.commit()
+
+    def list_pending_inbound(self, account_id: str | None = None) -> list[dict]:
+        """待处理批次，最早的排前面（先来的先补上）。"""
+        sql = (
+            "SELECT batch_id, account_id, peer_id, payload, attempts, created_at "
+            "FROM gateway_pending_inbound"
+        )
+        params: tuple = ()
+        if account_id is not None:
+            sql += " WHERE account_id=?"
+            params = (account_id,)
+        sql += " ORDER BY created_at"
+        with closing(self._connect()) as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "batch_id": row[0],
+                "account_id": row[1],
+                "peer_id": row[2],
+                "payload": json.loads(row[3]),
+                "attempts": int(row[4]),
+                "created_at": row[5],
+            }
+            for row in rows
+        ]
+
+    def count_pending_inbound(self) -> int:
+        """还欠着几批。界面每秒都要问一次，所以走 COUNT 而不是把整张表反序列化出来。"""
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM gateway_pending_inbound").fetchone()
+        return int(row[0]) if row else 0
+
+    def drop_pending_inbound(self, batch_id: str) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("DELETE FROM gateway_pending_inbound WHERE batch_id=?", (batch_id,))
+            conn.commit()
+
+    def bump_pending_attempts(self, batch_id: str) -> int:
+        """记一次失败，返回累计失败次数。"""
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE gateway_pending_inbound SET attempts=attempts+1, updated_at=? "
+                "WHERE batch_id=?",
+                (_utcnow().isoformat(), batch_id),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT attempts FROM gateway_pending_inbound WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def purge_pending_inbound_before(self, cutoff: datetime) -> list[dict]:
+        """清掉过期的待处理批次，返回被清掉的那些（调用方要把它们记进日志）。
+
+        队列是**短期**的：隔了一天还没送出去的消息，这时候再回过去反而更奇怪。
+        但清掉这件事必须留痕——静悄悄丢消息正是这一整块要根治的毛病。
+        """
+        stale = [
+            row for row in self.list_pending_inbound()
+            if row["created_at"] < cutoff.isoformat()
+        ]
+        if not stale:
+            return []
+        with closing(self._connect()) as conn:
+            conn.executemany(
+                "DELETE FROM gateway_pending_inbound WHERE batch_id=?",
+                [(row["batch_id"],) for row in stale],
+            )
+            conn.commit()
+        return stale
 
     # ────────────────────────── 发送计数（频次守门）──────────────────────────
 

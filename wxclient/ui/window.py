@@ -387,6 +387,10 @@ class MainWindow:
                 text="连不上" if failed else "连接中",
                 fg=theme.RED if failed else theme.ORANGE,
             )
+        elif (backlog := self.service.pending_backlog()) > 0:
+            # 连着但有积压：消息读到了、还没送出去。不显示出来的话，专员看到的就是
+            # 「微信显示已读、可是没人回」——只会以为功能坏了（070）。
+            self._rows["gateway"].configure(text=f"已连接 · 欠 {backlog} 批", fg=theme.ORANGE)
         elif connected >= total:
             self._rows["gateway"].configure(text="已连接", fg=theme.GREEN)
         else:

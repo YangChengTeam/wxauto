@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from structlog.testing import capture_logs
+
 from wxclient.gateway import (
     Debouncer,
     FriendWatcher,
@@ -26,6 +28,7 @@ from wxclient.gateway import (
     looks_like_rejection,
     within_active_hours,
 )
+from wxclient.gateway.inbound import PENDING_MAX_AGE_HOURS, PENDING_MAX_ATTEMPTS
 from wxclient.gateway.wechat_io import (
     QueueMessageSource,
     legacy_message_signature,
@@ -161,7 +164,7 @@ class DebouncerTests(unittest.TestCase):
         d = Debouncer(window_seconds=3)
         d.add(msg("甲", msg_id="m1", peer="p1"), T0)
         d.add(msg("乙", msg_id="m2", peer="p2"), T0)
-        due = dict(d.take_due(T0 + timedelta(seconds=5)))
+        due = {key: messages for key, messages, _batch_ids in d.take_due(T0 + timedelta(seconds=5))}
         self.assertEqual(len(due), 2)
 
     def test_take_due_clears_buffer(self) -> None:
@@ -597,11 +600,191 @@ class InboundLoopTests(StoreTestCase):
         await loop.tick()                                    # 派发第一轮 → handler 抛异常
         await loop.drain()
         self._now = T0 + timedelta(seconds=20)
-        await loop.tick()                                    # 攒第二条
+        await loop.tick()                                    # 攒第二条（顺带把炸掉那批捞回来）
         self._now = T0 + timedelta(seconds=30)
         await loop.tick()                                    # 派发第二轮：上一轮炸了不影响
         await loop.drain()
-        self.assertEqual(calls, 2)
+        self.assertGreaterEqual(calls, 2)                    # 循环没被一次异常带停
+        # 两批都还欠着（handler 一直在炸），一条都不许被悄悄丢掉。
+        self.assertEqual(len(self.store.list_pending_inbound()), 2)
+
+
+# ────────────────────────── 入站不丢消息（070）──────────────────────────
+
+
+class PendingInboundTests(StoreTestCase):
+    """★ 游标在**读到消息那一刻**就推进了，所以「读到」和「处理完」之间断掉任何一环，
+    这批消息就同时满足「游标翻过去了」和「谁也没处理」——候选人永远等不到回复，
+    日志上只有一行 warning（2026-08-13 真机，票据过期那段窗口就是这么静悄悄丢的）。
+    """
+
+    def _loop(self, source, handler, *, now: datetime, debounce: float = 3.0) -> InboundLoop:
+        self._now = now
+        return InboundLoop(
+            accounts=["acct-1"],
+            source=source,
+            store=self.store,
+            handler=handler,
+            debounce_seconds=debounce,
+            clock=lambda: self._now,
+        )
+
+    async def test_success_leaves_no_residue(self) -> None:
+        """跑通的批次必须销账，否则队列会越积越多、每趟都重投一遍已经回过的消息。"""
+        async def handler(_a: str, _p: str, _t: str, _m) -> None:
+            return None
+
+        loop = self._loop(FakeSource([[msg("在吗", msg_id="m1")], []]), handler, now=T0)
+        await loop.tick()
+        self.assertEqual(len(self.store.list_pending_inbound()), 1)   # 入缓冲即落盘
+        self._now = T0 + timedelta(seconds=10)
+        await loop.tick()
+        await loop.drain()
+        self.assertEqual(self.store.list_pending_inbound(), [])
+
+    async def test_ai_outage_is_retried_until_it_lands(self) -> None:
+        """★ AI 端断线期间的消息不许丢：恢复之后要自己补上。"""
+        delivered: list[str] = []
+        online = False
+
+        async def handler(_a: str, _p: str, transcript: str, _m) -> None:
+            if not online:
+                raise RuntimeError("AI 端连不上")
+            delivered.append(transcript)
+
+        loop = self._loop(FakeSource([[msg("还招人吗", msg_id="m1")], [], [], []]), handler, now=T0)
+        await loop.tick()
+        self._now = T0 + timedelta(seconds=10)
+        await loop.tick()                        # 派发 → 断线 → 失败
+        await loop.drain()
+        self.assertEqual(delivered, [])
+        self.assertEqual(len(self.store.list_pending_inbound()), 1)   # 还欠着，没丢
+
+        online = True                            # AI 端恢复
+        self._now = T0 + timedelta(seconds=20)
+        await loop.tick()                        # 重投
+        await loop.drain()
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("还招人吗", delivered[0])
+        self.assertEqual(self.store.list_pending_inbound(), [])
+
+    async def test_restart_replays_what_was_never_delivered(self) -> None:
+        """★ 进程被关掉/崩掉之后重新起来，欠的账要自己补上——微信那边已经是已读了。"""
+        async def boom(_a: str, _p: str, _t: str, _m) -> None:
+            raise RuntimeError("还没连上")
+
+        first = self._loop(FakeSource([[msg("我想应聘", msg_id="m1")], []]), boom, now=T0)
+        await first.tick()
+        self._now = T0 + timedelta(seconds=10)
+        await first.tick()
+        await first.drain()
+        self.assertEqual(len(self.store.list_pending_inbound()), 1)
+
+        # ——— 进程重启：全新的 loop，全新的内存缓冲，来源里一条新消息都没有 ———
+        delivered: list[str] = []
+
+        async def handler(_a: str, _p: str, transcript: str, _m) -> None:
+            delivered.append(transcript)
+
+        second = self._loop(FakeSource([[], []]), handler, now=T0 + timedelta(seconds=30))
+        await second.tick()
+        await second.drain()
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("我想应聘", delivered[0])
+
+    async def test_stale_batch_is_dropped_with_a_trace(self) -> None:
+        """队列是短期的：隔了一天再回过去更奇怪。但丢弃必须留痕，不能又变成静悄悄丢消息。"""
+        async def boom(_a: str, _p: str, _t: str, _m) -> None:
+            raise RuntimeError("AI 端连不上")
+
+        loop = self._loop(FakeSource([[msg("在吗", msg_id="m1")], [], []]), boom, now=T0)
+        await loop.tick()
+        self._now = T0 + timedelta(seconds=10)
+        await loop.tick()
+        await loop.drain()
+        self.assertEqual(len(self.store.list_pending_inbound()), 1)
+
+        self._now = T0 + timedelta(hours=PENDING_MAX_AGE_HOURS + 1)
+        with capture_logs() as logs:
+            await loop.tick()
+        self.assertEqual(self.store.list_pending_inbound(), [])
+        # 丢弃必须喊出来——静悄悄丢消息正是这一整块要根治的毛病。
+        self.assertTrue(
+            any(entry["log_level"] == "warning" and "保鲜期" in entry["event"] for entry in logs),
+            logs,
+        )
+
+    async def test_gives_up_after_max_attempts(self) -> None:
+        """一直失败的那一批不能无限重投，否则每趟都在原地打转。"""
+        self.store.put_pending_inbound(
+            "acct-1", "peer-1", "pi_dead",
+            [{"msg_id": "m1", "text": "在吗", "at": T0.isoformat(), "from_self": False}],
+        )
+        for _ in range(PENDING_MAX_ATTEMPTS):
+            self.store.bump_pending_attempts("pi_dead")
+
+        async def handler(_a: str, _p: str, _t: str, _m) -> None:
+            raise AssertionError("不该再被投出去")
+
+        loop = self._loop(FakeSource([[], []]), handler, now=T0 + timedelta(seconds=30))
+        with capture_logs() as logs:
+            await loop.tick()
+        await loop.drain()
+        self.assertEqual(self.store.list_pending_inbound(), [])
+        self.assertTrue(
+            any(entry["log_level"] == "warning" and "已放弃" in entry["event"] for entry in logs),
+            logs,
+        )
+
+    async def test_delivery_failure_does_not_retry(self) -> None:
+        """★ 已经开始往微信发了才失败 → **不许重投**。
+
+        重投的代价是「已经发出去的那几段再发一遍」，候选人收到重复消息且撤不回来
+        （需求文档 §12.4：结果未知先查询或转人工，不能盲目重发）。
+        与之相对，对话轮失败时一条微信都还没发，那才是该重投的场景。
+        """
+        from wxclient.gateway.guard import OutboundGuard
+        from wxclient.gateway.outbound import OutboundSender
+
+        class BoomSink:
+            async def send(self, account_id: str, peer_id: str, text: str) -> str:
+                raise OSError("微信窗口没了")
+
+        sender = OutboundSender(
+            sink=BoomSink(),
+            guard=OutboundGuard(self.store, active_hours="00:00-23:59"),
+            store=self.store,
+            clock=lambda: self._now,
+        )
+
+        async def handler(account_id: str, peer_id: str, _t: str, _m) -> None:
+            # 对话轮当作已经跑通（拿到卡），失败发生在投递阶段——照搬 runner.handle_turn 的边界。
+            try:
+                await sender.deliver(account_id, peer_id, reply_card(["您好"]))
+            except Exception:  # noqa: BLE001
+                return  # runner 在这里只记账、不上抛
+
+        loop = self._loop(FakeSource([[msg("在吗", msg_id="m1")], []]), handler, now=T0)
+        await loop.tick()
+        self._now = T0 + timedelta(seconds=10)
+        await loop.tick()
+        await loop.drain()
+        # 销账了：不会在下一趟把同一批再送一遍。
+        self.assertEqual(self.store.list_pending_inbound(), [])
+
+    async def test_self_only_batch_keeps_its_receipt(self) -> None:
+        """全是专员本人说的话不触发一轮，但那一批仍欠在账上——对方回话时要一起送上去。"""
+        async def handler(_a: str, _p: str, _t: str, _m) -> None:
+            raise AssertionError("不该被触发")
+
+        loop = self._loop(
+            FakeSource([[msg("我先问问他", msg_id="m1", from_self=True)], []]), handler, now=T0
+        )
+        await loop.tick()
+        self._now = T0 + timedelta(seconds=10)
+        self.assertEqual(await loop.tick(), 0)
+        await loop.drain()
+        self.assertEqual(len(self.store.list_pending_inbound()), 1)
 
     async def test_source_failure_is_survived(self) -> None:
         class BoomSource:
