@@ -97,7 +97,7 @@ class OutboundSender:
         self._apply_blacklist_actions(account_id, peer_id, actions)
 
         if not segments:
-            _log.info("本轮不回复", account=account_id, reason=no_reply_reason)
+            _log.info("本轮不回复", account=account_id, 会话=peer_id, reason=no_reply_reason)
             return DeliveryResult(skipped_reason=no_reply_reason, actions=actions)
 
         now = self._clock()
@@ -105,7 +105,7 @@ class OutboundSender:
         action = ACTION_GROUP if self._store.is_known_group(account_id, peer_id) else ACTION_MESSAGE
         decision: GuardDecision = self._guard.check(account_id, peer_id, now=now, action=action)
         if not decision.allowed:
-            _log.info("出站被守门拦下", account=account_id, reason=decision.reason)
+            _log.info("出站被守门拦下", account=account_id, 会话=peer_id, reason=decision.reason)
             return DeliveryResult(skipped_reason=decision.reason, actions=actions)
 
         task_ids: list[str] = []
@@ -113,7 +113,7 @@ class OutboundSender:
             task_id = await self._sink.send(account_id, peer_id, segment)
             self._store.record_send(account_id, peer_id, self._clock(), action=action)
             task_ids.append(task_id)
-        _log.info("已投递回复", account=account_id, segments=len(task_ids))
+        _log.info("已投递回复", account=account_id, 会话=peer_id, segments=len(task_ids))
         return DeliveryResult(sent=task_ids, actions=actions)
 
     def _apply_blacklist_actions(

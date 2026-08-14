@@ -210,6 +210,7 @@ class InboundLoop:
         self._sleeping = False
         self._inflight: dict[PeerKey, asyncio.Task[None]] = {}
         self._pending_loaded: set[str] = set()
+        self._quiet_notice: dict[PeerKey, tuple[str, int]] = {}
         self._stopped = asyncio.Event()
 
     # ────────────────────────── 单步 ──────────────────────────
@@ -314,6 +315,7 @@ class InboundLoop:
                 # 这个联系人正在被回复——放回缓冲，等这一轮收口后再合并派发。
                 # 同一会话严格串行（AI 端也只允许一轮，抢跑会直接报错）。
                 self._debouncer.readd(key, messages, now, batch_ids)
+                self._say_once(key, "上一轮还没跑完，这几条先等着", len(messages))
                 continue
 
             if not any(not message.from_self for message in messages):
@@ -321,15 +323,29 @@ class InboundLoop:
                 # **不能拿它触发一轮**，否则就是自己回自己，会一直刷。留在缓冲里，等对方
                 # 真回话时并进那一轮的上下文（CLAUDE.md §5.2「人工接管优先」要的就是这个）。
                 self._debouncer.readd(key, list(messages)[-_SELF_CONTEXT_LIMIT:], now, batch_ids)
+                self._say_once(key, "这几条全是自己说的，不触发回复，等对方开口", len(messages))
                 continue
 
             account_id, peer_id = key
             transcript = format_transcript(messages)
+            _log.info("派发一轮给 AI 端", 会话=peer_id, 条数=len(messages))
+            self._quiet_notice.pop(key, None)
             self._inflight[key] = asyncio.create_task(
                 self._run_handler(account_id, peer_id, transcript, messages, batch_ids)
             )
             dispatched += 1
         return dispatched
+
+    def _say_once(self, key: PeerKey, why: str, count: int) -> None:
+        """「这批为什么没派发」说一次就够。
+
+        缓冲里的消息每趟 tick 都会重新过一遍判定，逐趟都喊等于把实时日志刷满，
+        真正有用的那条反而被埋掉。内容变了（又攒了一条）才再说一次。
+        """
+        if self._quiet_notice.get(key) == (why, count):
+            return
+        self._quiet_notice[key] = (why, count)
+        _log.info(why, 会话=key[1], 条数=count)
 
     async def _run_handler(
         self,

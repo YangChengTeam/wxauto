@@ -168,6 +168,21 @@ def first_seen_fresh(raw_messages: Sequence[dict[str, Any]]) -> list[dict[str, A
     return fresh
 
 
+#: 日志里带上消息内容时截到多长。够看出「是哪条消息」，又不至于把整篇简历刷进实时日志。
+PREVIEW_CHARS = 40
+
+
+def preview(raw: dict[str, Any]) -> str:
+    """消息内容的日志摘要。
+
+    ⚠️ 这会把聊天内容写进本机日志文件——是专员自己那台机器上的运维日志，
+    也正是用户要的（「最好把最近的消息日志也打印到实时日志中」）。仍然截断：
+    日志不是聊天记录归档，`.wxclient/` 整个目录本来就禁止入库（CLAUDE.md §7）。
+    """
+    text = " ".join(str(raw.get("text") or "").split())
+    return text[:PREVIEW_CHARS] + "…" if len(text) > PREVIEW_CHARS else text or "（空）"
+
+
 def to_inbound(
     account_id: str,
     peer_id: str,
@@ -304,6 +319,26 @@ class QueueMessageSource:
             )
         if new_signature is not None:
             self._store.set_cursor(account_id, peer_id, new_signature, seq + len(fresh))
+
+        # ★ 读完必须说清楚「读到几条、其中几条算新的、新的都是谁说的什么」（用户 2026-08-14：
+        # 「我不知道你为什么不回复消息给监听的名单」）。原来读完只有一句「读取完成 N 条」，
+        # 之后要么回复、要么无声无息——现场根本分不清是「没有新消息」「新消息是自己发的」
+        # 还是「哪一环坏了」。这几行是排查这条链路唯一的抓手。
+        _log.info(
+            "读完这个会话",
+            会话=peer_id,
+            读到=len(raw_messages),
+            新消息=len(fresh),
+            最近一条=preview(raw_messages[-1]) if raw_messages else "（空）",
+        )
+        for raw in fresh:
+            _log.info(
+                "新消息",
+                会话=peer_id,
+                谁=SELF_SENDER if is_self_message(raw) else "对方",
+                时间=str(raw.get("timestamp_text") or "").strip() or "-",
+                内容=preview(raw),
+            )
 
         now = self._clock()
         return [

@@ -872,6 +872,27 @@ class PendingInboundTests(StoreTestCase):
         await loop.drain()
         self.assertEqual(self.store.list_pending_inbound(), [], "没欠账就不该有账")
 
+    async def test_not_dispatching_is_explained_once(self) -> None:
+        """★ 「读到了却没回」必须有一行说明，否则现场只能猜（用户 2026-08-14）。
+
+        又不能每趟都喊：缓冲里的消息每 tick 都重新过一遍判定，逐趟一行会把实时日志刷满。
+        """
+        async def handler(_a: str, _p: str, _t: str, _m) -> None:
+            raise AssertionError("不该被触发")
+
+        loop = self._loop(
+            FakeSource([[msg("我先问问他", msg_id="m1", from_self=True)], [], []]), handler, now=T0
+        )
+        with capture_logs() as logs:
+            await loop.tick()
+            self._now = T0 + timedelta(seconds=10)
+            await loop.tick()
+            self._now = T0 + timedelta(seconds=20)
+            await loop.tick()
+        said = [e for e in logs if e["event"].startswith("这几条全是自己说的")]
+        self.assertEqual(len(said), 1, f"同一批只该说一次：{said}")
+        self.assertEqual(said[0]["条数"], 1)
+
     async def test_self_message_still_joins_the_next_real_turn(self) -> None:
         """不记账不等于丢上下文：对方回话时，自己刚说的那句要一起送上去。"""
         seen: list[str] = []
@@ -1078,6 +1099,29 @@ class InboundScopeTests(StoreTestCase):
         )
         messages = await source.fetch("acct-1")
         self.assertEqual(format_transcript(messages), "[对方 · 今天 09:05] 还招人吗")
+
+    async def test_every_read_says_what_it_saw(self) -> None:
+        """★ 读完必须说清「读到几条、几条算新的、新的是谁说的什么」（用户 2026-08-14）。
+
+        原来读完只有一句「读取完成 N 条」，之后要么回复、要么无声无息——现场分不清是
+        「没有新消息」「新消息是自己发的」还是「哪一环坏了」。
+        """
+        runtime = FakeRuntime(
+            unread=[],
+            history={self.PERSON: [{"text": "还招人吗", "is_self": False, "timestamp_is_today": True}]},
+        )
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[self.PERSON])
+        )
+        with capture_logs() as logs:
+            await source.fetch("acct-1")
+        done = [e for e in logs if e["event"] == "读完这个会话"]
+        self.assertEqual(len(done), 1, logs)
+        self.assertEqual(done[0]["读到"], 1)
+        self.assertEqual(done[0]["新消息"], 1)
+        fresh_logs = [e for e in logs if e["event"] == "新消息"]
+        self.assertEqual([e["内容"] for e in fresh_logs], ["还招人吗"])
+        self.assertEqual(fresh_logs[0]["谁"], "对方")
 
     async def test_unreadable_peer_is_reported_once_not_every_poll(self) -> None:
         """名字和微信里对不上 → 说清楚是哪个名字，且只说一次。
