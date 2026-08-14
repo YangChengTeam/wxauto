@@ -67,7 +67,15 @@ OpenCV 138MB（`pyautogui → pyscreeze` 拖进来，只有模糊图像匹配 `c
 
 启动动画分两段接力：PyInstaller 的 `Splash` 先顶一张静态首屏（双击到 Python 起来那 1~2 秒
 tkinter 还不存在），Python 一起来由 `wxclient/ui/splash.py` 那个会动的接手并把它关掉。
-静态图别手改，跑 `python packaging/make_splash.py` 按 `theme.py` 重新生成。
+静态图别手改，跑 `python packaging/make_splash.py` 按 `theme.py` 重新生成。会动的那个整窗
+带 8% 透明（`splash_style.OPACITY`），静态首屏没有透明度可调——PyInstaller 的 `Splash`
+不提供这个参数，所以冻结包最开始那一两秒仍是实心的。
+
+**别让黑框冒出来。** spec 里 `console=False`，打出来的 exe 是 GUI 子系统，本身不带控制台。
+黑框基本都来自**快捷方式**：`.bat` 必然拉起一个 cmd.exe 窗口，`python.exe` 又是控制台版的
+（GUI 版叫 `pythonw.exe`）。所以快捷方式要么直接指 `劳小智微信助手.exe`，要么指一个
+`WScript.Shell.Run "...bat", 0` 的 `.vbs` 由它隐藏着拉起 `pythonw.exe`——
+**别把 `.bat` 或 `python.exe` 挂到 `.lnk` 上**（真机 2026-08-14 就是这么踩的）。
 
 两个真机踩过的坑，都已在仓库里修好，别再踩回去：
 

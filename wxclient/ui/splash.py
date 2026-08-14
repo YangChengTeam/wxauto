@@ -26,6 +26,7 @@ from .splash_style import (
     FRAME_MS,
     HEIGHT,
     LOGO_PX,
+    OPACITY,
     RING_RADIUS,
     RING_WIDTH,
     STEP_DEGREES,
@@ -69,6 +70,9 @@ class Splash:
         self._center()
         try:
             self._win.attributes("-topmost", True)
+            # 稍微透一点，别像块硬贴纸糊在桌面上。和淡出用的是同一个 -alpha，
+            # 所以 _fade 得从 OPACITY 往下走，不能从 1.0 起——否则一开始淡出反而先变亮。
+            self._win.attributes("-alpha", OPACITY)
         except tk.TclError:  # pragma: no cover - 少数环境不支持
             pass
 
@@ -192,7 +196,7 @@ class Splash:
             if left <= 0:
                 self._win.destroy()
                 return
-            self._win.attributes("-alpha", left / FADE_STEPS)
+            self._win.attributes("-alpha", OPACITY * left / FADE_STEPS)
             self._root.after(FADE_MS, lambda: self._fade(left - 1))
         except tk.TclError:
             pass

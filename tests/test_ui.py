@@ -619,6 +619,34 @@ class SplashTests(unittest.TestCase):
         self.assertIn("pyi_splash", source)
         self.assertIn("_close_frozen_splash()", source)
 
+    def test_splash_is_translucent_and_fades_from_that_same_opacity(self) -> None:
+        """启动窗要透一点；淡出得从这个透明度往下走，不能从 1.0 起（否则先变亮再消失）。"""
+        from wxclient.ui.splash_style import OPACITY
+
+        self.assertTrue(0.5 < OPACITY < 1.0, "太透就看不清，1.0 又等于没透")
+        source = (
+            Path(__file__).resolve().parent.parent / "wxclient/ui/splash.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('self._win.attributes("-alpha", OPACITY)', source)
+        self.assertIn('"-alpha", OPACITY * left / FADE_STEPS', source)
+
+
+class PackagingTests(unittest.TestCase):
+    """打包产物的硬约束。跑不了 pyinstaller 也要能守住的那几条，全在 spec 文本里。"""
+
+    SPEC = Path(__file__).resolve().parent.parent / "packaging/lxz-wechat-gateway.spec"
+
+    def test_no_console_window(self) -> None:
+        """★ 桌面程序绝不能弹控制台黑框：EXE 必须 console=False。
+
+        真机上黑框还有第二个来源，spec 管不着——**别把 .bat / python.exe 挂到快捷方式上**
+        （.bat 必然拉起 cmd.exe 窗口，python.exe 是控制台版）。要么直接指打包出来的 exe，
+        要么用 pythonw.exe 并由一个隐藏窗口的 .vbs 拉起。
+        """
+        spec = self.SPEC.read_text(encoding="utf-8")
+        self.assertIn("console=False", spec)
+        self.assertNotIn("console=True", spec)
+
 
 class SettingsStoreTests(unittest.TestCase):
     def test_round_trip_keeps_values(self) -> None:

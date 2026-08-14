@@ -27,6 +27,11 @@ FRAME_MS = 40
 FADE_STEPS = 6
 FADE_MS = 25
 
+#: 整窗不透明度（1.0 = 实心）。稍微透一点，深色块压在桌面上没那么硬。
+#: 别再往下调：白字压在花桌面上会开始发糊，而它统共只活几秒，看不清就白做了。
+#: 只对会动的这个 tk 启动窗生效——冻结包里 PyInstaller 那张静态首屏没有透明度可调。
+OPACITY = 0.92
+
 
 def blend(start: str, end: str, ratio: float) -> str:
     """两个 ``#rrggbb`` 之间取一个色。``ratio=0`` 给 start，``1`` 给 end。
