@@ -69,17 +69,8 @@ _REPLAY_LINES = 800
 #: 转圈用的帧。每秒换一帧（跟着 _tick 走），够看出「还活着」。
 _SPINNER = ("◐", "◓", "◑", "◒")
 
-#: 状态栏最多列几个会话名。名单长了就只列前几个 —— 侧栏就那么宽，列全了反而看不清。
-_WATCH_PREVIEW = 6
-
-
-def _watch_summary(names: list[str]) -> str:
-    """名单摘要：列出名字，多了就折成「…等 N 个」。纯函数，好测。"""
-    if not names:
-        return ""
-    if len(names) <= _WATCH_PREVIEW:
-        return "、".join(names)
-    return "、".join(names[:_WATCH_PREVIEW]) + f"…等 {len(names)} 个"
+#: 内容区各页的标题。加页在这里登记一条，别散在 _show_page 的分支里。
+_PAGE_TITLES = {"log": "实时日志", "settings": "参数设置", "watch": "监听名单"}
 
 
 class MainWindow:
@@ -190,12 +181,8 @@ class MainWindow:
         for key, label in (("service", "服务"), ("gateway", "网关"), ("wechat", "微信"), ("watch", "监听")):
             self._rows[key] = self._status_row(bar, label)
 
-        # 名单具体是谁：数字说明不了「他到底在不在名单上」，得把名字列出来。
-        self._watch_label = tk.Label(bar, text="", font=theme.FONT_SMALL,
-                                     bg=theme.SIDEBAR_BG, fg=theme.SIDEBAR_MUTED,
-                                     anchor="w", justify=tk.LEFT, wraplength=244)
-        self._watch_label.pack(anchor="w", padx=28, pady=(6, 0))
-
+        # 侧栏这一行只报「几个会话」。**具体是谁不铺在这儿**——名字一多就把整条侧栏顶下去，
+        # 而且多数时候没人在看。要看名字点左边「监听名单」，和「实时日志 / 参数设置」一个路数。
         self._uptime_label = tk.Label(bar, text="", font=theme.FONT_SMALL,
                                       bg=theme.SIDEBAR_BG, fg=theme.SIDEBAR_MUTED)
         self._uptime_label.pack(anchor="w", padx=28, pady=(22, 0))
@@ -203,7 +190,7 @@ class MainWindow:
         self._divider(bar, pady=(24, 10))
 
         self._nav: dict[str, tk.Label] = {}
-        for page, text in (("log", "实时日志"), ("settings", "参数设置")):
+        for page, text in (("log", "实时日志"), ("watch", "监听名单"), ("settings", "参数设置")):
             item = tk.Label(bar, text=text, font=theme.FONT_BODY, bg=theme.SIDEBAR_BG,
                             fg=theme.SIDEBAR_TEXT, anchor="w", padx=28, pady=8, cursor="hand2")
             item.pack(fill=tk.X)
@@ -268,6 +255,7 @@ class MainWindow:
         self._pages.pack(fill=tk.BOTH, expand=True)
 
         self._log_page = self._build_log_page(self._pages)
+        self._watch_page = self._build_watch_page(self._pages)
         self._overlay = self._build_overlay(self._pages)
 
         footer = tk.Frame(content, bg=theme.FOOTER_BG, height=36)
@@ -318,6 +306,58 @@ class MainWindow:
         self._table.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 16))
         return page
 
+    def _build_watch_page(self, parent: tk.Misc) -> tk.Frame:
+        """监听名单页：AI 端推下来的会话名单，一行一个。
+
+        名单是「谁会被自动回复」的唯一判据（069 fail-closed），所以必须看得见**具体是谁**；
+        但它也可能有几十条，铺在侧栏里会把状态行全顶下去。做成一页，点了才看。
+        """
+        page = tk.Frame(parent, bg=theme.CONTENT_BG)
+        self._watch_hint = tk.Label(page, text="", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                                    fg=theme.TEXT_MUTED, anchor="w", justify=tk.LEFT)
+        self._watch_hint.pack(fill=tk.X, padx=24, pady=(0, 10))
+
+        box = tk.Frame(page, bg=theme.ROW_LINE, padx=1, pady=1)
+        box.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 16))
+        self._watch_text = tk.Text(
+            box, bg=theme.CONTENT_BG, fg=theme.TEXT, font=theme.FONT_BODY,
+            relief=tk.FLAT, highlightthickness=0, bd=0, padx=18, pady=12,
+            spacing1=3, spacing3=5, cursor="arrow", insertwidth=0, wrap=tk.NONE,
+        )
+        scroll = tk.Scrollbar(box, orient=tk.VERTICAL, command=self._watch_text.yview, width=12)
+        self._watch_text.configure(yscrollcommand=scroll.set)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._watch_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._watch_text.tag_configure("empty", foreground=theme.ORANGE)
+        self._watch_text.configure(state=tk.DISABLED)
+        # 只读，但要能选中复制——「这个人到底在不在名单上」经常要贴给别人看
+        self._watch_text.bind("<Key>", lambda event: None
+                              if (event.state & 0x4 and event.keysym in {"c", "C", "a", "A"})
+                              or event.keysym in {"Up", "Down", "Prior", "Next", "Home", "End"}
+                              else "break")
+        return page
+
+    def _render_watch_page(self) -> None:
+        """把名单铺到页面上。停在这一页时每秒刷一次——名单是 AI 端随时会改的。"""
+        if self._page != "watch":
+            return
+        watched = list(self.service.status().watched)
+        running = self.service.state is ServiceState.RUNNING
+        if not running:
+            self._watch_hint.configure(text="服务没在跑，名单由 AI 端在运行时推下来。")
+        elif watched:
+            self._watch_hint.configure(text=f"共 {len(watched)} 个会话会被自动回复；不在名单里的一律不回。")
+        else:
+            self._watch_hint.configure(text="名单是空的——这意味着一条消息都不会回。")
+
+        body = "\n".join(watched) if watched else ("（空）" if running else "（未启动）")
+        if self._watch_text.get("1.0", "end-1c") == body:
+            return  # 没变就别重画，省得把用户选中的东西冲掉
+        self._watch_text.configure(state=tk.NORMAL)
+        self._watch_text.delete("1.0", tk.END)
+        self._watch_text.insert("1.0", body, () if watched else ("empty",))
+        self._watch_text.configure(state=tk.DISABLED)
+
     # ── 页面切换 ──────────────────────────────────────────────────
 
     def _show_page(self, page: str) -> None:
@@ -327,24 +367,28 @@ class MainWindow:
         for child in self._pages.winfo_children():
             child.pack_forget()
         self._render_nav()
+        self._heading.configure(text=_PAGE_TITLES.get(page, _PAGE_TITLES["log"]))
 
-        if page == "settings":
-            self._heading.configure(text="参数设置")
-            self._live_dot.pack_forget()
-            self._live_text.pack_forget()
-            self._filter_bar.pack_forget()
-            for widget in self._header_actions.winfo_children():
-                widget.pack_forget()
-            self._ensure_settings_page().pack(fill=tk.BOTH, expand=True)
-        else:
-            self._heading.configure(text="实时日志")
+        # 「实时更新 · N 行」「级别过滤」「打开目录 / 清空」这一排只属于日志页
+        if page == "log":
             self._live_dot.pack(side=tk.LEFT, padx=(12, 4))
             self._live_text.pack(side=tk.LEFT)
             for widget in self._header_actions.winfo_children():
                 widget.pack(side=tk.RIGHT, padx=10)
             self._filter_bar.pack(side=tk.RIGHT, padx=(0, 18))
             self._log_page.pack(fill=tk.BOTH, expand=True)
-        self._render_overlay()  # 两个分支都要摆一次：切走了就得把遮罩收掉
+        else:
+            self._live_dot.pack_forget()
+            self._live_text.pack_forget()
+            self._filter_bar.pack_forget()
+            for widget in self._header_actions.winfo_children():
+                widget.pack_forget()
+            if page == "settings":
+                self._ensure_settings_page().pack(fill=tk.BOTH, expand=True)
+            else:
+                self._watch_page.pack(fill=tk.BOTH, expand=True)
+                self._render_watch_page()
+        self._render_overlay()  # 每个分支都要摆一次：切走了就得把遮罩收掉
 
     def _prebuild_settings_page(self) -> None:
         """空闲时把参数页建出来（不显示）。失败无所谓——真点的时候还会再建一次。"""
@@ -608,7 +652,7 @@ class MainWindow:
             self._rows["watch"].configure(text="名单是空的", fg=theme.ORANGE)
         else:
             self._rows["watch"].configure(text=f"{len(watched)} 个会话", fg=theme.GREEN)
-        self._watch_label.configure(text=_watch_summary(watched))
+        self._render_watch_page()  # 停在监听名单页时跟着刷；不在那页是个空操作
 
         self._live_dot.configure(fg=theme.GREEN if state is ServiceState.RUNNING else theme.GRAY)
 

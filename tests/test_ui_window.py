@@ -28,7 +28,7 @@ except Exception:  # noqa: BLE001 - 没有 Tk / 没有显示环境都算「跑�
 if HAS_TK:
     from wxclient.logging_config import configure_logging
     from wxclient.ui.logbuffer import LogBuffer, LogPipeline
-    from wxclient.ui.service import GatewayService, GatewayStatus
+    from wxclient.ui.service import GatewayService, GatewayStatus, ServiceState
     from wxclient.ui.window import MainWindow
 
 
@@ -96,8 +96,8 @@ class WindowAdversarialTests(unittest.TestCase):
             self.window.open_log()
             self.window._render_busy()
 
-        # 只该有三个：日志页 + 设置页 + 遮罩
-        self.assertLessEqual(len(self.window._pages.winfo_children()), 3)
+        # 只该有四个：日志页 + 监听名单页 + 设置页 + 遮罩
+        self.assertLessEqual(len(self.window._pages.winfo_children()), 4)
 
     def test_transition_covers_the_settings_page_instead_of_kicking_you_out(self) -> None:
         """★ 转场态停在参数页：盖住就行，别把人正在填的东西丢掉。"""
@@ -133,6 +133,48 @@ class WindowAdversarialTests(unittest.TestCase):
         self.assertEqual(page.winfo_manager(), "", "预热只建不显示")
         self.window.open_settings()
         self.assertIs(self.window._settings_page, page, "真点的时候直接用预热那个")
+
+    def test_the_watch_list_lives_on_its_own_page_not_in_the_sidebar(self) -> None:
+        """★ 名单不再直接铺在侧栏「监听」下面，改成点「监听名单」才看（用户 2026-08-14）。
+
+        理由：名字一多就把整条侧栏顶下去，而多数时候没人在看。侧栏那行只留「几个会话」。
+        """
+        self.assertIn("watch", self.window._nav, "左边要有「监听名单」这一项")
+        self.assertEqual(self.window._nav["watch"].cget("text"), "监听名单")
+        self.assertFalse(hasattr(self.window, "_watch_label"), "侧栏不该再铺名单")
+
+        self.window._show_page("watch")
+
+        self.assertEqual(self.window._page, "watch")
+        self.assertEqual(self.window._heading.cget("text"), "监听名单")
+        self.assertEqual(self.window._watch_page.winfo_manager(), "pack")
+        self.assertEqual(self.window._log_page.winfo_manager(), "", "日志页要让位")
+        # 日志页专属的那一排不该跟着跑出来
+        self.assertEqual(self.window._filter_bar.winfo_manager(), "")
+        self.assertEqual(self.window._live_dot.winfo_manager(), "")
+
+    def test_the_watch_page_lists_the_actual_names(self) -> None:
+        """名单是「谁会被自动回复」的唯一判据，页上必须看得到具体是谁。"""
+        from wxclient.ui.service import GatewayStatus
+
+        self.window.service._status = GatewayStatus(watched=("张三", "李四", "王五"))
+        self.window._show_page("watch")
+
+        body = self.window._watch_text.get("1.0", "end-1c")
+        for name in ("张三", "李四", "王五"):
+            self.assertIn(name, body)
+        self.assertEqual(self.window._watch_text.cget("state"), "disabled", "只读")
+
+    def test_an_empty_watch_list_says_nothing_will_be_answered(self) -> None:
+        """空名单分两种，别混为一谈：没起服务是正常的，**跑着却空**才是要命的。"""
+        self.window._show_page("watch")
+        self.assertIn("没在跑", self.window._watch_hint.cget("text"), "没启动时别吓人")
+
+        # 跑起来了、名单却是空的：意味着一条消息都不会回，必须说出来
+        self.window.service._snapshot = (ServiceState.RUNNING, None)
+        self.window._render_watch_page()
+
+        self.assertIn("一条消息都不会回", self.window._watch_hint.cget("text"))
 
     def test_locked_nav_refuses_the_settings_page(self) -> None:
         """转场期间「参数设置」点不动——托盘那条路也一样。"""
