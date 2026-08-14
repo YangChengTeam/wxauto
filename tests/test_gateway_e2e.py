@@ -189,8 +189,11 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 text = sent["data"]["text"]
                 self.assertIn("[对方 · 14:00] 还招人吗", text)
                 self.assertIn("[专员本人 · 14:02] 稍等我看下", text)
-                self.assertNotIn(PEER, text)          # 不泄露联系人标识
+                self.assertNotIn(PEER, text)          # 对话正文里不夹联系人标识
                 self.assertTrue(sent["data"]["wechat"]["operator_intervened"])
+                # 078：AI 端拿这个名字当关系记忆的键——它那边只有 session_id，
+                # 从 session_id 反推不出「这是在跟谁说话」。
+                self.assertEqual(sent["data"]["wechat"]["peer"], PEER)
             finally:
                 await runner.stop()
 

@@ -338,7 +338,7 @@ class GatewayRunner:
                 result = await client.send_message(
                     session_id,
                     transcript,
-                    extra={"wechat": self._turn_meta(messages)},
+                    extra={"wechat": self._turn_meta(peer_id, messages)},
                 )
             except Unauthorized:
                 # 票据/归属出问题：会话多半已经不属于我们了，清掉重来。
@@ -385,9 +385,14 @@ class GatewayRunner:
         return session_id
 
     @staticmethod
-    def _turn_meta(messages: Sequence[InboundMessage]) -> dict[str, Any]:
-        """给 AI 端的这一轮元信息（064 design §2）。"""
+    def _turn_meta(peer_id: str, messages: Sequence[InboundMessage]) -> dict[str, Any]:
+        """给 AI 端的这一轮元信息（064 design §2）。
+
+        `peer` 是这个会话在微信里显示的名字。AI 端拿它当关系记忆的键（078）——
+        它那边只有 session_id，从 session_id 反推不出「这是在跟谁说话」。
+        """
         return {
+            "peer": peer_id,
             "funnel": "inbound",
             "operator_intervened": any(m.from_self for m in messages),
         }
