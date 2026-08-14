@@ -409,6 +409,10 @@ class GatewayRunner:
         """活着的 AI 端连接数。只读，给桌面端状态栏用。"""
         return self._pool.connected_count()
 
+    def watched_peers(self) -> list[str]:
+        """当前在盯哪些会话。只读，给桌面端状态栏用（可跨线程读）。"""
+        return self._watchlist.watched() if self._watchlist is not None else []
+
     def scheduled_count(self) -> int:
         """还排着几条定时指令（077）。只读，给状态栏用。"""
         return self._store.count_scheduled_commands()

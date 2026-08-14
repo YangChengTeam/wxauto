@@ -52,6 +52,12 @@ class InboundMessage:
     """True = 这条是**招聘专员本人手打发出去的**（人工接管）。必须一起喂给 AI，
     否则它会重复问专员已经问过的问题（``CLAUDE.md`` §5.2）。"""
     peer_name: str = ""
+    at_text: str = ""
+    """微信自己标的时间（「18:28」「昨天 20:11」），来自聊天记录里的时间分隔行。
+
+    有它就用它：``at`` 是**网关读到这条的时刻**，不是对方发出的时刻。改成直接读会话
+    之后（不再依赖未读），读到的很可能是几分钟前甚至昨天的消息——把读取时刻当发送时刻
+    喂给模型，它就会对着一条昨晚的消息说「你刚才说」。"""
 
     @property
     def key(self) -> PeerKey:
@@ -66,6 +72,7 @@ def message_to_row(message: InboundMessage) -> dict:
         "at": message.at.isoformat(),
         "from_self": message.from_self,
         "peer_name": message.peer_name,
+        "at_text": message.at_text,
     }
 
 
@@ -83,6 +90,7 @@ def message_from_row(account_id: str, peer_id: str, row: dict) -> InboundMessage
         at=at,
         from_self=bool(row.get("from_self")),
         peer_name=str(row.get("peer_name") or peer_id),
+        at_text=str(row.get("at_text") or ""),
     )
 
 
@@ -104,7 +112,8 @@ def format_transcript(messages: Iterable[InboundMessage]) -> str:
     lines = []
     for message in messages:
         who = "专员本人" if message.from_self else "对方"
-        lines.append(f"[{who} · {message.at:%H:%M}] {message.text}")
+        when = message.at_text or f"{message.at:%H:%M}"
+        lines.append(f"[{who} · {when}] {message.text}")
     return "\n".join(lines)
 
 

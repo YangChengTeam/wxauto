@@ -218,6 +218,21 @@ class GatewayService:
         except Exception:  # noqa: BLE001 - 状态展示不该把服务拖下水
             return 0
 
+    def watched_peers(self) -> list[str]:
+        """当前在盯哪些会话（AI 端推下来的名单）。没在跑就是空。
+
+        名单只在日志里闪一行「只管=2」，界面上看不到——于是「为什么这个人没被回」
+        永远要去翻日志（用户 2026-08-14 反馈：名单应该在 Windows 这端看得到）。
+        """
+        with self._lock:
+            gateway = self._gateway
+        if gateway is None or self._state is not ServiceState.RUNNING:
+            return []
+        try:
+            return gateway.runner.watched_peers()
+        except Exception:  # noqa: BLE001 - 状态展示不该把服务拖下水
+            return []
+
     def scheduled_count(self) -> int:
         """排着的定时指令条数；没在跑就是 0。"""
         with self._lock:

@@ -33,6 +33,9 @@ _log = structlog.get_logger(__name__)
 
 SELF_SENDER = "我"
 
+#: 一轮最多读几个会话。见 ``QueueMessageSource._due_peers``——每读一个就要开一次聊天窗口。
+MAX_PEERS_PER_POLL = 8
+
 
 def is_self_message(raw: dict[str, Any]) -> bool:
     """这条是不是专员本人发的。
@@ -146,11 +149,12 @@ def to_inbound(
         at=at or datetime.now(timezone.utc),
         from_self=is_self_message(raw),
         peer_name=peer_id,
+        at_text=str(raw.get("timestamp_text") or "").strip(),
     )
 
 
 class QueueMessageSource:
-    """入站来源：未读会话 → 逐个读聊天记录 → 按游标切出新消息。
+    """入站来源：**名单里的会话** → 逐个读聊天记录 → 按游标切出新消息。
 
     ``peer_id`` 用的是**微信会话名**——微信 UI 自动化能拿到的就是这个，
     ``wechat_api`` 的所有动作也都按会话名寻址。
@@ -170,6 +174,7 @@ class QueueMessageSource:
         self._watchlist = watchlist or Watchlist()
         self._history_limit = history_limit
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._rotation = 0
 
     def skip_reason(self, account_id: str, peer_id: str) -> str | None:
         """这个会话该不该碰；返回不碰的理由，None 表示可以处理。
@@ -185,23 +190,40 @@ class QueueMessageSource:
         return self._watchlist.reason(peer_id)
 
     async def fetch(self, account_id: str) -> list[InboundMessage]:
+        """读名单里的会话，按游标切出新消息。
+
+        ★ **不看微信的未读**（用户裁决 2026-08-14）。未读这个信号根本不可靠：
+        群多半设了消息免打扰、不进未读；专员在手机上瞄过一眼的也不再是未读——
+        于是「该回的消息网关压根看不见」。名单本来就是「要盯的会话」清单，
+        直接读它、按游标判新，跟「微信觉得你读没读过」彻底脱钩。
+        """
         # 名单空着 = 一个会话都不碰。这时候必须喊一嗓子，否则现场表现是
         # 「微信有新消息、网关一声不吭」，看的人只会以为功能坏了（069）。
         self._watchlist.warn_if_idle()
-        unread = await self._runtime.submit(TaskType.GET_UNREAD_MESSAGES, {})
-        sessions = ((unread or {}).get("result") or {}).get("unread_sessions") or []
+        watched = self._watchlist.watched()
+        if not watched:
+            return []
 
         collected: list[InboundMessage] = []
-        for session in sessions:
-            name = str((session or {}).get("name") or "").strip()
-            if not name:
-                continue
-            reason = self.skip_reason(account_id, name)
-            if reason is not None:
-                _log.debug("跳过该会话", account=account_id, reason=reason)
-                continue
-            collected.extend(await self._fetch_peer(account_id, name))
+        for peer_id in self._due_peers(watched):
+            collected.extend(await self._fetch_peer(account_id, peer_id))
         return collected
+
+    def _due_peers(self, watched: Sequence[str]) -> list[str]:
+        """这一轮读哪几个。名单长了就轮着来，一轮最多 ``MAX_PEERS_PER_POLL`` 个。
+
+        读一个会话 = 打开一次聊天窗口。名单有五十个人时，每轮把五十个窗口挨个点一遍
+        既慢又正是风控最不喜欢的形状（2026-08-12 自动退登事故）。轮转的代价只是
+        「名单很长时，某个人的消息最多晚几轮被看到」——比被封号强得多。
+        """
+        if len(watched) <= MAX_PEERS_PER_POLL:
+            return list(watched)
+        start = self._rotation % len(watched)
+        self._rotation = start + MAX_PEERS_PER_POLL
+        doubled = list(watched) + list(watched)
+        due = doubled[start:start + MAX_PEERS_PER_POLL]
+        _log.info("名单较长，本轮只读其中一段", 名单=len(watched), 本轮=len(due))
+        return due
 
     async def _fetch_peer(self, account_id: str, peer_id: str) -> list[InboundMessage]:
         history = await self._runtime.submit(

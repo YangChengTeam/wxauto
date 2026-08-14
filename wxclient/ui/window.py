@@ -51,6 +51,18 @@ _REPLAY_LINES = 800
 #: 转圈用的帧。每秒换一帧（跟着 _tick 走），够看出「还活着」。
 _SPINNER = ("◐", "◓", "◑", "◒")
 
+#: 状态栏最多列几个会话名。名单长了就只列前几个 —— 侧栏就那么宽，列全了反而看不清。
+_WATCH_PREVIEW = 6
+
+
+def _watch_summary(names: list[str]) -> str:
+    """名单摘要：列出名字，多了就折成「…等 N 个」。纯函数，好测。"""
+    if not names:
+        return ""
+    if len(names) <= _WATCH_PREVIEW:
+        return "、".join(names)
+    return "、".join(names[:_WATCH_PREVIEW]) + f"…等 {len(names)} 个"
+
 
 class MainWindow:
     def __init__(
@@ -148,8 +160,14 @@ class MainWindow:
         self._divider(bar)
 
         self._rows: dict[str, tk.Label] = {}
-        for key, label in (("service", "服务"), ("gateway", "网关"), ("wechat", "微信")):
+        for key, label in (("service", "服务"), ("gateway", "网关"), ("wechat", "微信"), ("watch", "监听")):
             self._rows[key] = self._status_row(bar, label)
+
+        # 名单具体是谁：数字说明不了「他到底在不在名单上」，得把名字列出来。
+        self._watch_label = tk.Label(bar, text="", font=theme.FONT_SMALL,
+                                     bg=theme.SIDEBAR_BG, fg=theme.SIDEBAR_MUTED,
+                                     anchor="w", justify=tk.LEFT, wraplength=244)
+        self._watch_label.pack(anchor="w", padx=28, pady=(6, 0))
 
         self._uptime_label = tk.Label(bar, text="", font=theme.FONT_SMALL,
                                       bg=theme.SIDEBAR_BG, fg=theme.SIDEBAR_MUTED)
@@ -403,6 +421,18 @@ class MainWindow:
 
         text, color = self._wechat_status
         self._rows["wechat"].configure(text=text, fg=color)
+
+        # 名单是「谁会被自动回复」的唯一判据（069 fail-closed）。它只在日志里闪过一行，
+        # 于是「这个人怎么没被回」永远得去翻日志——摆到状态栏上，一眼就知道。
+        watched = self.service.watched_peers() if state is ServiceState.RUNNING else []
+        if state is not ServiceState.RUNNING:
+            self._rows["watch"].configure(text="未启动", fg=theme.GRAY)
+        elif not watched:
+            # 空名单不是「没事」：意味着一条消息都不会回。必须是显眼的颜色。
+            self._rows["watch"].configure(text="名单是空的", fg=theme.ORANGE)
+        else:
+            self._rows["watch"].configure(text=f"{len(watched)} 个会话", fg=theme.GREEN)
+        self._watch_label.configure(text=_watch_summary(watched))
 
         self._live_dot.configure(fg=theme.GREEN if state is ServiceState.RUNNING else theme.GRAY)
 

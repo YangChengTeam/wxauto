@@ -98,6 +98,16 @@ class Watchlist:
     def reason(self, peer_id: str) -> str | None:
         return self._scope.reason(peer_id)
 
+    def watched(self) -> list[str]:
+        """要盯的会话名（名单减掉应急拉黑的），排序后返回。
+
+        ★ 这份名单**就是入站要读的会话清单**（用户裁决 2026-08-14）。原来是先扫微信的
+        未读列表、再读会话——可未读这个信号根本不可靠：群多半设了消息免打扰不进未读，
+        专员在手机上看过一眼的也不再是未读，于是该回的消息网关压根看不见。
+        改成直接读名单里的会话、按游标判新，跟「微信觉得你读没读过」彻底脱钩。
+        """
+        return sorted(name for name in self._scope.only if name not in self._scope.never)
+
     def warn_if_idle(self) -> None:
         """名单为空时喊一嗓子——只喊一次，别把日志刷满。
 

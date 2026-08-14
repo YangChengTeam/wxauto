@@ -38,6 +38,7 @@ from wxclient.gateway.guard import (
 )
 from wxclient.gateway.inbound import PENDING_MAX_AGE_HOURS, PENDING_MAX_ATTEMPTS
 from wxclient.gateway.wechat_io import (
+    MAX_PEERS_PER_POLL,
     QueueMessageSource,
     legacy_message_signature,
     message_signature,
@@ -981,6 +982,66 @@ class InboundScopeTests(StoreTestCase):
         )
         await source.fetch("acct-1")
         self.assertNotIn(self.GROUP, runtime.opened())
+
+    async def test_reads_watched_chats_even_when_nothing_is_unread(self) -> None:
+        """★ 不再依赖微信的「未读」（用户裁决 2026-08-14）。
+
+        未读这个信号根本不可靠：群多半设了消息免打扰不进未读，专员在手机上瞄过一眼的
+        也不再是未读——于是该回的消息网关压根看不见。名单里的会话就是要读的会话。
+        """
+        runtime = FakeRuntime(
+            unread=[],   # 微信这边一条未读都没有
+            history={self.PERSON: [
+                {"text": "还招人吗", "is_self": False},
+                {"text": "在的", "is_self": True},
+                {"text": "我明天能去看看吗", "is_self": False},
+            ]},
+        )
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[self.PERSON])
+        )
+        await source.fetch("acct-1")                      # 首轮只对齐游标
+        runtime.history[self.PERSON].append({"text": "在吗", "is_self": False})
+        messages = await source.fetch("acct-1")
+        self.assertEqual([m.text for m in messages], ["在吗"])
+        self.assertEqual(runtime.opened(), [self.PERSON, self.PERSON])
+
+    async def test_long_list_is_read_in_rotation(self) -> None:
+        """名单长了轮着读：每轮把几十个聊天窗口挨个点一遍正是风控最不喜欢的形状。"""
+        names = [f"候选人-{i:02d}" for i in range(20)]
+        runtime = FakeRuntime(unread=[], history={n: [{"text": "你好", "is_self": False}] for n in names})
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=names)
+        )
+        seen: set[str] = set()
+        for _ in range(3):
+            runtime.calls.clear()
+            await source.fetch("acct-1")
+            opened = runtime.opened()
+            self.assertLessEqual(len(opened), MAX_PEERS_PER_POLL, "一轮开的窗口数超了上限")
+            seen.update(opened)
+        # 20 个名字、一轮最多 8 个 → 三轮之内每个都该轮到（轮转不往前走的话会卡在头 8 个）。
+        self.assertEqual(seen, set(names), "轮转没走完一圈，有人永远读不到")
+
+    async def test_transcript_uses_wechat_own_timestamp(self) -> None:
+        """时间点用微信自己标的那个。
+
+        ``at`` 是**网关读到这条的时刻**；直接读会话之后，读到的很可能是几分钟前甚至
+        昨天的消息——拿读取时刻当发送时刻喂给模型，它会对着昨晚的消息说「你刚才说」。
+        """
+        runtime = FakeRuntime(
+            unread=[],
+            history={self.PERSON: [{"text": "在吗", "is_self": False, "timestamp_text": "昨天 20:11"}]},
+        )
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[self.PERSON])
+        )
+        await source.fetch("acct-1")
+        runtime.history[self.PERSON].append(
+            {"text": "还招人吗", "is_self": False, "timestamp_text": "今天 09:05"}
+        )
+        messages = await source.fetch("acct-1")
+        self.assertEqual(format_transcript(messages), "[对方 · 今天 09:05] 还招人吗")
 
     async def test_denylist_wins_and_never_opens_the_chat(self) -> None:
         runtime = self._runtime()
