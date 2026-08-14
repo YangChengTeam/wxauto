@@ -57,10 +57,17 @@ pyinstaller --noconfirm packaging\lxz-wechat-gateway.spec
 好几秒（杀软扫这个解压过程尤其慢）。要「一个文件发给客户」就打安装包或压缩包，别让
 用户天天付解压的钱。
 
-包大小 **120 MB**（2026-08-13 真机实测）。原始收集是 265 MB，一半以上是 OpenCV——
-`pyautogui → pyscreeze` 把它拖进来，而 pyscreeze 只有做模糊图像匹配（`confidence=`）
-时才用得上；本仓找元素走 UIA 控件树，全文没有一处 `import cv2`，所以在 spec 的
-`excludes` 里砍掉了。**哪天真要做图像匹配，得先把那行删掉再打包。**
+包大小 **61.8 MB / 1702 个文件**，双击到窗口出来 **4.5 秒**（2026-08-14 真机实测；
+2026-08-13 那版是 125.8 MB / 1835 个文件 / 12.3 秒）。砍的都是「一处都没 import」的整块：
+OpenCV 138MB（`pyautogui → pyscreeze` 拖进来，只有模糊图像匹配 `confidence=` 才用得上，
+本仓找元素走 UIA 控件树）、numpy+openblas 28MB、cryptography 9.2MB、PIL 的 AVIF 编解码器
+7.8MB、Pythonwin 6.7MB、aioquic 全家 4.6MB，逐条理由写在 spec 的 `excludes` 里。
+**要做图像匹配就得先把 `cv2` 那行删掉；要做语音消息就得先把 `numpy/soundfile/sounddevice`
+那行删掉**（对应地，`third_party/pywechat` 里那两处音频 import 已改成用到时再 import）。
+
+启动动画分两段接力：PyInstaller 的 `Splash` 先顶一张静态首屏（双击到 Python 起来那 1~2 秒
+tkinter 还不存在），Python 一起来由 `wxclient/ui/splash.py` 那个会动的接手并把它关掉。
+静态图别手改，跑 `python packaging/make_splash.py` 按 `theme.py` 重新生成。
 
 两个真机踩过的坑，都已在仓库里修好，别再踩回去：
 
