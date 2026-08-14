@@ -189,6 +189,11 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"开始读取聊天记录：{payload.get('friend') or '-'}，"
             f"最多 {payload.get('limit', 0)} 条"
         )
+    if event == "chat.history.main_window_fallback":
+        return (
+            f"主窗口里读不了「{payload.get('friend') or '-'}」，改用独立聊天窗口："
+            f"{payload.get('error') or '-'}"
+        )
     if event == "chat.history.done":
         return (
             f"聊天记录读取完成：{payload.get('friend') or '-'}，"
