@@ -10,10 +10,13 @@
 from __future__ import annotations
 
 import threading
+import time
 import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+import structlog
 
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 
@@ -44,6 +47,18 @@ _STATE_COLOR = {
 }
 
 _WECHAT_PROBE_SECONDS = 15
+
+_log = structlog.get_logger(__name__)
+
+#: 界面卡多久算「卡了一下」，要记一笔。心跳本身是 1 秒一次，留 0.6 秒余量给正常抖动。
+_STALL_WARN_SECONDS = 0.6
+
+#: 转场态（服务正在起/正在停）的提示语。这几秒里任何「再点一下」都只会把事情搞乱，
+#: 所以界面自己进入 busy：侧栏转圈说明在干什么，参数页盖住不给改。
+_TRANSITION_TEXT = {
+    ServiceState.STARTING: "正在启动服务，请稍候",
+    ServiceState.STOPPING: "正在停止服务，请稍候",
+}
 
 #: 窗口重新打开时从缓冲回放多少行。视图是单个 Text，几百行的重画是一次性的、不心疼。
 _REPLAY_LINES = 800
@@ -96,6 +111,10 @@ class MainWindow:
         self._log_visible = False  # 由 _sync_log_visibility() 每拍现场核对，别手动改
         self._page = "log"
         self._settings_page: Any = None  # 懒建一次、复用；每次进页 reload() 重读磁盘上的值
+        self._locked = False  # 转场态：由 _sync_transition_lock() 每拍现场核对，别手动改
+        self._last_tick: float | None = None  # 卡顿看门狗的上一拍时刻
+        self._ticks = 0  # 心跳计数：头两拍不报卡顿，理由见 _watch_for_stalls
+        self._pending_after: set[str] = set()  # 排着的 after 回调，destroy 时要撤掉
 
         root.title(WINDOW_TITLE)
         self._apply_window_icon()
@@ -242,6 +261,7 @@ class MainWindow:
         self._pages.pack(fill=tk.BOTH, expand=True)
 
         self._log_page = self._build_log_page(self._pages)
+        self._overlay = self._build_overlay(self._pages)
 
         footer = tk.Frame(content, bg=theme.FOOTER_BG, height=36)
         footer.pack(fill=tk.X)
@@ -262,6 +282,29 @@ class MainWindow:
         item.bind("<Button-1>", lambda _e: command())
         return item
 
+    def _build_overlay(self, parent: tk.Misc) -> tk.Frame:
+        """转场遮罩：盖住参数页，把点击全吞掉。
+
+        为什么**只盖参数页、不盖日志页**：起服务/停服务那几秒里最该看的就是日志，
+        盖住它等于把唯一的进度信息也拿走了。真正不能碰的是参数——正在重启时点
+        「保存并重启服务」会叠一次重启上去。
+        """
+        frame = tk.Frame(parent, bg=theme.CONTENT_BG, cursor="watch")
+        box = tk.Frame(frame, bg=theme.CONTENT_BG)
+        box.place(relx=0.5, rely=0.42, anchor="center")
+        self._overlay_label = tk.Label(box, text="", font=theme.FONT_BODY,
+                                       bg=theme.CONTENT_BG, fg=theme.TEXT)
+        self._overlay_label.pack()
+        tk.Label(box, text="这几秒别改参数，改完的值会被正在收尾的旧实例读走",
+                 font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                 fg=theme.TEXT_MUTED).pack(pady=(8, 0))
+        # 挡住输入靠的是**几何遮挡**：遮罩盖在参数页上面，鼠标事件先落到它身上，
+        # 下面的「保存并重启服务」就点不着了。这里再显式吞一道，免得哪天有人给遮罩
+        # 加了子控件又忘了这回事。（别绑 <Key>：Frame 拿不到键盘焦点，绑了也不会触发。）
+        for event in ("<Button-1>", "<Button-2>", "<Button-3>", "<Double-Button-1>"):
+            frame.bind(event, lambda _e: "break")
+        return frame
+
     def _build_log_page(self, parent: tk.Misc) -> tk.Frame:
         page = tk.Frame(parent, bg=theme.CONTENT_BG)
         self._table = LogTable(page)
@@ -271,12 +314,12 @@ class MainWindow:
     # ── 页面切换 ──────────────────────────────────────────────────
 
     def _show_page(self, page: str) -> None:
+        if page == "settings" and self._locked:
+            return  # 转场态不给进参数页，见 _build_overlay
         self._page = page
         for child in self._pages.winfo_children():
             child.pack_forget()
-        for key, item in self._nav.items():
-            item.configure(bg=theme.SIDEBAR_ACTIVE_BG if key == page else theme.SIDEBAR_BG,
-                           fg=theme.SIDEBAR_TITLE if key == page else theme.SIDEBAR_TEXT)
+        self._render_nav()
 
         if page == "settings":
             self._heading.configure(text="参数设置")
@@ -294,6 +337,7 @@ class MainWindow:
                 widget.pack(side=tk.RIGHT, padx=10)
             self._filter_bar.pack(side=tk.RIGHT, padx=(0, 18))
             self._log_page.pack(fill=tk.BOTH, expand=True)
+        self._render_overlay()  # 两个分支都要摆一次：切走了就得把遮罩收掉
 
     def _ensure_settings_page(self) -> Any:
         """设置页只建一次，之后每次进页重读磁盘上的值。
@@ -315,6 +359,45 @@ class MainWindow:
         else:
             self._settings_page.reload()
         return self._settings_page
+
+    # ── 转场态（正在启动/停止）：不让操作 ─────────────────────────
+
+    def _sync_transition_lock(self) -> None:
+        """每拍现场核对一次：服务正在起/停，界面就进 busy。
+
+        **不留状态、不靠事件**——早先「日志刷不出来」那次教训就是靠布尔量记可见性，
+        漏了几条路径就再也对不上（见 `_log_is_on_screen`）。这里同样每拍问一次现实。
+        """
+        locked = self.service.state in _TRANSITION_TEXT or self.service.restarting
+        if locked == self._locked:
+            return
+        self._locked = locked
+        # 停在参数页的**不把人赶走**：正在填的东西不该被界面自作主张丢掉。盖一层遮罩挡住
+        # 输入就够了，想看启动进度的自己点左边「实时日志」（转场态只禁参数页，不禁日志页）。
+        # 〔早先这里是 `_show_page("log")` 把人请出去，结果 `_locked and page=="settings"`
+        #   永远不成立——遮罩成了永远不会出现的死代码。〕
+        self._render_nav()
+        self._render_overlay()
+
+    def _render_nav(self) -> None:
+        """转场态里「参数设置」变灰、鼠标不再变手型——点不动这件事要看得出来。"""
+        for key, item in self._nav.items():
+            disabled = self._locked and key == "settings"
+            active = key == self._page and not disabled
+            item.configure(
+                bg=theme.SIDEBAR_ACTIVE_BG if active else theme.SIDEBAR_BG,
+                fg=theme.SIDEBAR_LINE if disabled
+                else (theme.SIDEBAR_TITLE if active else theme.SIDEBAR_TEXT),
+                cursor="" if disabled else "hand2",
+            )
+
+    def _render_overlay(self) -> None:
+        if self._locked and self._page == "settings":
+            self._overlay_label.configure(text=self._busy_text or "正在切换服务状态，请稍候")
+            self._overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+            self._overlay.lift()
+        else:
+            self._overlay.place_forget()
 
     def _on_settings_saved(self, restart: bool) -> None:
         if self._settings_saved_callback is not None:
@@ -348,24 +431,68 @@ class MainWindow:
     def set_busy(self, text: str) -> None:
         """显示/清除「正在忙」的转圈提示。传空字符串 = 忙完了。
 
+        只是**额外**说一句（「正在按新参数重启服务」这种）。起服务/停服务本身不用谁来
+        通知——`_effective_busy_text()` 会照着服务状态自己出提示，见那儿的说明。
+
         可从任意线程调？**不可以**——它动控件，调用方必须已经在 tk 线程上
         （后台线程请用 ``root.after(0, ...)`` 丢回来）。
         """
         self._busy_text = text
+        self._render_busy()
+
+    def _effective_busy_text(self) -> str:
+        """现在该显示什么忙碌提示。显式 set_busy 的优先，否则看服务状态。
+
+        ★ 为什么要自动出：转场那几秒是「点了没反应」的高发区（启动要装配网关、停机要等
+        网关线程收口，都能到十几秒）。原来只有「保存并重启」那一条路会 set_busy，从托盘
+        点启动/停止时侧栏一片安静，静止的「启动中」和卡死长得一模一样。
+        """
+        if self._busy_text:
+            return self._busy_text
+        if self.service.restarting:
+            return "正在重启服务，请稍候"
+        return _TRANSITION_TEXT.get(self.service.state, "")
+
+    def _render_busy(self) -> None:
+        text = self._effective_busy_text()
         if not text:
             self._busy_label.pack_forget()
             return
-        self._busy_label.pack(anchor="w", padx=28, pady=(0, 12))
-        self._render_busy()
-
-    def _render_busy(self) -> None:
-        if not self._busy_text:
-            return
+        if not self._busy_label.winfo_manager():
+            self._busy_label.pack(anchor="w", padx=28, pady=(0, 12))
         self._busy_frame = (self._busy_frame + 1) % len(_SPINNER)
-        self._busy_label.configure(text=f"{_SPINNER[self._busy_frame]}  {self._busy_text}")
+        self._busy_label.configure(text=f"{_SPINNER[self._busy_frame]}  {text}")
+        if self._overlay.winfo_manager():
+            self._overlay_label.configure(text=text)
+
+    def _later(self, delay_ms: int, callback: Callable[[], None]) -> None:
+        """排一个定时回调，并记下 id——销毁时要撤干净。
+
+        不撤的话，窗口销毁后那些还排着的心跳照样会被 Tcl 叫起来，而它们要动的控件已经没了：
+        退出时 stderr 上会甩出一串 ``invalid command name "...._pump_logs"``。
+        不致命，但那是「退出过程出错」的样子，排障时会把人往沟里带。
+        """
+        if self._destroyed:
+            return
+        holder: dict[str, str] = {}
+
+        def run() -> None:
+            # 谁跑完谁把自己摘掉。**别在别处整集合清空**——`_pump_logs` 是 120ms 一拍、
+            # 微信探测是 15s 一拍，跟着心跳一起清就等于 destroy 时撤不到它们。
+            self._pending_after.discard(holder.get("id", ""))
+            callback()
+
+        holder["id"] = self.root.after(delay_ms, run)
+        self._pending_after.add(holder["id"])
 
     def destroy(self) -> None:
         self._destroyed = True
+        for handle in self._pending_after:
+            try:
+                self.root.after_cancel(handle)
+            except tk.TclError:
+                pass  # 已经跑过或已经没了，无所谓
+        self._pending_after.clear()
         if self._unsubscribe is not None:
             self._unsubscribe()
             self._unsubscribe = None
@@ -430,17 +557,20 @@ class MainWindow:
         else:
             self._rows["service"].configure(text=_STATE_TEXT.get(state, "-"), fg=theme.GRAY)
 
-        connected, total = self.service.connection_summary()
+        # 一次读一份快照：这几个值都由后台轮询线程攒好（GatewayStatus），
+        # 主线程读它不拿锁、不查库、不进网关（原来这儿每秒要开一次 SQLite 连接）。
+        snapshot = self.service.status()
+        connected, total = snapshot.connected, snapshot.accounts
         if state is not ServiceState.RUNNING:
             self._rows["gateway"].configure(text="未启动", fg=theme.GRAY)
         elif connected <= 0:
             # 连不上和还没连上是两回事：前者要红着让人去看日志，后者几秒后自己会变绿。
-            failed = self.service.connect_error()
+            failed = snapshot.connect_error
             self._rows["gateway"].configure(
                 text="连不上" if failed else "连接中",
                 fg=theme.RED if failed else theme.ORANGE,
             )
-        elif (backlog := self.service.pending_backlog()) > 0:
+        elif (backlog := snapshot.backlog) > 0:
             # 连着但有积压：消息读到了、还没送出去。不显示出来的话，专员看到的就是
             # 「微信显示已读、可是没人回」——只会以为功能坏了（070）。
             self._rows["gateway"].configure(text=f"已连接 · 欠 {backlog} 批", fg=theme.ORANGE)
@@ -454,7 +584,7 @@ class MainWindow:
 
         # 名单是「谁会被自动回复」的唯一判据（069 fail-closed）。它只在日志里闪过一行，
         # 于是「这个人怎么没被回」永远得去翻日志——摆到状态栏上，一眼就知道。
-        watched = self.service.watched_peers() if state is ServiceState.RUNNING else []
+        watched = list(snapshot.watched) if state is ServiceState.RUNNING else []
         if state is not ServiceState.RUNNING:
             self._rows["watch"].configure(text="未启动", fg=theme.GRAY)
         elif not watched:
@@ -468,6 +598,12 @@ class MainWindow:
 
     def _tick(self) -> None:
         """每秒刷一次运行时长与连接数——这两样不会有事件通知，只能自己看。"""
+        # 先把日志通道接回来再报卡顿：微信探测线程首次 import pywinauto/comtypes 会把
+        # 整个 logging 重置掉，顺序反了的话，「刚被重置的那一拍」正好也是最该留痕的那一拍，
+        # 告警会凭空消失（真机 2026-08-14 写测试时撞到）。
+        if self._log_pipeline is not None:
+            self._log_pipeline.ensure()
+        self._watch_for_stalls()
         seconds = self.service.uptime_seconds()
         if seconds is None:
             self._uptime_label.configure(text="未运行")
@@ -475,17 +611,39 @@ class MainWindow:
             hours, rest = divmod(int(seconds), 3600)
             minutes, secs = divmod(rest, 60)
             self._uptime_label.configure(text=f"已运行  {hours:02d}:{minutes:02d}:{secs:02d}")
-        if self._log_pipeline is not None:
-            self._log_pipeline.ensure()
+        self._sync_transition_lock()
         self.refresh_state()
         self._render_busy()
-        if not self._destroyed:
-            self.root.after(1000, self._tick)
+        self._later(1000, self._tick)
+
+    def _watch_for_stalls(self) -> None:
+        """★ 卡顿看门狗：这一拍比约好的晚了多少，就是界面卡了多久。
+
+        「操作微信的时候界面容易卡」这类反馈**没法在事后复现**——等用户说的时候现场早没了。
+        心跳是 1 秒一拍的，只要主线程被谁占住，下一拍就晚多少。把超过阈值的那次记进日志，
+        下次再卡就有实证：卡了几秒、前后正在做什么，日志里连着看得见（这条自己也会出现在
+        实时日志页上）。**它只报告、不修**——真因得靠这些数据去定位。
+        """
+        now = time.monotonic()
+        previous, self._last_tick = self._last_tick, now
+        self._ticks += 1
+        # 头两拍不算：第一拍是在 `__init__` 里跑的，那会儿 `root.mainloop()` 还没开始，
+        # 中间还隔着建托盘 + 装配网关（真机 4.5 秒）。那段「迟到」是启动本来的样子，
+        # 不是卡顿——照报的话每次启动都会刷一条假警报，真警报就没人信了。
+        if previous is None or self._ticks <= 2:
+            return
+        late = now - previous - 1.0
+        if late >= _STALL_WARN_SECONDS:
+            _log.warning(
+                "界面卡了一下",
+                stalled_ms=int(late * 1000),
+                service=self.service.state.value,
+                page=self._page,
+            )
 
     def _schedule_wechat_probe(self) -> None:
         threading.Thread(target=self._probe_wechat, name="wx-ui-probe", daemon=True).start()
-        if not self._destroyed:
-            self.root.after(_WECHAT_PROBE_SECONDS * 1000, self._schedule_wechat_probe)
+        self._later(_WECHAT_PROBE_SECONDS * 1000, self._schedule_wechat_probe)
 
     def _probe_wechat(self) -> None:
         if not self._probe_lock.acquire(blocking=False):
@@ -565,8 +723,7 @@ class MainWindow:
         if lines:
             self._table.append([logline.parse(line) for line in lines])
             self._render_live_hint()
-        if not self._destroyed:
-            self.root.after(FLUSH_MS, self._pump_logs)
+        self._later(FLUSH_MS, self._pump_logs)
 
     def _append(self, lines: list[logline.LogLine]) -> None:
         self._table.append(lines)

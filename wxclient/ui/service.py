@@ -11,6 +11,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -45,6 +46,32 @@ STATE_LABELS = {
 }
 
 
+#: 后台状态轮询的间隔。界面本来就一秒刷一次，跟着这个节拍够用。
+STATUS_POLL_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class GatewayStatus:
+    """状态栏要显示的那几样，**整体替换的只读快照**。
+
+    ★ 为什么要有它：这些值原来是界面**在 tkinter 主线程上直接问网关**拿的，其中
+    ``pending_backlog`` 一路走到 ``GatewayStore.count_pending_inbound()``——那是
+    **开一条 SQLite 连接 + PRAGMA + COUNT**，一秒一次，跑在主线程上。
+
+    2026-08-14 真机实测（3 条线程同时写库，模拟正在收发微信消息）：这一句中位数
+    **15 ms**、p90 **31 ms**、最慢 **46 ms**；库闲着时是 0 ms。所以它**不足以**解释
+    「卡死」，但确实是每秒一次的顿挫，而且是主线程上唯一一处文件 I/O——
+    界面线程本就不该碰库。现在这些活全挪到后台轮询线程，界面只读这份快照：
+    不拿锁、不碰库、不进网关。真正的卡顿另有来源，靠 `window.py` 的卡顿看门狗取证。
+    """
+
+    connected: int = 0
+    accounts: int = 0
+    backlog: int = 0
+    watched: tuple[str, ...] = field(default_factory=tuple)
+    connect_error: str | None = None
+
+
 class GatewayService:
     """网关的生命周期管理。线程安全：UI 线程和网关线程都会碰它。"""
 
@@ -74,6 +101,11 @@ class GatewayService:
         self._stop_requested = False
         self._running_since: float | None = None
         self._restarting = False
+        # ★ 状态快照 + 专职轮询线程：界面读快照，真正去问网关（可能查库、可能等锁）的
+        #   活全在这条线程上。它卡多久都只卡自己，主线程照旧每秒重绘。
+        self._status = GatewayStatus()
+        self._poller = threading.Thread(target=self._poll_status, name="wx-svc-status", daemon=True)
+        self._poller.start()
 
     def set_state_listener(
         self, listener: Callable[[ServiceState, str | None], None] | None
@@ -191,32 +223,30 @@ class GatewayService:
         return thread
 
     def uptime_seconds(self) -> float | None:
-        """服务已经跑了多久；没在跑返回 None。"""
-        with self._lock:
-            since = self._running_since
+        """服务已经跑了多久；没在跑返回 None。
+
+        不拿锁：界面每秒读它，任何一次「为锁等待」都会变成窗口不重绘。单次读浮点是原子的。
+        """
+        since = self._running_since
         return None if since is None else time.monotonic() - since
+
+    # ── 状态读法：一律读后台轮询攒下的快照，**绝不在调用者线程上问网关** ──────
+    #
+    # 调这几个的是 tkinter 主线程（每秒一次）。真去问网关意味着可能查 SQLite、可能等
+    # 写锁（`sqlite3.connect` 默认等 5 秒），主线程被钉住就是「界面卡死」。见 GatewayStatus。
+
+    def status(self) -> GatewayStatus:
+        """当前状态快照。无锁、无 I/O，随便从哪个线程读。"""
+        return self._status
 
     def connection_summary(self) -> tuple[int, int]:
         """(已连上的 AI 端连接数, 接管的微信号数)。没在跑就是 (0, 0)。"""
-        with self._lock:
-            gateway = self._gateway
-        if gateway is None or self._state is not ServiceState.RUNNING:
-            return (0, 0)
-        try:
-            return (gateway.runner.connected_count(), len(gateway.accounts))
-        except Exception:  # noqa: BLE001 - 状态展示不该把服务拖下水
-            return (0, len(gateway.accounts))
+        snapshot = self._status
+        return (snapshot.connected, snapshot.accounts)
 
     def pending_backlog(self) -> int:
         """入站待处理队列积压批次数；没在跑就是 0。"""
-        with self._lock:
-            gateway = self._gateway
-        if gateway is None or self._state is not ServiceState.RUNNING:
-            return 0
-        try:
-            return gateway.runner.pending_backlog()
-        except Exception:  # noqa: BLE001 - 状态展示不该把服务拖下水
-            return 0
+        return self._status.backlog
 
     def watched_peers(self) -> list[str]:
         """当前在盯哪些会话（AI 端推下来的名单）。没在跑就是空。
@@ -224,36 +254,49 @@ class GatewayService:
         名单只在日志里闪一行「只管=2」，界面上看不到——于是「为什么这个人没被回」
         永远要去翻日志（用户 2026-08-14 反馈：名单应该在 Windows 这端看得到）。
         """
-        with self._lock:
-            gateway = self._gateway
-        if gateway is None or self._state is not ServiceState.RUNNING:
-            return []
-        try:
-            return gateway.runner.watched_peers()
-        except Exception:  # noqa: BLE001 - 状态展示不该把服务拖下水
-            return []
-
-    def scheduled_count(self) -> int:
-        """排着的定时指令条数；没在跑就是 0。"""
-        with self._lock:
-            gateway = self._gateway
-        if gateway is None or self._state is not ServiceState.RUNNING:
-            return 0
-        try:
-            return gateway.runner.scheduled_count()
-        except Exception:  # noqa: BLE001 - 状态展示不该把服务拖下水
-            return 0
+        return list(self._status.watched)
 
     def connect_error(self) -> str | None:
         """AI 端连不上的原因；连上了或没在跑就是 None。给状态栏区分「在连」与「连不上」。"""
+        return self._status.connect_error
+
+    def refresh_status_now(self) -> GatewayStatus:
+        """立刻同步取一次（会查库、可能等锁）。**别在 UI 线程上调**，测试和脚本用。"""
+        self._status = self._read_status()
+        return self._status
+
+    def _poll_status(self) -> None:
+        """专职问网关的线程。它可以慢、可以被库锁住，界面不跟着一起卡。"""
+        while True:
+            try:
+                self._status = self._read_status()
+            except Exception:  # noqa: BLE001 - 展示用的东西不该把这条线程弄死
+                self._status = GatewayStatus()
+            time.sleep(STATUS_POLL_SECONDS)
+
+    def _read_status(self) -> GatewayStatus:
+        """真去问一遍网关。每一项各自兜底——一项坏了不该把整排状态清空。"""
         with self._lock:
             gateway = self._gateway
         if gateway is None or self._state is not ServiceState.RUNNING:
-            return None
-        try:
-            return gateway.runner.connect_error
-        except Exception:  # noqa: BLE001 - 同上，只是展示
-            return None
+            return GatewayStatus()
+
+        def read(what: Callable[[], object], fallback: object) -> object:
+            try:
+                return what()
+            except Exception:  # noqa: BLE001 - 状态展示不该把服务拖下水
+                return fallback
+
+        accounts = read(lambda: len(gateway.accounts), 0)
+        return GatewayStatus(
+            # 一律裹成 lambda：直接写 `gateway.runner.xxx` 会在进 read() 之前就求值，
+            # runner 缺席时抛出来的 AttributeError 会绕过这里的兜底、把整排状态清空。
+            connected=int(read(lambda: gateway.runner.connected_count(), 0)),  # type: ignore[arg-type]
+            accounts=int(accounts),  # type: ignore[arg-type]
+            backlog=int(read(lambda: gateway.runner.pending_backlog(), 0)),  # type: ignore[arg-type]
+            watched=tuple(read(lambda: gateway.runner.watched_peers(), ())),  # type: ignore[arg-type]
+            connect_error=read(lambda: gateway.runner.connect_error, None),  # type: ignore[arg-type]
+        )
 
     def wait_ready(self, timeout: float = 10.0) -> bool:
         """等到网关真的跑起来（或启动失败）。给启动脚本和测试用。"""

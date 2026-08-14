@@ -426,6 +426,84 @@ class StateCallbackIsolationTests(unittest.TestCase):
         self.assertIs(service.state, ServiceState.STOPPED)
         wedged.set()
 
+    def test_status_reads_never_block_the_caller_even_if_the_store_is_wedged(self) -> None:
+        """★ 界面每秒读一次状态，这几个读法必须**秒回**，真去问网关的活在后台线程上。
+
+        红线的理由不是某一次实测有多慢，而是「主线程的耗时上界由网关说了算」这件事
+        本身不成立：`pending_backlog()` 一路走到 SQLite（实测写库时中位 15ms / 最慢
+        46ms），而只要网关那头有任何一处会等（等锁、等 I/O、等微信），主线程就跟着停。
+        这里用一个「卡住不返回」的读法把边界钉死。
+        """
+        started = threading.Event()
+        gateway = _FakeGateway(started)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def wedged_backlog() -> int:
+            entered.set()
+            release.wait(timeout=10)  # 模拟「等 SQLite 写锁」
+            return 7
+
+        gateway.runner.pending_backlog = wedged_backlog
+        service = GatewayService(lambda: gateway)
+        try:
+            service.start()
+            self.assertTrue(service.wait_ready(timeout=5))
+            self.assertTrue(entered.wait(timeout=5), "后台轮询应当已经卡在查库那句里")
+
+            begin = time.monotonic()
+            for _ in range(200):
+                service.status()
+                service.pending_backlog()
+                service.connection_summary()
+                service.watched_peers()
+                service.connect_error()
+                service.uptime_seconds()
+            elapsed = time.monotonic() - begin
+            self.assertLess(elapsed, 0.5, f"读状态被拖住了 {elapsed:.2f}s——主线程会跟着卡")
+        finally:
+            release.set()
+            service.stop(timeout=5)
+
+    def test_status_snapshot_carries_what_the_sidebar_shows(self) -> None:
+        """快照要真的把网关那几个值带回来，不能只是「不卡但永远是 0」。"""
+        started = threading.Event()
+        gateway = _FakeGateway(started)
+        gateway.runner.connected_count = lambda: 1
+        gateway.runner.pending_backlog = lambda: 3
+        gateway.runner.watched_peers = lambda: ["张三", "李四"]
+        service = GatewayService(lambda: gateway)
+        try:
+            service.start()
+            self.assertTrue(service.wait_ready(timeout=5))
+
+            status = service.refresh_status_now()
+
+            self.assertEqual((status.connected, status.accounts), (1, 1))
+            self.assertEqual(status.backlog, 3)
+            self.assertEqual(service.watched_peers(), ["张三", "李四"])
+            self.assertEqual(service.connection_summary(), (1, 1))
+        finally:
+            service.stop(timeout=5)
+
+    def test_one_broken_status_reader_does_not_blank_the_whole_row(self) -> None:
+        """某一项读崩了只该它显示成缺省值，别把整排状态清空。"""
+        started = threading.Event()
+        gateway = _FakeGateway(started)
+        gateway.runner.connected_count = lambda: 1
+        gateway.runner.watched_peers = lambda: (_ for _ in ()).throw(RuntimeError("名单没了"))
+        service = GatewayService(lambda: gateway)
+        try:
+            service.start()
+            self.assertTrue(service.wait_ready(timeout=5))
+
+            status = service.refresh_status_now()
+
+            self.assertEqual(status.connected, 1)   # 好的那项照常
+            self.assertEqual(status.watched, ())    # 坏的那项退回缺省
+        finally:
+            service.stop(timeout=5)
+
     def test_restart_reaches_start_even_if_the_callback_is_wedged(self) -> None:
         """真机现象的正面复现：停了之后**必须**还能起来。"""
         started = threading.Event()
