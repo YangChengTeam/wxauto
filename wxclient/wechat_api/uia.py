@@ -1031,48 +1031,36 @@ class UiaWeChatDriver:
         safe_limit = min(max(int(limit), 1), 200)
         self._ensure_ready()
         logger.info("chat.history.start", friend=normalized_friend, limit=safe_limit)
-        dialog_window = None
+        # ★ 先在**主窗口**里读，读不了才退回弹独立窗口（用户 2026-08-14：「查询记录时
+        # 不要点击弹出的窗口不行吗」）。弹窗的代价是实打实的：每读一个会话就弹一个
+        # mmui::ChatSingleWindow 抢焦点、读完再关掉；专员正在用电脑时窗口乱跳，
+        # 而且真机上它本身就常失败（16:15「读取聊天记录失败：mmui::ChatSingleWindow」）。
+        # 主窗口这条路读的是同一个消息列表控件（`read_current_chat` 一直这么读）。
         try:
-            dialog_window, reused_window = self._open_or_reuse_separate_dialog_window(
+            main_window = self._open_main_dialog_window(normalized_friend, select=False)
+            messages = self._collect_history_pages(main_window, normalized_friend, safe_limit)
+            reused_window = False
+        except Exception as main_exc:
+            logger.info(
+                "chat.history.main_window_fallback",
                 friend=normalized_friend,
-                select=False,
-                window_minimize=False,
+                error=str(main_exc)[:200],
             )
-            chat_list = self._resolve_chat_list(dialog_window)
-            if chat_list is None:
-                raise WeChatApiError("未找到聊天消息列表")
-            messages: list[dict[str, Any]] = []
-            seen: set[tuple[Any, ...]] = set()
-            max_pages = min(max((safe_limit + 7) // 8, 2), 30)
-            for _ in range(max_pages):
-                current = self._collect_visible_message_nodes(
-                    dialog_window,
-                    chat_name=normalized_friend,
-                    log_collection=False,
-                )
-                older = [item for item in current if _message_key(item) not in seen]
-                for item in current:
-                    seen.add(_message_key(item))
-                if older:
-                    messages = older + messages
-                elif messages:
-                    break
-                if len(messages) >= safe_limit:
-                    break
-                chat_list.click_input()
-                chat_list.type_keys("{PGUP}")
-                time.sleep(0.25)
-                if not current:
-                    break
+            dialog_window = None
             try:
-                chat_list.type_keys("{END}")
-            except Exception:
-                pass
-        except Exception as exc:
-            raise WeChatApiError(f"读取聊天记录失败：{exc}") from exc
-        finally:
-            if dialog_window is not None:
-                self._try_close_window(dialog_window)
+                dialog_window, reused_window = self._open_or_reuse_separate_dialog_window(
+                    friend=normalized_friend,
+                    select=False,
+                    window_minimize=False,
+                )
+                messages = self._collect_history_pages(
+                    dialog_window, normalized_friend, safe_limit
+                )
+            except Exception as exc:
+                raise WeChatApiError(f"读取聊天记录失败：{exc}") from exc
+            finally:
+                if dialog_window is not None:
+                    self._try_close_window(dialog_window)
         messages = messages[-safe_limit:]
         logger.info("chat.history.done", friend=normalized_friend, message_count=len(messages))
         return {
@@ -1083,6 +1071,42 @@ class UiaWeChatDriver:
             "limit": safe_limit,
             "window_reused": reused_window,
         }
+
+    def _collect_history_pages(
+        self, window: Any, chat_name: str, safe_limit: int
+    ) -> list[dict[str, Any]]:
+        """在给定窗口里往上翻页收集消息。主窗口和独立聊天窗口的消息列表控件是一样的。"""
+        chat_list = self._resolve_chat_list(window)
+        if chat_list is None:
+            raise WeChatApiError("未找到聊天消息列表")
+        messages: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
+        max_pages = min(max((safe_limit + 7) // 8, 2), 30)
+        for _ in range(max_pages):
+            current = self._collect_visible_message_nodes(
+                window,
+                chat_name=chat_name,
+                log_collection=False,
+            )
+            older = [item for item in current if _message_key(item) not in seen]
+            for item in current:
+                seen.add(_message_key(item))
+            if older:
+                messages = older + messages
+            elif messages:
+                break
+            if len(messages) >= safe_limit:
+                break
+            chat_list.click_input()
+            chat_list.type_keys("{PGUP}")
+            time.sleep(0.25)
+            if not current:
+                break
+        try:
+            chat_list.type_keys("{END}")
+        except Exception:
+            pass
+        return messages
 
     def scan_messages(
         self,
