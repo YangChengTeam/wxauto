@@ -1043,6 +1043,28 @@ class InboundScopeTests(StoreTestCase):
         messages = await source.fetch("acct-1")
         self.assertEqual(format_transcript(messages), "[对方 · 今天 09:05] 还招人吗")
 
+    async def test_unreadable_peer_is_reported_once_not_every_poll(self) -> None:
+        """名字和微信里对不上 → 说清楚是哪个名字，且只说一次。
+
+        名单按会话名逐字寻址，差一个空格就是「查无此人」。这条错误只落在队列日志里的话，
+        现场表现就成了「名单加了、可他就是不回」（2026-08-14 真机实测，群名对不上）。
+        """
+        class FailingRuntime(FakeRuntime):
+            async def submit(self, task_type, payload=None, **kw):
+                await super().submit(task_type, payload, **kw)
+                return {"status": "failed", "last_error": "读取聊天记录失败：好友或群聊备注有误！查无此人！"}
+
+        runtime = FailingRuntime(unread=[], history={})
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=["AI Agent"])
+        )
+        with capture_logs() as logs:
+            await source.fetch("acct-1")
+            await source.fetch("acct-1")
+        warnings = [e for e in logs if e["log_level"] == "warning" and "读不到" in e["event"]]
+        self.assertEqual(len(warnings), 1, "同一个读不到的会话每轮喊一次会把日志刷满")
+        self.assertEqual(warnings[0]["会话"], "AI Agent")
+
     async def test_denylist_wins_and_never_opens_the_chat(self) -> None:
         runtime = self._runtime()
         source = QueueMessageSource(

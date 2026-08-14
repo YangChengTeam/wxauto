@@ -175,6 +175,7 @@ class QueueMessageSource:
         self._history_limit = history_limit
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._rotation = 0
+        self._unreachable: set[str] = set()
 
     def skip_reason(self, account_id: str, peer_id: str) -> str | None:
         """这个会话该不该碰；返回不碰的理由，None 表示可以处理。
@@ -229,6 +230,20 @@ class QueueMessageSource:
         history = await self._runtime.submit(
             TaskType.READ_CHAT_HISTORY, {"friend": peer_id, "limit": self._history_limit}
         )
+        # 读不到要说清楚是**哪个名字**读不到。名单里的名字必须和微信里显示的**一字不差**
+        # （网关按会话名寻址），差一个空格就是「查无此人」——而这条错误如果只落在队列日志里，
+        # 现场表现就成了「名单加了、可他就是不回」，谁也想不到是名字对不上（2026-08-14 实测）。
+        if str((history or {}).get("status") or "") not in {"", "succeeded"}:
+            reason = str((history or {}).get("last_error") or "").strip()
+            # 只在「刚开始读不到」时喊一次：轮询是分钟级的，每轮一条会把日志刷满，
+            # 真正有用的信息（第一次是什么时候、为什么）反而被埋掉。
+            if peer_id not in self._unreachable:
+                self._unreachable.add(peer_id)
+                _log.warning("名单里的这个会话读不到，先跳过", 会话=peer_id, 原因=reason[:120])
+            return []
+        if peer_id in self._unreachable:
+            self._unreachable.discard(peer_id)
+            _log.info("名单里的这个会话又能读了", 会话=peer_id)
         raw_messages = ((history or {}).get("result") or {}).get("messages") or []
         # 时间分隔行必须在切游标**之前**滤掉：它会被当成一条消息发给 AI，还会把游标钉在
         # 一个随时间变化的字符串上（真机读回来过一行「18:28」）。
