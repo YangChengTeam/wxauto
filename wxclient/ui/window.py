@@ -95,6 +95,7 @@ class MainWindow:
         self._destroyed = False
         self._log_visible = False  # 由 _sync_log_visibility() 每拍现场核对，别手动改
         self._page = "log"
+        self._settings_page: Any = None  # 懒建一次、复用；每次进页 reload() 重读磁盘上的值
 
         root.title(WINDOW_TITLE)
         self._apply_window_icon()
@@ -278,16 +279,13 @@ class MainWindow:
                            fg=theme.SIDEBAR_TITLE if key == page else theme.SIDEBAR_TEXT)
 
         if page == "settings":
-            from .settings_page import SettingsPage
-
             self._heading.configure(text="参数设置")
             self._live_dot.pack_forget()
             self._live_text.pack_forget()
             self._filter_bar.pack_forget()
             for widget in self._header_actions.winfo_children():
                 widget.pack_forget()
-            settings_page = SettingsPage(self._pages, self.data_dir, on_saved=self._on_settings_saved)
-            settings_page.pack(fill=tk.BOTH, expand=True)
+            self._ensure_settings_page().pack(fill=tk.BOTH, expand=True)
         else:
             self._heading.configure(text="实时日志")
             self._live_dot.pack(side=tk.LEFT, padx=(12, 4))
@@ -296,6 +294,27 @@ class MainWindow:
                 widget.pack(side=tk.RIGHT, padx=10)
             self._filter_bar.pack(side=tk.RIGHT, padx=(0, 18))
             self._log_page.pack(fill=tk.BOTH, expand=True)
+
+    def _ensure_settings_page(self) -> Any:
+        """设置页只建一次，之后每次进页重读磁盘上的值。
+
+        早先是每次切页 ``SettingsPage(...)`` 新建一个、旧的只 ``pack_forget()``——控件一直
+        挂在 ``_pages`` 底下不销毁，来回切几十次就攒几十份。改销毁也不行：保存那条路径是
+        ``_save() → on_saved() → _show_page("log")``，销毁完回到 ``_save()`` 还要拿
+        ``parent=self`` 弹提示框，父控件已经没了会直接抛 TclError。复用 + reload 两头都躲开。
+
+        ``SettingsPage`` 的 import 仍然留在这儿：它拖着 ``tkinter.messagebox``，
+        启动时不进设置页就不该为它付这份钱。
+        """
+        if self._settings_page is None:
+            from .settings_page import SettingsPage
+
+            self._settings_page = SettingsPage(
+                self._pages, self.data_dir, on_saved=self._on_settings_saved
+            )
+        else:
+            self._settings_page.reload()
+        return self._settings_page
 
     def _on_settings_saved(self, restart: bool) -> None:
         if self._settings_saved_callback is not None:
@@ -368,7 +387,18 @@ class MainWindow:
         if sys.platform == "win32":
             subprocess.Popen(["explorer", str(self.data_dir)])
 
+    def open_log(self) -> None:
+        """托盘「显示日志」：窗口露面，**并且停在日志页**。
+
+        只 deiconify 是不够的——上次要是停在参数设置页，点「显示日志」弹出来的还是设置页，
+        看起来就是菜单点了不算数。
+        """
+        self.show()
+        self._show_page("log")
+
     def open_settings(self) -> None:
+        """托盘「参数设置」：窗口露面，并且停在设置页。"""
+        self.show()
         self._show_page("settings")
 
     def set_dry_run_notice(self, text: str) -> None:

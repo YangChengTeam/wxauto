@@ -126,6 +126,27 @@ class SettingsPage(tk.Frame):
                 ).grid(row=row, column=2, sticky="w", padx=12)
         self._vars[field.key] = var
 
+    def reload(self) -> None:
+        """重新进这一页时按磁盘上的现值刷一遍输入框。
+
+        页是复用的（见 ``MainWindow._ensure_settings_page``），不刷的话看到的还是上次
+        打开时的快照——别人手工改过 settings 文件、或者刚保存过一轮，界面就和现实对不上。
+        """
+        self._values = settings_store.effective(self.data_dir)
+        for field in FIELDS:
+            var = self._vars.get(field.key)
+            if var is None:
+                continue
+            current = self._values.get(field.key, "")
+            if field.kind == "bool":
+                var.set(settings_store.as_bool(current))
+                continue
+            if field.secret:
+                self._secret_touched[field.key] = False  # 又是没动过的状态，掩码不能写回去
+                var.set(_MASK if current else "")
+                continue
+            var.set(current)
+
     def _mark_touched(self, key: str) -> None:
         self._secret_touched[key] = True
 

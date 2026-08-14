@@ -163,8 +163,10 @@ def main(argv: list[str] | None = None) -> int:
 
     tray = Tray(
         service,
-        on_show=lambda: root.after(0, window.show),
-        on_settings=lambda: root.after(0, lambda: (window.show(), window.open_settings())),
+        # 菜单点哪一项就落到哪一页：open_log/open_settings 自己负责「露面 + 切页」，
+        # 别在这儿只 show()——那样点「显示日志」出来的可能还是上次停着的设置页。
+        on_show=lambda: root.after(0, window.open_log),
+        on_settings=lambda: root.after(0, window.open_settings),
         on_quit=lambda: root.after(0, lambda: shutdown(root, window, service, tray)),
     )
 
