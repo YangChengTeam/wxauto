@@ -853,8 +853,13 @@ class PendingInboundTests(StoreTestCase):
         # 销账了：不会在下一趟把同一批再送一遍。
         self.assertEqual(self.store.list_pending_inbound(), [])
 
-    async def test_self_only_batch_keeps_its_receipt(self) -> None:
-        """全是专员本人说的话不触发一轮，但那一批仍欠在账上——对方回话时要一起送上去。"""
+    async def test_self_only_batch_is_not_booked_as_a_debt(self) -> None:
+        """★ 全是专员本人说的话 → 不触发一轮，也**不记进待处理表**。
+
+        待处理表记的是「欠对方一条回复」。自己说的那几条谁也没在等回复，记进去就是一笔
+        永远销不掉的账：状态栏一直橙着「已连接 · 欠 1 批」，看的人以为消息卡住了
+        （2026-08-14 真机，专员自己在群里说了句话就挂了一下午）。
+        """
         async def handler(_a: str, _p: str, _t: str, _m) -> None:
             raise AssertionError("不该被触发")
 
@@ -865,7 +870,34 @@ class PendingInboundTests(StoreTestCase):
         self._now = T0 + timedelta(seconds=10)
         self.assertEqual(await loop.tick(), 0)
         await loop.drain()
-        self.assertEqual(len(self.store.list_pending_inbound()), 1)
+        self.assertEqual(self.store.list_pending_inbound(), [], "没欠账就不该有账")
+
+    async def test_self_message_still_joins_the_next_real_turn(self) -> None:
+        """不记账不等于丢上下文：对方回话时，自己刚说的那句要一起送上去。"""
+        seen: list[str] = []
+
+        async def handler(_a: str, _p: str, transcript: str, _m) -> None:
+            seen.append(transcript)
+
+        loop = self._loop(
+            FakeSource([
+                [msg("我先问问他", msg_id="m1", from_self=True)],
+                [msg("好的我在", msg_id="m2")],
+                [],
+            ]),
+            handler,
+            now=T0,
+        )
+        await loop.tick()
+        self._now = T0 + timedelta(seconds=10)
+        await loop.tick()
+        self._now = T0 + timedelta(seconds=20)
+        await loop.tick()
+        await loop.drain()
+        self.assertEqual(len(seen), 1)
+        self.assertIn("我先问问他", seen[0])
+        self.assertIn("好的我在", seen[0])
+        self.assertEqual(self.store.list_pending_inbound(), [], "真回复跑完，账要销干净")
 
     async def test_source_failure_is_survived(self) -> None:
         class BoomSource:

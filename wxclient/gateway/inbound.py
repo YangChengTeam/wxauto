@@ -290,10 +290,19 @@ class InboundLoop:
 
         # ★ 落盘再入缓冲（070）：游标在读到消息那一刻就推进了，从这里到「AI 端跑完一轮」
         # 之间断掉任何一环，这批消息就同时满足「游标翻过去了」和「谁也没处理」。
-        batch_id = f"pi_{uuid.uuid4().hex}"
-        self._store.put_pending_inbound(
-            account_id, peer_id, batch_id, [message_to_row(m) for m in fresh], at=now
-        )
+        #
+        # 但**只有欠着对方一条回复的批次才记账**：一批全是专员自己说的话（含网关刚发出去、
+        # 下一轮被读回来的那几条）根本不会触发任何一轮（见 `_dispatch_due`），记进待处理表
+        # 就成了一笔永远销不掉的账——状态栏一直橙着「已连接 · 欠 N 批」，看的人以为消息卡住了
+        # （2026-08-14 真机：专员自己在群里说了句话，欠 1 批挂了一下午）。这几条仍留在内存
+        # 缓冲里当上下文，等对方真回话时并进那一轮；进程中途重启最多丢掉这点上下文，
+        # 而「欠对方的回复不能丢」这条不变量一点没松。
+        owes_reply = any(not message.from_self for message in fresh)
+        batch_id = f"pi_{uuid.uuid4().hex}" if owes_reply else None
+        if batch_id:
+            self._store.put_pending_inbound(
+                account_id, peer_id, batch_id, [message_to_row(m) for m in fresh], at=now
+            )
         for message in fresh:
             self._debouncer.add(message, now, batch_id)
 
