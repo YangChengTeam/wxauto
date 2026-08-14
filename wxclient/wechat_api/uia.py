@@ -411,7 +411,28 @@ class UiaWeChatDriver:
             is_maximize=False,
             close_weixin=False,
         )
-        return {"dry_run": False, "action": "send_message", "friend": friend}
+        # ★ 发后核对（075，需求文档 §12.4）：文字没发走会**留在输入框里**，
+        # 而底座照样返回成功——067 的文件路径上真机踩过一模一样的坑
+        # （文件躺在输入框里、回执却报 done）。宁可报失败，也不谎报「已发送」：
+        # AI 会照着回执告诉用户「已经发过去了」。
+        #
+        # 判据只看**文字**，不看子元素：空输入框天生就带子元素（067 的教训），
+        # 但它的 window_text() 一定是空的——所以这里不需要跟基线较劲。
+        leftover = self._chat_input_text_len(friend)
+        verified = leftover >= 0
+        if leftover > 0:
+            self._nudge_send(friend)
+            leftover = self._chat_input_text_len(friend)
+            if leftover > 0:
+                logger.warning("message.send.stuck_in_input", friend=friend, left=leftover)
+                raise WeChatApiError("消息打进输入框后没能发出去，已停在输入框里，对方没有收到")
+        return {
+            "dry_run": False,
+            "action": "send_message",
+            "friend": friend,
+            # 探测不到输入框时据实说「没核对过」，别把「不知道」讲成「已确认发出」。
+            "verified": verified,
+        }
 
     def send_files(
         self,
@@ -497,6 +518,40 @@ class UiaWeChatDriver:
         except Exception as exc:  # noqa: BLE001 —— 探测失败只是没法判定，不改变发送结论
             logger.warning("files.send.input_probe_failed", error=str(exc))
             return -1
+
+    def _chat_input_text_len(self, friend: str) -> int:
+        """输入框里还剩多少**文字**。``-1`` = 看不出来（判不了，不当作失败）。
+
+        只数文字是刻意的：空输入框本来就可能带子元素（067 真机教训），拿子元素个数
+        判「发没发出去」要跟空态基线比才准；而文字不用——发走了就是空的。
+        """
+        try:
+            edit_area = self._chat_input_area(friend)
+            if edit_area is None:
+                return -1
+            left = len(str(edit_area.window_text() or "").strip())
+            logger.info("message.send.input_state", text=left)
+            return left
+        except Exception as exc:  # noqa: BLE001 —— 探测失败只是没法判定，不改变发送结论
+            logger.warning("message.send.input_probe_failed", error=str(exc))
+            return -1
+
+    def _nudge_send(self, friend: str) -> None:
+        """补按一次回车把停在输入框里的内容发走。
+
+        ★ 这**不是**重发：发走的是已经打进框里的那一条，不会产生第二条消息
+        （需求文档 §12.4「结果未知不能盲目重发」——重复消息发给候选人是硬伤）。
+        """
+        try:
+            edit_area = self._chat_input_area(friend)
+            if edit_area is None:
+                return
+            edit_area.click_input()   # 焦点必须先回到输入框：不然按下的键会落到别处
+            time.sleep(0.3)
+            __import__("pyautogui").press("enter")
+            time.sleep(1.0)
+        except Exception as exc:  # noqa: BLE001 —— 补发失败就按「没发出去」处理
+            logger.warning("message.send.retry_failed", error=str(exc))
 
     def _flush_chat_input(self, friend: str, baseline: int) -> bool:
         """确认粘进去的东西已经发走；没发走就补按发送键。返回 True = 仍有残留（= 没发出去）。
