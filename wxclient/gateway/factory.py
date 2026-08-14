@@ -24,7 +24,7 @@ from .pacing import MIN_FRIEND_INTERVAL_SECONDS, clamp_interval
 from .runner import GatewayRunner
 from .sessions import GatewayStore
 from .ticket import BusinessTicketProvider, LocalFileTicketProvider, TicketProvider
-from .watchlist import Watchlist
+from .watchlist import Watchlist, WatchScope
 from .wechat_io import QueueMessageSink, QueueMessageSource
 
 _log = structlog.get_logger(__name__)
@@ -90,11 +90,24 @@ def build_gateway(
     store = GatewayStore(database_path)
 
     # 监听范围的权威在 AI 端（连上后由 WS 推下来覆盖）；这里装的是推之前的本地兜底。
+    # ★ 名单落盘再读回来（069）：不这么做的话，进程一重启就要等 AI 端重推才恢复，
+    #   中间那段网关是全哑的——名单为空意味着一个会话都不碰。
     watchlist = Watchlist.from_local(
         only=normalize_accounts(gateway_settings.peer_allowlist),
         never=normalize_accounts(gateway_settings.peer_denylist),
-        allow_groups=gateway_settings.allow_groups,
+        persist=lambda scope: store.put_watchlist(
+            {"only": sorted(scope.only), "never": sorted(scope.never)}
+        ),
     )
+    if (saved := store.get_watchlist()) is not None:
+        watchlist.apply_scope(
+            WatchScope(
+                only=frozenset(saved.get("only") or ()),
+                never=frozenset(saved.get("never") or ()),
+                received=True,
+                origin="上次 AI 端推送（本地留存）",
+            )
+        )
     friend_interval = gateway_settings.friend_check_interval_seconds
     if friend_interval > 0:
         friend_interval = clamp_interval(

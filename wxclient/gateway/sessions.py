@@ -62,6 +62,11 @@ CREATE TABLE IF NOT EXISTS gateway_commands (
   done_at    TEXT NOT NULL,
   PRIMARY KEY (account_id, command_id)
 );
+CREATE TABLE IF NOT EXISTS gateway_watchlist (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  payload    TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS gateway_pending_inbound (
   batch_id   TEXT PRIMARY KEY,
   account_id TEXT NOT NULL,
@@ -280,6 +285,33 @@ class GatewayStore:
                     if outcome.get("result") is not None else None,
                     _utcnow().isoformat(),
                 ),
+            )
+            conn.commit()
+
+    # ────────────────────────── 监听名单（069）──────────────────────────
+    #
+    # 名单的权威在 AI 端，但**必须落盘**：进程重启后如果要等 AI 端重推才恢复，
+    # 中间那段网关是全哑的（名单为空 = 一个会话都不碰）。存一行覆盖一行。
+
+    def get_watchlist(self) -> dict | None:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT payload FROM gateway_watchlist WHERE id=1").fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row[0])
+        except ValueError:
+            return None
+
+    def put_watchlist(self, payload: dict) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO gateway_watchlist (id, payload, updated_at) VALUES (1,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                  payload=excluded.payload, updated_at=excluded.updated_at
+                """,
+                (json.dumps(payload, ensure_ascii=False), _utcnow().isoformat()),
             )
             conn.commit()
 

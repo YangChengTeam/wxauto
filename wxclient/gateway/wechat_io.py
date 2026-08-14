@@ -177,16 +177,17 @@ class QueueMessageSource:
         判定放在**打开会话之前**：打开一个聊天窗口本身就是打扰（窗口会弹到前台，
         还会把未读清掉），不该为了判断该不该回而先去动它。名单本身由 AI 端推下来
         （``watchlist.py``），这里只负责照办。
-        """
-        return self._watchlist.reason(
-            peer_id, is_group=self._store.is_known_group(account_id, peer_id)
-        )
 
-    @property
-    def allow_groups(self) -> bool:
-        return self._watchlist.scope.allow_groups
+        ★ 判据**只有名单**，不再看「是不是群」（用户裁决 2026-08-14）：要不要管一个群，
+        是 AI 端那份名单说了算的业务判断。这也顺带解掉了老问题——判断是不是群本来就得
+        先把会话打开才知道，等于为了「决定要不要打扰」先打扰一次。
+        """
+        return self._watchlist.reason(peer_id)
 
     async def fetch(self, account_id: str) -> list[InboundMessage]:
+        # 名单空着 = 一个会话都不碰。这时候必须喊一嗓子，否则现场表现是
+        # 「微信有新消息、网关一声不吭」，看的人只会以为功能坏了（069）。
+        self._watchlist.warn_if_idle()
         unread = await self._runtime.submit(TaskType.GET_UNREAD_MESSAGES, {})
         sessions = ((unread or {}).get("result") or {}).get("unread_sessions") or []
 
@@ -211,18 +212,10 @@ class QueueMessageSource:
         # 一个随时间变化的字符串上（真机读回来过一行「18:28」）。
         raw_messages = [raw for raw in raw_messages if not is_timestamp_row(raw)]
 
-        # 是不是群，只有打开会话读到消息才判得出来（未读列表里没有这个信息）。判出来就记下，
-        # 下一轮在 skip_reason 里直接拦掉，不用再开一次窗口。
+        # 是不是群只有打开会话才判得出来（未读列表里没有这个信息）。记下来只为诊断和日志——
+        # **不再拿它决定处理与否**（069）：群和单聊一样都只看监听名单。
         if any(raw.get("is_group") for raw in raw_messages):
             self._store.mark_peer_kind(account_id, peer_id, is_group=True)
-            if not self.allow_groups:
-                # 游标仍然对齐到最新：不处理不等于要在下次把这些当成新消息。
-                if raw_messages:
-                    self._store.set_cursor(
-                        account_id, peer_id, message_signature(raw_messages[-1]), 0
-                    )
-                _log.info("群聊消息不处理", account=account_id)
-                return []
 
         last_signature, seq = self._store.get_cursor(account_id, peer_id)
         fresh, new_signature = split_new_messages(raw_messages, last_signature)

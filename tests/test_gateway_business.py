@@ -21,6 +21,7 @@ from wxclient.gateway import (
     OutboundGuard,
     OutboundSender,
     Watchlist,
+    WatchScope,
     clamp_interval,
     extract_reply,
     format_transcript,
@@ -863,27 +864,45 @@ class InboundScopeTests(StoreTestCase):
             },
         )
 
-    async def test_group_is_skipped_and_remembered(self) -> None:
+    async def test_nothing_is_touched_before_the_list_arrives(self) -> None:
+        """★ 名单没到之前一个会话都不碰（fail-closed，069）。
+
+        原来的兜底是「所有单聊都管」，意味着装上就会自动回复任何人——包括专员的
+        家人朋友，违反需求文档 §13.1「对象必须在 HR 数据权限范围内」。
+        """
         runtime = self._runtime()
         source = QueueMessageSource(runtime=runtime, store=self.store)
+        with capture_logs() as logs:
+            await source.fetch("acct-1")
+        self.assertEqual(runtime.opened(), [], "名单没到就不该打开任何会话")
+        # 且必须喊出来，否则现场表现是「有新消息、网关一声不吭」，看的人以为坏了。
+        self.assertTrue(
+            any(entry["log_level"] == "warning" and "监听名单" in entry["event"] for entry in logs),
+            logs,
+        )
 
-        await source.fetch("acct-1")
-        self.assertTrue(self.store.is_known_group("acct-1", self.GROUP))
-        self.assertIn(self.GROUP, runtime.opened(), "第一次判群必须打开一次才知道")
+    async def test_group_is_handled_when_it_is_on_the_list(self) -> None:
+        """★ 群和单聊一视同仁，只看名单（用户裁决 2026-08-14）。
 
-        runtime.calls.clear()
-        await source.fetch("acct-1")
-        self.assertNotIn(self.GROUP, runtime.opened(), "判过一次之后连开都不该再开")
-
-    async def test_group_allowed_when_explicitly_turned_on(self) -> None:
+        原来写死「群聊一概不管」，于是「把某个招聘群纳入自动化」在网关侧根本做不到。
+        """
         runtime = self._runtime()
         source = QueueMessageSource(
-            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(allow_groups=True)
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[self.GROUP])
         )
         await source.fetch("acct-1")          # 首次只对齐游标
-        messages = await source.fetch("acct-1")
-        self.assertEqual(messages, [], "首次对齐游标后没有新消息，但群没被拦下")
         self.assertIn(self.GROUP, runtime.opened())
+        self.assertTrue(self.store.is_known_group("acct-1", self.GROUP), "是不是群仍要记下来备查")
+        self.assertNotIn(self.PERSON, runtime.opened(), "不在名单上的人照样不碰")
+
+    async def test_group_off_the_list_is_never_opened(self) -> None:
+        """不在名单上的群，连开都不开——开窗口本身就是打扰。"""
+        runtime = self._runtime()
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[self.PERSON])
+        )
+        await source.fetch("acct-1")
+        self.assertNotIn(self.GROUP, runtime.opened())
 
     async def test_denylist_wins_and_never_opens_the_chat(self) -> None:
         runtime = self._runtime()
@@ -920,8 +939,34 @@ class InboundScopeTests(StoreTestCase):
         self.assertFalse(watchlist.apply_push({"only": "王建国"}))
         self.assertFalse(watchlist.apply_push({}))
         self.assertEqual(watchlist.scope.only, frozenset({self.PERSON}))
-        self.assertIsNone(watchlist.reason(self.PERSON, is_group=False))
-        self.assertIsNotNone(watchlist.reason("路人甲", is_group=False))
+        self.assertIsNone(watchlist.reason(self.PERSON))
+        self.assertIsNotNone(watchlist.reason("路人甲"))
+
+    async def test_pushed_empty_list_means_watch_nothing(self) -> None:
+        """★ AI 端推来一份空名单 = 一个都不管，**不是**「不限制」。
+
+        「空 = 不限制」这个默认值正是「装上就自动回复所有人」的来源。
+        """
+        watchlist = Watchlist.from_local(only=[self.PERSON])
+        self.assertTrue(watchlist.apply_push({"only": []}))
+        self.assertIsNotNone(watchlist.reason(self.PERSON))
+
+    async def test_pushed_list_survives_a_restart(self) -> None:
+        """名单要落盘：重启后如果得等 AI 端重推才恢复，中间那段网关是全哑的。"""
+        saved: list[dict] = []
+        watchlist = Watchlist(persist=lambda scope: saved.append({"only": sorted(scope.only)}))
+        self.assertTrue(watchlist.apply_push({"only": [self.PERSON, self.GROUP]}))
+        self.assertEqual(saved[-1]["only"], sorted([self.GROUP, self.PERSON]))
+
+        # ——— 重启：从库里读回来那份 ———
+        restored = Watchlist()
+        restored.apply_scope(
+            WatchScope(only=frozenset(saved[-1]["only"]), received=True, origin="本地留存")
+        )
+        self.assertTrue(restored.ready)
+        self.assertIsNone(restored.reason(self.PERSON))
+        self.assertIsNone(restored.reason(self.GROUP))
+        self.assertIsNotNone(restored.reason("路人甲"))
 
 
 # ────────────────────────── 节拍（防风控）──────────────────────────

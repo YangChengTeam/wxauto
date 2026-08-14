@@ -38,7 +38,7 @@ class ServerPushTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unsolicited_event_reaches_on_push(self) -> None:
         received: list[tuple[str, dict]] = []
-        payload = {"only": ["候选人-王建国"], "allow_groups": False}
+        payload = {"only": ["候选人-王建国", "招聘交流群"], "never": []}
         async with FakeAgentServer(
             valid_tickets={"tkt-ok"}, push_on_auth=(PUSH_EVENT, payload)
         ) as server:
