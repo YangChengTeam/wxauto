@@ -10,7 +10,7 @@
 ⚠️ 本模块的字段映射来自对 `uia.py` 返回结构的静态阅读，**尚未在真机验证**。
 真机联调（Phase C）时必须专门验这三条：
   ① 同一个人连发两条一模一样的消息，两条都要被处理；
-  ② 网关首次上线，不能对着历史记录逐条回复；
+  ② 第一次读一个会话，只接尾部今天、对方发的那几条，更早的历史不回溯；
   ③ 专员本人手打的消息 `sender == "我"`，要被标成 from_self。
 """
 
@@ -102,16 +102,15 @@ def split_new_messages(
 ) -> tuple[list[dict[str, Any]], str | None]:
     """按游标切出新消息，返回 (新消息, 新游标签名)。
 
-    - 游标为空（首次见到这个联系人）→ **不返回任何新消息**，只把游标对齐到最新。
-      网关刚上线就照着几个月历史逐条回复是灾难。
-    - 游标找不到（历史滚出了读取窗口）→ 同样保守处理：不回溯，只对齐游标。
+    - 游标为空（第一次读这个会话）→ 只取**尾部今天的、对方发的**那几条，见 ``first_seen_fresh``。
+    - 游标找不到（历史滚出了读取窗口）→ 保守处理：不回溯，只对齐游标。
     """
     if not raw_messages:
         return [], last_signature
 
     latest_signature = message_signature(raw_messages[-1])
     if last_signature is None:
-        return [], latest_signature
+        return first_seen_fresh(raw_messages), latest_signature
 
     # 从后往前找游标最后一次出现的位置（老游标按旧算法也认一次，见 legacy_message_signature）。
     cursor_index = -1
@@ -131,6 +130,42 @@ def split_new_messages(
         return [], latest_signature
 
     return list(raw_messages[cursor_index + 1:]), latest_signature
+
+
+#: 第一次读一个会话时，最多把尾部几条当成待处理。够装下「连发三条」那种，
+#: 又不至于把一屏历史整个倒给模型。
+FIRST_SEEN_TAIL = 5
+
+
+def first_seen_fresh(raw_messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """第一次读这个会话时，哪些算「要处理的新消息」。
+
+    ★ 原来是**一条都不算**，只对齐游标——理由是「网关刚上线不能对着几个月历史逐条回复」。
+    可那是「先扫未读、被动等消息」时代的设定。现在是名单驱动、直接读会话：把一个人
+    加进名单的那一刻，他很可能刚问完话正等着，而「首次不回」意味着他永远等不到——
+    除非他再发一条（用户 2026-08-14：「没有首次见到这一说」）。
+
+    两边都要：不倒着回历史，也不能把刚问的话咽掉。判据就是**时间 + 谁说的**——
+    只认尾部连续的、今天的、对方发的那几条：
+
+    - 尾部是专员自己发的 → 停（他已经在人工接着了，轮不到分身插话）；
+    - 遇到不是今天的 → 停（昨天以前的都是历史，不回溯）；
+    - 最多 ``FIRST_SEEN_TAIL`` 条。
+
+    没有时间分隔行时 ``timestamp_is_today`` 是 None —— 当今天处理（宁可回一条稍旧的，
+    也好过把刚到的消息咽掉；真正的老历史前面必然夹着日期分隔行）。
+    """
+    fresh: list[dict[str, Any]] = []
+    for raw in reversed(raw_messages):
+        if is_self_message(raw):
+            break
+        if raw.get("timestamp_is_today") is False:
+            break
+        fresh.append(raw)
+        if len(fresh) >= FIRST_SEEN_TAIL:
+            break
+    fresh.reverse()
+    return fresh
 
 
 def to_inbound(
@@ -257,14 +292,15 @@ class QueueMessageSource:
         last_signature, seq = self._store.get_cursor(account_id, peer_id)
         fresh, new_signature = split_new_messages(raw_messages, last_signature)
         if last_signature is None and raw_messages:
-            # 首次见到这个会话：按设计只对齐游标、不回溯（否则网关一上线就照着几个月历史
-            # 逐条回复）。但**必须说出来**——不然日志上就是「读完了 N 条」然后再无下文，
-            # 看的人只会以为回复功能坏了（2026-08-13 真机，用户就是这么问的）。
+            # 第一次读这个会话：只接尾部今天、对方发的那几条（见 first_seen_fresh），
+            # 更早的算历史不回溯。**必须说出来**——不然日志上就是「读完了 N 条」然后
+            # 再无下文，看的人只会以为回复功能坏了（2026-08-13 真机，用户就是这么问的）。
             _log.info(
-                "首次见到这个会话，只对齐游标不回溯；下一条新消息才会触发回复",
+                "第一次读这个会话，只接尾部今天、对方发的那几条，更早的算历史不回溯",
                 account=account_id,
                 peer=peer_id,
                 已读到=len(raw_messages),
+                要处理=len(fresh),
             )
         if new_signature is not None:
             self._store.set_cursor(account_id, peer_id, new_signature, seq + len(fresh))

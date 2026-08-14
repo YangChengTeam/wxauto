@@ -38,6 +38,7 @@ from wxclient.gateway.guard import (
 )
 from wxclient.gateway.inbound import PENDING_MAX_AGE_HOURS, PENDING_MAX_ATTEMPTS
 from wxclient.gateway.wechat_io import (
+    FIRST_SEEN_TAIL,
     MAX_PEERS_PER_POLL,
     QueueMessageSource,
     legacy_message_signature,
@@ -969,7 +970,7 @@ class InboundScopeTests(StoreTestCase):
         source = QueueMessageSource(
             runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[self.GROUP])
         )
-        await source.fetch("acct-1")          # 首次只对齐游标
+        await source.fetch("acct-1")          # 先读一轮，把游标建起来
         self.assertIn(self.GROUP, runtime.opened())
         self.assertTrue(self.store.is_known_group("acct-1", self.GROUP), "是不是群仍要记下来备查")
         self.assertNotIn(self.PERSON, runtime.opened(), "不在名单上的人照样不碰")
@@ -1000,7 +1001,7 @@ class InboundScopeTests(StoreTestCase):
         source = QueueMessageSource(
             runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[self.PERSON])
         )
-        await source.fetch("acct-1")                      # 首轮只对齐游标
+        await source.fetch("acct-1")                      # 先读一轮，把游标建起来
         runtime.history[self.PERSON].append({"text": "在吗", "is_self": False})
         messages = await source.fetch("acct-1")
         self.assertEqual([m.text for m in messages], ["在吗"])
@@ -1031,7 +1032,10 @@ class InboundScopeTests(StoreTestCase):
         """
         runtime = FakeRuntime(
             unread=[],
-            history={self.PERSON: [{"text": "在吗", "is_self": False, "timestamp_text": "昨天 20:11"}]},
+            history={self.PERSON: [
+                {"text": "在吗", "is_self": False,
+                 "timestamp_text": "昨天 20:11", "timestamp_is_today": False},
+            ]},
         )
         source = QueueMessageSource(
             runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[self.PERSON])
@@ -1238,6 +1242,58 @@ class FriendWatcherTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class FirstSightTests(unittest.TestCase):
+    """★ 第一次读一个会话时，该处理哪些消息（用户裁决 2026-08-14：「没有首次见到这一说」）。
+
+    老规则是「首次一条都不回，只对齐游标」——那是「先扫未读、被动等消息」时代的设定。
+    现在是名单驱动、直接读会话：把一个人加进名单的那一刻，他很可能刚问完话正等着；
+    首次不回 = 他永远等不到答复，除非自己再发一条。
+    新判据只看**时间 + 谁说的**：尾部连续的、今天的、对方发的那几条。
+    """
+
+    def test_the_question_he_just_asked_gets_answered_on_the_very_first_read(self) -> None:
+        history = [
+            {"text": "在吗", "is_self": False, "timestamp_is_today": True},
+            {"text": "还招人吗", "is_self": False, "timestamp_is_today": True},
+        ]
+        fresh, cursor = split_new_messages(history, None)
+        self.assertEqual([m["text"] for m in fresh], ["在吗", "还招人吗"])
+        self.assertEqual(cursor, message_signature(history[-1]))
+
+    def test_history_before_today_is_not_replayed(self) -> None:
+        history = [
+            {"text": "三个月前问过", "is_self": False, "timestamp_is_today": False},
+            {"text": "昨天又问了一遍", "is_self": False, "timestamp_is_today": False},
+            {"text": "今天再问一次", "is_self": False, "timestamp_is_today": True},
+        ]
+        fresh, _ = split_new_messages(history, None)
+        self.assertEqual([m["text"] for m in fresh], ["今天再问一次"], "只接今天的，更早的算历史")
+
+    def test_stops_at_the_operator_s_own_message(self) -> None:
+        """尾巴是专员自己发的 → 他已经在人工接着了，分身不插话。"""
+        history = [
+            {"text": "还招人吗", "is_self": False, "timestamp_is_today": True},
+            {"text": "招的，明天来看看", "is_self": True, "timestamp_is_today": True},
+        ]
+        fresh, cursor = split_new_messages(history, None)
+        self.assertEqual(fresh, [])
+        self.assertEqual(cursor, message_signature(history[-1]), "不回也要对齐游标")
+
+    def test_tail_is_capped(self) -> None:
+        """一屏都是今天的也不至于整屏倒给模型。"""
+        history = [
+            {"text": f"第{i}条", "is_self": False, "timestamp_is_today": True} for i in range(20)
+        ]
+        fresh, _ = split_new_messages(history, None)
+        self.assertEqual(len(fresh), FIRST_SEEN_TAIL)
+        self.assertEqual(fresh[-1]["text"], "第19条", "留的是最新的几条，不是最老的")
+
+    def test_rows_without_a_timestamp_count_as_today(self) -> None:
+        """没有时间分隔行时 uia 标不出今天与否 —— 宁可回一条稍旧的，也不能把刚到的咽掉。"""
+        fresh, _ = split_new_messages([{"text": "在吗", "is_self": False}], None)
+        self.assertEqual([m["text"] for m in fresh], ["在吗"])
+
 
 class CursorSignatureStabilityTests(unittest.TestCase):
     """★ 2026-08-13 真机：自动回复**一次都没触发过**，日志反复报「游标已滚出读取窗口」。

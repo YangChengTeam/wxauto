@@ -454,8 +454,11 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
 class WeChatIoMappingTests(unittest.TestCase):
     """微信侧字段映射的纯函数部分（真机验证前先把逻辑钉住）。"""
 
-    def test_first_sight_of_peer_replies_to_nothing(self) -> None:
-        """★ 网关首次见到某个联系人：只对齐游标，绝不照着历史逐条回复。"""
+    def test_first_sight_of_peer_does_not_replay_history(self) -> None:
+        """★ 第一次读一个会话：不照着历史逐条回复（尾部是专员自己发的 → 一条都不接）。
+
+        「刚问的那句要不要接」见 ``tests/test_gateway_business.py::FirstSightTests``。
+        """
         history = [
             {"sender": "对方", "text": "三个月前的消息"},
             {"sender": "我", "text": "早就回过了"},
