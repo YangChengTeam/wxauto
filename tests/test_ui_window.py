@@ -812,21 +812,26 @@ class LogLookTests(unittest.TestCase):
         self.assertIn("sep", self.table._text.tag_names("4.0"))
         self.assertNotIn("sep", self.table._text.tag_names("1.0"))
         self.assertEqual(self.table._text.tag_cget("sep", "background"), theme.TABLE_ROW_LINE)
-        # ★ 用户 2026-08-15 两次反馈「分割线太粗」。两件事一起治：
-        # ① 正字号是「磅」，高 DPI 上会被放成三四像素；负字号是「像素」，写多少是多少；
-        # ② 即便都写 -1，各家字体的行高也不一样（这台机器上 Consolas 3px、Arial 2px），
-        #    所以要现挑行高最小的那个——线有多粗，就是这个字体的行高。
+        # ★ 用户 2026-08-15 连着三次说「分割线太粗」。线的粗细 = 分隔行那个字体的行高，
+        # 所以这里直接量行高，别再去看字号写了几（写 -1 也可能是 3px）。
         import tkinter.font as tkfont
 
         from wxclient.ui import logtable
 
-        sep_size = int(self.table._text.tag_cget("sep", "font").split()[-1])
-        self.assertLess(sep_size, 0, "分隔线字号必须是负数（像素），否则 DPI 一高线就变粗")
-
-        height = tkfont.Font(font=logtable._sep_font()).metrics("linespace")
-        for family in ("Consolas", "Arial", "Tahoma"):
-            self.assertLessEqual(height, tkfont.Font(font=(family, -1)).metrics("linespace"),
-                                 f"{family} 的行高更小，就该用它")
+        height = int(self.table._sep_font.metrics("linespace"))
+        self.assertLessEqual(height, 2, f"分隔线不该超过 2px，现在 {height}px")
+        for family in logtable._SEP_FAMILIES:
+            try:
+                other = int(tkfont.Font(family=family, size=-1).metrics("linespace"))
+            except tk.TclError:
+                continue
+            self.assertLessEqual(height, other, f"{family} 更矮，就该用它")
+        # ★ 量字体必须用 family=/size= 这条路：font=(...) 元组形式在 Windows 上会多报一档
+        # （Consolas 报 4，实际 3），拿它比大小会挑回最粗的那个——上一版就是这么错的
+        self.assertLessEqual(
+            int(tkfont.Font(family="Consolas", size=-1).metrics("linespace")),
+            int(tkfont.Font(font=("Consolas", -1)).metrics("linespace")),
+        )
         # ★ 行距不归零的话，这条「线」会有十几像素高，看着就是行与行之间空了一大块
         self.assertEqual(str(self.table._text.tag_cget("sep", "spacing1")), "0")
         self.assertEqual(str(self.table._text.tag_cget("sep", "spacing3")), "0")

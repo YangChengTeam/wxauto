@@ -69,20 +69,34 @@ _TIME_SAMPLE = "2026-08-15 13:29:13"
 _LEVEL_SAMPLE = "● DEBUG"
 
 
-def _sep_font() -> tuple[str, int]:
-    """分隔线用的字体：**行高最小的那个**。
+#: 分隔线候选字体。线有多粗 = 这个字体的行高有多高，所以只看谁矮：Windows 自带的
+#: Modern / Roman / Script 是 1px，Arial / Tahoma 2px，Consolas 要 3px。
+_SEP_FAMILIES = ("Modern", "Roman", "Script", "Arial", "Tahoma", theme.UI, theme.MONO)
 
-    分隔线是「一整行只有一个空格」，所以线有多粗 = 这个字体的行高有多高。字号写成负数是
-    「像素」（正数是磅，96 DPI 上 1 磅就 1.33px，缩放一开更粗），但即便 -1，各家字体的
-    行高也不一样：这台机器上 Consolas 是 3px、Arial/Tahoma 是 2px。现挑最小的那个，
-    别把「细线」写成一条 3px 的灰带（用户 2026-08-15 两次反馈「分割线太粗」）。
+
+def _sep_font() -> tkfont.Font:
+    """给分隔线挑一个**行高最小**的字体，返回字体对象。
+
+    分隔线是「一整行只有一个空格」，line 的高度就是线的粗细，而这个高度由字体的
+    ascent+descent 决定，压不下去——所以只能挑一个本来就矮的。
+
+    ★ 这里踩过两个坑（用户 2026-08-15 连着三次说「分割线太粗」）：
+      ① **元组形式量出来是错的**：``tkfont.Font(font=("Consolas", -1))`` 报 4，
+         ``tkfont.Font(family="Consolas", size=-1)`` 报 3——元组那条路解析不到这个字号。
+         用错的数去比大小，挑出来的自然也是错的（当时就挑回了最粗的 Consolas）。
+      ② 各家字体差得远：同样写 -1（负数=像素，正数是「磅」会随 DPI 放大），
+         Consolas 3px、Arial 2px、Modern 1px。挑最矮的那个才叫细。
     """
-    best, best_height = (theme.MONO, -1), tkfont.Font(font=(theme.MONO, -1)).metrics("linespace")
-    for family in ("Arial", "Tahoma", theme.UI):
-        height = tkfont.Font(font=(family, -1)).metrics("linespace")
-        if height < best_height:
-            best, best_height = (family, -1), height
-    return best
+    best: tuple[int, tkfont.Font] | None = None
+    for family in _SEP_FAMILIES:
+        try:
+            candidate = tkfont.Font(family=family, size=-1)
+            height = int(candidate.metrics("linespace"))
+        except tk.TclError:
+            continue  # 这台机器没这个字体，换下一个
+        if best is None or height < best[0]:
+            best = (height, candidate)
+    return best[1] if best is not None else tkfont.Font(family=theme.MONO, size=-1)
 
 
 def _bar_font(width: int) -> tuple[str, int]:
@@ -147,7 +161,10 @@ class LogTable(tk.Frame):
         # ★字号用**负数**：Tk 里正数是「磅」，1 磅在 96 DPI 上就有 1.33 px，缩放一开更粗，
         # 于是这条「1px 细线」实际画出来三四像素（用户 2026-08-15：「分割线太粗」）。
         # 负数是「像素」，写多少就是多少，跟 DPI 无关。
-        self._text.tag_configure("sep", background=theme.TABLE_ROW_LINE, font=_sep_font(),
+        # 字体对象要**自己留一份引用**：tkfont.Font 被 GC 掉时会把 Tcl 里那个字体一起删掉，
+        # 到时候这一行就退回默认字体（也就退回一条粗线）。
+        self._sep_font = _sep_font()
+        self._text.tag_configure("sep", background=theme.TABLE_ROW_LINE, font=self._sep_font,
                                  spacing1=0, spacing3=0)
         for severity, (color, row_bg) in _SEVERITY_STYLE.items():
             self._text.tag_configure(f"level_{severity}", foreground=color,
