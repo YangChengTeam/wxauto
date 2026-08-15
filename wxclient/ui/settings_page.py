@@ -35,12 +35,10 @@ class SettingsPage(tk.Frame):
         data_dir: Path,
         *,
         on_saved: Callable[[bool], None] | None = None,
-        on_refetch: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent, bg=theme.CONTENT_BG)
         self.data_dir = Path(data_dir)
         self.on_saved = on_saved
-        self.on_refetch = on_refetch
         self._values = settings_store.effective(self.data_dir)
         self._overridden = settings_store.overridden(self.data_dir)
         self._vars: dict[str, tk.Variable] = {}
@@ -52,17 +50,9 @@ class SettingsPage(tk.Frame):
         self._state_text: tk.Label | None = None
         self._state_dot: tk.Label | None = None
 
-        head = tk.Frame(self, bg=theme.CONTENT_BG)
-        head.pack(fill=tk.X, padx=24, pady=(0, 4))
-        self._source_label = tk.Label(head, text="", font=theme.FONT_SMALL,
-                                      bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
-        self._source_label.pack(side=tk.LEFT)
-        if on_refetch is not None:
-            refetch = tk.Label(head, text="重新拉取", font=theme.FONT_SMALL,
-                               bg=theme.CONTENT_BG, fg=theme.GREEN, cursor="hand2")
-            refetch.pack(side=tk.RIGHT)
-            refetch.bind("<Button-1>", lambda _e: self.on_refetch and self.on_refetch())
-
+        # ★ 这里曾经有一行「参数由后端下发…」和一个「重新拉取」，2026-08-15 用户要求撤掉：
+        # 后端那头还没有，摆着只会让人以为「点一下就能同步」。参数在哪儿生效看下面的
+        # 「保存到：…」那行就够了。
         for section in SECTIONS:
             self._build_section(section)
         self._render_marks()
@@ -183,32 +173,22 @@ class SettingsPage(tk.Frame):
                                     bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
         self._state_text.pack(side=tk.LEFT, padx=(8, 0))
 
-        primary = tk.Frame(inner, bg=theme.GREEN_DEEP, cursor="hand2")
+        primary = tk.Label(inner, text="保存并重启服务", font=theme.FONT_SMALL,
+                           bg=theme.GREEN_DEEP, fg="#ffffff", padx=22, pady=8, cursor="hand2")
         primary.pack(side=tk.RIGHT)
-        title = tk.Label(primary, text="⟳  保存并重启服务", font=theme.FONT_SMALL,
-                         bg=theme.GREEN_DEEP, fg="#ffffff")
-        title.pack(padx=22, pady=(8, 0))
-        # 副标题不是装饰：重启会断开微信/AI 端连接几秒，点之前就该知道
-        note = tk.Label(primary, text="连接将短暂中断", font=(theme.UI, 8),
-                        bg=theme.GREEN_DEEP, fg="#d8f3e2")
-        note.pack(padx=22, pady=(0, 8))
-        for widget in (primary, title, note):
-            widget.bind("<Button-1>", lambda _e: self._save(restart=True))
+        primary.bind("<Button-1>", lambda _e: self._save(restart=True))
 
         widgets.ghost_button(inner, "仅保存", lambda: self._save(restart=False)).pack(
-            side=tk.RIGHT, padx=(0, 12), ipady=8)
+            side=tk.RIGHT, padx=(0, 12), ipady=1)
+        # 这句摆在按钮外面（`docs/setting2.png`）：它是「点下去会发生什么」的提醒，
+        # 不是按钮的一部分——重启会断开微信/AI 端连接几秒，点之前就该知道。
+        tk.Label(inner, text="重启时连接将短暂中断", font=theme.FONT_SMALL,
+                 bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED).pack(side=tk.RIGHT, padx=(0, 16))
 
         self._render_dirty()
         return bar
 
     # ── 状态 ─────────────────────────────────────────────────────
-
-    def set_source(self, source: str) -> None:
-        """说清这份参数是哪来的。空着不写比写错强，所以没拉到就直说没拉到。"""
-        self._source_label.configure(
-            text={"后端": "参数由后端下发，本机改动会盖在上面",
-                  "本机": "还没接后端，这些参数都在这台机器上"}.get(source, "参数来源未知")
-        )
 
     def _render_marks(self) -> None:
         """在被本机盖掉的那几行标出后端的原值。**只标不同的**，一样的没什么好说。"""

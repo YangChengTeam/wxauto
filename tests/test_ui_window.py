@@ -210,13 +210,37 @@ class WindowAdversarialTests(unittest.TestCase):
         """名单是「谁会被自动回复」的唯一判据，配置中心里必须看得到具体是谁。"""
         from wxclient.ui.service import GatewayStatus
 
+        self.window.service._snapshot = (ServiceState.RUNNING, None)
         self.window.service._status = GatewayStatus(watched=("张三", "李四", "王五"))
         self.window._show_page("settings")
 
-        body = self.window._watch_text.get("1.0", "end-1c")
+        def texts(widget) -> list[str]:
+            found = []
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Label):
+                    found.append(str(child.cget("text")))
+                found.extend(texts(child))
+            return found
+
+        shown = texts(self.window._watch_card)
         for name in ("张三", "李四", "王五"):
-            self.assertIn(name, body)
-        self.assertEqual(self.window._watch_text.cget("state"), "disabled", "只读")
+            self.assertIn(name, shown)
+        self.assertEqual(self.window._watch_count.cget("text"), "3 个会话")
+        # 一人一行（`docs/setting2.png`）：名字 + 「微信会话」+ 右边「监听中」
+        self.assertEqual(shown.count("微信会话"), 3)
+        self.assertEqual(shown.count("监听中"), 3)
+
+    def test_the_sync_button_is_a_placeholder_that_admits_it(self) -> None:
+        """★ 名单以后能从线上同步（用户 2026-08-15 要求先留位）。后端那头还没有，
+        所以按钮是灰的，点了要说清「还没接上」——摆一个点了什么都不发生的按钮比没有更糟。
+        """
+        self.window._show_page("settings")
+
+        self.window._sync_watchlist()
+
+        hint = self.window._watch_hint.cget("text")
+        self.assertIn("还没接", hint)
+        self.assertNotIn("同步成功", hint, "没同步就别说同步过")
 
     def test_an_empty_watch_list_says_nothing_will_be_answered(self) -> None:
         """空名单分两种，别混为一谈：没起服务是正常的，**跑着却空**才是要命的。"""
@@ -555,18 +579,23 @@ class ConfigCenterTests(unittest.TestCase):
         self.assertIn("本机已改", mark.cget("text"))
         self.assertNotIn("后端的密钥", mark.cget("text"))
 
-    def test_the_banner_only_shows_up_when_something_is_actually_wrong(self) -> None:
+    def test_connection_trouble_still_shows_up_after_the_banner_was_removed(self) -> None:
+        """★ 顶部那条告警条按用户要求撤了（2026-08-15），但「连不上」不能跟着消失——
+        侧栏那行仍要说，否则界面上一切正常、消息其实一条都没送出去。
+        """
         self.service._snapshot = (ServiceState.RUNNING, None)
         self.service._status = GatewayStatus(connected=1, accounts=1)
         self.window.refresh_state()
-        self.assertEqual(self.window._banner.winfo_manager(), "", "一切正常时不占地方")
+        self.assertFalse(hasattr(self.window, "_banner"), "告警条已删")
+        self.assertEqual(self.window._rows["gateway"].cget("text"), "已连接")
 
         self.service._status = GatewayStatus(connected=0, accounts=1, connect_error="认证失败")
         self.window.refresh_state()
+        self.assertEqual(self.window._rows["gateway"].cget("text"), "连不上")
 
-        self.assertEqual(self.window._banner.winfo_manager(), "pack")
-        self.assertIn("AI 端连接异常", self.window._banner_title.cget("text"))
-        self.assertIn("认证失败", self.window._banner_detail.cget("text"))
+        self.service._status = GatewayStatus(connected=1, accounts=1, backlog=3)
+        self.window.refresh_state()
+        self.assertIn("欠 3 批", self.window._rows["gateway"].cget("text"))
 
 
 @unittest.skipUnless(HAS_TK, "没有 tkinter / 显示环境，窗口层测不了")

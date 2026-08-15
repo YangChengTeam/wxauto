@@ -24,7 +24,7 @@ import structlog
 
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 
-from . import logline, theme
+from . import logline, theme, widgets
 from .logbuffer import LogBuffer
 from .logfeed import FLUSH_MS, LogFeed, is_log_on_screen
 from .logtable import LEVEL_FILTERS, LogTable
@@ -90,6 +90,14 @@ _PAGE_SUBTITLES = {"settings": "管理连接、调度与启动设置"}
 _NAV_MARK_W = 4
 
 
+def _initials(name: str) -> str:
+    """头像圈里写什么：英文名取前两位，中文名取后两位（姓氏重的多，名字才分得开）。"""
+    text = name.strip()
+    if not text:
+        return "?"
+    return text[:2].upper() if text.isascii() else text[-2:]
+
+
 class MainWindow:
     def __init__(
         self,
@@ -100,7 +108,6 @@ class MainWindow:
         data_dir: Path,
         dry_run_notice: str = "",
         on_settings_saved: Callable[[bool], None] | None = None,
-        on_refetch: Callable[[], None] | None = None,
         log_pipeline: Any = None,
         probe_wechat: bool = True,
     ) -> None:
@@ -109,7 +116,6 @@ class MainWindow:
         self.service = service
         self.data_dir = Path(data_dir)
         self._settings_saved_callback = on_settings_saved
-        self._refetch_callback = on_refetch
         self._log_pipeline = log_pipeline
         self._dry_run_notice = dry_run_notice
         self._unsubscribe: Any = None
@@ -124,14 +130,13 @@ class MainWindow:
         self._page = "log"
         self._settings_page: Any = None  # 懒建一次、复用；每次进页 reload() 重读磁盘上的值
         self._config_page: Any = None  # 配置中心的外壳（可滚动）：参数表 + 监听名单一节
-        self._watch_text: Any = None  # 监听名单那个只读文本框，跟着配置中心一起建
+        self._watch_card: Any = None  # 监听名单那张卡片，跟着配置中心一起建
         self._locked = False  # 转场态：由 _sync_transition_lock() 每拍现场核对，别手动改
         self._last_tick: float | None = None  # 卡顿看门狗的上一拍时刻
         self._ticks = 0  # 心跳计数：头两拍不报卡顿，理由见 _watch_for_stalls
         self._pending_after: set[str] = set()  # 排着的 after 回调，destroy 时要撤掉
         self._login: Any = None  # 登录页盖在最上面时是它，登进来之后是 None
         self._identity: Any = None  # 当前登录的人（auth.Identity）
-        self._config_source = ""  # 参数是「后端」下发的还是「本机」填的，配置中心要说清
         self._logout_provider: Any = None  # 退出登录之后拿什么再登一次
         self._logout_callback: Any = None
         self._version = ""
@@ -340,8 +345,6 @@ class MainWindow:
         self._active_filter = LEVEL_FILTERS[0][0]
         self._render_filter_chips()
 
-        self._banner = self._build_banner(content)
-
         self._pages = tk.Frame(content, bg=theme.CONTENT_BG)
         self._pages.pack(fill=tk.BOTH, expand=True)
 
@@ -359,47 +362,6 @@ class MainWindow:
         self._dry_run_label = tk.Label(footer, text="", font=theme.FONT_SMALL,
                                        bg=theme.FOOTER_BG, fg=theme.ORANGE)
         self._render_dry_run_notice()
-
-    def _build_banner(self, parent: tk.Misc) -> tk.Frame:
-        """顶部告警条：连不上 AI 端这种事，不该只在日志里滚过去。
-
-        它**只报一件事**：现在有没有一个「看得见但自己好不了」的毛病，以及去哪儿治。
-        右边那个「检查参数 ›」直接跳配置中心——多数情况就是地址或 key 填错了。
-        平时整条不占位（``pack_forget``），别让界面天天顶着一条黄边。
-        """
-        banner = tk.Frame(parent, bg=theme.BANNER_BG)
-        inner = tk.Frame(banner, bg=theme.BANNER_BG)
-        inner.pack(fill=tk.X, padx=24, pady=12)
-        tk.Label(inner, text="⚠", font=(theme.UI, 12), bg=theme.BANNER_BG,
-                 fg=theme.ORANGE).pack(side=tk.LEFT, padx=(0, 10))
-        self._banner_title = tk.Label(inner, text="", font=theme.FONT_TITLE,
-                                      bg=theme.BANNER_BG, fg=theme.TEXT)
-        self._banner_title.pack(side=tk.LEFT)
-        self._banner_detail = tk.Label(inner, text="", font=theme.FONT_SMALL,
-                                       bg=theme.BANNER_BG, fg=theme.TEXT_MUTED)
-        self._banner_detail.pack(side=tk.LEFT, padx=(16, 0))
-        action = tk.Label(inner, text="检查参数  ›", font=theme.FONT_SMALL,
-                          bg=theme.BANNER_BG, fg=theme.ORANGE, cursor="hand2")
-        action.pack(side=tk.RIGHT)
-        action.bind("<Button-1>", lambda _e: self._show_page("settings"))
-        return banner
-
-    def _render_banner(self, snapshot: Any, state: ServiceState) -> None:
-        title, detail = "", ""
-        if state is ServiceState.FAILED:
-            title, detail = "服务没起来", (self.service.error or "看下面的日志")[:60]
-        elif state is ServiceState.RUNNING and snapshot.connect_error:
-            title, detail = "AI 端连接异常", f"{str(snapshot.connect_error)[:50]}，消息处理将继续重试"
-        elif state is ServiceState.RUNNING and snapshot.backlog > 0:
-            # 「微信显示已读、却没人回」在专员眼里就是坏了（070）。积压要说出来。
-            title, detail = "消息还没送出去", f"欠 {snapshot.backlog} 批，连上 AI 端后会自动补发"
-        if not title:
-            self._banner.pack_forget()
-            return
-        self._banner_title.configure(text=title)
-        self._banner_detail.configure(text=detail)
-        if not self._banner.winfo_manager():
-            self._banner.pack(fill=tk.X, before=self._pages)
 
     def _action(self, text: str, command: Callable[[], None]) -> tk.Label:
         item = tk.Label(self._header_actions, text=text, font=theme.FONT_SMALL,
@@ -438,60 +400,97 @@ class MainWindow:
         return page
 
     def _build_watch_section(self, parent: tk.Misc) -> tk.Frame:
-        """监听名单：AI 端推下来的会话名单，一行一个。**配置中心里的一节。**
+        """监听名单：谁会被自动回复。**配置中心里的一节**，版式照 `docs/setting2.png`。
 
-        名单是「谁会被自动回复」的唯一判据（069 fail-closed），所以必须看得见**具体是谁**；
-        但它是 AI 端说了算的，本机改不了——摆在配置中心里当只读的一节，正好和上面那些
-        「本机能改的参数」形成对照（用户 2026-08-15：监听名单归到配置中心）。
+        名单是「谁会被自动回复」的唯一判据（069 fail-closed），所以必须看得见**具体是谁**。
+        名单从两条路来：这台机器上加的好友，和以后从线上同步下来的那份——所以这里留了一个
+        「同步名单」的位置（用户 2026-08-15）。**后端那头还没有**，按钮是灰的，点了会说清
+        为什么，不会假装同步过一次。
         """
         page = tk.Frame(parent, bg=theme.CONTENT_BG)
-        tk.Label(page, text="监听名单", font=theme.FONT_HEADING, bg=theme.CONTENT_BG,
-                 fg=theme.TEXT).pack(anchor="w", pady=(8, 6))
+
+        head = tk.Frame(page, bg=theme.CONTENT_BG)
+        head.pack(fill=tk.X, pady=(14, 4))
+        tk.Label(head, text="监听名单", font=theme.FONT_HEADING, bg=theme.CONTENT_BG,
+                 fg=theme.TEXT).pack(side=tk.LEFT)
+        self._watch_count = tk.Label(head, text="", font=theme.FONT_SMALL,
+                                     bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
+        self._watch_count.pack(side=tk.RIGHT)
+        widgets.ghost_button(head, "同步名单", self._sync_watchlist, enabled=False).pack(
+            side=tk.RIGHT, padx=(0, 14))
+
         self._watch_hint = tk.Label(page, text="", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
                                     fg=theme.TEXT_MUTED, anchor="w", justify=tk.LEFT)
         self._watch_hint.pack(fill=tk.X, pady=(0, 10))
 
         box = tk.Frame(page, bg=theme.ROW_LINE, padx=1, pady=1)
-        box.pack(fill=tk.BOTH, expand=True, pady=(0, 16))
-        self._watch_text = tk.Text(
-            box, bg=theme.CONTENT_BG, fg=theme.TEXT, font=theme.FONT_BODY,
-            relief=tk.FLAT, highlightthickness=0, bd=0, padx=18, pady=12,
-            spacing1=3, spacing3=5, cursor="arrow", insertwidth=0, wrap=tk.NONE,
-        )
-        scroll = tk.Scrollbar(box, orient=tk.VERTICAL, command=self._watch_text.yview, width=12)
-        self._watch_text.configure(yscrollcommand=scroll.set)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self._watch_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._watch_text.configure(height=8)  # 一节而不是一整页，给上面的参数留地方
-        self._watch_text.tag_configure("empty", foreground=theme.ORANGE)
-        self._watch_text.configure(state=tk.DISABLED)
-        # 只读，但要能选中复制——「这个人到底在不在名单上」经常要贴给别人看
-        self._watch_text.bind("<Key>", lambda event: None
-                              if (event.state & 0x4 and event.keysym in {"c", "C", "a", "A"})
-                              or event.keysym in {"Up", "Down", "Prior", "Next", "Home", "End"}
-                              else "break")
+        box.pack(fill=tk.X, pady=(0, 16))
+        self._watch_card = tk.Frame(box, bg=theme.CONTENT_BG)
+        self._watch_card.pack(fill=tk.BOTH, expand=True)
+        self._watch_shown: tuple[str, ...] | None = None
         return page
+
+    def _sync_watchlist(self) -> None:
+        """「同步名单」的预留位。真接上之前，说清现在名单是怎么来的，别让人干等。"""
+        self._watch_hint.configure(
+            text="同步接口还没接上：名单现在由 AI 端在服务运行时推下来，本机只显示。",
+            fg=theme.ORANGE,
+        )
 
     def _render_watch_page(self) -> None:
         """把名单铺到页面上。停在配置中心时每秒刷一次——名单是 AI 端随时会改的。"""
-        if self._page != "settings" or self._watch_text is None:
+        if self._page != "settings" or self._watch_card is None:
             return
-        watched = list(self.service.status().watched)
+        watched = tuple(self.service.status().watched)
         running = self.service.state is ServiceState.RUNNING
         if not running:
-            self._watch_hint.configure(text="服务没在跑，名单由 AI 端在运行时推下来。")
+            self._watch_count.configure(text="未启动")
+            self._watch_hint.configure(text="服务没在跑，名单由 AI 端在运行时推下来。",
+                                       fg=theme.TEXT_MUTED)
         elif watched:
-            self._watch_hint.configure(text=f"共 {len(watched)} 个会话会被自动回复；不在名单里的一律不回。")
+            self._watch_count.configure(text=f"{len(watched)} 个会话")
+            self._watch_hint.configure(text="名单内会话将自动回复，未列入名单的会话不回复。",
+                                       fg=theme.TEXT_MUTED)
         else:
-            self._watch_hint.configure(text="名单是空的——这意味着一条消息都不会回。")
+            self._watch_count.configure(text="0 个会话")
+            self._watch_hint.configure(text="名单是空的——这意味着一条消息都不会回。",
+                                       fg=theme.ORANGE)
 
-        body = "\n".join(watched) if watched else ("（空）" if running else "（未启动）")
-        if self._watch_text.get("1.0", "end-1c") == body:
-            return  # 没变就别重画，省得把用户选中的东西冲掉
-        self._watch_text.configure(state=tk.NORMAL)
-        self._watch_text.delete("1.0", tk.END)
-        self._watch_text.insert("1.0", body, () if watched else ("empty",))
-        self._watch_text.configure(state=tk.DISABLED)
+        if watched == self._watch_shown:
+            return  # 没变就别重画：每秒重建一次控件既费又会把滚动位置抖没
+        self._watch_shown = watched
+        for child in self._watch_card.winfo_children():
+            child.destroy()
+        if not watched:
+            tk.Label(self._watch_card, text="（空）" if running else "（未启动）",
+                     font=theme.FONT_BODY, bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED,
+                     anchor="w").pack(fill=tk.X, padx=18, pady=14)
+            return
+        for index, name in enumerate(watched):
+            self._watch_row(index, name)
+
+    def _watch_row(self, index: int, name: str) -> None:
+        if index:
+            tk.Frame(self._watch_card, bg=theme.ROW_LINE, height=1).pack(fill=tk.X)
+        row = tk.Frame(self._watch_card, bg=theme.CONTENT_BG)
+        row.pack(fill=tk.X)
+
+        avatar = tk.Canvas(row, width=34, height=34, bg=theme.CONTENT_BG,
+                           highlightthickness=0, bd=0)
+        avatar.pack(side=tk.LEFT, padx=(16, 12), pady=12)
+        avatar.create_oval(1, 1, 33, 33, fill=theme.PILL_BG, outline=theme.PILL_BG)
+        avatar.create_text(17, 17, text=_initials(name), font=theme.FONT_SMALL,
+                           fill=theme.TEXT_MUTED)
+
+        tk.Label(row, text=name, font=theme.FONT_BODY, bg=theme.CONTENT_BG,
+                 fg=theme.TEXT).pack(side=tk.LEFT)
+        tk.Label(row, text="微信会话", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                 fg=theme.TEXT_MUTED).pack(side=tk.LEFT, padx=(14, 0))
+
+        tk.Label(row, text="监听中", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                 fg=theme.TEXT_MUTED).pack(side=tk.RIGHT, padx=(0, 16))
+        tk.Label(row, text="●", font=(theme.UI, 8), bg=theme.CONTENT_BG,
+                 fg=theme.GREEN_BRIGHT).pack(side=tk.RIGHT, padx=(0, 5))
 
     # ── 页面切换 ──────────────────────────────────────────────────
 
@@ -555,7 +554,6 @@ class MainWindow:
             scroller, inner = self._build_scroller(self._config_page)
             self._settings_page = SettingsPage(
                 inner, self.data_dir, on_saved=self._on_settings_saved,
-                on_refetch=self._refetch_config,
             )
             # ★ 动作条**先** pack（side=BOTTOM）再 pack 滚动区：反过来的话 expand 的滚动区
             # 会把它挤出可视范围，参数一多就得先滚到底才找得到「保存」。
@@ -591,11 +589,6 @@ class MainWindow:
         page.bind("<Enter>", lambda _e: page.bind_all("<MouseWheel>", wheel))
         page.bind("<Leave>", lambda _e: page.unbind_all("<MouseWheel>"))
         return page, inner
-
-    def _refetch_config(self) -> None:
-        """配置中心上的「重新拉取」。真正干活的是 ``__main__`` 注入的回调。"""
-        if self._refetch_callback is not None:
-            self._refetch_callback()
 
     # ── 转场态（正在启动/停止）：不让操作 ─────────────────────────
 
@@ -735,11 +728,6 @@ class MainWindow:
             ServiceState.FAILED: "本地服务启动失败",
         }.get(state, "本地服务未启动")
         self._login.set_local_status(text, _STATE_COLOR.get(state, theme.GRAY))
-
-    def set_config_source(self, source: str) -> None:
-        self._config_source = source
-        if self._settings_page is not None:
-            self._settings_page.set_source(source)
 
     # ── 显示 / 隐藏 ───────────────────────────────────────────────
 
@@ -945,7 +933,6 @@ class MainWindow:
         else:
             self._rows["watch"].configure(text=f"{len(watched)} 个会话", fg=theme.GREEN)
         self._render_watch_page()  # 停在配置中心时跟着刷；不在那页是个空操作
-        self._render_banner(snapshot, state)
         self._sync_login_status()  # 登录页那行「本地服务…」也跟着现实走
 
         self._live_dot.configure(fg=theme.GREEN if state is ServiceState.RUNNING else theme.GRAY)

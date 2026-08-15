@@ -189,7 +189,6 @@ def main(argv: list[str] | None = None) -> int:
         data_dir=wechat_settings.data_dir,
         dry_run_notice=_dry_run_notice(args, settings),
         on_settings_saved=on_settings_saved,
-        on_refetch=lambda: pull_config(window.identity),
         log_pipeline=log_pipeline,
     )
 
@@ -224,7 +223,6 @@ def main(argv: list[str] | None = None) -> int:
         threading.Thread(target=work, name="wx-ui-config", daemon=True).start()
 
     def after_config(config: Any, changed: bool) -> None:
-        window.set_config_source(config.source)
         window.set_busy("")
         if service.state is ServiceState.RUNNING and changed:
             # 参数变了就按新参数重来一遍：让「后端改了配置」和「这台机器上真的在按它跑」

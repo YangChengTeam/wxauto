@@ -56,16 +56,21 @@ def focus_ring(box: tk.Frame, entry: tk.Entry) -> None:
 
 
 def ghost_button(parent: tk.Misc, text: str, command: Callable[[], None],
-                 *, bg: str = theme.CONTENT_BG) -> tk.Label:
+                 *, bg: str = theme.CONTENT_BG, enabled: bool = True) -> tk.Label:
     """描边按钮（白底 + 绿框 + 绿字）。设计稿上「测试连接」「选择文件」「仅保存」都是这一款。
 
     用 Label 而不是 Button：tk 的 Button 在 Windows 上自带一圈没法关掉的立体边，
     和设计稿那种扁平描边对不上。
+
+    ``enabled=False`` 是「预留位」：灰框灰字、鼠标不变手型，**但点击照样会调 command**——
+    留给它去说清「这个还没接上」。摆一个点了什么都不发生的按钮，比没有还糟。
     """
-    button = tk.Label(parent, text=text, font=theme.FONT_SMALL, bg=bg, fg=theme.GREEN,
-                      padx=14, pady=6, cursor="hand2",
-                      highlightthickness=1, highlightbackground=theme.GREEN,
-                      highlightcolor=theme.GREEN, bd=0)
+    color = theme.GREEN if enabled else theme.TEXT_MUTED
+    edge = theme.GREEN if enabled else theme.ROW_LINE
+    button = tk.Label(parent, text=text, font=theme.FONT_SMALL, bg=bg, fg=color,
+                      padx=14, pady=6, cursor="hand2" if enabled else "arrow",
+                      highlightthickness=1, highlightbackground=edge,
+                      highlightcolor=edge, bd=0)
     button.bind("<Button-1>", lambda _e: command())
     return button
 
