@@ -130,9 +130,19 @@ class ClientAuth:
 
     # ── 登录 / 退出 ──────────────────────────────────────────────
 
+    def remembered_login(self) -> tuple[str, str]:
+        """记住的（邮箱，密码）。两个都有才够自动登录一次（`ui/login_page.py`）。
+
+        为什么记了 Token 还要记密码：Token 会**没**——换了 Windows 账号、数据目录被清、
+        文件损坏。那几种情况下人没变、授权也没变，却要重打一遍密码。勾了「记住登录状态」
+        的人要的就是别再打（用户 2026-08-15）。
+        ★ 但**被撤销**不算这种情况：`handle_revoked` 会把密码一起清掉，见下面。
+        """
+        return self.store.credentials()
+
     def login(self, email: str, password: str, *, replace_existing: bool = False,
               remember: bool = True) -> Identity:
-        """``remember=False`` 时**不把 Token 落盘**：这台电脑一关，登录状态就没了。
+        """``remember=False`` 时**不把 Token 和密码落盘**：这台电脑一关，登录状态就没了。
 
         默认记住——招聘分身是常驻这台电脑替人干活的，每天开机重登一次纯属折腾。
         公用电脑上取消勾选，是唯一一个「不记住」还说得通的场景。
@@ -178,6 +188,7 @@ class ClientAuth:
                 agent_id=identity.agent_id,
                 agent_name=identity.agent_name,
                 tenant_name=identity.tenant_name,
+                password=password,
             ))
         else:
             # 上一次可能是勾着记住登的，这次明确说了不记住，就得把旧的清掉——
@@ -201,7 +212,13 @@ class ClientAuth:
         self.store.clear()
 
     def handle_revoked(self) -> None:
-        """任何一次调用发现会话被撤销时走这里：清干净 + 通知界面回登录页。"""
+        """任何一次调用发现会话被撤销时走这里：清干净 + 通知界面回登录页。
+
+        ★ `store.clear()` 会把记住的密码一起清掉，这一点是**故意的**：撤销的理由可能是
+        管理员在企业端手工撤、账号被停用、或者别的设备顶掉了这台。留着密码等于让这台
+        机器转头自己登回来，契约 §2.2 的「立即失效」当场作废。撤销之后要回来，必须有人
+        坐在这台电脑前重新输一次密码。
+        """
         self._identity = None
         self.store.clear()
         if self._on_revoked is not None:

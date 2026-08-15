@@ -67,6 +67,7 @@ class LoginPage(tk.Frame):
 
         self._build_panel()
         self._build_form()
+        self._maybe_autologin()
 
     # ── 左：品牌面板 ─────────────────────────────────────────────
 
@@ -201,6 +202,32 @@ class LoginPage(tk.Frame):
         for widget in (self, right, form):
             widget.bind("<Return>", lambda _e: self.submit())
         account_entry.focus_set()
+
+    # ── 自动登录 ─────────────────────────────────────────────────
+
+    def _maybe_autologin(self) -> None:
+        """勾过「记住登录状态」的机器：把邮箱密码填回去并**直接登一次**。
+
+        什么时候会走到这儿：Token 还在的话，`ClientAuth.restore()` 早就把人放进去了，
+        压根不会建这个登录页。所以走到这儿意味着**Token 没了而人没变**——换了 Windows
+        账号、数据目录被清、文件损坏、重装。那几种情况下让人再打一遍密码纯属白折腾。
+
+        ★ 走不到这儿的两种情况，都是故意的：
+        * **主动退出登录** → `store.clear()`，密码也没了，下次要自己输（他就是想下来）。
+        * **会话被撤销** → 同上（见 `auth.ClientAuth.handle_revoked`）。不这么做的话，
+          管理员刚把这台机器撤掉，它转头自己登回来了。
+
+        自动登录**失败就停在这一页**，把话摆出来、密码留在框里让人改——不重试：
+        密码错了重试一百次也是错的，而账号有 5 次连续失败就锁 15 分钟的闸。
+        """
+        email, password = self._auth.remembered_login()
+        if not (email and password):
+            return
+        self._account.set(email)
+        self._password.set(password)
+        self._pill_text.configure(text="正在用记住的账号登录…")
+        # 等界面先画出来：自动登录要发网络请求，人总得先看见这一页在做什么。
+        self.after(60, lambda: self._start(email, password, replace=False))
 
     def _pill_default(self) -> str:
         """顶上那颗胶囊。**只说这台机器上确定的事**——地址配没配、Token 能不能存住，
@@ -372,6 +399,9 @@ class LoginPage(tk.Frame):
 
     def _failed(self, message: str) -> None:
         self._set_busy(False)
+        # 自动登录没成，胶囊上那句「正在用记住的账号登录…」得撤回去——不然它会一直挂在
+        # 那儿，和下面刚贴出来的红字各说各的。
+        self._pill_text.configure(text=self._pill_default())
         self._show_error(message)
 
     def _set_busy(self, busy: bool) -> None:

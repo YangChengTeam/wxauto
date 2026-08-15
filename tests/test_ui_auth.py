@@ -25,7 +25,12 @@ from typing import Any
 from wxclient.ui import auth, client_api, device, token_store, uia_status
 from wxclient.ui.client_api import ApiError, ClientApi
 from wxclient.ui.status_reporter import StatusReporter
-from wxclient.ui.token_store import Protector, StoredSession, TokenStore
+from wxclient.ui.token_store import (
+    Protector,
+    RefusingProtector,
+    StoredSession,
+    TokenStore,
+)
 
 LOGIN_OK = {
     "accessToken": "lxz_rc_token",
@@ -361,7 +366,86 @@ class ClientAuthTests(unittest.TestCase):
 
         self.assertIn("hr@example.com", raw)
         self.assertEqual(auth.last_account(self.dir), "hr@example.com")
-        self.assertNotIn("password", raw, "密码存在本机等于没有密码")
+        self.assertNotIn("password", raw,
+                         "★ 这是**明文** JSON。记住密码走 DPAPI 密文（token_store），"
+                         "永远不许落到这里")
+
+    # ── 记住登录状态 = 连密码一起记（用户 2026-08-15）──────────────
+
+    def test_remembering_keeps_the_password_for_a_silent_relogin(self) -> None:
+        """Token 会没（换 Windows 账号、清数据目录、重装），人却没变。
+
+        勾了「记住登录状态」的人要的就是那时候也别再打一遍密码。
+        """
+        self.auth.login("hr@example.com", "pw-secret")
+
+        self.assertEqual(self.store.credentials(), ("hr@example.com", "pw-secret"))
+
+    def test_the_password_is_never_written_in_the_clear(self) -> None:
+        """★ 落盘的必须是密文。明文的话，拿到这个文件 = 拿到这个 HR 的整个企业端账号
+        （工资、合同、人才库），比拿到只开得了客户端接口的 Token 严重得多。"""
+        self.auth.login("hr@example.com", "pw-secret")
+
+        raw = (self.dir / "client-session.json").read_text(encoding="utf-8")
+
+        self.assertNotIn("pw-secret", raw)
+        self.assertIn("pw-secret"[::-1], raw, "MemoryProtector 是倒序『加密』")
+
+    def test_not_remembering_forgets_the_password_too(self) -> None:
+        self.auth.login("hr@example.com", "pw-secret")
+
+        self.auth.login("hr@example.com", "pw-secret", remember=False)
+
+        self.assertEqual(self.store.credentials(), ("", ""))
+
+    def test_logging_out_forgets_the_password(self) -> None:
+        """人自己点了退出——他就是想下来，别替他记着怎么再上去。"""
+        self.auth.login("hr@example.com", "pw-secret")
+
+        self.auth.logout()
+
+        self.assertEqual(TokenStore(self.dir, MemoryProtector()).credentials(), ("", ""))
+
+    def test_a_revoked_session_forgets_the_password_as_well(self) -> None:
+        """★ 撤销的理由可能是管理员手工撤、账号停用、别的设备顶掉了这台。
+
+        留着密码 = 这台机器转头自己登回来，契约 §2.2 的「立即失效」当场作废。
+        """
+        self.auth.login("hr@example.com", "pw-secret")
+
+        self.auth.handle_revoked()
+
+        self.assertEqual(TokenStore(self.dir, MemoryProtector()).credentials(), ("", ""),
+                         "撤销之后必须有人坐在这台电脑前重新输一次密码")
+
+    def test_credentials_survive_a_token_that_cannot_be_read(self) -> None:
+        """自动重登要用的正是这种情况：Token 解不开（换了 Windows 账号），但人没换。"""
+        self.auth.login("hr@example.com", "pw-secret")
+        path = self.dir / "client-session.json"
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw["token_protected"] = ""          # 解不开的 Token
+        path.write_text(json.dumps(raw), encoding="utf-8")
+
+        store = TokenStore(self.dir, MemoryProtector())
+
+        self.assertIsNone(store.load(), "Token 没了")
+        self.assertEqual(store.credentials(), ("hr@example.com", "pw-secret"),
+                         "但邮箱密码还在，够自动登一次")
+
+    def test_a_machine_that_cannot_encrypt_stores_no_password(self) -> None:
+        """加密不了的机器（非 Windows 的开发机 / CI）：一个字节都不落盘，密码也一样。
+
+        ★ 必须**显式**用 RefusingProtector，不能靠「默认 protector」——真机上默认的就是
+        DPAPI，那样这条断言在 Windows 上必然翻车（2026-08-15 就是这么红的）。
+        """
+        refusing = TokenStore(self.dir, RefusingProtector())
+        client = auth.ClientAuth("https://business.test", self.dir, api=FakeApi(),
+                                 store=refusing)
+
+        client.login("hr@example.com", "pw-secret")
+
+        self.assertEqual(TokenStore(self.dir, RefusingProtector()).credentials(), ("", ""))
+        self.assertFalse((self.dir / "client-session.json").exists())
 
 
 class UiaStatusTests(unittest.TestCase):
@@ -625,6 +709,66 @@ class StatusReporterTests(unittest.TestCase):
 
         posts = [call for name, call in self.api.calls if name == "wechat_status"]
         self.assertEqual(len(posts), 1, "同一份不合格的内容只发一次")
+
+    def test_a_retry_reuses_the_same_idempotency_key(self) -> None:
+        """★ 契约 §12.3：eventId 是幂等键。重发**必须**沿用同一个。
+
+        每次重发都现生成一个新 UUID 的话，这个键就白设了：请求其实送到了、回包在路上
+        丢了，我们判成失败重发一次，服务端看到的是两个不同的事件 —— 同一件事记两遍审计。
+        """
+        self.api._error = ApiError("连不上业务端")
+        probe = {"platform": "Windows", "window_count": 0}
+
+        self.reporter.wechat_probe(probe)
+        self._drain()
+        self.api._error = None
+        self.reporter.wechat_probe(probe)
+        self._drain()
+
+        keys = [call["event_id"] for name, call in self.api.calls if name == "wechat_status"]
+        self.assertEqual(len(keys), 2)
+        self.assertEqual(keys[0], keys[1], "同一条状态重试，键不能换")
+
+    def test_a_different_state_gets_a_new_idempotency_key(self) -> None:
+        """状态变了就是另一件事，得用新键——否则服务端会以 409 EVENT_ID_CONFLICT 拒掉。"""
+        self.reporter.wechat_probe({"platform": "Windows", "window_count": 0})
+        self._drain()
+        self.reporter.wechat_probe({"platform": "Windows", "login_window": True,
+                                    "window_count": 1})
+        self._drain()
+
+        keys = [call["event_id"] for name, call in self.api.calls if name == "wechat_status"]
+        self.assertEqual(len(keys), 2)
+        self.assertNotEqual(keys[0], keys[1])
+
+    def test_a_new_session_throws_the_old_keys_away(self) -> None:
+        """换了会话，上一个会话没送出去的键就别再用了（服务端全局唯一，会 409）。"""
+        self.api._error = ApiError("连不上业务端")
+        self.reporter.client_error("runtime_error")
+        self._drain()
+
+        self.reporter.session_changed()
+        self.api._error = None
+        self.reporter.client_error("runtime_error")
+        self._drain()
+
+        keys = [call["event_id"] for name, call in self.api.calls if name == "client_status"]
+        self.assertNotEqual(keys[0], keys[1])
+
+    def test_a_permanent_conflict_is_not_hammered_every_tick(self) -> None:
+        """★ 409 也是「重发也不会变」：微信已被别的分身占着（契约表里 retryable=false），
+        或者幂等键撞了。当成网络抖动去重试，就是每 15 秒刷一条一样的告警。
+        """
+        self.api._error = ApiError("这个微信已被别的分身占着",
+                                   code="WECHAT_UIA_ACCOUNT_IN_USE", status=409)
+        probe = {"platform": "Windows", "window_count": 0}
+
+        for _ in range(4):
+            self.reporter.wechat_probe(probe)
+        self._drain()
+
+        posts = [call for name, call in self.api.calls if name == "wechat_status"]
+        self.assertEqual(len(posts), 1)
 
     def test_a_transient_failure_is_still_retried(self) -> None:
         """网络抖一下和内容不合格是两回事：前者必须重来，否则这个状态永远报不出去。"""

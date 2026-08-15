@@ -22,7 +22,7 @@ from typing import Any
 import structlog
 
 from . import uia_status
-from .client_api import ApiError, ClientApi
+from .client_api import ApiError, ClientApi, new_event_id
 from .uia_status import UiaState
 
 _log = structlog.get_logger(__name__)
@@ -50,6 +50,9 @@ class StatusReporter:
         self._lock = threading.Lock()
         self._client_status = ""
         self._wechat: UiaState | None = None
+        #: 还没送到的那条状态用的幂等键：``{"client": (这条状态的指纹, eventId)}``。
+        #: 见 `_event_id`——重试必须**沿用**同一个 eventId。
+        self._events: dict[str, tuple[Any, str]] = {}
         self._queue: queue.Queue[Callable[[], None] | None] = queue.Queue()
         self._worker = threading.Thread(target=self._pump, name="wx-ui-status", daemon=True)
         self._worker.start()
@@ -76,6 +79,9 @@ class StatusReporter:
         with self._lock:
             self._client_status = ""
             self._wechat = None
+            # 幂等键也一起扔掉：eventId 在服务端是全局唯一的，把上一个会话没送出去的键
+            # 拿到新会话里用，只会换来一个 409 EVENT_ID_CONFLICT。
+            self._events.clear()
 
     def shutdown(self, reason: str = "client_shutdown") -> None:
         """退出前把 offline 送出去，**同步等**（有上限）。
@@ -86,11 +92,12 @@ class StatusReporter:
             if self._client_status == OFFLINE or not self._token():
                 return
             self._client_status = OFFLINE
+            event_id = self._event_id("client", OFFLINE)
         done = threading.Event()
 
         def work() -> None:
             try:
-                self._put_client(OFFLINE, reason)
+                self._put_client(OFFLINE, reason, event_id)
             finally:
                 done.set()
 
@@ -98,18 +105,34 @@ class StatusReporter:
         if not done.wait(SHUTDOWN_TIMEOUT_SECONDS):
             _log.warning("退出前上报离线超时，先走了")
 
+    def _event_id(self, kind: str, fingerprint: Any) -> str:
+        """这条状态的幂等键。**同一条状态重试时沿用同一个 id**（契约 §12.3）。
+
+        ★ 每次重发都现生成一个新 UUID 的话，幂等键就白设了：请求送到了、回包在路上丢了，
+        我们判成失败重发一次，服务端看到的是两个不同的事件，于是审计里同一件事记两遍。
+        状态**变了**才换新 id——那本来就是另一件事。
+        """
+        previous, event_id = self._events.get(kind, (None, ""))
+        if previous != fingerprint or not event_id:
+            event_id = new_event_id()
+            self._events[kind] = (fingerprint, event_id)
+        return event_id
+
     def _client(self, status: str, reason: str) -> None:
         with self._lock:
             if status == self._client_status or not self._token():
                 return
             self._client_status = status
-        self._submit(lambda: self._put_client(status, reason))
+            event_id = self._event_id("client", status)
+        self._submit(lambda: self._put_client(status, reason, event_id))
 
-    def _put_client(self, status: str, reason: str) -> None:
+    def _put_client(self, status: str, reason: str, event_id: str = "") -> None:
         try:
             self._api.put_client_status(self._token(), status,
                                         client_version=self._client_version,
-                                        reason=reason)
+                                        reason=reason, event_id=event_id)
+            with self._lock:
+                self._events.pop("client", None)  # 送到了，这个键的使命结束
             _log.info("已上报客户端状态", status=status, reason=reason or None)
         except ApiError as exc:
             self._failed("客户端状态", exc, lambda: self._reset_client(status))
@@ -158,14 +181,20 @@ class StatusReporter:
             if state.same_as(self._wechat):
                 return  # 相同状态不重复上报（契约 §8）
             previous, self._wechat = self._wechat, state
-        self._submit(lambda: self._put_wechat(state, previous))
+            event_id = self._event_id(
+                "wechat", (state.status, state.failure_code, state.capability_status))
+        self._submit(lambda: self._put_wechat(state, previous, event_id))
 
-    def _put_wechat(self, state: UiaState, previous: UiaState | None) -> None:
+    def _put_wechat(self, state: UiaState, previous: UiaState | None,
+                    event_id: str = "") -> None:
         try:
             self._api.put_wechat_uia_status(self._token(), state.status,
                                             instance=state.instance,
                                             failure=state.failure,
-                                            capability_status=state.capability_status)
+                                            capability_status=state.capability_status,
+                                            event_id=event_id)
+            with self._lock:
+                self._events.pop("wechat", None)
             _log.info("已上报微信连接状态", status=state.status,
                       failure=state.failure_code or None,
                       capability=state.capability_status or None)
@@ -186,11 +215,11 @@ class StatusReporter:
             if self._on_revoked is not None:
                 self._on_revoked()
             return
-        if exc.bad_payload:
-            # ★ 请求本身不合格：**不回滚**。回滚等于每 15 秒把同一份不合格的内容再发一遍，
+        if exc.permanent:
+            # ★ 重发同样的内容也不会变：**不回滚**。回滚等于每 15 秒把同一份内容再发一遍，
             # 日志里刷出几百条一模一样的告警，真正的原因反而被埋掉（2026-08-15 真机上出过）。
             # details 里是服务端指出的字段，必须留下来——不然只剩一句「填的内容格式不对」。
-            _log.warning(f"上报{what}被拒：内容不合格，先不重发", error=str(exc)[:120],
+            _log.warning(f"上报{what}被拒：重发也不会变，先不重试", error=str(exc)[:120],
                          code=exc.code or None, details=exc.details or None)
             return
         rollback()

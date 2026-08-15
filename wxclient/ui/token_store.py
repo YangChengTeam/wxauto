@@ -12,6 +12,16 @@ Credential Manager 或 DPAPI 保存，**禁止写入明文配置文件和日志*
 
 密文之外还要记住几样不算凭证的东西（sessionId、agentId、显示名），它们决定了「重开
 之后还认不认得这台机器上是谁」，明文存在同一个 JSON 里没有问题。
+
+★ 2026-08-15 起「记住登录状态」**连密码一起记**（用户要求），同样走 DPAPI，和 Token
+分开加密。密码比 Token 值钱——Token 只开得了 `/recruitment-agent/client/*`，密码开得了
+整个企业端（工资、合同、人才库）。所以它配了三条硬约束：
+
+* 只在人**明确勾上「记住登录状态」**时才写；取消勾选连旧的一起清掉。
+* 只用于「本机 Token 没了但人没变」这一种情况下的自动重登（`ui/login_page.py`）。
+* **会话被撤销（管理员撤、被别的设备顶掉、账号停用）时和 Token 一起清掉**——见
+  `auth.ClientAuth.handle_revoked`。不清的话，管理员刚撤销，这台机器转头拿密码
+  自己又登回来了，契约 §2.2「立即失效」就成了一句空话。
 """
 
 from __future__ import annotations
@@ -40,6 +50,8 @@ class StoredSession:
     agent_id: str = ""
     agent_name: str = ""
     tenant_name: str = ""
+    password: str = ""
+    """勾了「记住登录状态」才有值。和 ``token`` 一样单独 DPAPI 加密，绝不明文落盘。"""
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -115,6 +127,7 @@ class TokenStore:
             return None
         session = StoredSession(
             token=token,
+            password=self._unprotect_optional(raw.get("password_protected")),
             session_id=str(raw.get("session_id") or ""),
             email=str(raw.get("email") or ""),
             user_name=str(raw.get("user_name") or ""),
@@ -125,12 +138,40 @@ class TokenStore:
         self._memory = session
         return session if session.usable else None
 
+    def credentials(self) -> tuple[str, str]:
+        """记住的（邮箱，密码）。**Token 还在不在都能取**——它正是给「Token 没了、
+        人没换」那种情况用的（换了 Windows 账号、文件损坏、重装）。
+
+        取不到就返回两个空串：没记过、没勾过、或者这台机器根本存不住（非 Windows）。
+        """
+        if self._memory is not None:
+            return self._memory.email, self._memory.password
+        if not self._protector.available or not self.path.exists():
+            return "", ""
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
+        except Exception:  # noqa: BLE001 - 文件坏了：当成没记过
+            return "", ""
+        return str(raw.get("email") or ""), self._unprotect_optional(raw.get("password_protected"))
+
+    def _unprotect_optional(self, blob: Any) -> str:
+        """解一段可有可无的密文。解不开就当没有——它不该拦住登录。"""
+        if not blob:
+            return ""
+        try:
+            return self._protector.unprotect(str(blob))
+        except Exception:  # noqa: BLE001
+            return ""
+
     def save(self, session: StoredSession) -> None:
         self._memory = session
         if not self._protector.available:
             return  # 加密不了就不写——磁盘上永远不该出现明文 Token
-        data = {k: v for k, v in asdict(session).items() if k not in {"token", "extra"}}
+        data = {k: v for k, v in asdict(session).items()
+                if k not in {"token", "password", "extra"}}
         data["token_protected"] = self._protector.protect(session.token)
+        if session.password:
+            data["password_protected"] = self._protector.protect(session.password)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
