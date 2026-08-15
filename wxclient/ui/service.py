@@ -70,6 +70,10 @@ class GatewayStatus:
     backlog: int = 0
     watched: tuple[str, ...] = field(default_factory=tuple)
     connect_error: str | None = None
+    #: 离下一趟读消息还有几秒。None = 这会儿没有排期（正在读，或不在工作时间窗）。
+    next_read_seconds: float | None = None
+    #: 在不在工作时间窗之外。窗外一个微信动作都不做，所以也就没有「下一趟」。
+    quiet_hours: bool = False
 
 
 class GatewayService:
@@ -296,6 +300,8 @@ class GatewayService:
             backlog=int(read(lambda: gateway.runner.pending_backlog(), 0)),  # type: ignore[arg-type]
             watched=tuple(read(lambda: gateway.runner.watched_peers(), ())),  # type: ignore[arg-type]
             connect_error=read(lambda: gateway.runner.connect_error, None),  # type: ignore[arg-type]
+            next_read_seconds=read(lambda: gateway.runner.seconds_to_next_read(), None),  # type: ignore[arg-type]
+            quiet_hours=bool(read(lambda: gateway.runner.in_quiet_hours(), False)),
         )
 
     def wait_ready(self, timeout: float = 10.0) -> bool:

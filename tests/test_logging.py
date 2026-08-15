@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import unittest
+from pathlib import Path
 
 from wxclient.logging_config import ChineseLogRenderer
 
@@ -81,5 +82,63 @@ class ChineseLogRendererTests(unittest.TestCase):
         self.assertEqual(
             output, "2026-08-08 17:30:00 [信息] 好友申请已提交：13800138000"
         )
+class DailyLogFileTests(unittest.TestCase):
+    """日志按天分文件（用户 2026-08-15：「里面应该是按日期天的日志」）。"""
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self.dir = Path(tempfile.mkdtemp()) / "logs"
+
+    def _handler(self, keep_days: int = 30):
+        from wxclient.logging_config import DailyFileHandler
+
+        handler = DailyFileHandler(self.dir, keep_days=keep_days)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        self.addCleanup(handler.close)
+        return handler
+
+    def _record(self, message: str, created: float) -> logging.LogRecord:
+        record = logging.LogRecord("wx", logging.INFO, __file__, 1, message, None, None)
+        record.created = created
+        return record
+
+    def test_each_day_gets_its_own_file_named_after_that_day(self) -> None:
+        import time
+
+        handler = self._handler()
+        day_one = time.mktime((2026, 8, 14, 23, 59, 0, 0, 0, -1))
+        day_two = time.mktime((2026, 8, 15, 0, 1, 0, 0, 0, -1))
+
+        handler.emit(self._record("昨天的事", day_one))
+        handler.emit(self._record("今天的事", day_two))
+
+        self.assertEqual(sorted(path.name for path in self.dir.glob("*.log")),
+                         ["gateway-2026-08-14.log", "gateway-2026-08-15.log"])
+        # ★ 当天那份也得带日期：TimedRotatingFileHandler 会把今天写进不带日期的
+        # gateway.log，按日期找日志时最想要的那份反而没名字，所以没用它。
+        self.assertFalse((self.dir / "gateway.log").exists())
+        self.assertIn("昨天的事", (self.dir / "gateway-2026-08-14.log").read_text("utf-8"))
+        self.assertIn("今天的事", (self.dir / "gateway-2026-08-15.log").read_text("utf-8"))
+
+    def test_old_days_are_dropped_so_the_folder_does_not_grow_forever(self) -> None:
+        import time
+
+        handler = self._handler(keep_days=2)
+        for day in (12, 13, 14, 15):
+            handler.emit(self._record(f"第 {day} 天", time.mktime((2026, 8, day, 10, 0, 0, 0, 0, -1))))
+
+        self.assertEqual(sorted(path.name for path in self.dir.glob("*.log")),
+                         ["gateway-2026-08-14.log", "gateway-2026-08-15.log"])
+
+    def test_a_write_that_fails_does_not_take_the_caller_down(self) -> None:
+        """★ 日志写不出去是小事，把正在发消息的那条线程带崩是大事。"""
+        handler = self._handler()
+        handler.emit(self._record("先开一份", 0))
+        handler._stream.close()  # 模拟句柄没了
+
+        handler.emit(self._record("再写一条", 0))  # 不许抛
+
+
 if __name__ == "__main__":
     unittest.main()

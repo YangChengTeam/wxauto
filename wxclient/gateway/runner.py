@@ -440,6 +440,14 @@ class GatewayRunner:
         """当前在盯哪些会话。只读，给桌面端状态栏用（可跨线程读）。"""
         return self._watchlist.watched() if self._watchlist is not None else []
 
+    def in_quiet_hours(self) -> bool:
+        """现在在不在工作时间窗之外。只读，给桌面端状态栏用。"""
+        return self.loop.in_quiet_window()
+
+    def seconds_to_next_read(self) -> float | None:
+        """离下一趟读消息还有几秒（None = 现在不会读）。只读，给桌面端状态栏用。"""
+        return self.loop.seconds_to_next_poll()
+
     def scheduled_count(self) -> int:
         """还排着几条定时指令（077）。只读，给状态栏用。"""
         return self._store.count_scheduled_commands()

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from logging.handlers import RotatingFileHandler
+import time
 from pathlib import Path
 from typing import Any
 
@@ -37,8 +37,71 @@ _TASK_LABELS = {
     "read_recent_moments": "读取最近朋友圈",
 }
 
-def configure_logging(level: str = "INFO", log_file: Path | None = None) -> None:
-    """网关与微信任务执行器的中文精简日志。"""
+#: 日志目录里留多少天。半个月足够回溯一次「上周三那单怎么回事」，又不会把盘吃掉。
+KEEP_DAYS = 30
+
+
+class DailyFileHandler(logging.Handler):
+    """一天一个日志文件：``logs/gateway-2026-08-15.log``。
+
+    **为什么不用 ``TimedRotatingFileHandler``**：它把「当天」那份写在 ``gateway.log`` 里、
+    等隔天才改名带上日期——于是目录里最新的一天恰恰是唯一不带日期的那个文件，而人按日期
+    找日志时，最想要的就是今天这份（用户 2026-08-15：「里面应该是按日期天的日志」）。
+    这里按记录自己的时间戳决定写哪个文件，跨零点自动换，名字从落笔那一刻就是对的。
+    """
+
+    def __init__(self, directory: Path, *, prefix: str = "gateway",
+                 keep_days: int = KEEP_DAYS, encoding: str = "utf-8") -> None:
+        super().__init__()
+        self.directory = Path(directory)
+        self.prefix = prefix
+        self.keep_days = max(1, keep_days)
+        self.encoding = encoding
+        self._day = ""
+        self._stream: Any = None
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def path_for(self, day: str) -> Path:
+        return self.directory / f"{self.prefix}-{day}.log"
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            day = time.strftime("%Y-%m-%d", time.localtime(record.created))
+            if self._stream is None or day != self._day:
+                self._open(day)
+            self._stream.write(self.format(record) + "\n")
+            self._stream.flush()
+        except Exception:  # noqa: BLE001 - 日志写不出去不能把业务带崩
+            self.handleError(record)
+
+    def _open(self, day: str) -> None:
+        if self._stream is not None:
+            self._stream.close()
+        self._stream = self.path_for(day).open("a", encoding=self.encoding, errors="replace")
+        self._day = day
+        self._prune()
+
+    def _prune(self) -> None:
+        """只留最近 ``keep_days`` 天。文件名带 ISO 日期，按名字排就是按时间排。"""
+        files = sorted(self.directory.glob(f"{self.prefix}-*.log"))
+        for stale in files[:-self.keep_days]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass  # 正被别的进程占着就下次再说，删不掉不是错
+
+    def close(self) -> None:
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
+        super().close()
+
+
+def configure_logging(level: str = "INFO", log_dir: Path | None = None) -> None:
+    """网关与微信任务执行器的中文精简日志。
+
+    ``log_dir`` 给了就一天一个文件写进去（见 ``DailyFileHandler``）。
+    """
     _configure_redirected_stream_encoding()
     level_value = getattr(logging, level.upper(), logging.INFO)
     root = logging.getLogger()
@@ -69,14 +132,8 @@ def configure_logging(level: str = "INFO", log_file: Path | None = None) -> None
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    if log_file is not None:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(
-            log_file,
-            maxBytes=5 * 1024 * 1024,
-            backupCount=5,
-            encoding="utf-8",
-        )
+    if log_dir is not None:
+        file_handler = DailyFileHandler(log_dir)
         file_handler.setLevel(level_value)
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)

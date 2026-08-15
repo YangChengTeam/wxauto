@@ -1247,6 +1247,55 @@ class QuietHoursTests(StoreTestCase):
         self.assertEqual(await loop.tick(), 0)
         self.assertEqual(source.calls, 0, "非工作时段还去读了微信")
 
+    async def test_the_countdown_says_nothing_when_nothing_is_scheduled(self) -> None:
+        """★ 界面上那个「下次读消息」的倒计时，源头在这儿（用户 2026-08-15）。
+
+        窗外一趟都不会读，就别给个会走到 00:00 却什么都不发生的数——宁可留白。
+        """
+        loop = InboundLoop(
+            accounts=["acct-1"],
+            source=FakeSource([[]]),
+            store=self.store,
+            handler=self._nothing,
+            is_active=lambda _now: False,
+            clock=lambda: T0,
+        )
+        self.assertIsNone(loop.seconds_to_next_poll(), "还没跑起来就没有「下一趟」")
+        self.assertTrue(loop.in_quiet_window())
+
+        loop._next_poll_at = T0 + timedelta(seconds=30)   # 假装排过一趟
+        self.assertIsNone(loop.seconds_to_next_poll(), "窗外排了也不会读，倒计时不许照报")
+
+    async def test_the_countdown_follows_the_nap_the_loop_really_took(self) -> None:
+        """★ 报的是**真实那一觉**（含抖动、含快慢档），不是照配置算的。
+
+        照配置算的话，热的时候快到 30 秒、抖动又 ±30%，界面会一直和现实差几十秒，
+        看着就像坏了。
+        """
+        loop = InboundLoop(
+            accounts=["acct-1"],
+            source=FakeSource([[]]),
+            store=self.store,
+            handler=self._nothing,
+            poll_interval_seconds=60.0,
+            clock=lambda: datetime.now(timezone.utc),
+        )
+        task = asyncio.ensure_future(loop.run())
+        for _ in range(20):                      # 让它跑完第一趟、排上下一觉
+            await asyncio.sleep(0)
+            if loop.seconds_to_next_poll() is not None:
+                break
+        left = loop.seconds_to_next_poll()
+        self.assertIsNotNone(left, "跑起来之后就该有排期了")
+        self.assertTrue(41.9 <= left <= 78.1, f"{left} 不在 60 秒那一档的抖动范围里")
+
+        loop.stop()
+        await task
+        self.assertIsNone(loop.seconds_to_next_poll(), "停了就没有「下一趟」")
+
+    async def _nothing(self, *_args: Any) -> None:
+        return None
+
     async def test_uses_local_wall_clock_not_utc(self) -> None:
         """时间窗说的是专员那台机器上的九点到九点。
 

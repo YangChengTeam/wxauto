@@ -93,6 +93,12 @@
 - 监听名单是配置中心里一节只读卡片（`docs/setting2.png`）：一人一行，谁在名单里就是谁会被
   自动回复（069 fail-closed）。「同步名单」是**预留位**，后端没接上之前点了要说清没接，
   别假装同步过。名单权威始终在 AI 端，本机不给编辑。
+- 名单标题上那个「下次读消息」倒计时取自 `InboundLoop.seconds_to_next_poll()`——**记的是
+  循环真睡的那一觉**（`_next_poll_at`，含抖动与快慢档），不是照配置算的；照配置算会一直和
+  现实差几十秒，看着像坏了。没排期/窗外就留白或直说，别给个走到 00:00 却什么都不发生的数。
+- 日志按天分文件（`logging_config.DailyFileHandler`，`logs/gateway-YYYY-MM-DD.log`，留 30 天）。
+  不用 `TimedRotatingFileHandler`：它把**今天**那份留成没有日期的 `gateway.log`，
+  一目录里两种命名，按日期找的人第一眼就找不到今天。
 
 ## 扩展方式
 

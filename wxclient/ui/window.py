@@ -90,6 +90,19 @@ _PAGE_SUBTITLES = {"settings": "管理连接、调度与启动设置"}
 _NAV_MARK_W = 4
 
 
+def _next_read_text(snapshot: Any, running: bool) -> str:
+    """标题栏上「下次读消息」那一格。**说不准就别说**，宁可留白也不给个会骗人的数。"""
+    if not running:
+        return ""
+    if snapshot.quiet_hours:
+        return "不在工作时间窗，暂不读"
+    seconds = snapshot.next_read_seconds
+    if seconds is None:
+        return "正在读消息…"
+    minutes, secs = divmod(int(seconds), 60)
+    return f"下次读消息 {minutes:02d}:{secs:02d}"
+
+
 def _initials(name: str) -> str:
     """头像圈里写什么：英文名取前两位，中文名取后两位（姓氏重的多，名字才分得开）。"""
     text = name.strip()
@@ -325,7 +338,7 @@ class MainWindow:
 
         self._header_actions = tk.Frame(header, bg=theme.CONTENT_BG)
         self._header_actions.pack(side=tk.RIGHT)
-        self._action("打开日志", self.open_log_file)
+        self._action("打开目录", self.open_log_dir)
         self._action("清空", self.clear)
 
         # 级别过滤。排障时最常问的一句是「有没有报错」，让人自己在几千行里翻不合适。
@@ -416,6 +429,11 @@ class MainWindow:
         self._watch_count = tk.Label(head, text="", font=theme.FONT_SMALL,
                                      bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
         self._watch_count.pack(side=tk.RIGHT)
+        # 下一趟读消息的倒计时（用户 2026-08-15）。**读的是网关真实那一觉**（含抖动、
+        # 含快慢档），不是照配置算的——照配置算会一直和现实差几十秒，看着就像坏了。
+        self._watch_next = tk.Label(head, text="", font=theme.FONT_SMALL,
+                                    bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
+        self._watch_next.pack(side=tk.RIGHT, padx=(0, 14))
         widgets.ghost_button(head, "同步名单", self._sync_watchlist, enabled=False).pack(
             side=tk.RIGHT, padx=(0, 14))
 
@@ -441,8 +459,10 @@ class MainWindow:
         """把名单铺到页面上。停在配置中心时每秒刷一次——名单是 AI 端随时会改的。"""
         if self._page != "settings" or self._watch_card is None:
             return
-        watched = tuple(self.service.status().watched)
+        snapshot = self.service.status()
+        watched = tuple(snapshot.watched)
         running = self.service.state is ServiceState.RUNNING
+        self._watch_next.configure(text=_next_read_text(snapshot, running))
         if not running:
             self._watch_count.configure(text="未启动")
             self._watch_hint.configure(text="服务没在跑，名单由 AI 端在运行时推下来。",
@@ -511,7 +531,7 @@ class MainWindow:
         else:
             self._subtitle.pack_forget()
 
-        # 「实时更新 · N 行」「级别过滤」「清空 / 打开日志」这一排只属于日志页
+        # 「实时更新 · N 行」「级别过滤」「清空 / 打开目录」这一排只属于日志页
         if page == "log":
             self._live_row.pack(anchor="w", pady=(2, 0))
             for widget in self._header_actions.winfo_children():
@@ -836,28 +856,23 @@ class MainWindow:
         self._table.clear()
         self._render_live_hint()
 
-    def open_data_dir(self) -> None:
+    @property
+    def log_dir(self) -> Path:
+        """日志目录：一天一个文件（``gateway-2026-08-15.log``，见 ``logging_config``）。"""
+        return self.data_dir / "logs"
+
+    def open_log_dir(self) -> None:
+        """日志页右上角「打开目录」：在资源管理器里打开日志目录。
+
+        不直接开某一个文件（用户 2026-08-15）：日志按天分文件，要看的往往不是今天这份——
+        「上周三那单怎么回事」得自己挑日期。开目录把选择权留给人，也顺手让人看见一共存了几天。
+        """
         import subprocess
         import sys
 
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         if sys.platform == "win32":
-            subprocess.Popen(["explorer", str(self.data_dir)])
-
-    def open_log_file(self) -> None:
-        """日志页右上角「打开日志」：拿系统默认程序打开 `gateway.log`。
-
-        比「打开目录」少一步——要日志的人十有八九是要把整份文件发出去或者用编辑器搜，
-        文件还没生成（刚起、还没写过一行）就退回打开目录，别弹一个「找不到文件」了事。
-        """
-        import os
-        import sys
-
-        path = self.data_dir / "gateway.log"
-        if sys.platform == "win32" and path.exists():
-            os.startfile(str(path))  # noqa: S606 —— 就是要交给系统默认程序
-            return
-        self.open_data_dir()
+            subprocess.Popen(["explorer", str(self.log_dir)])
 
     def open_log(self) -> None:
         """托盘「实时日志」：窗口露面，**并且停在日志页**。

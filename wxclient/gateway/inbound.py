@@ -216,6 +216,7 @@ class InboundLoop:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._rng = rng
         self._sleeping = False
+        self._next_poll_at: datetime | None = None  # 下一趟读消息的时刻，给界面倒计时用
         self._inflight: dict[PeerKey, asyncio.Task[None]] = {}
         self._pending_loaded: set[str] = set()
         self._quiet_notice: dict[PeerKey, tuple[str, int]] = {}
@@ -501,14 +502,32 @@ class InboundLoop:
         while not self._stopped.is_set():
             await self.tick()
             # 抖动而不是定时：每 60 秒整点动一次微信，是「这不是人在用」最明显的指纹。
+            delay = jittered(self._interval_for(self._clock()), rng=self._rng)
+            # 记下这一觉睡到几点：界面拿它做「下次读消息」的倒计时。**记的是真实那一觉**
+            # （含抖动、含快慢档），不是配置里那个数——照配置算的倒计时会一直和现实差几十秒。
+            self._next_poll_at = self._clock() + timedelta(seconds=delay)
             try:
-                await asyncio.wait_for(
-                    self._stopped.wait(),
-                    timeout=jittered(self._interval_for(self._clock()), rng=self._rng),
-                )
+                await asyncio.wait_for(self._stopped.wait(), timeout=delay)
             except TimeoutError:
                 continue
+        self._next_poll_at = None
         await self.drain()
+
+    def in_quiet_window(self) -> bool:
+        """现在是不是在工作时间窗之外（窗外一个微信动作都不做）。只读，可跨线程读。"""
+        return not self._is_active(self._clock())
+
+    def seconds_to_next_poll(self) -> float | None:
+        """离下一趟读消息还有几秒。``None`` = 现在压根不会读（没在跑 / 不在工作时间窗）。
+
+        只读，可跨线程读——界面每秒问一次。
+        """
+        if self._next_poll_at is None:
+            return None
+        now = self._clock()
+        if not self._is_active(now):
+            return None  # 窗外一个微信动作都不做，倒计时到点了也不会读，别给个会骗人的数
+        return max(0.0, (self._next_poll_at - now).total_seconds())
 
     def stop(self) -> None:
         self._stopped.set()

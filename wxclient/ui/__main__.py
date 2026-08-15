@@ -135,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
     buffer = LogBuffer(capacity=settings.log_lines)
     log_pipeline = LogPipeline(
         buffer,
-        lambda: configure_logging(log_file=wechat_settings.data_dir / "gateway.log"),
+        lambda: configure_logging(log_dir=wechat_settings.data_dir / "logs"),
     )
     log_pipeline.install()
 

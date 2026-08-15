@@ -230,6 +230,33 @@ class WindowAdversarialTests(unittest.TestCase):
         self.assertEqual(shown.count("微信会话"), 3)
         self.assertEqual(shown.count("监听中"), 3)
 
+    def test_the_watch_list_counts_down_to_the_next_read(self) -> None:
+        """★ 「下一次什么时候读消息」是这一页最常被问的一件事（用户 2026-08-15）。
+
+        倒计时读的是网关**真实排的那一觉**（含抖动、含快慢档）；没排期就别编——
+        窗外说窗外，正在读说正在读。
+        """
+        from wxclient.ui.service import GatewayStatus
+
+        self.window.service._snapshot = (ServiceState.RUNNING, None)
+        self.window.service._status = GatewayStatus(watched=("张三",), next_read_seconds=134.0)
+        self.window._show_page("settings")
+        self.assertEqual(self.window._watch_next.cget("text"), "下次读消息 02:14")
+
+        self.window.service._status = GatewayStatus(watched=("张三",), quiet_hours=True,
+                                                    next_read_seconds=None)
+        self.window._render_watch_page()
+        self.assertIn("不在工作时间窗", self.window._watch_next.cget("text"))
+
+        self.window.service._status = GatewayStatus(watched=("张三",), next_read_seconds=None)
+        self.window._render_watch_page()
+        self.assertIn("正在读", self.window._watch_next.cget("text"))
+
+        # 没起服务时一个字都不说——这会儿本来就不会读
+        self.window.service._snapshot = (ServiceState.STOPPED, None)
+        self.window._render_watch_page()
+        self.assertEqual(self.window._watch_next.cget("text"), "")
+
     def test_the_sync_button_is_a_placeholder_that_admits_it(self) -> None:
         """★ 名单以后能从线上同步（用户 2026-08-15 要求先留位）。后端那头还没有，
         所以按钮是灰的，点了要说清「还没接上」——摆一个点了什么都不发生的按钮比没有更糟。
@@ -909,10 +936,14 @@ class FilterChipTests(unittest.TestCase):
                if str(chip.cget("highlightbackground")) == theme.GREEN]
         self.assertEqual(lit, ["警告"], "同一时刻只有一档亮着")
 
-    def test_the_log_page_offers_clear_and_open_log(self) -> None:
+    def test_the_log_page_offers_clear_and_open_dir(self) -> None:
+        """★ 开的是**目录**不是某个文件（用户 2026-08-15）：日志按天分文件，
+        要看的往往是前几天那份，直接开今天这份等于替人选错。
+        """
         labels = [child.cget("text") for child in self.window._header_actions.winfo_children()]
 
-        self.assertEqual(sorted(labels), sorted(["清空", "打开日志"]))
+        self.assertEqual(sorted(labels), sorted(["清空", "打开目录"]))
+        self.assertEqual(self.window.log_dir, self.window.data_dir / "logs")
 
 
 try:
