@@ -78,6 +78,10 @@ def probe_account() -> WeChatAccount | None:
                 found = _ACCOUNT_DIR.search(handle.path)
                 if found and found.group(1).lower() not in _SHARED_DIRS:
                     names.add(found.group(1))
+                    # ★ 别在这儿 break 提速：一个进程可能同时摸到两个账号目录，
+                    #   提前收工就会在「一台机器开了两个微信」时认错人（单测抓到过）。
+                    #   这一段确实不便宜，省法在调用方——没登录时压根不调（见
+                    #   `ui/status_reporter.wechat_probe`），登录后只算一次。
         except Exception as exc:  # noqa: BLE001 - 权限/进程刚退出，都不该往上炸
             _log.debug("枚举微信打开的文件失败", error=str(exc)[:80])
 

@@ -275,6 +275,30 @@ class ClientAuthTests(unittest.TestCase):
         self.auth = auth.ClientAuth("https://business.test", self.dir,
                                     client_version="1.0.0", api=self.api, store=self.store)
 
+    def test_not_remembering_leaves_nothing_on_disk(self) -> None:
+        """★ 「记住登录状态」没勾上，就**一个字节都不落盘**——公用电脑上这是唯一说得通的用法。
+
+        还得把上一次记住的清掉：不然「不记住」只对这一次生效，下次打开照样自动进去。
+        """
+        self.auth.login("hr@example.com", "pw")
+        self.assertIsNotNone(self.store.load(), "先记一次")
+
+        self.auth.login("hr@example.com", "pw", remember=False)
+
+        self.assertIsNone(self.store.load(), "不记住就得把旧的也清干净")
+
+    def test_remembering_is_the_default(self) -> None:
+        """招聘分身常驻这台电脑替人干活，每天开机重登一次纯属折腾。"""
+        self.auth.login("hr@example.com", "pw")
+
+        # 重开客户端 = 新的 ClientAuth，读同一份落盘会话
+        again = auth.ClientAuth("https://business.test", self.dir,
+                                client_version="1.0.0", api=FakeApi(), store=self.store)
+        restored = again.restore()
+
+        assert restored is not None
+        self.assertEqual(restored.email, "hr@example.com")
+
     def test_a_successful_login_is_remembered_for_next_time(self) -> None:
         identity = self.auth.login("hr@example.com", "pw")
 
@@ -641,6 +665,30 @@ class StatusReporterTests(unittest.TestCase):
 
         posts = [call for name, call in self.api.calls if name == "wechat_status"]
         self.assertEqual(len(posts), 2)
+
+    def test_nothing_is_even_computed_before_login(self) -> None:
+        """★ 真机：人还停在登录页，界面却卡了 795ms。
+
+        没登录时这一拍的结论根本没人要，可我们照样去认微信账号（枚举进程打开的文件，
+        真机 2.4 秒）、照样把网关那套重型模块 import 进来算能力表。它们在后台线程上跑，
+        GIL 一样是从界面线程手里抢的。**没登录就一件都别干。**
+        """
+        checked: list[str] = []
+
+        def check(probe: dict[str, Any]) -> str:
+            checked.append("算了")
+            return "passed"
+
+        reporter = StatusReporter(self.api, lambda: "", client_version="1.0.0",
+                                  capability_check=check)
+        self.addCleanup(reporter.stop)
+
+        reporter.wechat_probe({"platform": "Windows", "uia_exposed": True,
+                               "selected_window": {"process_version": "4.1.12.26"}})
+        self._drain(reporter)
+
+        self.assertEqual(checked, [], "没登录就别算能力表")
+        self.assertEqual(self.api.calls, [])
 
     def test_nothing_is_reported_before_login(self) -> None:
         """没 Token 的时候（还没登录）不该往服务端打——那些请求只会得到 401。"""

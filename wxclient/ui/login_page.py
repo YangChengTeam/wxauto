@@ -136,23 +136,9 @@ class LoginPage(tk.Frame):
         canvas.create_text(left, int(height * 0.54), anchor="w", text=HERO_SUB,
                            fill=theme.PANEL_SUBTLE, font=theme.FONT_BODY, tags="text")
 
-        # 底部那行状态：这台机器上的服务在不在。由 `set_local_status` 现填，
-        # 写死「已就绪」等于在登录页上撒谎。
-        canvas.create_text(left, int(height * 0.9), anchor="w", text="●",
-                           fill=self._status_color, font=(theme.UI, 12), tags="text")
-        canvas.create_text(left + 22, int(height * 0.9), anchor="w", text=self._status_text,
-                           fill=theme.SIDEBAR_TEXT, font=theme.FONT_BODY, tags="text")
-
-    _status_text = "本地服务未启动"
-    _status_color = theme.GRAY
-
-    def set_local_status(self, text: str, color: str) -> None:
-        self._status_text = text
-        self._status_color = color
-        try:
-            self._render_panel_text()
-        except tk.TclError:
-            pass
+        # ★ 这儿原来有一行「本地服务未启动」。删了（用户 2026-08-15）：登录页上服务本来
+        # 就该是停的（登录之后才起），把这句话摆在人第一眼看到的地方，只会让人以为
+        # 有东西坏了、去找哪里能「启动」它——而这里根本没有那个按钮。
 
     # ── 右：表单 ─────────────────────────────────────────────────
 
@@ -180,7 +166,8 @@ class LoginPage(tk.Frame):
         self._account = tk.StringVar(value=auth.last_account(self._data_dir))
         self._password = tk.StringVar()
         self._server = tk.StringVar(value=self._auth.api.base_url)
-        self._remember = tk.BooleanVar(value=bool(self._account.get()))
+        # 默认记住：招聘分身是常驻这台电脑替人干活的，每天开机重登一次纯属折腾。
+        self._remember = tk.BooleanVar(value=True)
 
         if self._needs_server:
             self._field(form, "服务器地址", self._server,
@@ -190,7 +177,7 @@ class LoginPage(tk.Frame):
 
         row = tk.Frame(form, bg=theme.CONTENT_BG)
         row.pack(fill=tk.X, pady=(6, 0))
-        tk.Checkbutton(row, text="记住邮箱", variable=self._remember, font=theme.FONT_SMALL,
+        tk.Checkbutton(row, text="记住登录状态", variable=self._remember, font=theme.FONT_SMALL,
                        bg=theme.CONTENT_BG, fg=theme.TEXT, activebackground=theme.CONTENT_BG,
                        selectcolor=theme.CONTENT_BG, highlightthickness=0,
                        cursor="hand2").pack(side=tk.LEFT)
@@ -217,12 +204,17 @@ class LoginPage(tk.Frame):
 
     def _pill_default(self) -> str:
         """顶上那颗胶囊。**只说这台机器上确定的事**——地址配没配、Token 能不能存住，
-        至于业务端此刻通不通，只有真发一次登录请求才知道，别在这儿替它打包票。"""
+        至于业务端此刻通不通，只有真发一次登录请求才知道，别在这儿替它打包票。
+
+        ★ 原来写的是「用邮箱密码登录，登录状态会记住」（用户 2026-08-15 说不够好）：
+        一句话把下面那两个输入框和那个勾选框各复述了一遍——人看得见的东西不需要旁白。
+        换成说这台电脑登录之后**会变成什么**：这才是登录页该回答的问题。
+        """
         if self._needs_server:
             return "先填服务器地址，再用邮箱登录"
         if not self._auth.store.persistent:
             return "这台机器存不住登录状态，每次打开都要重新登录"
-        return "用邮箱密码登录，登录状态会记住"
+        return "登录后，这台电脑就是你的招聘分身"
 
     def _field(self, parent: tk.Misc, label: str, var: tk.StringVar, *,
                secret: bool = False, placeholder: str = "") -> tk.Entry:
@@ -314,7 +306,8 @@ class LoginPage(tk.Frame):
     def _work(self, email: str, password: str, replace: bool) -> None:
         """后台线程：登录。**这里一律不碰控件**，结果 after 回 tk 线程。"""
         try:
-            identity = self._auth.login(email, password, replace_existing=replace)
+            identity = self._auth.login(email, password, replace_existing=replace,
+                                        remember=self._remember.get())
         except AuthError as exc:
             # 先把话取出来再进 lambda：except 块一结束 Python 就把 exc 删了，
             # 闭包里再去读它拿到的是 NameError（ruff F821 当场抓到过）。
@@ -368,6 +361,8 @@ class LoginPage(tk.Frame):
             pass
 
     def _succeeded(self, identity: Identity) -> None:
+        # 勾了就连登录状态一起记（Token 已由 `ClientAuth.login` 加密落盘），
+        # 没勾就把邮箱也一并忘掉——两件事必须同进同退，不然「不记住」只忘一半。
         if self._remember.get():
             auth.remember_account(self._data_dir, identity.email)
         else:

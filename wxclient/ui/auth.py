@@ -130,7 +130,13 @@ class ClientAuth:
 
     # ── 登录 / 退出 ──────────────────────────────────────────────
 
-    def login(self, email: str, password: str, *, replace_existing: bool = False) -> Identity:
+    def login(self, email: str, password: str, *, replace_existing: bool = False,
+              remember: bool = True) -> Identity:
+        """``remember=False`` 时**不把 Token 落盘**：这台电脑一关，登录状态就没了。
+
+        默认记住——招聘分身是常驻这台电脑替人干活的，每天开机重登一次纯属折腾。
+        公用电脑上取消勾选，是唯一一个「不记住」还说得通的场景。
+        """
         try:
             body = self.api.login(
                 email, password,
@@ -163,15 +169,20 @@ class ClientAuth:
             # 没有分身就没有「用哪个身份记账」，往下跑只会记出一堆无主数据。
             raise AuthError("业务端没返回招聘分身信息，请联系管理员")
         self._identity = identity
-        self.store.save(StoredSession(
-            token=identity.token,
-            session_id=identity.session_id,
-            email=identity.email,
-            user_name=identity.user_name,
-            agent_id=identity.agent_id,
-            agent_name=identity.agent_name,
-            tenant_name=identity.tenant_name,
-        ))
+        if remember:
+            self.store.save(StoredSession(
+                token=identity.token,
+                session_id=identity.session_id,
+                email=identity.email,
+                user_name=identity.user_name,
+                agent_id=identity.agent_id,
+                agent_name=identity.agent_name,
+                tenant_name=identity.tenant_name,
+            ))
+        else:
+            # 上一次可能是勾着记住登的，这次明确说了不记住，就得把旧的清掉——
+            # 否则「不记住」只对这次生效，下次打开还是自动进去了。
+            self.store.clear()
         return identity
 
     def logout(self) -> None:
@@ -204,7 +215,7 @@ def build_auth(data_dir: Path, base_url: str, *, client_version: str = "") -> Cl
     return ClientAuth(base_url, data_dir, client_version=client_version)
 
 
-# ── 「记住邮箱」 ──────────────────────────────────────────────────
+# ── 上次登录的邮箱（登录框里预填，和「记不记登录状态」是两件事）───────
 
 UI_STATE_FILE = "console-ui.json"
 

@@ -127,6 +127,13 @@ class StatusReporter:
     # ── 微信 UIA 状态 ───────────────────────────────────────────
 
     def wechat_probe(self, probe: dict[str, Any]) -> None:
+        if not self._token():
+            # ★ 还没登录：这一拍的结论没人要（`_wechat_state` 到最后也会丢掉）。
+            # 但下面两件事都不便宜——认微信账号要枚举进程打开的文件（真机 2.4 秒），
+            # 算能力表要把网关那套重型模块 import 进来。它们跑在后台线程上，照样把
+            # 主线程的 GIL 抢走：真机上就是一条「界面卡了一下 795ms」，而当时人还停在
+            # 登录页，什么都还没开始。**没登录就一件都别干。**
+            return
         state = uia_status.classify(probe)
         if state is None:
             return
@@ -139,6 +146,8 @@ class StatusReporter:
         self._wechat_state(state)
 
     def wechat_probe_failed(self, error: BaseException) -> None:
+        if not self._token():
+            return
         self._wechat_state(uia_status.probe_failed(error))
 
     def _wechat_state(self, state: UiaState) -> None:

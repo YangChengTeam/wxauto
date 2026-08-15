@@ -690,7 +690,6 @@ class MainWindow:
                                 on_authenticated=done, version=version)
         self._login.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._login.lift()
-        self._sync_login_status()
 
     def finish_login(self, identity: Any) -> None:
         self._identity = identity
@@ -759,19 +758,6 @@ class MainWindow:
         if not self._who.winfo_manager():
             self._logout_item.pack(side=tk.BOTTOM, anchor="w", padx=28, pady=(0, 24))
             self._who.pack(side=tk.BOTTOM, anchor="w", padx=28, pady=(0, 10))
-
-    def _sync_login_status(self) -> None:
-        """登录页左下角那行「本地服务…」要说实话，跟着服务状态走。"""
-        if self._login is None:
-            return
-        state = self.service.state
-        text = {
-            ServiceState.RUNNING: "本地服务已就绪",
-            ServiceState.STARTING: "本地服务正在启动",
-            ServiceState.STOPPING: "本地服务正在停止",
-            ServiceState.FAILED: "本地服务启动失败",
-        }.get(state, "本地服务未启动")
-        self._login.set_local_status(text, _STATE_COLOR.get(state, theme.GRAY))
 
     # ── 显示 / 隐藏 ───────────────────────────────────────────────
 
@@ -972,7 +958,6 @@ class MainWindow:
         else:
             self._rows["watch"].configure(text=f"{len(watched)} 个会话", fg=theme.GREEN)
         self._render_watch_page()  # 停在配置中心时跟着刷；不在那页是个空操作
-        self._sync_login_status()  # 登录页那行「本地服务…」也跟着现实走
 
         self._live_dot.configure(fg=theme.GREEN if state is ServiceState.RUNNING else theme.GRAY)
 
