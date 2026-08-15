@@ -287,7 +287,7 @@ class MainWindow:
                                  bg=theme.CONTENT_BG, fg=theme.TEXT)
         self._heading.pack(side=tk.LEFT)
         self._live_dot = tk.Label(header, text="●", font=(theme.UI, 9),
-                                  bg=theme.CONTENT_BG, fg=theme.GREEN)
+                                  bg=theme.CONTENT_BG, fg=theme.GREEN_BRIGHT)
         self._live_dot.pack(side=tk.LEFT, padx=(12, 4))
         self._live_text = tk.Label(header, text="实时更新", font=theme.FONT_SMALL,
                                    bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
@@ -295,7 +295,7 @@ class MainWindow:
 
         self._header_actions = tk.Frame(header, bg=theme.CONTENT_BG)
         self._header_actions.pack(side=tk.RIGHT)
-        self._action("打开目录", self.open_data_dir)
+        self._action("打开日志", self.open_log_file)
         self._action("清空", self.clear)
 
         # 级别过滤。排障时最常问的一句是「有没有报错」，让人自己在几千行里翻不合适。
@@ -303,10 +303,13 @@ class MainWindow:
         self._filter_bar.pack(side=tk.RIGHT, padx=(0, 18))
         self._filters: dict[str, tk.Label] = {}
         for name, allowed in LEVEL_FILTERS:
+            # 边框走 highlight：选中时点亮成绿框，没选中时和底色同色——看不见，但位置不跳
             chip = tk.Label(self._filter_bar, text=name, font=theme.FONT_SMALL,
                             bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED,
-                            padx=10, pady=3, cursor="hand2")
-            chip.pack(side=tk.LEFT, padx=2)
+                            padx=12, pady=4, cursor="hand2",
+                            highlightthickness=1, highlightbackground=theme.CONTENT_BG,
+                            highlightcolor=theme.CONTENT_BG, bd=0)
+            chip.pack(side=tk.LEFT, padx=4)
             chip.bind("<Button-1>", lambda _e, n=name, a=allowed: self._set_level_filter(n, a))
             self._filters[name] = chip
         self._active_filter = LEVEL_FILTERS[0][0]
@@ -515,7 +518,7 @@ class MainWindow:
         self._render_nav()
         self._heading.configure(text=_PAGE_TITLES.get(page, _PAGE_TITLES["log"]))
 
-        # 「实时更新 · N 行」「级别过滤」「打开目录 / 清空」这一排只属于日志页
+        # 「实时更新 · N 行」「级别过滤」「清空 / 打开日志」这一排只属于日志页
         if page == "log":
             self._live_dot.pack(side=tk.LEFT, padx=(12, 4))
             self._live_text.pack(side=tk.LEFT)
@@ -857,6 +860,21 @@ class MainWindow:
         if sys.platform == "win32":
             subprocess.Popen(["explorer", str(self.data_dir)])
 
+    def open_log_file(self) -> None:
+        """日志页右上角「打开日志」：拿系统默认程序打开 `gateway.log`。
+
+        比「打开目录」少一步——要日志的人十有八九是要把整份文件发出去或者用编辑器搜，
+        文件还没生成（刚起、还没写过一行）就退回打开目录，别弹一个「找不到文件」了事。
+        """
+        import os
+        import sys
+
+        path = self.data_dir / "gateway.log"
+        if sys.platform == "win32" and path.exists():
+            os.startfile(str(path))  # noqa: S606 —— 就是要交给系统默认程序
+            return
+        self.open_data_dir()
+
     def open_log(self) -> None:
         """托盘「显示日志」：窗口露面，**并且停在日志页**。
 
@@ -1045,10 +1063,12 @@ class MainWindow:
         self._render_live_hint()
 
     def _render_filter_chips(self) -> None:
+        """选中的那档描一圈绿边、字也变绿（`docs/main.png`）；其余就是一行灰字。"""
         for name, chip in self._filters.items():
             active = name == self._active_filter
-            chip.configure(bg=theme.ROW_LINE if active else theme.CONTENT_BG,
-                           fg=theme.TEXT if active else theme.TEXT_MUTED)
+            edge = theme.GREEN if active else theme.CONTENT_BG
+            chip.configure(bg=theme.CONTENT_BG, fg=theme.GREEN if active else theme.TEXT_MUTED,
+                           highlightbackground=edge, highlightcolor=edge)
 
     def _render_live_hint(self) -> None:
         """标题旁边报一下收了多少行——「它到底还在不在动」一眼可见。"""

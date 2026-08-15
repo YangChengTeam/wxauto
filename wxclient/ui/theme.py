@@ -25,9 +25,12 @@ FOOTER_BG = "#f7f7f7"
 # 用状态绿会让人以为「已经在跑了」，而那一刻服务其实还没起来。
 BRAND = "#f97316"
 
-# 状态色
-GREEN = "#22c55e"
-ORANGE = "#f59e0b"
+# 状态色。绿色一族取自设计稿本身（`docs/login.png` 的输入框聚焦边 / 登录按钮，
+# `docs/main.png` 的实时点），别再自己调——差一档人眼就看得出来跟稿子不是一套。
+GREEN = "#1eb146"         # 主绿：聚焦边框、选中态、INFO 级别
+GREEN_DEEP = "#019a3c"    # 实心绿：登录按钮底色
+GREEN_BRIGHT = "#06d356"  # 亮绿：状态点、「实时更新」那颗点
+ORANGE = "#fd940d"
 RED = "#ef4444"
 GRAY = "#9ca3af"
 
@@ -41,12 +44,13 @@ FONT_HEADING = (UI, 14, "bold")
 FONT_BODY = (UI, 10)
 FONT_SMALL = (UI, 9)
 FONT_LOG = (MONO, 9)
+FONT_TABLE_HEAD = (UI, 9)
 
 # 登录页（`docs/login.png`）：左边深色品牌面板 + 右边白色表单
-PANEL_BG = "#1c1c1c"          # 和背景图 `assets/login-bg.png` 的底色对齐，接缝看不出来
+PANEL_BG = "#1c1c1c"          # 和背景图 `assets/panel-bg.png` 的底色对齐，接缝看不出来
 PANEL_SUBTLE = "#9aa0a6"
 FIELD_BG = "#ffffff"
-FIELD_LINE = "#d9dde1"
+FIELD_LINE = "#d6d6d8"
 PILL_BG = "#f2f3f5"
 
 FONT_HERO = (UI, 30, "bold")
@@ -56,3 +60,8 @@ FONT_BUTTON = (UI, 12, "bold")
 
 # 顶部告警条（`docs/main.png` 里那条橙色的）
 BANNER_BG = "#fff7ed"
+
+# 日志表（`docs/main.png`）：表头一条细线，警告/错误整行铺浅色底 + 左边一根竖色条
+TABLE_HEAD_LINE = "#e4e3e3"
+WARN_ROW_BG = "#fdf7ee"
+ERROR_ROW_BG = "#fef2f2"

@@ -33,7 +33,7 @@ PANEL_RATIO = 0.5
 #: 拖动窗口边框时每一像素都铺一次会卡；等手停下来再铺。
 _BG_REDRAW_MS = 90
 
-HERO_PARTS = (("让", theme.SIDEBAR_TITLE), ("微信服务", theme.GREEN), ("稳定在线", theme.SIDEBAR_TITLE))
+HERO_PARTS = (("让", theme.SIDEBAR_TITLE), ("微信服务", theme.GREEN_DEEP), ("稳定在线", theme.SIDEBAR_TITLE))
 HERO_SUB = "连接、监听与消息处理，一处完成"
 BRAND_LINE = "劳小智微信服务"
 
@@ -200,8 +200,8 @@ class LoginPage(tk.Frame):
 
         self._button = tk.Button(
             form, text="设置并进入" if self._setup_mode else "登录", command=self.submit,
-            font=theme.FONT_BUTTON, bg=theme.GREEN, fg="#ffffff",
-            activebackground=theme.GREEN, activeforeground="#ffffff",
+            font=theme.FONT_BUTTON, bg=theme.GREEN_DEEP, fg="#ffffff",
+            activebackground=theme.GREEN_DEEP, activeforeground="#ffffff",
             relief=tk.FLAT, cursor="hand2", pady=10, highlightthickness=0,
         )
         self._button.pack(fill=tk.X, pady=(22, 0))
@@ -351,7 +351,7 @@ class LoginPage(tk.Frame):
             self._button.configure(
                 text=("正在设置…" if self._setup_mode else "正在登录…") if busy
                 else ("设置并进入" if self._setup_mode else "登录"),
-                bg=theme.GRAY if busy else theme.GREEN,
+                bg=theme.GRAY if busy else theme.GREEN_DEEP,
                 cursor="watch" if busy else "hand2",
             )
         except tk.TclError:

@@ -56,6 +56,7 @@ def tearDownModule() -> None:
 
 if HAS_TK:
     from wxclient.logging_config import configure_logging
+    from wxclient.ui import theme
     from wxclient.ui.logbuffer import LogBuffer, LogPipeline
     from wxclient.ui.service import GatewayService, GatewayStatus, ServiceState
     from wxclient.ui.window import MainWindow
@@ -631,6 +632,148 @@ class LoginLookTests(unittest.TestCase):
                                     "眼睛必须先 pack，先把右边那块占下来")
                     self.assertEqual(slave.pack_info()["side"], "right")
         self.assertEqual(eyes, 1, "正常登录态只有密码那一行有眼睛")
+
+
+@unittest.skipUnless(HAS_TK, "没有 Tk，界面样式测不了")
+class LogLookTests(unittest.TestCase):
+    """实时日志页要长成 `docs/main.png` 那样（用户 2026-08-15：「样式不对，日志的显示也不符合」）。
+
+    像素级好不好看只能人在控制台上看（这条 SSH 上截不了图），所以这里断言的是**结构**：
+    列有没有对齐、警告行有没有铺底和左边那根竖条、参数有没有压灰、选中的档位有没有绿框。
+    这几条恰好就是当时被指出来的那几处。
+    """
+
+    def setUp(self) -> None:
+        from wxclient.ui.logline import parse
+        from wxclient.ui.logtable import LogTable
+
+        self.parse = parse
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.table = LogTable(self.root)
+        self.table.pack(fill=tk.BOTH, expand=True)
+        self.root.update()
+        self.addCleanup(self._teardown)
+
+    def _teardown(self) -> None:
+        _KEEP_ALIVE.extend([self.root, self.table])
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _feed(self, *raw: str) -> None:
+        self.table.append([self.parse(line) for line in raw])
+        self.root.update()
+
+    def _dump(self) -> str:
+        return self.table._text.get("1.0", tk.END)
+
+    def test_the_columns_have_a_header_that_lines_up_with_the_rows(self) -> None:
+        """★ 表头和正文各写各的偏移就会错位——这里逼它们用同一组数字。"""
+        heads = {}
+
+        def walk(widget: tk.Misc) -> None:
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Label) and child.place_info():
+                    heads[child.cget("text")] = int(child.place_info()["x"])
+                walk(child)
+
+        walk(self.table)
+        self.assertEqual(set(heads), {"时间", "级别", "消息"})
+
+        from wxclient.ui import logtable
+
+        tabs = [int(float(tab)) for tab in self.root.tk.splitlist(self.table._text.cget("tabs"))]
+        pad = logtable._PAD_X
+        self.assertEqual(heads["级别"], pad + tabs[0], "「级别」要正对级别列")
+        self.assertEqual(heads["消息"], pad + tabs[1], "「消息」要正对消息列")
+        self.assertLess(heads["时间"], heads["级别"], "时间列在最左边")
+
+    def test_a_warning_row_gets_both_a_wash_and_a_bar_and_an_info_row_gets_neither(self) -> None:
+        """★ 设计稿上警告行是「浅橙底 + 左边一根橙竖条」，光换字色扫一眼看不出来。"""
+        self._feed(
+            '2026-08-15 13:29:13 [警告] 站消息失败 account="zk_weixin"',
+            "2026-08-15 13:29:32 [信息] 已读取本地联调票",
+        )
+
+        warn_line, info_line = "1.0", "2.0"
+        self.assertIn("row_warn", self.table._text.tag_names(f"{warn_line}+2c"))
+        self.assertIn("bar_warn", self.table._text.tag_names(warn_line))
+        self.assertNotIn("row_warn", self.table._text.tag_names(f"{info_line}+2c"))
+        for name in self.table._text.tag_names(info_line):
+            self.assertFalse(name.startswith("bar_"), f"普通行不该有竖条：{name}")
+
+        self.assertTrue(self.table._text.tag_cget("bar_warn", "background"))
+        self.assertNotEqual(self.table._text.tag_cget("bar_warn", "background"),
+                            self.table._text.tag_cget("row_warn", "background"),
+                            "竖条要比整行底色重，否则等于没有")
+
+    def test_the_level_column_is_a_dot_plus_an_uppercase_level(self) -> None:
+        self._feed("2026-08-15 13:29:13 [警告] 站消息失败")
+
+        self.assertIn("● WARN", self._dump())
+
+    def test_the_structured_arguments_are_greyed_out_but_still_there(self) -> None:
+        """★ 一行日志里最该先读到的是那句人话；参数压灰，但一个字都不能丢。"""
+        self._feed('2026-08-15 13:29:33 [警告] AI 端连接不可用 account="zk_weixin"')
+
+        text = self._dump()
+        self.assertIn('account="zk_weixin"', text, "灰是灰，内容不许吞")
+
+        ranges = self.table._text.tag_ranges("kv")
+        self.assertTrue(ranges, "参数要单独打上 kv 标签才灰得掉")
+        self.assertEqual(self.table._text.get(*ranges[:2]), 'account="zk_weixin"')
+        self.assertEqual(self.table._text.tag_cget("kv", "foreground"), theme.TEXT_MUTED)
+
+    def test_a_line_that_does_not_parse_still_shows_up_whole(self) -> None:
+        """★ 拆不开的行（异常栈、第三方 print）不许被列渲染吃掉。"""
+        self._feed("Traceback (most recent call last):")
+
+        self.assertIn("Traceback (most recent call last):", self._dump())
+
+
+@unittest.skipUnless(HAS_TK, "没有 Tk，界面样式测不了")
+class FilterChipTests(unittest.TestCase):
+    """★ 「上面的全部/警告的选中也不对」——选中态是白底绿框绿字，不是灰底黑字。"""
+
+    def setUp(self) -> None:
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.window = MainWindow(
+            self.root, LogBuffer(), GatewayService(lambda: None),
+            data_dir=Path(tempfile.mkdtemp()), probe_wechat=False,
+        )
+        self.addCleanup(self._teardown)
+
+    def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.window)
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+    def test_the_selected_filter_is_the_only_one_wearing_a_green_border(self) -> None:
+        for name, chip in self.window._filters.items():
+            selected = name == self.window._active_filter
+            self.assertEqual(chip.cget("bg"), theme.CONTENT_BG, "没有哪档是灰底的")
+            self.assertEqual(chip.cget("fg"), theme.GREEN if selected else theme.TEXT_MUTED)
+            self.assertEqual(str(chip.cget("highlightbackground")),
+                             theme.GREEN if selected else theme.CONTENT_BG)
+
+    def test_switching_the_filter_moves_the_border_and_leaves_one_lit(self) -> None:
+        from wxclient.ui.logline import LEVEL_FILTERS
+
+        self.window._set_level_filter(*LEVEL_FILTERS[1])
+
+        lit = [name for name, chip in self.window._filters.items()
+               if str(chip.cget("highlightbackground")) == theme.GREEN]
+        self.assertEqual(lit, ["警告"], "同一时刻只有一档亮着")
+
+    def test_the_log_page_offers_clear_and_open_log(self) -> None:
+        labels = [child.cget("text") for child in self.window._header_actions.winfo_children()]
+
+        self.assertEqual(sorted(labels), sorted(["清空", "打开日志"]))
 
 
 try:
