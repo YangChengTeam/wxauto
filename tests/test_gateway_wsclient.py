@@ -402,13 +402,22 @@ class SettingsTests(unittest.TestCase):
     def test_allows_plaintext_ws_on_loopback(self) -> None:
         self._settings(ai_ws_url="ws://127.0.0.1:8137/v1/ws").validate_for_start()
 
-    def test_rejects_both_ticket_sources(self) -> None:
-        with self.assertRaises(ValueError):
-            self._settings(local_ticket_file=Path("/tmp/t.json")).validate_for_start()
+    def test_a_local_ticket_file_wins_over_the_business_endpoint(self) -> None:
+        """联调票据文件和业务端地址可以并存，用**优先级**分胜负，不是拒绝启动。
+
+        ★ business_api_url 现在有默认值、登录本身也走它，再要求「二选一」等于让每台
+        配过联调文件的机器都起不来。
+        """
+        from wxclient.gateway.factory import build_ticket_provider
+
+        settings = self._settings(local_ticket_file=Path("/tmp/t.json"))
+        settings.validate_for_start()
+        self.assertIsInstance(build_ticket_provider(settings, lambda: "tok"),
+                              LocalFileTicketProvider)
 
     def test_requires_one_ticket_source(self) -> None:
         with self.assertRaises(ValueError):
-            self._settings(business_api_url="").validate_for_start()
+            self._settings(business_api_url="", local_ticket_file=None).validate_for_start()
 
 
 if __name__ == "__main__":

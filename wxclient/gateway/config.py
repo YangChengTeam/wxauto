@@ -99,13 +99,14 @@ class GatewaySettings(BaseSettings):
         if self.ticket_timeout_seconds <= 0:
             raise ValueError("ticket_timeout_seconds 必须为正")
 
-        # 票据来源二选一，且必须有一个。业务端那条用的是**登录拿到的客户端 Token**，
-        # 这里只校验地址——Token 不进配置（它在 DPAPI 里，见 `ui/token_store.py`）。
-        has_business = bool(self.business_api_url)
-        has_local = self.local_ticket_file is not None
-        if has_business and has_local:
-            raise ValueError("business_api_url 与 local_ticket_file 不能同时配置")
-        if not has_business and not has_local:
+        # 票据来源至少要有一个。业务端那条用的是**登录拿到的客户端 Token**，这里只校验
+        # 地址——Token 不进配置（它在 DPAPI 里，见 `ui/token_store.py`）。
+        #
+        # ★ 2026-08-15：原来这里还要求两者**不能同时**配置（怕「票到底从哪来」有两个答案）。
+        # 现在 business_api_url 有默认值、而且登录本身就走它，硬碰硬只会让所有配过联调
+        # 票据文件的机器起不来。改成**明确的优先级**：联调文件在场就用它，
+        # `build_ticket_provider` 那里会喊一句「仅供联调，生产禁用」。
+        if not self.business_api_url and self.local_ticket_file is None:
             raise ValueError("必须配置 business_api_url 或 local_ticket_file 之一")
 
         if not self.allow_insecure_transport:
