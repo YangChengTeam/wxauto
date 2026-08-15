@@ -7,6 +7,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
+
+import httpx
 
 from fake_agent_ws import FakeAgentServer, TurnScript
 
@@ -15,6 +18,7 @@ from wxclient.gateway import (
     AgentWsClient,
     AgentWsError,
     GatewaySettings,
+    ClientTokenTicketProvider,
     LocalFileTicketProvider,
     TicketError,
     TurnTimeout,
@@ -289,12 +293,58 @@ class LocalTicketProviderTests(unittest.IsolatedAsyncioTestCase):
                 await provider.mint("wxid_b")
 
 
+class ClientTokenTicketTests(unittest.IsolatedAsyncioTestCase):
+    """换票改用登录拿到的客户端 Token（2026-08-15，替掉了手抄的 internal key）。"""
+
+    def _provider(self, handler: Any, token: str = "tok") -> ClientTokenTicketProvider:
+        transport = httpx.MockTransport(handler)
+        return ClientTokenTicketProvider(
+            "https://business.example", lambda: token,
+            client=httpx.AsyncClient(transport=transport),
+        )
+
+    async def test_mints_with_the_client_token(self) -> None:
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["auth"] = request.headers.get("authorization")
+            seen["path"] = request.url.path
+            return httpx.Response(200, json={"sessionTicket": "tkt-1"})
+
+        self.assertEqual(await self._provider(handler).mint("agent-1"), "tkt-1")
+        self.assertEqual(seen["auth"], "Bearer tok",
+                         "★ 用的是这台机器登录到的那把可撤销 Token，不是共享密钥")
+        self.assertEqual(seen["path"], "/recruitment-agent/client/ai-ticket")
+
+    async def test_without_a_login_it_fails_closed(self) -> None:
+        """★ 没登录就换不到票 = 一条消息都发不出去。这正是想要的：撤销会话即刻停手。"""
+        def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover - 不该被调到
+            raise AssertionError("没有 Token 就不该发请求")
+
+        with self.assertRaises(TicketError):
+            await self._provider(handler, token="").mint("agent-1")
+
+    async def test_a_revoked_session_says_so(self) -> None:
+        """401 和「网络不通」不是一回事：前者要人重新登录，后者等一会儿自己好。"""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"error": {"code": "CLIENT_SESSION_REVOKED"}})
+
+        with self.assertRaises(TicketError) as caught:
+            await self._provider(handler).mint("agent-1")
+        self.assertIn("重新登录", str(caught.exception))
+
+    async def test_snake_case_response_is_also_accepted(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"session_ticket": "tkt-2"})
+
+        self.assertEqual(await self._provider(handler).mint("agent-1"), "tkt-2")
+
+
 class SettingsTests(unittest.TestCase):
     def _settings(self, **kwargs: object) -> GatewaySettings:
         base: dict[str, object] = {
             "ai_ws_url": "wss://ai.example/v1/ws",
             "business_api_url": "https://business.example",
-            "internal_key": "k",
         }
         base.update(kwargs)
         return GatewaySettings(**base)  # type: ignore[arg-type]
@@ -314,17 +364,13 @@ class SettingsTests(unittest.TestCase):
     def test_allows_plaintext_ws_on_loopback(self) -> None:
         self._settings(ai_ws_url="ws://127.0.0.1:8137/v1/ws").validate_for_start()
 
-    def test_requires_internal_key_with_business_url(self) -> None:
-        with self.assertRaises(ValueError):
-            self._settings(internal_key="").validate_for_start()
-
     def test_rejects_both_ticket_sources(self) -> None:
         with self.assertRaises(ValueError):
             self._settings(local_ticket_file=Path("/tmp/t.json")).validate_for_start()
 
     def test_requires_one_ticket_source(self) -> None:
         with self.assertRaises(ValueError):
-            self._settings(business_api_url="", internal_key="").validate_for_start()
+            self._settings(business_api_url="").validate_for_start()
 
 
 if __name__ == "__main__":

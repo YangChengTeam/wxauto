@@ -148,9 +148,9 @@ class ConfigLookTests(unittest.TestCase):
         """
         self.assertIn("所有更改均已保存", self._labels(self.bar))
 
-        var = self.page._vars["WXCLIENT_UI_ACCOUNTS"]
+        var = self.page._vars["WXCLIENT_GATEWAY_AI_WS_URL"]
         original = str(var.get())
-        var.set("zk_weixin_改了")
+        var.set("wss://改过的/v1/ws")
         self.root.update()
         self.assertIn("有未保存的更改", self._labels(self.bar))
 
@@ -158,23 +158,29 @@ class ConfigLookTests(unittest.TestCase):
         self.root.update()
         self.assertIn("所有更改均已保存", self._labels(self.bar))
 
-    def test_the_optional_field_placeholder_never_becomes_a_value(self) -> None:
-        """★ 占位文字要是塞进变量，「业务端地址」就会被存成「用于换票，可选」这句话本身。"""
-        field = next(f for f in settings_store.FIELDS if f.key.endswith("BUSINESS_API_URL"))
+    def test_a_placeholder_never_becomes_a_value(self) -> None:
+        """★ 占位文字要是塞进变量，那一格就会被存成提示语本身。
 
-        self.assertTrue(field.placeholder)
-        self.assertEqual(str(self.page._vars[field.key].get()), "")
-        self.assertNotIn(field.placeholder, self.page._collect().values())
+        现在这一页没有带占位的字段了（登录相关的几格都撤了），所以这条守的是**机制**：
+        `attach_placeholder` 挂的是一个盖在上面的 Label，不是往变量里写字。
+        """
+        from wxclient.ui import widgets
 
-    def test_a_secret_is_still_masked_and_not_written_back_as_dots(self) -> None:
-        """★ 版式换了，这条红线不能跟着换：没动过的密钥不许被掩码覆盖掉。"""
-        key = "WXCLIENT_GATEWAY_INTERNAL_KEY"
-        settings_store.save(self.dir, {key: "real-secret"})
-        page = SettingsPage(self.root, self.dir)
-        _KEEP_ALIVE.append(page)
+        entry = tk.Entry(self.root)
+        var = tk.StringVar()
+        widgets.attach_placeholder(entry, var, "请输入邮箱")
+        self.root.update()
 
-        self.assertNotEqual(str(page._vars[key].get()), "real-secret", "界面上只显示掩码")
-        self.assertEqual(page._collect().get(key), "real-secret", "没动过就保留原值")
+        self.assertEqual(var.get(), "", "占位只是画上去的，不进值")
+
+    def test_no_credential_input_is_left_on_this_page(self) -> None:
+        """★ 2026-08-15：内部 key 那一格撤了，换票改用登录签发的可撤销 Token。
+
+        这一页再出现 secret 字段，就意味着又有一把凭证要人手抄进十台机器。
+        """
+        self.assertEqual([f.key for f in settings_store.FIELDS if f.secret], [])
+        self.assertNotIn("WXCLIENT_GATEWAY_INTERNAL_KEY",
+                         [f.key for f in settings_store.FIELDS])
 
 
 @unittest.skipUnless(HAS_TK, "没有 tkinter / 显示环境，配置中心测不了")

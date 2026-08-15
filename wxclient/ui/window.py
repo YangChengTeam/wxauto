@@ -123,6 +123,8 @@ class MainWindow:
         on_settings_saved: Callable[[bool], None] | None = None,
         log_pipeline: Any = None,
         probe_wechat: bool = True,
+        on_wechat_probe: Callable[[dict[str, Any] | None, BaseException | None], None]
+        | None = None,
     ) -> None:
         self.root = root
         self.buffer = buffer
@@ -133,6 +135,9 @@ class MainWindow:
         self._dry_run_notice = dry_run_notice
         self._unsubscribe: Any = None
         self._wechat_status = ("未检测", theme.GRAY)
+        # 探测结果除了摆在侧栏，还要上报给业务端（契约 §8）。窗口自己不发请求——
+        # 它只把「探到了什么」原样交出去，发不发、怎么去重是 status_reporter 的事。
+        self._on_wechat_probe = on_wechat_probe
         self._probe_lock = threading.Lock()
         self._shutting_down = False
         self._busy_text = ""
@@ -152,6 +157,7 @@ class MainWindow:
         self._identity: Any = None  # 当前登录的人（auth.Identity）
         self._logout_provider: Any = None  # 退出登录之后拿什么再登一次
         self._logout_callback: Any = None
+        self._logout_action: Any = None  # 退出登录时向服务端撤销会话
         self._version = ""
 
         root.title(WINDOW_TITLE)
@@ -702,6 +708,11 @@ class MainWindow:
         """
         if self._login is not None or self._logout_provider is None:
             return
+        # 撤销服务端那边的会话（契约 §6）。**丢到后台线程**：它是一次网络调用，
+        # 在 tk 线程上等就是「点了退出登录，窗口白一片」。
+        if self._logout_action is not None:
+            threading.Thread(target=self._logout_action, name="wx-ui-logout",
+                             daemon=True).start()
         self._identity = None
         self._render_identity()
         if self.service.state in {ServiceState.RUNNING, ServiceState.STARTING}:
@@ -711,10 +722,13 @@ class MainWindow:
                            on_authenticated=self._logout_callback)
 
     def set_login_context(self, provider: Any, *, version: str = "",
-                          on_authenticated: Callable[[Any], None] | None = None) -> None:
-        """记下「退出登录之后拿什么再登一次」。require_login 之前调。"""
+                          on_authenticated: Callable[[Any], None] | None = None,
+                          on_logout: Callable[[], None] | None = None) -> None:
+        """记下「退出登录之后拿什么再登一次」，以及退出时要向服务端做什么。
+        require_login 之前调。"""
         self._logout_provider = provider
         self._logout_callback = on_authenticated
+        self._logout_action = on_logout
         self._version = version
 
     @property
@@ -1016,6 +1030,7 @@ class MainWindow:
                 from wxclient.uia_probe import probe_wechat_uia
 
             probe = probe_wechat_uia()
+            self._report_probe(probe, None)
             if probe.get("logged_in"):
                 status = ("已登录", theme.GREEN)
             elif probe.get("login_window"):
@@ -1024,9 +1039,20 @@ class MainWindow:
                 status = (str(probe.get("reason") or "未登录")[:12], theme.GRAY)
         except Exception as exc:  # noqa: BLE001 - 探测失败只影响这一格显示
             status = (f"探测失败：{type(exc).__name__}"[:16], theme.GRAY)
+            self._report_probe(None, exc)
         finally:
             self._probe_lock.release()
         self._wechat_status = status
+
+    def _report_probe(self, probe: dict[str, Any] | None, error: BaseException | None) -> None:
+        """把探测结果交给上报层。**它自己出错不能影响探测线程**——上报失败最多是企业端
+        那一格显示旧值，探测线程死了才是这一格永远不再更新。"""
+        if self._on_wechat_probe is None:
+            return
+        try:
+            self._on_wechat_probe(probe, error)
+        except Exception as exc:  # noqa: BLE001
+            _log.debug("上报微信状态失败", error=str(exc)[:120])
 
     # ── 日志 ──────────────────────────────────────────────────────
 

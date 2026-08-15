@@ -832,10 +832,18 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(values["WXCLIENT_UI_ACCOUNTS"], "文件里的")  # 文件有值就以文件为准
         self.assertEqual(values["WXCLIENT_GATEWAY_AI_WS_URL"], "wss://env/v1/ws")
 
-    def test_secret_field_is_declared_as_secret(self) -> None:
-        # 内部 key 一旦当成普通字段就会明文显示在界面上
-        internal_key = next(f for f in settings_store.FIELDS if f.key.endswith("INTERNAL_KEY"))
-        self.assertTrue(internal_key.secret)
+    def test_no_credential_is_kept_in_the_settings_file(self) -> None:
+        """★ 2026-08-15 起这份 env 文件里**一个凭证都没有**。
+
+        原来有一把手抄的 internal key。现在换票用的是登录签发的客户端 Token，它加密存在
+        `client-session.json`（DPAPI）。再往 FIELDS 里加一个 secret 字段，就是把凭证又
+        请回了明文文件——先想清楚它为什么不能走登录接口。
+        """
+        secrets = [field.key for field in settings_store.FIELDS if field.secret]
+
+        self.assertEqual(secrets, [], "配置中心不该再有任何密钥输入框")
+        self.assertNotIn("WXCLIENT_GATEWAY_INTERNAL_KEY",
+                         [field.key for field in settings_store.FIELDS])
 
 
 class LogLineTests(unittest.TestCase):

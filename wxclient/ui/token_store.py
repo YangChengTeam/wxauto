@@ -1,0 +1,174 @@
+"""客户端 Token 的存放处。
+
+契约 §2.2 的原话：Token **不设自动过期**，但必须能随时撤销；客户端必须用 Windows
+Credential Manager 或 DPAPI 保存，**禁止写入明文配置文件和日志**。
+
+一个不过期的凭证躺在磁盘上，明文和加密的差别不是「更安全一点」，而是「拿到这个文件
+就等于拿到这个 HR 的招聘分身」和「拿不到」。所以这里的规矩是硬的：
+
+* Windows → DPAPI（`CryptProtectData`，按**当前用户**加密，换个 Windows 账号解不开）。
+* 非 Windows（开发机、CI）→ **一个字节都不落盘**，只留在内存里。宁可每次重开都要重新
+  登录，也不在 Linux 上留一份明文 Token 当「反正只是开发环境」。
+
+密文之外还要记住几样不算凭证的东西（sessionId、agentId、显示名），它们决定了「重开
+之后还认不认得这台机器上是谁」，明文存在同一个 JSON 里没有问题。
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+FILE_NAME = "client-session.json"
+
+#: DPAPI 的附加熵。换个应用即使跑在同一个 Windows 账号下，也解不开这份密文。
+_ENTROPY = b"laoxiaozhi.recruitment-agent.client-token.v1"
+
+
+@dataclass(frozen=True)
+class StoredSession:
+    """磁盘上那份会话。``token`` 是唯一的凭证，其余只是「上次是谁」。"""
+
+    token: str = ""
+    session_id: str = ""
+    email: str = ""
+    user_name: str = ""
+    agent_id: str = ""
+    agent_name: str = ""
+    tenant_name: str = ""
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.token and self.agent_id)
+
+
+class Protector:
+    """加解密后端。有两种实现，选哪种只看这台机器是不是 Windows。"""
+
+    available = False
+    name = "none"
+
+    def protect(self, plain: str) -> str:  # pragma: no cover - 由子类实现
+        raise NotImplementedError
+
+    def unprotect(self, blob: str) -> str:  # pragma: no cover - 由子类实现
+        raise NotImplementedError
+
+
+class DpapiProtector(Protector):
+    """Windows DPAPI。按当前用户加密，密文离开这个账号就是一串废字节。"""
+
+    available = True
+    name = "dpapi"
+
+    def protect(self, plain: str) -> str:
+        from ctypes import windll  # 只在 Windows 上 import，别污染别的平台
+
+        blob = _dpapi_call(windll.crypt32.CryptProtectData, plain.encode("utf-8"))
+        return base64.b64encode(blob).decode("ascii")
+
+    def unprotect(self, blob: str) -> str:
+        from ctypes import windll
+
+        raw = base64.b64decode(blob.encode("ascii"))
+        return _dpapi_call(windll.crypt32.CryptUnprotectData, raw).decode("utf-8")
+
+
+class RefusingProtector(Protector):
+    """非 Windows：不加密，也就**不落盘**。Token 只在内存里活到进程结束。"""
+
+    available = False
+    name = "memory"
+
+
+def default_protector() -> Protector:
+    return DpapiProtector() if sys.platform == "win32" else RefusingProtector()
+
+
+class TokenStore:
+    """读写这台机器上的客户端会话。线程安全性由调用方保证（只在 UI 线程用）。"""
+
+    def __init__(self, data_dir: Path, protector: Protector | None = None) -> None:
+        self.path = Path(data_dir) / FILE_NAME
+        self._protector = protector or default_protector()
+        self._memory: StoredSession | None = None
+
+    @property
+    def persistent(self) -> bool:
+        """这台机器上的 Token 能不能活过重启。Linux 上是 False，界面据此说实话。"""
+        return self._protector.available
+
+    def load(self) -> StoredSession | None:
+        if self._memory is not None:
+            return self._memory
+        if not self._protector.available or not self.path.exists():
+            return None
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
+            token = self._protector.unprotect(str(raw.get("token_protected") or ""))
+        except Exception:  # noqa: BLE001 - 文件坏了/换了 Windows 账号：当成没登录过
+            return None
+        session = StoredSession(
+            token=token,
+            session_id=str(raw.get("session_id") or ""),
+            email=str(raw.get("email") or ""),
+            user_name=str(raw.get("user_name") or ""),
+            agent_id=str(raw.get("agent_id") or ""),
+            agent_name=str(raw.get("agent_name") or ""),
+            tenant_name=str(raw.get("tenant_name") or ""),
+        )
+        self._memory = session
+        return session if session.usable else None
+
+    def save(self, session: StoredSession) -> None:
+        self._memory = session
+        if not self._protector.available:
+            return  # 加密不了就不写——磁盘上永远不该出现明文 Token
+        data = {k: v for k, v in asdict(session).items() if k not in {"token", "extra"}}
+        data["token_protected"] = self._protector.protect(session.token)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
+        try:
+            self.path.chmod(0o600)  # Windows 上是空操作，别的平台有意义
+        except OSError:
+            pass
+
+    def clear(self) -> None:
+        """退出登录 / 会话被撤销。**先删文件再清内存**，中途出错也不会留下一份还能用的。"""
+        self._memory = None
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _dpapi_call(func: Any, payload: bytes) -> bytes:
+    """调一次 DPAPI。两个方向的入参出参形状一模一样，所以共用这一段。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class _Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    def _blob(data: bytes) -> _Blob:
+        buffer = ctypes.create_string_buffer(data, len(data))
+        return _Blob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+
+    source = _blob(payload)
+    entropy = _blob(_ENTROPY)
+    result = _Blob()
+    ok = func(ctypes.byref(source), None, ctypes.byref(entropy), None, None, 0,
+              ctypes.byref(result))
+    if not ok:
+        raise OSError(ctypes.GetLastError(), "DPAPI 调用失败")
+    try:
+        return ctypes.string_at(result.pbData, result.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(result.pbData)

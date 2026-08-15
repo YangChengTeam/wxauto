@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from .guard import OutboundGuard, action_limits_from
 from .pacing import MIN_FRIEND_INTERVAL_SECONDS, clamp_interval
 from .runner import GatewayRunner
 from .sessions import GatewayStore
-from .ticket import BusinessTicketProvider, LocalFileTicketProvider, TicketProvider
+from .ticket import ClientTokenTicketProvider, LocalFileTicketProvider, TicketProvider
 from .watchlist import Watchlist, WatchScope
 from .wechat_io import QueueMessageSink, QueueMessageSource
 
@@ -43,13 +44,15 @@ class Gateway:
     allow_real_actions: bool
 
 
-def build_ticket_provider(settings: GatewaySettings) -> TicketProvider:
+def build_ticket_provider(
+    settings: GatewaySettings, client_token: Callable[[], str] | None = None
+) -> TicketProvider:
     if settings.local_ticket_file is not None:
         _log.warning("使用本地票据文件（仅供联调，生产禁用）")
         return LocalFileTicketProvider(settings.local_ticket_file)
-    return BusinessTicketProvider(
+    return ClientTokenTicketProvider(
         settings.business_api_url,
-        settings.internal_key.get_secret_value(),
+        client_token or (lambda: ""),
         timeout_seconds=settings.ticket_timeout_seconds,
     )
 
@@ -74,6 +77,7 @@ def build_gateway(
     allow_real_actions: bool = False,
     config_path: str | Path | None = None,
     gateway_db: str | Path | None = None,
+    client_token: Callable[[], str] | None = None,
 ) -> Gateway:
     """装配一套可运行的网关。配置不合法直接抛 ``ValueError``，绝不带着半套配置启动。"""
     resolved_accounts = normalize_accounts(accounts)
@@ -116,7 +120,7 @@ def build_gateway(
             friend_interval, MIN_FRIEND_INTERVAL_SECONDS, what="加好友检查间隔"
         )
 
-    ticket_provider = build_ticket_provider(gateway_settings)
+    ticket_provider = build_ticket_provider(gateway_settings, client_token)
 
     file_fetcher = FileFetcher()
 

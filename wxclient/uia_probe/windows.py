@@ -75,6 +75,34 @@ def process_info(process_id: Any) -> dict[str, str]:
         return {}
 
 
+#: exe 路径 → 文件版本号。版本号一个进程里问一次就够，别每 15 秒的探测都去读一遍文件。
+_VERSION_CACHE: dict[str, str] = {}
+
+
+def file_version(path: Any) -> str:
+    """读微信 exe 的文件版本（如 ``4.0.1.15``）。
+
+    上报给业务端做兼容性判断用（客户端状态接口契约 §8 的 ``processVersion``）。
+    读不到就给空串——这个字段是可选的，编一个版本号出来只会让兼容性判断更糟。
+    """
+    if not isinstance(path, str) or not path:
+        return ""
+    if path in _VERSION_CACHE:
+        return _VERSION_CACHE[path]
+    version = ""
+    try:
+        import win32api
+
+        info = win32api.GetFileVersionInfo(path, "\\")
+        most, least = info["FileVersionMS"], info["FileVersionLS"]
+        version = ".".join(str(part) for part in (
+            most >> 16, most & 0xFFFF, least >> 16, least & 0xFFFF))
+    except Exception:
+        version = ""
+    _VERSION_CACHE[path] = version
+    return version
+
+
 def _find_wechat_window_candidates() -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     seen_handles: set[int] = set()
@@ -99,6 +127,7 @@ def _find_wechat_window_candidates() -> list[dict[str, Any]]:
                 "process_id": process_id,
                 "process_name": process_name,
                 "process_path": info.get("path"),
+                "process_version": file_version(info.get("path")),
                 "class_name": class_name,
                 "uia_class_name": uia_class_name,
                 "uia_descendant_count": uia_descendant_count,

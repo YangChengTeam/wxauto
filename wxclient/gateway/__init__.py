@@ -37,7 +37,7 @@ from .pacing import clamp_interval, jittered
 from .runner import ConnectionPool, GatewayRunner
 from .sessions import GatewayStore
 from .ticket import (
-    BusinessTicketProvider,
+    ClientTokenTicketProvider,
     LocalFileTicketProvider,
     TicketError,
     TicketProvider,
@@ -69,7 +69,7 @@ __all__ = [
     "RESULT_OP",
     "AgentWsClient",
     "AgentWsError",
-    "BusinessTicketProvider",
+    "ClientTokenTicketProvider",
     "CommandError",
     "CommandExecutor",
     "CommandResult",

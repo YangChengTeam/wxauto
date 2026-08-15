@@ -3,9 +3,9 @@
 保存只落文件、不热改运行中的服务——参数的生效点就是服务启动那一刻，含糊不得。
 所以给了「保存并重启服务」，让「改完到底生效没有」这件事不留悬念。
 
-★ 两处真相要对得上（用户 2026-08-15 裁决：「本地可以改 后端可下发」）：登录之后后端会
-下发一份参数（``auth.py``），本机在这一页填的**盖过**它。两边都有值又不一样时，行尾会
-标出「本机已改（后端：xxx）」——不标的话，「我在后端管理页改了怎么不生效」会变成悬案。
+★ 只有这一份真相（2026-08-15）：正式的客户端接口**不下发配置**（见
+`docs/招聘分身_客户端认证与状态接口_v1.md` 的接口清单），所以原来那层「后端下发 +
+本机覆盖」连同标注一起删了——两份配置就会有两个答案，而人只会相信自己看见的那个。
 
 版式（设计稿）：参数按「连接 / 调度 / 启动」分三段，每段一个标题 + 一句说明 + 一条横线；
 每行是「右对齐标签 + 输入框 + 灰字说明」；底部一条固定的动作条（保存状态 + 仅保存 +
@@ -40,7 +40,6 @@ class SettingsPage(tk.Frame):
         self.data_dir = Path(data_dir)
         self.on_saved = on_saved
         self._values = settings_store.effective(self.data_dir)
-        self._overridden = settings_store.overridden(self.data_dir)
         self._vars: dict[str, tk.Variable] = {}
         self._secret_touched: dict[str, bool] = {}
         self._marks: dict[str, tk.Label] = {}
@@ -55,7 +54,6 @@ class SettingsPage(tk.Frame):
         # 「保存到：…」那行就够了。
         for section in SECTIONS:
             self._build_section(section)
-        self._render_marks()
 
         tk.Label(
             self,
@@ -124,12 +122,7 @@ class SettingsPage(tk.Frame):
         var.trace_add("write", lambda *_: self._render_dirty())
 
     def _field_box(self, cell: tk.Frame, field: Field, var: tk.Variable) -> tk.Entry:
-        """一格输入框。边框画在外层 Frame 上，聚焦变绿；单位/眼睛/选文件都贴在它右边。"""
-        if field.kind == "file":
-            # 「选择文件」先 pack，才不会被 expand 的输入框挤没（登录页那个眼睛踩过这个坑）
-            widgets.ghost_button(cell, "选择文件", lambda: self._pick_file(field)).pack(
-                side=tk.RIGHT, padx=(10, 0))
-
+        """一格输入框。边框画在外层 Frame 上，聚焦变绿；单位和眼睛贴在它右边。"""
         box = tk.Frame(cell, bg=theme.FIELD_BG, highlightthickness=1,
                        highlightbackground=theme.FIELD_LINE, highlightcolor=theme.FIELD_LINE)
         box.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -190,19 +183,6 @@ class SettingsPage(tk.Frame):
 
     # ── 状态 ─────────────────────────────────────────────────────
 
-    def _render_marks(self) -> None:
-        """在被本机盖掉的那几行标出后端的原值。**只标不同的**，一样的没什么好说。"""
-        for field in FIELDS:
-            mark = self._marks.get(field.key)
-            if mark is None:
-                continue
-            remote = self._overridden.get(field.key)
-            if remote is None:
-                mark.configure(text=field.help, fg=theme.TEXT_MUTED)
-            else:
-                shown = _MASK if field.secret else remote
-                mark.configure(text=f"本机已改（后端：{shown}）", fg=theme.ORANGE)
-
     def _render_dirty(self) -> None:
         """底下那行「所有更改均已保存 / 有未保存的更改」。
 
@@ -242,8 +222,6 @@ class SettingsPage(tk.Frame):
         打开时的快照——别人手工改过 settings 文件、或者刚保存过一轮，界面就和现实对不上。
         """
         self._values = settings_store.effective(self.data_dir)
-        self._overridden = settings_store.overridden(self.data_dir)
-        self._render_marks()
         for field in FIELDS:
             var = self._vars.get(field.key)
             if var is None:
@@ -263,16 +241,6 @@ class SettingsPage(tk.Frame):
         self._secret_touched[key] = True
 
     # ── 动作 ─────────────────────────────────────────────────────
-
-    def _pick_file(self, field: Field) -> None:
-        from tkinter import filedialog
-
-        chosen = filedialog.askopenfilename(
-            parent=self, title=f"选择{field.label}",
-            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
-        )
-        if chosen:
-            self._vars[field.key].set(chosen)
 
     def _test_connection(self) -> None:
         """测一下地址通不通。点了就立刻有反馈，别让人对着一个没反应的按钮猜。"""
@@ -350,24 +318,6 @@ class SettingsPage(tk.Frame):
             if field.secret and not self._secret_touched.get(field.key, False):
                 continue  # 没动过就保留原值，别把掩码写回去
             values[field.key] = str(var.get()).strip()
-        return self._drop_same_as_remote(values)
-
-    def _drop_same_as_remote(self, values: dict[str, str]) -> dict[str, str]:
-        """和后端下发的一模一样的键，**不在本机留一份**。
-
-        ★ 不这么做的话，这一页只要保存过一次，十几个键就全部变成「本机覆盖」——从此后端
-        再下发什么都不生效，而界面上看不出任何异常（值确实是对的，只是冻在了保存那一刻）。
-        本机文件里只该躺着「这台机器上的人真的改过的那几个」。
-        """
-        remote = settings_store.load_remote(self.data_dir)
-        kinds = {field.key: field.kind for field in FIELDS}
-        for key, value in list(values.items()):
-            if key not in remote:
-                continue
-            same = (settings_store.as_bool(value) == settings_store.as_bool(remote[key])
-                    if kinds.get(key) == "bool" else value == remote[key])
-            if same:
-                values.pop(key)
         return values
 
     def _save(self, *, restart: bool) -> None:
@@ -378,8 +328,6 @@ class SettingsPage(tk.Frame):
             messagebox.showerror("保存失败", f"写入 {settings_store.FILE_NAME} 失败：{exc}", parent=self)
             return
         self._values = settings_store.effective(self.data_dir)
-        self._overridden = settings_store.overridden(self.data_dir)
-        self._render_marks()
         self._render_dirty()
         if self.on_saved is not None:
             self.on_saved(restart)

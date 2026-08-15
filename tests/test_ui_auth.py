@@ -1,213 +1,465 @@
-"""登录与「登录后取配置」的测试（不含 GUI，到处都能跑）。
+"""客户端登录与状态上报（不含 GUI，到处都能跑）。
 
-这一层管三件事，每件都能把人挡在门外或者放错人进来，所以全都要测：
-① 本机账号——密码不存明文、错密码进不来、首次运行认得出来；
-② 后端 provider——契约字段解析、坏数据不崩、错误翻成人话；
-③ 两份配置的合并——后端下发打底、本机改的盖在上面，谁也别把谁吃掉。
+对的是 `docs/招聘分身_客户端认证与状态接口_v1.md`。这一层管的每件事都能「把人挡在门外」
+或者「放错人进来」，所以全都要测：
+
+① 登录请求的形状——字段名、`clientType`、邮箱大小写、`replaceExistingSession`；
+② 错误码翻译——尤其「不区分邮箱不存在和密码错误」这条硬要求；
+③ Token 的存法——非 Windows 一个字节都不落盘；
+④ 会话被撤销（401）能不能被认出来并清干净；
+⑤ 状态上报的两条规矩：相同状态不重复报、上报失败不能把状态「吞掉」。
 """
 
 from __future__ import annotations
 
 import json
+import sys
+import time
 import tempfile
 import unittest
+import urllib.error
+from io import BytesIO
 from pathlib import Path
+from typing import Any
 
-from wxclient.ui import auth, settings_store
+from wxclient.ui import auth, client_api, device, token_store, uia_status
+from wxclient.ui.client_api import ApiError, ClientApi
+from wxclient.ui.status_reporter import StatusReporter
+from wxclient.ui.token_store import Protector, StoredSession, TokenStore
+
+LOGIN_OK = {
+    "accessToken": "lxz_rc_token",
+    "tokenType": "Bearer",
+    "expiresIn": None,
+    "expiresAt": None,
+    "sessionId": "sess-1",
+    "scope": ["recruitment_agent:client"],
+    "clientType": "recruitment_agent_windows",
+    "user": {"id": "u-1", "name": "陈敏", "email": "hr@example.com"},
+    "agent": {"id": "agent-1", "name": "陈敏的招聘分身"},
+    "activationStatus": {"stage": "waiting_wechat_uia_connection", "enabled": False},
+}
 
 
-class LocalAccountTests(unittest.TestCase):
+class FakeApi:
+    """记下每次调用的假 API。只实现被用到的那几个方法。"""
+
+    def __init__(self, *, login_result: Any = None, error: Exception | None = None) -> None:
+        self.base_url = "https://business.test"
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._login_result = login_result if login_result is not None else dict(LOGIN_OK)
+        self._error = error
+
+    def login(self, email: str, password: str, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("login", {"email": email, "password": password, **kwargs}))
+        if self._error is not None:
+            raise self._error
+        return self._login_result
+
+    def logout(self, token: str) -> dict[str, Any]:
+        self.calls.append(("logout", {"token": token}))
+        return {"success": True}
+
+    def put_client_status(self, token: str, status: str, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("client_status", {"token": token, "status": status, **kwargs}))
+        if self._error is not None:
+            raise self._error
+        return {"accepted": True}
+
+    def put_wechat_uia_status(self, token: str, status: str, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("wechat_status", {"token": token, "status": status, **kwargs}))
+        if self._error is not None:
+            raise self._error
+        return {"accepted": True}
+
+
+class MemoryProtector(Protector):
+    """测试用：假装加密（倒序），好验证「写出去的不是明文」这件事本身。"""
+
+    available = True
+    name = "test"
+
+    def protect(self, plain: str) -> str:
+        return plain[::-1]
+
+    def unprotect(self, blob: str) -> str:
+        return blob[::-1]
+
+
+def http_error(status: int, code: str, message: str = "x",
+               details: dict[str, Any] | None = None) -> urllib.error.HTTPError:
+    body = json.dumps({"error": {"code": code, "message": message,
+                                 "details": details or {}}}).encode("utf-8")
+    return urllib.error.HTTPError("https://business.test/x", status, message, {},  # type: ignore[arg-type]
+                                  BytesIO(body))
+
+
+class LoginRequestTests(unittest.TestCase):
+    """请求体的形状（契约 §5.1）。字段名错一个，后端就只会回 400。"""
+
+    def setUp(self) -> None:
+        self.sent: dict[str, Any] = {}
+        self.api = ClientApi("https://business.test")
+        self.api._request = self._capture  # type: ignore[method-assign]
+
+    def _capture(self, method: str, path: str, *, payload: Any = None,
+                 token: str = "") -> dict[str, Any]:
+        self.sent = {"method": method, "path": path, "payload": payload, "token": token}
+        return dict(LOGIN_OK)
+
+    def test_the_login_body_matches_the_contract(self) -> None:
+        self.api.login("  HR@Example.COM ", "pw", device_id="dev-1",
+                       device_name="陈敏的办公电脑", client_version="1.0.0",
+                       os_version="Windows 11")
+
+        self.assertEqual(self.sent["method"], "POST")
+        self.assertEqual(self.sent["path"], "/recruitment-agent/client/auth/login")
+        payload = self.sent["payload"]
+        self.assertEqual(payload["email"], "hr@example.com", "★ 去空格 + 转小写后再匹配账号")
+        self.assertEqual(payload["clientType"], "recruitment_agent_windows")
+        self.assertEqual(payload["deviceId"], "dev-1")
+        self.assertEqual(payload["clientVersion"], "1.0.0")
+        self.assertIs(payload["replaceExistingSession"], False, "默认不顶掉别人的设备")
+
+    def test_replacing_another_device_is_explicit(self) -> None:
+        self.api.login("hr@example.com", "pw", device_id="d", device_name="n",
+                       client_version="1.0.0", replace_existing=True)
+
+        self.assertIs(self.sent["payload"]["replaceExistingSession"], True)
+
+    def test_status_reports_carry_an_idempotency_key(self) -> None:
+        """★ eventId 是幂等键（契约 §7）：断线重发同一条，服务端不该记两遍。"""
+        self.api.put_client_status("tok", "offline", client_version="1.0.0",
+                                   reason="client_shutdown")
+
+        payload = self.sent["payload"]
+        self.assertEqual(self.sent["method"], "PUT")
+        self.assertTrue(payload["eventId"])
+        self.assertTrue(payload["occurredAt"].endswith("Z"), "时间是 UTC ISO-8601")
+        self.assertEqual(self.sent["token"], "tok")
+
+
+class ErrorTranslationTests(unittest.TestCase):
+    def test_wrong_password_and_unknown_email_say_the_same_thing(self) -> None:
+        """★ 契约 §3.4 硬要求：两者说同一句话。分开说，这个接口就成了「查这个邮箱在不在册」。"""
+        message = client_api.MESSAGES["INVALID_CREDENTIALS"]
+
+        self.assertEqual(message, "邮箱或密码错误")
+        self.assertNotIn("不存在", message)
+
+    def test_a_revoked_session_is_recognisable(self) -> None:
+        error = client_api._from_http_error(http_error(401, "CLIENT_SESSION_REVOKED"))
+
+        self.assertTrue(error.revoked, "认不出来就回不到登录页，等于一把撤不掉的钥匙")
+        self.assertEqual(str(error), "客户端登录已失效，请重新登录")
+
+    def test_another_device_conflict_keeps_the_details(self) -> None:
+        error = client_api._from_http_error(http_error(
+            409, "ACTIVE_CLIENT_SESSION_EXISTS", details={"deviceName": "办公电脑",
+                                                          "canReplace": True}))
+
+        self.assertTrue(error.session_exists)
+        self.assertEqual(error.details["deviceName"], "办公电脑",
+                         "要把「是哪台机器」摆给人看，才谈得上让他决定顶不顶")
+
+    def test_an_unknown_code_still_says_something_usable(self) -> None:
+        """认不出来的错也得给人一句话——先用服务端那句，实在没有才退回状态码。"""
+        self.assertEqual(str(client_api._from_http_error(http_error(500, "", "服务器开小差"))),
+                         "服务器开小差")
+
+        blank = urllib.error.HTTPError("https://business.test/x", 503, "", {},  # type: ignore[arg-type]
+                                       BytesIO(b""))
+        self.assertIn("503", str(client_api._from_http_error(blank)))
+
+
+class TokenStorageTests(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp())
-        self.provider = auth.LocalAccountProvider(self.dir)
 
-    def test_a_fresh_machine_asks_you_to_set_an_account(self) -> None:
-        self.assertTrue(self.provider.needs_setup())
+    def test_a_machine_without_dpapi_writes_nothing_to_disk(self) -> None:
+        """★ 契约 §2.2：Token 不设过期时间，落一份明文在磁盘上等于把分身送人。
 
-        self.provider.create("zhangsan", "hunter2")
+        非 Windows（开发机 / CI）没有 DPAPI，那就**一个字节都不写**——宁可重开要重登。
+        """
+        store = TokenStore(self.dir)  # 默认 protector：Linux 上是 RefusingProtector
+        store.save(StoredSession(token="secret-token", agent_id="agent-1"))
 
-        self.assertFalse(self.provider.needs_setup(), "设过之后就不该再问")
+        if sys.platform != "win32":
+            self.assertFalse(store.path.exists(), "非 Windows 上不该留下任何文件")
+            self.assertFalse(store.persistent)
+            self.assertEqual(TokenStore(self.dir).load(), None, "换个进程就什么都没有")
 
-    def test_the_password_is_never_stored_in_the_clear(self) -> None:
-        """★ 本机账号文件是明摆在磁盘上的，存明文等于没有密码。"""
-        self.provider.create("zhangsan", "hunter2")
+    def test_the_token_is_never_written_in_the_clear(self) -> None:
+        store = TokenStore(self.dir, MemoryProtector())
+        store.save(StoredSession(token="secret-token", agent_id="agent-1", email="hr@x.com"))
 
-        raw = auth.account_path(self.dir).read_text(encoding="utf-8")
+        raw = store.path.read_text(encoding="utf-8")
 
-        self.assertNotIn("hunter2", raw)
-        record = json.loads(raw)
-        self.assertTrue(record["salt"], "要有盐——否则同样的密码在每台机器上哈希都一样")
-        self.assertNotEqual(record["password"], record["salt"])
+        self.assertNotIn("secret-token", raw)
+        self.assertIn("agent-1", raw, "不是凭证的那些照常明文，重开时要靠它认人")
 
-    def test_the_right_password_gets_in_and_the_wrong_one_does_not(self) -> None:
-        self.provider.create("zhangsan", "hunter2")
+    def test_a_saved_session_comes_back_and_clears_completely(self) -> None:
+        TokenStore(self.dir, MemoryProtector()).save(
+            StoredSession(token="tok", agent_id="agent-1", user_name="陈敏"))
 
-        identity = self.provider.login("zhangsan", "hunter2")
-        self.assertEqual(identity.account, "zhangsan")
+        restored = TokenStore(self.dir, MemoryProtector()).load()
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        self.assertEqual(restored.token, "tok")
+        self.assertEqual(restored.user_name, "陈敏")
+
+        store = TokenStore(self.dir, MemoryProtector())
+        store.clear()
+        self.assertFalse(store.path.exists())
+        self.assertIsNone(TokenStore(self.dir, MemoryProtector()).load())
+
+    def test_a_corrupt_file_is_treated_as_not_logged_in(self) -> None:
+        """★ 换了 Windows 账号就解不开这份密文。那时要退回登录页，不是崩在启动路上。"""
+        (self.dir / token_store.FILE_NAME).write_text("{ 坏掉的", encoding="utf-8")
+
+        self.assertIsNone(TokenStore(self.dir, MemoryProtector()).load())
+
+    @unittest.skipUnless(sys.platform == "win32", "DPAPI 只有 Windows 上有")
+    def test_dpapi_round_trip_on_the_real_machine(self) -> None:
+        store = TokenStore(self.dir)
+        store.save(StoredSession(token="lxz_rc_real", agent_id="agent-1"))
+
+        raw = store.path.read_text(encoding="utf-8")
+        self.assertNotIn("lxz_rc_real", raw)
+        restored = TokenStore(self.dir).load()
+        assert restored is not None
+        self.assertEqual(restored.token, "lxz_rc_real")
+
+
+class DeviceIdentityTests(unittest.TestCase):
+    def test_the_device_id_is_random_and_stable(self) -> None:
+        """★ 契约 §5.1：20–128 位 URL-safe 随机串，**不许**用 MAC / 硬盘序列号。"""
+        data_dir = Path(tempfile.mkdtemp())
+
+        first = device.load(data_dir)
+        second = device.load(data_dir)
+
+        self.assertEqual(first.device_id, second.device_id, "同一台机器每次都是同一个")
+        self.assertTrue(20 <= len(first.device_id) <= 128)
+        self.assertTrue(first.device_name)
+        other = device.load(Path(tempfile.mkdtemp()))
+        self.assertNotEqual(first.device_id, other.device_id, "不同机器不能撞")
+
+
+class ClientAuthTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.api = FakeApi()
+        self.store = TokenStore(self.dir, MemoryProtector())
+        self.auth = auth.ClientAuth("https://business.test", self.dir,
+                                    client_version="1.0.0", api=self.api, store=self.store)
+
+    def test_a_successful_login_is_remembered_for_next_time(self) -> None:
+        identity = self.auth.login("hr@example.com", "pw")
+
+        self.assertEqual(identity.agent_id, "agent-1")
+        self.assertEqual(identity.account, "agent-1",
+                         "★ 网关用它记账——不再手抄微信号")
+        self.assertEqual(identity.title, "陈敏")
+
+        again = auth.ClientAuth("https://business.test", self.dir, api=FakeApi(),
+                                store=TokenStore(self.dir, MemoryProtector())).restore()
+        assert again is not None
+        self.assertEqual(again.token, "lxz_rc_token", "重开客户端不该让人再登一次")
+
+    def test_a_login_without_an_agent_is_refused(self) -> None:
+        """★ 没有分身就没有「用谁的身份记账」，让它进去只会记出一堆无主数据。"""
+        payload = dict(LOGIN_OK)
+        payload["agent"] = {}
+        self.auth.api = FakeApi(login_result=payload)  # type: ignore[assignment]
 
         with self.assertRaises(auth.AuthError):
-            self.provider.login("zhangsan", "hunter3")
-        with self.assertRaises(auth.AuthError):
-            self.provider.login("lisi", "hunter2")
+            self.auth.login("hr@example.com", "pw")
 
-    def test_setting_an_account_twice_is_refused(self) -> None:
-        """★ 否则谁先摸到这台机器谁就能把别人的账号顶掉。"""
-        self.provider.create("zhangsan", "hunter2")
+    def test_another_device_conflict_is_handed_back_for_a_human_to_decide(self) -> None:
+        self.auth.api = FakeApi(error=ApiError(  # type: ignore[assignment]
+            "这个招聘分身已在另一台电脑登录", code="ACTIVE_CLIENT_SESSION_EXISTS",
+            status=409, details={"deviceName": "办公电脑"}))
 
-        with self.assertRaises(auth.AuthError):
-            self.provider.create("lisi", "hunter2")
+        with self.assertRaises(auth.AuthError) as caught:
+            self.auth.login("hr@example.com", "pw")
 
-    def test_a_too_short_password_is_refused_up_front(self) -> None:
-        with self.assertRaises(auth.AuthError):
-            self.provider.create("zhangsan", "123")
+        self.assertTrue(caught.exception.needs_replace_confirm,
+                        "★ 顶掉的是同事正在用的机器，客户端不能自己决定")
+        self.assertEqual(caught.exception.details["deviceName"], "办公电脑")
 
-    def test_remembering_only_ever_stores_the_account_name(self) -> None:
-        auth.remember_account(self.dir, "zhangsan")
+    def test_logging_out_tells_the_server_first_then_forgets_locally(self) -> None:
+        self.auth.login("hr@example.com", "pw")
+
+        self.auth.logout()
+
+        self.assertIn("logout", [name for name, _ in self.api.calls],
+                      "★ 只清本机不告诉服务端，企业端会一直显示这台机器在线")
+        self.assertIsNone(self.auth.identity)
+        self.assertIsNone(TokenStore(self.dir, MemoryProtector()).load())
+
+    def test_a_revoked_session_clears_the_token_and_calls_back(self) -> None:
+        self.auth.login("hr@example.com", "pw")
+        seen: list[str] = []
+        self.auth.set_revoked_hook(lambda: seen.append("回登录页"))
+
+        self.auth.handle_revoked()
+
+        self.assertEqual(seen, ["回登录页"])
+        self.assertEqual(self.auth.token, "")
+        self.assertIsNone(TokenStore(self.dir, MemoryProtector()).load())
+
+    def test_remembering_only_ever_stores_the_email(self) -> None:
+        auth.remember_account(self.dir, "hr@example.com")
 
         raw = (self.dir / auth.UI_STATE_FILE).read_text(encoding="utf-8")
 
-        self.assertIn("zhangsan", raw)
-        self.assertEqual(auth.last_account(self.dir), "zhangsan")
-        auth.forget_account(self.dir)
-        self.assertEqual(auth.last_account(self.dir), "")
-
-    def test_a_corrupt_account_file_says_so_instead_of_throwing_json_at_you(self) -> None:
-        auth.account_path(self.dir).write_text("{这不是 json", encoding="utf-8")
-
-        with self.assertRaises(auth.AuthError) as caught:
-            self.provider.login("zhangsan", "hunter2")
-
-        self.assertIn("读不了", str(caught.exception))
+        self.assertIn("hr@example.com", raw)
+        self.assertEqual(auth.last_account(self.dir), "hr@example.com")
+        self.assertNotIn("password", raw, "密码存在本机等于没有密码")
 
 
-class RemoteProviderTests(unittest.TestCase):
-    """后端还不存在，所以这里对着契约测——后端照着 ``REMOTE_CONTRACT`` 实现就能接上。"""
+class UiaStatusTests(unittest.TestCase):
+    """探测结果 → 契约 §8 的状态。报错方向错了，人就会去做无用功。"""
 
-    def _provider_returning(self, payload: object, status: int = 200) -> auth.RemoteProvider:
-        import io
-        import urllib.error
-        import urllib.request
-        from unittest import mock
+    def test_no_wechat_at_all_says_open_wechat(self) -> None:
+        state = uia_status.classify({"platform": "Windows", "window_count": 0})
+        assert state is not None
+        self.assertEqual(state.status, uia_status.FAILED)
+        self.assertEqual(state.failure_code, uia_status.PROCESS_NOT_FOUND)
+        self.assertIn("打开", state.failure["message"])
 
-        provider = auth.RemoteProvider("https://example.test/api")
-        body = json.dumps(payload).encode("utf-8")
+    def test_a_login_window_says_log_into_wechat(self) -> None:
+        """★ 「微信没开」和「微信开着但没登录」是两句不同的话。"""
+        state = uia_status.classify({"platform": "Windows", "login_window": True,
+                                     "logged_in": False, "window_count": 1})
+        assert state is not None
+        self.assertEqual(state.failure_code, uia_status.NOT_LOGGED_IN)
 
-        def fake_urlopen(request, timeout=None):
-            if status != 200:
-                raise urllib.error.HTTPError(
-                    request.full_url, status, "nope", {}, io.BytesIO(body)  # type: ignore[arg-type]
-                )
-            return mock.MagicMock(
-                __enter__=lambda _self: mock.Mock(read=lambda: body),
-                __exit__=lambda *_: False,
-            )
+    def test_logged_in_but_not_exposed_is_its_own_failure(self) -> None:
+        state = uia_status.classify({"platform": "Windows", "logged_in": True,
+                                     "uia_exposed": False, "window_count": 1})
+        assert state is not None
+        self.assertEqual(state.failure_code, uia_status.WINDOW_UNAVAILABLE)
 
-        patcher = mock.patch.object(urllib.request, "urlopen", fake_urlopen)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        return provider
+    def test_exposed_uia_is_connected_and_carries_no_made_up_identity(self) -> None:
+        state = uia_status.classify({"platform": "Windows", "logged_in": True,
+                                     "uia_exposed": True,
+                                     "selected_window": {"process_version": "4.0.1.15"}})
+        assert state is not None
+        self.assertEqual(state.status, uia_status.CONNECTED)
+        self.assertIsNone(state.failure)
+        self.assertEqual(state.instance, {"processVersion": "4.0.1.15"})
+        self.assertNotIn("accountRef", state.instance or {},
+                         "★ 读不到微信账号就别编一个「稳定标识」，那会让服务端的占用检查形同虚设")
 
-    def test_login_reads_who_you_are_out_of_the_response(self) -> None:
-        provider = self._provider_returning({
-            "token": "tok-1", "display_name": "张三", "tenant_name": "某某劳务",
-            "expires_at": "2026-08-15T12:00:00Z",
-        })
+    def test_a_non_windows_machine_reports_nothing(self) -> None:
+        """★ 在 Linux 上报「微信没找到」，等于往企业端灌一条不存在的事实。"""
+        self.assertIsNone(uia_status.classify({"platform": "Linux"}))
 
-        identity = provider.login("zhangsan", "hunter2")
+    def test_losing_a_live_connection_is_disconnected_not_failed(self) -> None:
+        connected = uia_status.UiaState(uia_status.CONNECTED)
+        now = uia_status.UiaState(uia_status.FAILED, uia_status.PROCESS_NOT_FOUND)
 
-        self.assertEqual((identity.token, identity.display_name, identity.tenant_name),
-                         ("tok-1", "张三", "某某劳务"))
+        moved = uia_status.transition(connected, now)
 
-    def test_a_login_without_a_token_is_a_failure_not_a_success(self) -> None:
-        """★ 后端返回 200 但没给票，照样是进不去——别让界面以为登上了。"""
-        provider = self._provider_returning({"display_name": "张三"})
-
-        with self.assertRaises(auth.AuthError):
-            provider.login("zhangsan", "hunter2")
-
-    def test_401_becomes_a_sentence_a_human_can_act_on(self) -> None:
-        provider = self._provider_returning({"error": {"message": "no"}}, status=401)
-
-        with self.assertRaises(auth.AuthError) as caught:
-            provider.login("zhangsan", "bad")
-
-        self.assertEqual(str(caught.exception), "账号或密码不对")
-
-    def test_config_takes_only_wxclient_keys(self) -> None:
-        """★ 后端多下发的键不该悄悄变成本机环境变量——那是一条没人看管的注入路径。"""
-        provider = self._provider_returning({
-            "settings": {"WXCLIENT_UI_ACCOUNTS": "zk_weixin", "PATH": "/evil/bin"},
-        })
-
-        config = provider.fetch_config(auth.Identity(account="zhangsan", token="tok-1"))
-
-        self.assertEqual(config.values, {"WXCLIENT_UI_ACCOUNTS": "zk_weixin"})
-        self.assertEqual(config.source, "后端")
-
-    def test_the_client_no_longer_asks_for_or_parses_plans(self) -> None:
-        """★ 计划归 AI 端（用户 2026-08-15 裁决），桌面端连解析都不该留着——
-        留一个没人调的解析器，下一个人会以为「计划是从这条路下来的」。
-        """
-        self.assertFalse(hasattr(auth, "parse_plans"))
-        self.assertFalse(hasattr(auth, "Plan"))
-        self.assertNotIn("plans", auth.REMOTE_CONTRACT)
-
-    def test_the_provider_is_chosen_by_whether_a_backend_is_configured(self) -> None:
-        data_dir = Path(tempfile.mkdtemp())
-
-        self.assertIsInstance(auth.build_provider(data_dir, {}), auth.LocalAccountProvider)
-        self.assertIsInstance(
-            auth.build_provider(data_dir, {"WXCLIENT_UI_LOGIN_API_URL": "https://x.test"}),
-            auth.RemoteProvider,
-        )
+        self.assertEqual(moved.status, uia_status.DISCONNECTED)
+        self.assertEqual(moved.failure_code, uia_status.CONNECTION_LOST)
 
 
-class ConfigLayeringTests(unittest.TestCase):
-    """后端下发的和本机填的，两份怎么合。"""
-
+class StatusReporterTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.dir = Path(tempfile.mkdtemp())
+        self.api = FakeApi()
+        self.reporter = StatusReporter(self.api, lambda: "tok", client_version="1.0.0")
+        self.addCleanup(self.reporter.stop)
 
-    def test_local_wins_over_remote_but_only_where_local_actually_has_a_value(self) -> None:
-        settings_store.save_remote(self.dir, {
-            "WXCLIENT_UI_ACCOUNTS": "后端给的", "WXCLIENT_GATEWAY_AI_WS_URL": "wss://后端/ws",
-        })
-        settings_store.save(self.dir, {"WXCLIENT_UI_ACCOUNTS": "本机改的"})
+    def _drain(self, reporter: StatusReporter | None = None) -> None:
+        """等上报线程把队列跑空。上报是异步的，断言之前必须等它落地。"""
+        target = reporter or self.reporter
+        for _ in range(200):
+            if target._queue.empty():
+                break
+            time.sleep(0.01)
+        time.sleep(0.05)  # 队列空了不代表最后一条跑完了
 
-        merged = settings_store.merged(self.dir)
+    def test_the_same_state_is_not_reported_twice(self) -> None:
+        """★ 微信探测 15 秒一拍。照拍上报 = 每天几千条毫无信息量的审计（契约 §8）。"""
+        probe = {"platform": "Windows", "window_count": 0}
 
-        self.assertEqual(merged["WXCLIENT_UI_ACCOUNTS"], "本机改的")
-        self.assertEqual(merged["WXCLIENT_GATEWAY_AI_WS_URL"], "wss://后端/ws",
-                         "本机没填的键要照用后端那份")
+        self.reporter.wechat_probe(probe)
+        self.reporter.wechat_probe(probe)
+        self._drain()
 
-    def test_the_config_page_can_tell_which_rows_the_machine_overrode(self) -> None:
-        settings_store.save_remote(self.dir, {
-            "WXCLIENT_UI_ACCOUNTS": "后端给的", "WXCLIENT_GATEWAY_AI_WS_URL": "wss://后端/ws",
-        })
-        settings_store.save(self.dir, {
-            "WXCLIENT_UI_ACCOUNTS": "本机改的", "WXCLIENT_GATEWAY_AI_WS_URL": "wss://后端/ws",
-        })
+        posts = [call for name, call in self.api.calls if name == "wechat_status"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["status"], uia_status.FAILED)
+        self.assertEqual(posts[0]["failure"]["code"], uia_status.PROCESS_NOT_FOUND)
 
-        overridden = settings_store.overridden(self.dir)
+    def test_a_changed_reason_is_reported_again(self) -> None:
+        self.reporter.wechat_probe({"platform": "Windows", "window_count": 0})
+        self.reporter.wechat_probe({"platform": "Windows", "login_window": True,
+                                    "window_count": 1})
+        self._drain()
 
-        self.assertEqual(overridden, {"WXCLIENT_UI_ACCOUNTS": "后端给的"},
-                         "只有真的不一样的那行才算「本机已改」")
+        codes = [call["failure"]["code"] for name, call in self.api.calls
+                 if name == "wechat_status"]
+        self.assertEqual(codes, [uia_status.PROCESS_NOT_FOUND, uia_status.NOT_LOGGED_IN],
+                         "原因换了就得说——它对应的是两句不同的恢复引导")
 
-    def test_a_new_push_replaces_the_remote_file_wholesale(self) -> None:
-        """★ 合并会让被后端删掉的键在本机永远活下去。"""
-        settings_store.save_remote(self.dir, {"WXCLIENT_UI_ACCOUNTS": "a", "WXCLIENT_X": "留不得"})
+    def test_a_failed_report_does_not_get_swallowed_forever(self) -> None:
+        """★ 上报失败还记着「报过了」，这个状态就**再也**报不出去了：
+        去重表说报过，服务端那边压根没收到。
+        """
+        self.api._error = ApiError("连不上业务端")
 
-        settings_store.save_remote(self.dir, {"WXCLIENT_UI_ACCOUNTS": "a"})
+        self.reporter.client_error("runtime_error")
+        self._drain()
+        self.api._error = None
+        self.reporter.client_error("runtime_error")
+        self._drain()
 
-        self.assertEqual(settings_store.load_remote(self.dir), {"WXCLIENT_UI_ACCOUNTS": "a"})
+        reports = [call for name, call in self.api.calls if name == "client_status"]
+        self.assertEqual(len(reports), 2, "第一次失败了，第二次还得再试")
 
-    def test_effective_still_falls_back_to_the_environment(self) -> None:
-        settings_store.save_remote(self.dir, {"WXCLIENT_UI_ACCOUNTS": "后端给的"})
+    def test_a_revoked_session_during_a_report_is_escalated(self) -> None:
+        seen: list[str] = []
+        reporter = StatusReporter(FakeApi(error=ApiError("失效", code="CLIENT_SESSION_REVOKED",
+                                                         status=401)),
+                                  lambda: "tok", client_version="1.0.0",
+                                  on_revoked=lambda: seen.append("清 token"))
+        self.addCleanup(reporter.stop)
 
-        values = settings_store.effective(self.dir, {"WXCLIENT_GATEWAY_AI_WS_URL": "wss://env/ws"})
+        reporter.client_error("runtime_error")
+        for _ in range(200):
+            if seen:
+                break
+            time.sleep(0.01)
 
-        self.assertEqual(values["WXCLIENT_UI_ACCOUNTS"], "后端给的")
-        self.assertEqual(values["WXCLIENT_GATEWAY_AI_WS_URL"], "wss://env/ws")
+        self.assertEqual(seen, ["清 token"])
+
+    def test_quitting_reports_offline_before_the_process_goes_away(self) -> None:
+        """★ 契约 §7：没有心跳，服务端不会自己把 online 改成 offline。
+
+        退出前这一下必须**同步**发出去——异步丢队列的话，进程先没了，请求也就没了，
+        企业端会一直显示这台早就关机的电脑在线。
+        """
+        self.reporter.shutdown()
+
+        offline = [call for name, call in self.api.calls
+                   if name == "client_status" and call["status"] == "offline"]
+        self.assertEqual(len(offline), 1)
+        self.assertEqual(offline[0]["reason"], "client_shutdown")
+
+    def test_nothing_is_reported_before_login(self) -> None:
+        """没 Token 的时候（还没登录）不该往服务端打——那些请求只会得到 401。"""
+        reporter = StatusReporter(self.api, lambda: "", client_version="1.0.0")
+        self.addCleanup(reporter.stop)
+
+        reporter.client_online()
+        reporter.wechat_probe({"platform": "Windows", "window_count": 0})
+        self._drain()
+
+        self.assertEqual(self.api.calls, [])
 
 
 if __name__ == "__main__":

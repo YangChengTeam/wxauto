@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,12 +20,9 @@ class GatewaySettings(BaseSettings):
     """劳小智 AI 服务的 WS 门，如 ``wss://host/v1/ws``。"""
 
     business_api_url: str = ""
-    """业务后端基址，用于换取员工短票。"""
+    """业务后端基址。登录（`ui/client_api.py`）和换票（`ticket.py`）都用它。"""
 
-    internal_key: SecretStr = SecretStr("")
-    """网关对业务后端的服务间凭证——网关唯一持有的秘密。"""
-
-    # ── 联调用的本地票据来源（生产必须留空）──
+    # ── 联调用的本地票据来源（生产必须留空；界面上没有这一项，只认环境变量）──
     local_ticket_file: Path | None = None
 
     # ── 对话 ──
@@ -103,15 +99,14 @@ class GatewaySettings(BaseSettings):
         if self.ticket_timeout_seconds <= 0:
             raise ValueError("ticket_timeout_seconds 必须为正")
 
-        # 票据来源二选一，且必须有一个。
+        # 票据来源二选一，且必须有一个。业务端那条用的是**登录拿到的客户端 Token**，
+        # 这里只校验地址——Token 不进配置（它在 DPAPI 里，见 `ui/token_store.py`）。
         has_business = bool(self.business_api_url)
         has_local = self.local_ticket_file is not None
         if has_business and has_local:
             raise ValueError("business_api_url 与 local_ticket_file 不能同时配置")
         if not has_business and not has_local:
             raise ValueError("必须配置 business_api_url 或 local_ticket_file 之一")
-        if has_business and not self.internal_key.get_secret_value():
-            raise ValueError("配置 business_api_url 时 WXCLIENT_GATEWAY_INTERNAL_KEY 必填")
 
         if not self.allow_insecure_transport:
             if self.ai_ws_url.startswith("ws://") and not _is_loopback_url(self.ai_ws_url):

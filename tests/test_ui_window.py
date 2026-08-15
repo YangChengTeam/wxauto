@@ -61,6 +61,57 @@ if HAS_TK:
     from wxclient.ui.service import GatewayService, GatewayStatus, ServiceState
     from wxclient.ui.window import MainWindow
 
+if True:  # 这几样不碰 Tk，没有显示环境也 import 得动
+    from typing import Any
+
+    from wxclient.ui import auth as auth_module
+    from wxclient.ui import settings_store as settings_store_module
+    from wxclient.ui.client_api import ApiError
+    from wxclient.ui.token_store import Protector, TokenStore
+
+LOGIN_OK = {
+    "accessToken": "lxz_rc_token",
+    "sessionId": "sess-1",
+    "user": {"id": "u-1", "name": "陈敏", "email": "hr@example.com"},
+    "agent": {"id": "agent-1", "name": "陈敏的招聘分身"},
+}
+
+
+class StubApi:
+    """假的客户端接口。登录页只关心「登进去了没有、报了什么错」。"""
+
+    def __init__(self) -> None:
+        self.base_url = "https://business.test"
+        self.error: Exception | None = None
+        self.calls: list[str] = []
+
+    def login(self, email: str, password: str, **_kwargs: Any) -> dict:
+        self.calls.append("login")
+        if self.error is not None:
+            raise self.error
+        return dict(LOGIN_OK)
+
+    def logout(self, token: str) -> dict:
+        self.calls.append("logout")
+        return {"success": True}
+
+
+class _NoDiskProtector(Protector):
+    """测试里不往磁盘写 Token，也不需要真 DPAPI。"""
+
+    available = False
+    name = "test"
+
+
+def make_auth(data_dir: Path, api: StubApi, *, base_url: str = "https://business.test"):
+    api.base_url = base_url  # ClientAuth.configured 看的就是它
+    return auth_module.ClientAuth(base_url, data_dir, client_version="test",
+                                  api=api, store=TokenStore(data_dir, _NoDiskProtector()))
+
+
+def settings_store_fields():
+    return settings_store_module.FIELDS
+
 
 class _EvilRunner:
     """每一个状态读法都炸。界面不许被它带崩，也不许因此整排清空。"""
@@ -410,8 +461,6 @@ class LoginGateTests(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        from wxclient.ui import auth
-
         self.dir = Path(tempfile.mkdtemp())
         self.root = tk.Tk()
         self.root.withdraw()
@@ -419,7 +468,8 @@ class LoginGateTests(unittest.TestCase):
         self.window = MainWindow(
             self.root, LogBuffer(), self.service, data_dir=self.dir, probe_wechat=False,
         )
-        self.provider = auth.LocalAccountProvider(self.dir)
+        self.api = StubApi()
+        self.auth = make_auth(self.dir, self.api)
         self.addCleanup(self._teardown)
 
     def _teardown(self) -> None:
@@ -453,44 +503,64 @@ class LoginGateTests(unittest.TestCase):
         self.root.mainloop()
         return done["ok"]
 
-    def test_a_fresh_machine_asks_you_to_set_an_account_first(self) -> None:
-        self.window.require_login(self.provider)
+    def test_the_door_covers_the_whole_window(self) -> None:
+        self.window.require_login(self.auth)
 
         self.assertFalse(self.window.logged_in, "还没登录")
         login = self.window._login
-        self.assertTrue(login._setup_mode, "第一次要设账号，不是登录")
-        self.assertEqual(login._button.cget("text"), "设置并进入")
+        self.assertEqual(login._button.cget("text"), "登录")
         self.assertIs(self.root.winfo_children()[-1], login, "登录页要压在最上面")
         self.assertEqual(login.place_info().get("relwidth"), "1", "要盖满整个窗口")
 
-    def test_the_wrong_password_keeps_you_out_and_says_why(self) -> None:
-        self.provider.create("zhangsan", "hunter2")
-        self.window.require_login(self.provider)
+    def test_a_machine_without_a_server_address_asks_for_one_on_the_login_page(self) -> None:
+        """★ 全新的一台机器：地址没配 → 登录请求发不出去，而这时人还进不了配置中心。
+
+        所以那一格必须摆在登录页上，填一次就落进 `gateway.env`（**同一个键**，
+        不另开一份「登录用的地址」）。
+        """
+        from wxclient.ui import settings_store
+
+        self.window.require_login(make_auth(self.dir, StubApi(), base_url=""))
         login = self.window._login
-        login._account.set("zhangsan")
+        self.assertTrue(login._needs_server, "没配地址就得当场问")
+
+        login._server.set("https://business.test")
+        login._account.set("hr@example.com")
+        login._password.set("pw")
+        login.submit()
+        self._pump(lambda: self.window.logged_in)
+
+        saved = settings_store.load(self.dir)
+        self.assertEqual(saved["WXCLIENT_GATEWAY_BUSINESS_API_URL"], "https://business.test")
+
+    def test_the_wrong_password_keeps_you_out_and_says_why(self) -> None:
+        self.api.error = ApiError("邮箱或密码错误", code="INVALID_CREDENTIALS", status=401)
+        self.window.require_login(self.auth)
+        login = self.window._login
+        login._account.set("hr@example.com")
         login._password.set("这不是密码")
 
         login.submit()
 
         self.assertTrue(self._pump(lambda: bool(login._error.cget("text"))), "错误要显示出来")
-        self.assertEqual(login._error.cget("text"), "账号或密码不对")
+        self.assertEqual(login._error.cget("text"), "邮箱或密码错误")
         self.assertFalse(self.window.logged_in, "★ 密码错了绝不能放进来")
-        self.assertEqual(login._account.get(), "zhangsan", "账号别给人清掉，改密码再来就行")
+        self.assertEqual(login._account.get(), "hr@example.com", "邮箱别给人清掉，改密码再来就行")
 
     def test_logging_in_takes_the_door_away_and_shows_who_you_are(self) -> None:
-        self.provider.create("zhangsan", "hunter2")
         seen = []
-        self.window.require_login(self.provider, on_authenticated=seen.append)
+        self.window.require_login(self.auth, on_authenticated=seen.append)
         login = self.window._login
-        login._account.set("zhangsan")
-        login._password.set("hunter2")
+        login._account.set("hr@example.com")
+        login._password.set("pw")
 
         login.submit()
 
         self.assertTrue(self._pump(lambda: self.window.logged_in), "登录之后门要撤掉")
-        self.assertEqual([identity.account for identity in seen], ["zhangsan"])
+        self.assertEqual([identity.account for identity in seen], ["agent-1"],
+                         "★ 记账用的是分身 ID，不是手抄的微信号")
         self.assertEqual(self.window._page, "log", "登进来落在实时日志")
-        self.assertIn("zhangsan", self.window._who.cget("text"), "侧栏要说清是谁在用")
+        self.assertIn("陈敏", self.window._who.cget("text"), "侧栏要说清是谁在用")
 
     def test_logging_out_also_stops_the_service(self) -> None:
         """★ 「退出登录和退出服务是一个意思，只留一个退出登录」（用户 2026-08-15）。
@@ -498,10 +568,10 @@ class LoginGateTests(unittest.TestCase):
         服务本来就只在登录之后才起，所以「不再用了」只有一种表达：退出登录 = 停网关 + 回登录页。
         """
         stopped: list[bool] = []
+        revoked: list[bool] = []
         self.service.stop_async = lambda **_kwargs: stopped.append(True)  # type: ignore[method-assign]
-        self.provider.create("zhangsan", "hunter2")
-        self.window.set_login_context(self.provider)
-        self.window.finish_login(self.provider.login("zhangsan", "hunter2"))
+        self.window.set_login_context(self.auth, on_logout=lambda: revoked.append(True))
+        self.window.finish_login(self.auth.login("hr@example.com", "pw"))
         self.service._snapshot = (ServiceState.RUNNING, None)
 
         self.window.logout()
@@ -509,6 +579,8 @@ class LoginGateTests(unittest.TestCase):
         self.assertTrue(stopped, "退出登录必须把网关一起停掉")
         self.assertFalse(self.window.logged_in, "门要关回去")
         self.assertEqual(self.window._who.cget("text"), "", "身份要抹掉")
+        self.assertTrue(self._pump(lambda: bool(revoked)),
+                        "★ 还要告诉服务端撤销这台设备的会话，否则企业端一直显示在线")
 
     def test_the_sidebar_has_exactly_one_way_out(self) -> None:
         """摆两个按钮做同一件事，只会让人猜它们差在哪。"""
@@ -521,10 +593,9 @@ class LoginGateTests(unittest.TestCase):
     def test_remembering_the_account_never_remembers_the_password(self) -> None:
         from wxclient.ui import auth
 
-        self.provider.create("zhangsan", "hunter2")
-        self.window.require_login(self.provider)
+        self.window.require_login(self.auth)
         login = self.window._login
-        login._account.set("zhangsan")
+        login._account.set("hr@example.com")
         login._password.set("hunter2")
         login._remember.set(True)
 
@@ -532,7 +603,7 @@ class LoginGateTests(unittest.TestCase):
         self.assertTrue(self._pump(lambda: self.window.logged_in))
 
         raw = (self.dir / auth.UI_STATE_FILE).read_text(encoding="utf-8")
-        self.assertIn("zhangsan", raw)
+        self.assertIn("hr@example.com", raw)
         self.assertNotIn("hunter2", raw)
 
 
@@ -555,56 +626,33 @@ class ConfigCenterTests(unittest.TestCase):
         except tk.TclError:
             pass
 
-    def test_saving_does_not_freeze_every_pushed_value_into_a_local_override(self) -> None:
-        """★ 这是最容易埋进去、又最难发现的一个坑。
+    def test_the_settings_page_has_exactly_one_source_of_truth(self) -> None:
+        """★ 2026-08-15：正式的客户端接口**不下发配置**，所以「后端下发 + 本机覆盖」
+        那一层整个删了。
 
-        配置中心一保存就把满屏的值全写进本机文件的话，十几个键会**全部**变成「本机覆盖」，
-        从此后端下发什么都不生效——而界面上一切正常（值确实对，只是冻在了保存那一刻）。
-        本机文件里只该躺着「这台机器上的人真改过的那几个」。
+        原来那层的坑还留在这条测试的记忆里：保存一次就把满屏的值全冻进本机文件，
+        从此后端下发什么都不生效，而界面上一切正常。现在只有一份 `gateway.env`，
+        再往回加第二份之前，先想清楚谁赢。
         """
         from wxclient.ui import settings_store
 
-        settings_store.save_remote(self.dir, {
-            "WXCLIENT_UI_ACCOUNTS": "后端给的",
-            "WXCLIENT_GATEWAY_AI_WS_URL": "wss://后端/ws",
-        })
+        self.assertFalse(hasattr(settings_store, "load_remote"), "第二份配置已经删了")
         page = self.window._ensure_settings_page() and self.window._settings_page
+        self.assertFalse(hasattr(page, "_drop_same_as_remote"))
+        self.assertFalse((self.dir / "gateway.remote.env").exists())
 
-        kept = page._drop_same_as_remote({
-            "WXCLIENT_UI_ACCOUNTS": "后端给的",      # 没动过 → 不该留在本机
-            "WXCLIENT_GATEWAY_AI_WS_URL": "wss://本机/ws",  # 真改了 → 留
-            "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": "20",    # 后端压根没下发 → 留
-        })
+    def test_the_settings_page_no_longer_asks_for_hand_copied_credentials(self) -> None:
+        """★ 微信号、内部 key、本地票据文件三格都撤了（2026-08-15）。
 
-        self.assertEqual(kept, {
-            "WXCLIENT_GATEWAY_AI_WS_URL": "wss://本机/ws",
-            "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": "20",
-        })
+        微信号改用登录返回的分身 ID，内部 key 改用可撤销的客户端 Token。装十台机器抄十遍
+        凭证这件事，就是靠这三格消失才真正结束的——留一格都会有人继续抄。
+        """
+        keys = [field.key for field in settings_store_fields()]
 
-    def test_an_overridden_row_shows_what_the_backend_had(self) -> None:
-        from wxclient.ui import settings_store
-
-        settings_store.save_remote(self.dir, {"WXCLIENT_UI_ACCOUNTS": "后端给的"})
-        settings_store.save(self.dir, {"WXCLIENT_UI_ACCOUNTS": "本机改的"})
-
-        self.window._ensure_settings_page()
-        mark = self.window._settings_page._marks["WXCLIENT_UI_ACCOUNTS"]
-
-        self.assertIn("本机已改", mark.cget("text"))
-        self.assertIn("后端给的", mark.cget("text"))
-
-    def test_a_secret_override_never_prints_the_backend_value(self) -> None:
-        """★ internal key 是网关唯一的凭证，界面上任何地方都不该把它铺出来。"""
-        from wxclient.ui import settings_store
-
-        settings_store.save_remote(self.dir, {"WXCLIENT_GATEWAY_INTERNAL_KEY": "后端的密钥"})
-        settings_store.save(self.dir, {"WXCLIENT_GATEWAY_INTERNAL_KEY": "本机的密钥"})
-
-        self.window._ensure_settings_page()
-        mark = self.window._settings_page._marks["WXCLIENT_GATEWAY_INTERNAL_KEY"]
-
-        self.assertIn("本机已改", mark.cget("text"))
-        self.assertNotIn("后端的密钥", mark.cget("text"))
+        self.assertNotIn("WXCLIENT_UI_ACCOUNTS", keys)
+        self.assertNotIn("WXCLIENT_GATEWAY_INTERNAL_KEY", keys)
+        self.assertNotIn("WXCLIENT_GATEWAY_LOCAL_TICKET_FILE", keys)
+        self.assertIn("WXCLIENT_GATEWAY_BUSINESS_API_URL", keys, "登录和换票都要它")
 
     def test_connection_trouble_still_shows_up_after_the_banner_was_removed(self) -> None:
         """★ 顶部那条告警条按用户要求撤了（2026-08-15），但「连不上」不能跟着消失——
@@ -630,15 +678,12 @@ class LoginLookTests(unittest.TestCase):
     """登录页那两处被用户当场指出来的毛病（2026-08-15）：背景没铺满、输入框是乱的。"""
 
     def setUp(self) -> None:
-        from wxclient.ui import auth
         from wxclient.ui.login_page import LoginPage
 
         self.dir = Path(tempfile.mkdtemp())
-        provider = auth.LocalAccountProvider(self.dir)
-        provider.create("zhangsan", "hunter2")  # 设过账号 → 正常登录态（不是首次设置那一版）
         self.root = tk.Tk()
         self.root.geometry("1180x720")
-        self.page = LoginPage(self.root, provider,
+        self.page = LoginPage(self.root, make_auth(self.dir, StubApi()),
                               data_dir=self.dir, on_authenticated=lambda _i: None)
         self.page.place(relx=0, rely=0, relwidth=1, relheight=1)
         self.root.update()

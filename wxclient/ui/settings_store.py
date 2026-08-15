@@ -4,7 +4,8 @@
 这里只是给它加了一个「上次填的值存哪」。文件落在运行数据目录（``.wxclient/``），
 和日志、队列库一起，**永不入库**（见 README「永不入库」）。
 
-内部 key 属于凭证：它进这个本机文件，但绝不进仓库、不进日志、界面上也只显示掩码。
+★ 这里**一个凭证都没有**：客户端 Token 由业务端签发，加密存在 `client-session.json`
+（DPAPI，见 `token_store.py`），永远不进这个 env 文件、不进日志、不进环境变量。
 """
 
 from __future__ import annotations
@@ -15,10 +16,9 @@ from pathlib import Path
 
 FILE_NAME = "gateway.env"
 
-#: 后端下发的那一份。**和本机那份分开存**，因为两份的权威不同：下发的可以随时被后端整份
-#: 覆盖，本机填的是这台机器上的人自己的决定，不能被下一次拉取冲掉（用户 2026-08-15 裁决：
-#: 「本地可以改 后端可下发」）。合并规则只有一条：同名键**本机盖过后端**，见 ``effective``。
-REMOTE_FILE_NAME = "gateway.remote.env"
+# ★ 曾经还有一份 `gateway.remote.env`（后端下发、本机覆盖）。2026-08-15 删了：
+#   正式的客户端接口（`docs/招聘分身_客户端认证与状态接口_v1.md`）**不下发任何配置**，
+#   留着那一层只会让「我改的到底生不生效」有两个答案。参数只有这一份。
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ class Field:
     label: str
     help: str = ""
     secret: bool = False
-    kind: str = "text"      # text | bool | file
+    kind: str = "text"      # text | bool
     section: str = "conn"   # 归到哪一段，见 SECTIONS
     unit: str = ""          # 输入框右边贴着的单位（设计稿上「秒」是框内的一格）
     placeholder: str = ""   # 空着时框里的灰字。**只是提示，永远不会被当成值**
@@ -58,17 +58,16 @@ SECTIONS: tuple[Section, ...] = (
 #: 刻意不放的三类：
 #:   ① 有正确默认值、改了只会更糟的（任务类型、去抖窗口、单轮上限）；
 #:   ② 监听哪些会话——权威在 AI 端，由 WS 推下来（``gateway/watchlist.py``），不该在这里手抄；
-#:   ③ 群聊开关等应急项——留作环境变量，出事时手工加一行，不占日常界面。
+#:   ③ 群聊开关等应急项——留作环境变量，出事时手工加一行，不占日常界面；
+#:   ④ **登录接口已经给了的**（2026-08-15）：微信号（改用登录返回的 agent_id 记账，见
+#:      `auth.Identity.account`）、内部 key（换票改用客户端 Token）、本地票据文件（仅联调，
+#:      留作环境变量 `WXCLIENT_GATEWAY_LOCAL_TICKET_FILE`）。手抄凭证这件事到此为止。
 #: 这些键手工写进 gateway.env 依然生效（``render_env_text`` 会原样保留、``apply_to_environ``
 #: 会照灌），只是不再摆在人人都会点的界面上。
 FIELDS: tuple[Field, ...] = (
-    Field("WXCLIENT_UI_ACCOUNTS", "微信号", "要接管的微信号，多个用逗号分隔"),
+    Field("WXCLIENT_GATEWAY_BUSINESS_API_URL", "业务端地址",
+          "登录和换票都用它，如 https://<business-host>"),
     Field("WXCLIENT_GATEWAY_AI_WS_URL", "AI 端地址", "wss://<ai-host>/v1/ws"),
-    Field("WXCLIENT_GATEWAY_BUSINESS_API_URL", "业务端地址", "https://<business-host>，用于换票",
-          placeholder="用于换票，可选"),
-    Field("WXCLIENT_GATEWAY_INTERNAL_KEY", "内部 key", "网关唯一持有的凭证", secret=True),
-    Field("WXCLIENT_GATEWAY_LOCAL_TICKET_FILE", "本地票据文件", "仅联调用，与业务端地址二选一",
-          kind="file"),
     Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔",
           "多久看一次未读，下限 30 秒", section="sched", unit="秒"),
     Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔",
@@ -92,10 +91,6 @@ _TRUE = {"1", "true", "yes", "on", "是"}
 
 def settings_path(data_dir: Path) -> Path:
     return Path(data_dir) / FILE_NAME
-
-
-def remote_path(data_dir: Path) -> Path:
-    return Path(data_dir) / REMOTE_FILE_NAME
 
 
 def parse_env_text(text: str) -> dict[str, str]:
@@ -138,56 +133,6 @@ def load(data_dir: Path) -> dict[str, str]:
     return parse_env_text(path.read_text(encoding="utf-8"))
 
 
-def load_remote(data_dir: Path) -> dict[str, str]:
-    path = remote_path(data_dir)
-    if not path.exists():
-        return {}
-    return parse_env_text(path.read_text(encoding="utf-8"))
-
-
-def save_remote(data_dir: Path, values: dict[str, str]) -> Path:
-    """整份覆盖后端那一份。
-
-    **整份覆盖、不做合并**：后端删掉一个键，意思就是「这个键不该再有值」，
-    合并会让被删的键在本机永远活下去。本机自己填的在另一个文件里，冲不掉。
-    """
-    path = remote_path(data_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        "# 后端下发的网关参数（登录后自动拉取，本机改动请在「配置中心」里改）",
-        "# 这个文件每次拉取都会被整份覆盖，手工改这里没意义。",
-    ]
-    lines.extend(f"{key}={value}" for key, value in sorted(values.items()) if value != "")
-    tmp = path.with_suffix(".env.tmp")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    tmp.replace(path)
-    return path
-
-
-def merged(data_dir: Path) -> dict[str, str]:
-    """后端下发打底，本机填的盖在上面。**服务真正按这份跑。**"""
-    values = dict(load_remote(data_dir))
-    for key, value in load(data_dir).items():
-        if value != "":
-            values[key] = value
-    return values
-
-
-def overridden(data_dir: Path) -> dict[str, str]:
-    """本机改过、和后端下发的不一样的键 → 后端那个值。
-
-    配置中心要把这件事标出来：两处各有一份真相时，「我改的到底生不生效」必须一眼看得见，
-    否则排障时会对着后端管理页反复怀疑人生。
-    """
-    remote = load_remote(data_dir)
-    local = load(data_dir)
-    return {
-        key: remote[key]
-        for key, value in local.items()
-        if value != "" and key in remote and remote[key] != value
-    }
-
-
 def effective(data_dir: Path, environ: dict[str, str] | None = None) -> dict[str, str]:
     """界面要显示的是「当前实际生效的值」，不是「文件里存了什么」。
 
@@ -195,7 +140,7 @@ def effective(data_dir: Path, environ: dict[str, str] | None = None) -> dict[str
     保存时再把空值写回去，等于悄悄把配置抹了。所以文件缺的键回落到环境变量。
     """
     target = os.environ if environ is None else environ
-    values = merged(data_dir)
+    values = load(data_dir)
     for field in FIELDS:
         if not values.get(field.key):
             from_env = target.get(field.key, "")

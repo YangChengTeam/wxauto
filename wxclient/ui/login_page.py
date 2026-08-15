@@ -1,7 +1,10 @@
 """登录页（按 ``docs/login.png``）：左边深色品牌面板，右边白色表单。
 
-**这是一道真门，不是欢迎页**：登录之前看不到日志、配置和计划，参数也还没拉下来
-（谁能用这台机器 = 谁的参数，见 ``auth.py``）。
+**这是一道真门，不是欢迎页**：登录之前看不到日志和配置，服务也不起。
+
+登的是**业务后端的招聘分身客户端接口**（邮箱 + 密码，不走邮箱验证码，契约见
+`docs/招聘分身_客户端认证与状态接口_v1.md`）。原来那个「本机模式」已经删了——
+服务端管不到的登录方式，撤销会话、停用账号对它一律无效。
 
 两件必须做对的事：
 
@@ -11,8 +14,12 @@
 2. **失败要说人话且留在原地。** 密码打错不该弹个模态框再把输入框清空，错误就贴在按钮
    上方，账号还在，改一下再来。
 
-首次运行（本机模式且还没设过账号）会切成「设置管理员账号」：多一个确认密码框，
-按钮变成「设置并进入」。不给「跳过」——留后门等于没有这道门。
+还没配业务端地址时（全新的一台机器），表单上会多出一格「服务器地址」：不填它连登录
+请求都发不出去，而这时人还进不了配置中心。填一次就落到 `gateway.env`，之后不再出现。
+
+「这个分身已在另一台电脑登录」（`409 ACTIVE_CLIENT_SESSION_EXISTS`）**不自动顶掉**：
+弹一句问清楚，人点了确认才带 `replaceExistingSession=true` 再来一次——顶掉的是同事
+正在用的那台机器，这个决定不能由客户端自己做。
 """
 
 from __future__ import annotations
@@ -23,8 +30,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import auth, theme, widgets
-from .auth import AuthError, AuthProvider, Identity
+from . import auth, settings_store, theme, widgets
+from .auth import AuthError, ClientAuth, Identity
 
 #: 左侧品牌面板占窗口宽度的比例。设计稿是 790/1570 ≈ 0.5。
 PANEL_RATIO = 0.5
@@ -42,29 +49,24 @@ class LoginPage(tk.Frame):
     def __init__(
         self,
         parent: tk.Misc,
-        provider: AuthProvider,
+        auth_client: ClientAuth,
         *,
         data_dir: Path,
         on_authenticated: Callable[[Identity], None],
         version: str = "",
     ) -> None:
         super().__init__(parent, bg=theme.CONTENT_BG)
-        self._provider = provider
+        self._auth = auth_client
         self._data_dir = Path(data_dir)
         self._on_authenticated = on_authenticated
         self._version = version
         self._busy = False
         self._photo: tk.PhotoImage | None = None
-        self._setup_mode = self._needs_setup()
+        #: 没配业务端地址就得当场填一个，否则登录请求根本发不出去。
+        self._needs_server = not auth_client.configured
 
         self._build_panel()
         self._build_form()
-
-    def _needs_setup(self) -> bool:
-        try:
-            return bool(self._provider.needs_setup())
-        except Exception:  # noqa: BLE001 - provider 坏了也得让登录页画出来
-            return False
 
     # ── 左：品牌面板 ─────────────────────────────────────────────
 
@@ -170,27 +172,25 @@ class LoginPage(tk.Frame):
                                    bg=theme.PILL_BG, fg=theme.TEXT)
         self._pill_text.pack(side=tk.LEFT)
 
-        tk.Label(form, text="设置管理员账号" if self._setup_mode else "登录",
-                 font=theme.FONT_LOGIN_TITLE, bg=theme.CONTENT_BG,
+        tk.Label(form, text="登录", font=theme.FONT_LOGIN_TITLE, bg=theme.CONTENT_BG,
                  fg=theme.TEXT).pack(anchor="w")
-        tk.Label(form, text=("这台机器第一次使用，先设一个本机账号"
-                             if self._setup_mode else "使用管理员账号继续"),
-                 font=theme.FONT_BODY, bg=theme.CONTENT_BG,
-                 fg=theme.TEXT_MUTED).pack(anchor="w", pady=(8, 26))
+        tk.Label(form, text="用劳小智的邮箱账号登录", font=theme.FONT_BODY,
+                 bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED).pack(anchor="w", pady=(8, 26))
 
         self._account = tk.StringVar(value=auth.last_account(self._data_dir))
         self._password = tk.StringVar()
-        self._confirm = tk.StringVar()
+        self._server = tk.StringVar(value=self._auth.api.base_url)
         self._remember = tk.BooleanVar(value=bool(self._account.get()))
 
-        account_entry = self._field(form, "账号", self._account, placeholder="请输入账号")
+        if self._needs_server:
+            self._field(form, "服务器地址", self._server,
+                        placeholder="如 https://<business-host>")
+        account_entry = self._field(form, "邮箱", self._account, placeholder="请输入邮箱")
         self._field(form, "密码", self._password, secret=True, placeholder="请输入密码")
-        if self._setup_mode:
-            self._field(form, "确认密码", self._confirm, secret=True, placeholder="再输一遍")
 
         row = tk.Frame(form, bg=theme.CONTENT_BG)
         row.pack(fill=tk.X, pady=(6, 0))
-        tk.Checkbutton(row, text="记住账号", variable=self._remember, font=theme.FONT_SMALL,
+        tk.Checkbutton(row, text="记住邮箱", variable=self._remember, font=theme.FONT_SMALL,
                        bg=theme.CONTENT_BG, fg=theme.TEXT, activebackground=theme.CONTENT_BG,
                        selectcolor=theme.CONTENT_BG, highlightthickness=0,
                        cursor="hand2").pack(side=tk.LEFT)
@@ -199,7 +199,7 @@ class LoginPage(tk.Frame):
                                fg=theme.RED, anchor="w", justify=tk.LEFT, wraplength=360)
 
         self._button = tk.Button(
-            form, text="设置并进入" if self._setup_mode else "登录", command=self.submit,
+            form, text="登录", command=self.submit,
             font=theme.FONT_BUTTON, bg=theme.GREEN_DEEP, fg="#ffffff",
             activebackground=theme.GREEN_DEEP, activeforeground="#ffffff",
             relief=tk.FLAT, cursor="hand2", pady=10, highlightthickness=0,
@@ -208,7 +208,7 @@ class LoginPage(tk.Frame):
 
         foot = tk.Frame(right, bg=theme.CONTENT_BG)
         foot.place(relx=0.5, rely=0.94, anchor="center")
-        tk.Label(foot, text=f"版本 {self._version or '-'}  ·  {self._provider.name}模式",
+        tk.Label(foot, text=f"版本 {self._version or '-'}  ·  劳小智招聘分身客户端",
                  font=theme.FONT_SMALL, bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED).pack()
 
         for widget in (self, right, form):
@@ -216,8 +216,13 @@ class LoginPage(tk.Frame):
         account_entry.focus_set()
 
     def _pill_default(self) -> str:
-        return "本机模式：账号和参数都在这台机器上" if self._provider.name == "本机" \
-            else "已连上后端，可以登录"
+        """顶上那颗胶囊。**只说这台机器上确定的事**——地址配没配、Token 能不能存住，
+        至于业务端此刻通不通，只有真发一次登录请求才知道，别在这儿替它打包票。"""
+        if self._needs_server:
+            return "先填服务器地址，再用邮箱登录"
+        if not self._auth.store.persistent:
+            return "这台机器存不住登录状态，每次打开都要重新登录"
+        return "用邮箱密码登录，登录状态会记住"
 
     def _field(self, parent: tk.Misc, label: str, var: tk.StringVar, *,
                secret: bool = False, placeholder: str = "") -> tk.Entry:
@@ -261,31 +266,62 @@ class LoginPage(tk.Frame):
     def submit(self) -> None:
         if self._busy:
             return  # 连点两下不该发两次请求
-        account = self._account.get().strip()
+        email = self._account.get().strip()
         password = self._password.get()
-        if not account or not password:
-            self._show_error("账号和密码都要填")
+        if self._needs_server and not self._apply_server():
             return
-        if self._setup_mode and password != self._confirm.get():
-            self._show_error("两次输入的密码不一样")
+        if not email or not password:
+            self._show_error("邮箱和密码都要填")
             return
+        if "@" not in email:
+            # 只挡最明显的那一类（把用户名当邮箱填）。真正的校验在服务端，
+            # 这里多拦一层只是省一次往返，不该自己发明一套邮箱规则。
+            self._show_error("这看着不像一个邮箱")
+            return
+        self._start(email, password, replace=False)
 
+    def _apply_server(self) -> bool:
+        """把「服务器地址」当场存下来并生效。
+
+        ★ 存的是**同一个键**（``WXCLIENT_GATEWAY_BUSINESS_API_URL``），配置中心里改的
+        就是它——不另开一份「登录用的地址」，否则登录连一个后端、换票连另一个，
+        而两处界面各自看着都对。
+        """
+        url = self._server.get().strip()
+        if not url:
+            self._show_error("先填服务器地址")
+            return False
+        if not url.startswith(("http://", "https://")):
+            self._show_error("服务器地址要以 http:// 或 https:// 开头")
+            return False
+        values = settings_store.load(self._data_dir)
+        values["WXCLIENT_GATEWAY_BUSINESS_API_URL"] = url
+        try:
+            settings_store.save(self._data_dir, values)
+        except OSError as exc:
+            self._show_error(f"存不下服务器地址：{exc}")
+            return False
+        settings_store.apply_to_environ(values, force=True)
+        self._auth.api.base_url = url.rstrip("/")
+        return True
+
+    def _start(self, email: str, password: str, *, replace: bool) -> None:
         self._set_busy(True)
         self._show_error("")
-        threading.Thread(target=self._work, args=(account, password),
+        threading.Thread(target=self._work, args=(email, password, replace),
                          name="wx-ui-login", daemon=True).start()
 
-    def _work(self, account: str, password: str) -> None:
+    def _work(self, email: str, password: str, replace: bool) -> None:
         """后台线程：登录。**这里一律不碰控件**，结果 after 回 tk 线程。"""
         try:
-            if self._setup_mode:
-                identity = self._provider.create(account, password)  # type: ignore[attr-defined]
-            else:
-                identity = self._provider.login(account, password)
+            identity = self._auth.login(email, password, replace_existing=replace)
         except AuthError as exc:
             # 先把话取出来再进 lambda：except 块一结束 Python 就把 exc 删了，
             # 闭包里再去读它拿到的是 NameError（ruff F821 当场抓到过）。
-            message = str(exc)
+            message, details = str(exc), dict(exc.details)
+            if exc.needs_replace_confirm:
+                self._later(lambda: self._ask_replace(email, password, details))
+                return
             self._later(lambda: self._failed(message))
             return
         except Exception as exc:  # noqa: BLE001 - 没预料到的也得让人看见，不能只在日志里
@@ -293,6 +329,31 @@ class LoginPage(tk.Frame):
             self._later(lambda: self._failed(message))
             return
         self._later(lambda: self._succeeded(identity))
+
+    def _ask_replace(self, email: str, password: str, details: dict[str, Any]) -> None:
+        """另一台电脑还占着这个分身。**问清楚再顶**（契约 §5.1）。
+
+        顶掉之后旧设备上没执行完的动作不会转过来（服务端明写不转移），所以这句话必须
+        让人看见「是哪台机器、最后一次活动是什么时候」，而不是一句轻飘飘的「确定吗」。
+        """
+        from tkinter import messagebox
+
+        self._set_busy(False)
+        if not details.get("canReplace", True):
+            self._failed("这个招聘分身已在另一台电脑登录，且不允许在这里切换")
+            return
+        where = str(details.get("deviceName") or "另一台电脑")
+        seen = str(details.get("lastSeenAt") or "")
+        detail = f"最后活动：{seen}\n\n" if seen else ""
+        if not messagebox.askyesno(
+            "切换到这台电脑？",
+            f"这个招聘分身正在「{where}」上登录。\n{detail}"
+            "切换过来会让那台电脑立即退出登录，它上面还没执行的动作不会转移过来。",
+            parent=self,
+        ):
+            self._show_error("没有切换，仍在另一台电脑上登录")
+            return
+        self._start(email, password, replace=True)
 
     def _later(self, callback: Callable[[], None]) -> None:
         """把结果丢回 tk 线程。
@@ -308,7 +369,7 @@ class LoginPage(tk.Frame):
 
     def _succeeded(self, identity: Identity) -> None:
         if self._remember.get():
-            auth.remember_account(self._data_dir, identity.account)
+            auth.remember_account(self._data_dir, identity.email)
         else:
             auth.forget_account(self._data_dir)
         self._set_busy(False)
@@ -322,8 +383,7 @@ class LoginPage(tk.Frame):
         self._busy = busy
         try:
             self._button.configure(
-                text=("正在设置…" if self._setup_mode else "正在登录…") if busy
-                else ("设置并进入" if self._setup_mode else "登录"),
+                text="正在登录…" if busy else "登录",
                 bg=theme.GRAY if busy else theme.GREEN_DEEP,
                 cursor="watch" if busy else "hand2",
             )

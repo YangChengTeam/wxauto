@@ -37,7 +37,7 @@ wxclient/gateway/
 
 ### Phase A · 协议层（Linux 全可测）✅ 完成 2026-08-10
 
-- [x] A1. `config.py`：`GatewaySettings`（AI 端 WS 地址、业务端地址、internal key、轮询间隔、去抖窗口、频次上限）+ `validate_for_start()`（非回环禁明文、票据源二选一）
+- [x] A1. `config.py`：`GatewaySettings`（AI 端 WS 地址、业务端地址、轮询间隔、去抖窗口、频次上限）+ `validate_for_start()`（非回环禁明文、票据源二选一）
 - [x] A2. `ticket.py`：`TicketProvider` 协议 + `BusinessTicketProvider`（HTTP 换票，3s 超时，**fail-closed**）+ `LocalFileTicketProvider`（读本地未入库 json，仅供联调）
 - [x] A3. `wsclient.py`：帧编解码、`auth`/`session.start`/`session.resume`/`message.send`、轮内事件按 `session_id` 归位（不依赖 ack 到齐）、`card`/`status`/`error` 解析、同 session 串行护栏
 - [x] A4. **Fake AI 端 WS 服务** `tests/fake_agent_ws.py`：按契约回放 `status → text.delta × N → card → done`，支持按输入分支与错误/延迟脚本
@@ -161,8 +161,9 @@ codex 把 JSON 叙述在正文里 → `card_count=0`，网关一个字也发不�
 ```
 WXCLIENT_GATEWAY_AI_WS_URL             wss://<ai-host>/v1/ws
 WXCLIENT_GATEWAY_BUSINESS_API_URL      https://<business-host>
-WXCLIENT_GATEWAY_INTERNAL_KEY          <网关专用 internal key>   ← 网关唯一持有的秘密
-WXCLIENT_GATEWAY_LOCAL_TICKET_FILE     联调用本地票据文件（与上面两项互斥，生产留空）
+                                       ↑ 登录（客户端接口）和换票都用它
+                                       换票凭证 = 登录签发的客户端 Token（DPAPI 保存，不进配置）
+WXCLIENT_GATEWAY_LOCAL_TICKET_FILE     联调用本地票据文件（与上面一项互斥，生产留空）
 WXCLIENT_GATEWAY_TASK_TYPE             默认 wechat_reply
 WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS 读消息间隔，默认 60，下限 30
 WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS  查新好友间隔，默认 900，下限 300，0=不查

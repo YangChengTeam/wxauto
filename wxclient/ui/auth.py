@@ -1,301 +1,223 @@
-"""登录与「登录后取配置」。
+"""登录：谁在用这台机器。
 
-**为什么要有登录**：在这之前，这台机器上的人手工往「参数设置」里填微信号、AI 端地址、
-还有网关唯一的那把 internal key——凭证靠手抄，装十台机器就抄十遍，错一个字符的表现是
-「服务起来了但一直连不上」。改成登录之后，参数由后端按这个账号下发，人只需要认得自己
-的账号密码。
+**只有一条路**：邮箱 + 密码，向业务后端的招聘分身客户端接口登录
+（`docs/招聘分身_客户端认证与状态接口_v1.md`，实现在 `client_api.py`）。
 
-**这一版后端还没有**（用户 2026-08-15：「本次只做客户端，后端留插座」）。所以这里做成两个
-可替换的 provider，接口一模一样：
+★ 2026-08-15 之前这里还有一个「本机模式」——账号存在本机文件里、参数也用本机那份，
+用来在后端还没有的时候把流程跑起来。**现在删掉了**：正式接口已经定稿，留着两条登录路
+的后果是「这台机器到底归谁」有两个答案，而其中一个（本机账号）**服务端根本不知道**，
+于是撤销会话、停用账号、换设备这些管控对它一律无效。宁可后端没上线时登不进去，
+也不留一条服务端管不到的入口。
 
-* ``RemoteProvider``——真后端。契约见本文件末尾 ``REMOTE_CONTRACT``，也抄了一份进 AGENTS.md。
-  配了 ``WXCLIENT_UI_LOGIN_API_URL`` 就走它。
-* ``LocalAccountProvider``——本机兜底。账号存在本机一个文件里（scrypt 派生，不存明文），
-  配置就用本机 ``gateway.env`` 那份。它让整条流程今天就能跑通、能测，后端就绪时只是换个
-  provider，界面一行都不用动。
+三件事这里必须守住：
 
-**刻意不做的事**：不给「跳过登录」的后门。留一个「没配后端就放行」的分支，等于把登录做成
-装饰——那还不如不做。本机模式照样要密码，第一次运行时当场设一个。
-
-用 ``urllib``（标准库）而不是 ``httpx`` 发请求：登录发生在**启动最早的那几秒**，那正是
-桌面端花了大力气瘦身的一段（见 ``ui/__main__.py`` 顶上的说明），不值得为两个 POST 再拉
-一整个 http 栈进来。
+* **Token 不落明文**：磁盘上那份由 `token_store` 用 DPAPI 加密；非 Windows 一个字节都不写。
+* **会话被撤销要认得出来**：任何一次调用回 `401 CLIENT_SESSION_REVOKED`，就地清 Token、
+  回登录页（契约 §7）。这是「不过期的 Token」唯一的刹车。
+* **顶掉别人的设备要问过人**：`409 ACTIVE_CLIENT_SESSION_EXISTS` 不自动重试，把「另一台
+  电脑正在用」摆给人看，他点了确认才带 `replaceExistingSession=true` 再来一次（契约 §5.1）。
 """
 
 from __future__ import annotations
 
 import json
-import os
-import secrets
-from dataclasses import dataclass, field
-from hashlib import scrypt
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
-ACCOUNT_FILE = "console-account.json"
-
-#: scrypt 参数。登录一次算一遍，几十毫秒——人感觉不到，暴力猜密码的人感觉得到。
-_SCRYPT = {"n": 2**14, "r": 8, "p": 1}
-_KEY_LEN = 32
-
-LOGIN_PATH = "/desktop/login"
-CONFIG_PATH = "/desktop/config"
-
-#: 后端接口契约（客户端这一侧已经按它写好了，后端照着实现就能接上）。
-REMOTE_CONTRACT = """\
-POST {base}/desktop/login
-    请求  {"account": "...", "password": "...", "device_id": "..."}
-    成功  200 {"token": "...", "expires_at": "2026-08-15T12:00:00Z",
-               "display_name": "张三", "tenant_name": "某某劳务"}
-    失败  401 {"error": {"code": "INVALID_CREDENTIALS", "message": "账号或密码错误"}}
-
-GET {base}/desktop/config      Authorization: Bearer <token>
-    成功  200 {"settings": {"WXCLIENT_UI_ACCOUNTS": "zk_weixin", ...},
-               "server_time": "2026-08-15T12:00:00Z"}
-    失败  401 → 票过期，客户端会退回登录页
-
-settings 里只放 WXCLIENT_* 键；客户端原样落到 gateway.remote.env，本机在「配置中心」
-改过的同名键仍然盖过它（用户 2026-08-15 裁决：本地可以改、后端可下发）。
-
-★ 这里**不下发计划**：几点做什么、多久跟进一次归 AI 端排，指令经 WS 推给网关执行
-（用户 2026-08-15 裁决，桌面端的「计划中心」也是那次删掉的）。多下发的键客户端一律不认。
-"""
+from . import device as device_mod
+from .client_api import ApiError, ClientApi
+from .token_store import StoredSession, TokenStore
 
 
 class AuthError(RuntimeError):
-    """登录/取配置失败。message 是能直接摆到界面上的中文。"""
+    """登录失败。message 是能直接摆到界面上的中文。"""
+
+    def __init__(self, message: str, *, code: str = "",
+                 details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+    @property
+    def needs_replace_confirm(self) -> bool:
+        """另一台电脑还占着 → 要人点头才能顶掉。"""
+        return self.code == "ACTIVE_CLIENT_SESSION_EXISTS"
 
 
 @dataclass(frozen=True)
 class Identity:
     """登录成功之后，我们知道的关于「谁在用这台机器」的事。
 
-    ``token`` **只在内存里**：它是能换配置的凭证，落盘就等于把登录这一步作废了。
+    ``token`` 只在内存和 DPAPI 密文里；**绝不进日志、不进环境变量、不进 gateway.env**。
     """
 
-    account: str
-    display_name: str = ""
+    email: str = ""
+    user_id: str = ""
+    user_name: str = ""
+    agent_id: str = ""
+    agent_name: str = ""
+    session_id: str = ""
     tenant_name: str = ""
     token: str = ""
-    expires_at: str = ""
+    stage: str = ""
 
     @property
     def title(self) -> str:
-        return self.display_name or self.account
+        return self.user_name or self.email
+
+    @property
+    def account(self) -> str:
+        """网关那边用来给消息记账的账号标识。
+
+        用 ``agent_id``：一个 HR 一个分身、一个分身一个微信（PRD §1.3），它是服务端认的
+        那个稳定标识。原来这里是人手抄的微信号——抄错一个字符的表现是「消息游标全乱」。
+        """
+        return self.agent_id or self.email
 
 
-@dataclass(frozen=True)
-class RemoteConfig:
-    """一次「取配置」的结果。"""
+class ClientAuth:
+    """登录 / 退出 / 记住这台机器上的会话。GUI 只调这一层，不碰 HTTP。"""
 
-    values: dict[str, str] = field(default_factory=dict)
-    source: str = ""  # 界面上要说清这份配置是哪来的：「后端」还是「本机」
-    server_time: str = ""
+    name = "劳小智"
 
+    def __init__(self, base_url: str, data_dir: Path, *, client_version: str = "",
+                 api: ClientApi | None = None, store: TokenStore | None = None,
+                 on_revoked: Callable[[], None] | None = None) -> None:
+        self.data_dir = Path(data_dir)
+        self.client_version = client_version
+        self.api = api or ClientApi(base_url)
+        self.store = store or TokenStore(self.data_dir)
+        self.device = device_mod.load(self.data_dir)
+        self._on_revoked = on_revoked
+        self._identity: Identity | None = None
 
-class AuthProvider(Protocol):
-    name: str
+    # ── 状态 ─────────────────────────────────────────────────────
 
-    def needs_setup(self) -> bool:
-        """首次运行、还没有账号可用（只有本机模式会为真）。"""
-        ...
+    @property
+    def identity(self) -> Identity | None:
+        return self._identity
 
-    def login(self, account: str, password: str) -> Identity: ...
+    @property
+    def token(self) -> str:
+        return self._identity.token if self._identity else ""
 
-    def fetch_config(self, identity: Identity) -> RemoteConfig: ...
+    @property
+    def configured(self) -> bool:
+        """业务端地址配了没有。没配就连登录页都别装成能登。"""
+        return bool(self.api.base_url)
 
+    def restore(self) -> Identity | None:
+        """重开客户端时接上上次那个会话。
 
-# ── 本机账号（兜底） ──────────────────────────────────────────────
+        Token 不过期（契约 §2.2），所以正常情况下**不该让人每天重登一次**。它到底还算不算
+        数，由第一次状态上报去问服务端（401 → 回登录页），这里不额外发一个探活请求。
+        """
+        session = self.store.load()
+        if session is None or not session.usable:
+            return None
+        self._identity = Identity(
+            email=session.email,
+            user_name=session.user_name,
+            agent_id=session.agent_id,
+            agent_name=session.agent_name,
+            session_id=session.session_id,
+            tenant_name=session.tenant_name,
+            token=session.token,
+        )
+        return self._identity
 
+    # ── 登录 / 退出 ──────────────────────────────────────────────
 
-def account_path(data_dir: Path) -> Path:
-    return Path(data_dir) / ACCOUNT_FILE
-
-
-def hash_password(password: str, salt: str) -> str:
-    return scrypt(password.encode("utf-8"), salt=bytes.fromhex(salt),
-                  dklen=_KEY_LEN, **_SCRYPT).hex()
-
-
-def make_account_record(account: str, password: str) -> dict[str, str]:
-    salt = secrets.token_hex(16)
-    return {"account": account.strip(), "salt": salt, "password": hash_password(password, salt)}
-
-
-def verify_account(record: dict[str, Any], account: str, password: str) -> bool:
-    """核对账号密码。比较用 ``compare_digest``——普通 ``==`` 会随匹配长度早退。"""
-    if str(record.get("account", "")).strip().lower() != account.strip().lower():
-        return False
-    salt = str(record.get("salt", ""))
-    stored = str(record.get("password", ""))
-    if not salt or not stored:
-        return False
-    return secrets.compare_digest(hash_password(password, salt), stored)
-
-
-class LocalAccountProvider:
-    """本机账号 + 本机配置。后端就绪之前的兜底，也是单测里的那一档。"""
-
-    name = "本机"
-
-    def __init__(self, data_dir: Path) -> None:
-        self._path = account_path(data_dir)
-
-    def needs_setup(self) -> bool:
-        return not self._path.exists()
-
-    def _read(self) -> dict[str, Any]:
+    def login(self, email: str, password: str, *, replace_existing: bool = False) -> Identity:
         try:
-            raw = json.loads(self._path.read_text(encoding="utf-8-sig"))
-        except FileNotFoundError as exc:
-            raise AuthError("这台机器还没设过账号") from exc
-        except Exception as exc:  # 文件坏了要说人话，不是甩 JSONDecodeError
-            raise AuthError(f"本机账号文件读不了：{exc}") from exc
-        if not isinstance(raw, dict):
-            raise AuthError("本机账号文件格式不对")
-        return raw
+            body = self.api.login(
+                email, password,
+                device_id=self.device.device_id,
+                device_name=self.device.device_name,
+                client_version=self.client_version,
+                os_version=self.device.os_version,
+                replace_existing=replace_existing,
+            )
+        except ApiError as exc:
+            raise AuthError(str(exc), code=exc.code, details=exc.details) from exc
 
-    def create(self, account: str, password: str) -> Identity:
-        """首次运行时当场设一个账号。已经设过就不给悄悄改掉。"""
-        if not account.strip():
-            raise AuthError("账号不能为空")
-        if len(password) < 6:
-            raise AuthError("密码至少 6 位")
-        if self._path.exists():
-            raise AuthError("这台机器已经设过账号了")
-        record = make_account_record(account, password)
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self._path)
-        try:
-            self._path.chmod(0o600)  # Windows 上是空操作，Linux/测试环境里有意义
-        except OSError:
-            pass
-        return Identity(account=record["account"], display_name=record["account"])
-
-    def login(self, account: str, password: str) -> Identity:
-        record = self._read()
-        if not verify_account(record, account, password):
-            raise AuthError("账号或密码不对")
-        return Identity(account=str(record.get("account", account)),
-                        display_name=str(record.get("account", account)))
-
-    def fetch_config(self, identity: Identity) -> RemoteConfig:
-        """本机模式没有下发这回事：配置就是「配置中心」里填的那份。"""
-        return RemoteConfig(values={}, source=self.name)
-
-
-# ── 真后端 ────────────────────────────────────────────────────────
-
-
-class RemoteProvider:
-    """向后端登录、取配置。契约见 ``REMOTE_CONTRACT``。"""
-
-    name = "后端"
-
-    def __init__(self, base_url: str, *, device_id: str = "", timeout: float = 8.0) -> None:
-        self._base = base_url.rstrip("/")
-        self._device_id = device_id
-        self._timeout = timeout
-
-    def needs_setup(self) -> bool:
-        return False  # 账号是后端发的，这台机器上没什么可设的
-
-    def login(self, account: str, password: str) -> Identity:
-        body = self._post(LOGIN_PATH, {
-            "account": account.strip(), "password": password, "device_id": self._device_id,
-        })
-        token = str(body.get("token") or "")
+        token = str(body.get("accessToken") or "")
         if not token:
-            raise AuthError("后端没给票，登不进去")
-        return Identity(
-            account=account.strip(),
-            display_name=str(body.get("display_name") or account.strip()),
-            tenant_name=str(body.get("tenant_name") or ""),
+            raise AuthError("业务端没给 Token，登不进去")
+        user = body.get("user") if isinstance(body.get("user"), dict) else {}
+        agent = body.get("agent") if isinstance(body.get("agent"), dict) else {}
+        activation = body.get("activationStatus")
+        identity = Identity(
+            email=email.strip().lower(),
+            user_id=str(user.get("id") or ""),
+            user_name=str(user.get("name") or ""),
+            agent_id=str(agent.get("id") or ""),
+            agent_name=str(agent.get("name") or ""),
+            session_id=str(body.get("sessionId") or ""),
             token=token,
-            expires_at=str(body.get("expires_at") or ""),
+            stage=str(activation.get("stage") or "") if isinstance(activation, dict) else "",
         )
+        if not identity.agent_id:
+            # 没有分身就没有「用哪个身份记账」，往下跑只会记出一堆无主数据。
+            raise AuthError("业务端没返回招聘分身信息，请联系管理员")
+        self._identity = identity
+        self.store.save(StoredSession(
+            token=identity.token,
+            session_id=identity.session_id,
+            email=identity.email,
+            user_name=identity.user_name,
+            agent_id=identity.agent_id,
+            agent_name=identity.agent_name,
+            tenant_name=identity.tenant_name,
+        ))
+        return identity
 
-    def fetch_config(self, identity: Identity) -> RemoteConfig:
-        body = self._get(CONFIG_PATH, identity.token)
-        raw = body.get("settings")
-        values = {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
-        # 只收 WXCLIENT_* ——后端多下发的键不该悄悄变成本机环境变量。
-        values = {k: v for k, v in values.items() if k.startswith("WXCLIENT_")}
-        return RemoteConfig(
-            values=values,
-            source=self.name,
-            server_time=str(body.get("server_time") or ""),
-        )
+    def logout(self) -> None:
+        """退出登录。**先告诉服务端，再清本机**。
 
-    # 下面两个只做「发出去、拿回来、错误翻成人话」，不认识业务字段。
+        顺序反了的话，网络刚好不通那一下就成了「本机看着已退出，服务端那边这台设备还活着」
+        ——企业端会一直显示在线，而这台机器已经没有 Token 去纠正它了。
+        """
+        token = self.token
+        if token:
+            try:
+                self.api.logout(token)
+            except ApiError:
+                pass  # 服务端说不通也得让人退出去；那边的会话可以在企业端手工撤销
+        self._identity = None
+        self.store.clear()
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        return self._request(path, data=data, headers={"content-type": "application/json"})
+    def handle_revoked(self) -> None:
+        """任何一次调用发现会话被撤销时走这里：清干净 + 通知界面回登录页。"""
+        self._identity = None
+        self.store.clear()
+        if self._on_revoked is not None:
+            self._on_revoked()
 
-    def _get(self, path: str, token: str) -> dict[str, Any]:
-        return self._request(path, data=None, headers={"authorization": f"Bearer {token}"})
-
-    def _request(self, path: str, *, data: bytes | None, headers: dict[str, str]) -> dict[str, Any]:
-        import urllib.error
-        import urllib.request
-
-        if not self._base:
-            raise AuthError("没配后端地址")
-        request = urllib.request.Request(f"{self._base}{path}", data=data, headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise AuthError(_http_message(exc)) from exc
-        except Exception as exc:  # 连不上、超时、返回不是 JSON，都是一句话
-            raise AuthError(f"连不上后端：{exc}") from exc
-        if not isinstance(body, dict):
-            raise AuthError("后端返回的不是一个对象")
-        return body
-
-
-def _http_message(exc: Any) -> str:
-    """把 HTTP 错误翻成能摆到登录页上的一句话。"""
-    status = getattr(exc, "code", 0)
-    if status == 401:
-        return "账号或密码不对"
-    if status == 403:
-        return "这个账号没有开通桌面端"
-    detail = ""
-    try:
-        payload = json.loads(exc.read().decode("utf-8"))
-        detail = str(payload.get("error", {}).get("message") or "")
-    except Exception:  # noqa: BLE001 —— 拿不到细节就只报状态码
-        detail = ""
-    return f"后端拒绝了这次请求（HTTP {status}）" + (f"：{detail}" if detail else "")
+    def set_revoked_hook(self, hook: Callable[[], None] | None) -> None:
+        self._on_revoked = hook
 
 
-def build_provider(data_dir: Path, environ: dict[str, str] | None = None) -> AuthProvider:
-    """配了后端地址走后端，否则走本机账号。"""
-    target = os.environ if environ is None else environ
-    base = (target.get("WXCLIENT_UI_LOGIN_API_URL") or "").strip()
-    if base:
-        return RemoteProvider(base, device_id=(target.get("WXCLIENT_UI_DEVICE_ID") or "").strip())
-    return LocalAccountProvider(data_dir)
+def build_auth(data_dir: Path, base_url: str, *, client_version: str = "") -> ClientAuth:
+    return ClientAuth(base_url, data_dir, client_version=client_version)
 
 
-# ── 「记住账号」 ──────────────────────────────────────────────────
+# ── 「记住邮箱」 ──────────────────────────────────────────────────
 
 UI_STATE_FILE = "console-ui.json"
 
 
-def remember_account(data_dir: Path, account: str) -> None:
-    """记住上次登录的账号名。**只记账号，永不记密码**——密码存在本机等于没有密码。"""
+def remember_account(data_dir: Path, email: str) -> None:
+    """记住上次登录的邮箱。**只记邮箱，永不记密码**——密码存在本机等于没有密码。"""
     path = Path(data_dir) / UI_STATE_FILE
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"last_account": account.strip()}, ensure_ascii=False),
+        path.write_text(json.dumps({"last_account": email.strip()}, ensure_ascii=False),
                         encoding="utf-8")
     except OSError:
-        pass  # 记不住只是下次要重打一遍账号，不该让登录失败
+        pass  # 记不住只是下次要重打一遍，不该让登录失败
 
 
 def forget_account(data_dir: Path) -> None:
