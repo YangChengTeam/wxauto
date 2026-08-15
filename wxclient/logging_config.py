@@ -149,7 +149,11 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "friend.add.start":
         return f"开始添加好友：{payload.get('number')}"
     if event == "friend.add.done":
-        return f"好友申请已提交：{payload.get('number')}"
+        # 只是「申请发出去了」，不是「已经是好友了」——对方点同意才算数。
+        who = payload.get("session_name") or payload.get("name")
+        return f"好友申请已提交：{payload.get('number')}" + (f"（{who}）" if who else "")
+    if event == "friend.add.fallback":
+        return f"添加好友改走备用流程：{payload.get('number')}（这次读不到对方昵称）"
     if event == "friend.add.failed":
         return f"添加好友失败：{payload.get('number')}，原因：{payload.get('error') or '-'}"
     if event == "friend.check.start":

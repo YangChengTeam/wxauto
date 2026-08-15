@@ -854,10 +854,6 @@ class AccountNormalizationTests(unittest.TestCase):
         self.assertEqual(normalize_accounts(None), ())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SingleInstanceTests(unittest.TestCase):
     """★ 076 单实例：绝不允许两个进程同时驱动同一个微信。
 
@@ -923,3 +919,5 @@ class SingleInstanceTests(unittest.TestCase):
             self.assertTrue(acquired)
             self.assertFalse(SingleInstance(self.data_dir).acquire())
         self.assertTrue(SingleInstance(self.data_dir).acquire())
+if __name__ == "__main__":
+    unittest.main()

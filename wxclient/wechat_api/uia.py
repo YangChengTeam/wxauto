@@ -40,10 +40,101 @@ class UiaWeChatDriver:
         remark: str | None = None,
         dry_run: bool | None = None,
     ) -> dict[str, Any]:
+        """按手机号/微信号加好友，并把**后续拿什么名字回消息**一并带回来。
+
+        返回里三个名字各有各的用处，别混：
+          · ``name``         —— 申请时对方名片上的**昵称**。会变、会重名、可能带 emoji，
+                                只适合给人看，**不要拿它当回复的锚**。
+          · ``remark``       —— 我们自己设的备注。对方通过后，会话列表里显示的就是它。
+          · ``session_name`` —— 后续 ``send_message(to=...)`` 该用的名字 = 备注优先，
+                                没设备注才退回昵称。这是唯一该被记下来的那个。
+
+        ⚠️ 加好友是**异步**的：这里返回成功只代表申请发出去了，对方没通过就没有会话、
+        也发不了消息。真正"可以回了"的信号是 ``check_new_friends`` / 对方通过。
+        """
         if self._is_dry_run(dry_run):
-            return {"dry_run": True, "action": "add_friend", "number": number}
+            return {
+                "dry_run": True, "action": "add_friend", "number": number,
+                "name": None, "remark": remark, "session_name": remark,
+            }
         self._ensure_ready()
         logger.info("friend.add.start", number=number, greetings=greetings[:20])
+        name: str | None = None
+        try:
+            name = self._add_friend_reading_profile(number, greetings, remark)
+        except _AddFriendNotStarted as exc:
+            # 只有在**一个按钮都还没点**的时候才会走到这儿，退回原来那条路，
+            # 最坏也就是拿不到昵称——绝不会变成"申请发了两遍"。
+            logger.info("friend.add.fallback", number=number, reason=str(exc)[:120])
+            self._add_friend_via_vendor(number, greetings, remark)
+        except WeChatApiError:
+            raise
+        except Exception as exc:
+            logger.info("friend.add.failed", number=number, error=str(exc)[:100])
+            raise WeChatApiError(f"添加好友失败：{exc}") from exc
+        session_name = remark or name
+        logger.info("friend.add.done", number=number, name=name, session_name=session_name)
+        return {
+            "dry_run": False, "action": "add_friend", "number": number,
+            "name": name, "remark": remark, "session_name": session_name,
+        }
+
+    def _add_friend_reading_profile(
+        self, number: str, greetings: str, remark: str | None
+    ) -> str | None:
+        """自己走一遍加好友流程，好在中间把名片上的昵称读下来。
+
+        为什么不"先查一次名字再让 vendor 加一次"：那是**两次陌生号网络查找**，
+        正是最招风控的动作（节拍红线：查好友 ≥300s 一次）。自己走一遍 = 和原来一样
+        只搜一次、只加一次，昵称是顺手读的，不多动微信一下。
+
+        任何"还没点到按钮"的失败都抛 ``_AddFriendNotStarted``，由调用方退回 vendor 实现。
+        """
+        Navigator = self._pyweixin_class("Navigator")
+        Tools = self._pyweixin_class("Tools")
+        Uielements = self._pyweixin_submodule("Uielements")
+        try:
+            add_friend_pane, _main_window = Navigator.open_add_friend_panel(is_maximize=False)
+        except Exception as exc:
+            raise _AddFriendNotStarted(f"打不开添加朋友面板：{exc}") from exc
+
+        try:
+            try:
+                search_edit = add_friend_pane.child_window(control_type="Edit")
+                search_edit.set_text("")
+                search_edit.type_keys(str(number), with_spaces=True)
+                search_edit.type_keys("{ENTER}")
+            except Exception as exc:
+                raise _AddFriendNotStarted(f"搜索框用不了：{exc}") from exc
+            time.sleep(1)
+
+            profile = add_friend_pane.child_window(**Uielements.Groups.ContactProfileViewGroup)
+            if not _truthy_safe_call(lambda: profile.exists(timeout=2)):
+                # 原来这种情况是**静默返回成功**的：查无此号也报"加好友完成"，
+                # AI 端只会以为对方没通过而一直等。说清楚是查不到。
+                raise WeChatApiError(f"没搜到这个号：{number}（号码不对，或对方不允许被搜到）")
+
+            name = _pick_profile_name(_profile_text_lines(profile), str(number))
+
+            add_button = profile.child_window(**Uielements.Buttons.AddToContactsButton)
+            if not _truthy_safe_call(lambda: add_button.exists(timeout=2)):
+                raise WeChatApiError(f"这个号加不了：{number}（多半已经是好友了）")
+
+            add_button.click_input()          # ← 从这里开始就动真格了，不再退回 vendor
+            verify_window = Tools.move_window_to_center(Window=Uielements.Windows.VerifyFriendWindow)
+            request_edit = verify_window.child_window(control_type="Edit", found_index=0)
+            remark_edit = verify_window.child_window(control_type="Edit", found_index=1)
+            if greetings:
+                request_edit.set_text(greetings)
+            if remark:
+                remark_edit.set_text(remark)
+            verify_window.child_window(**Uielements.Buttons.ConfirmButton).click_input()
+            return name
+        finally:
+            _safe_call(getattr(add_friend_pane, "close", None))
+
+    def _add_friend_via_vendor(self, number: str, greetings: str, remark: str | None) -> None:
+        """原来那条路：vendor 全包，但什么名字都不给。只在退化时用。"""
         FriendSettings = self._pyweixin_class("FriendSettings")
         try:
             FriendSettings.add_new_friend(
@@ -57,8 +148,6 @@ class UiaWeChatDriver:
         except Exception as exc:
             logger.info("friend.add.failed", number=number, error=str(exc)[:100])
             raise WeChatApiError(f"添加好友失败：{exc}") from exc
-        logger.info("friend.add.done", number=number)
-        return {"dry_run": False, "action": "add_friend", "number": number}
 
     def search_contacts(self, query: str, limit: int = 10) -> dict[str, Any]:
         normalized_query = str(query or "").strip()
@@ -1907,6 +1996,88 @@ _SEARCH_RESULT_SECTIONS = {
     "官方賬號": ("official_accounts", "official_account"),
     "聊天記錄": ("chat_history", "chat_history"),
 }
+class _AddFriendNotStarted(Exception):
+    """加好友流程还没点到任何按钮就走不下去了——可以安全退回 vendor 实现重来一次。"""
+
+
+#: 名片上这些是**字段行**不是昵称。前缀匹配，冒号写法（中英文冒号）都算。
+_PROFILE_LABEL_PREFIXES = (
+    "微信号", "微信號", "wechat id", "weixin id",
+    "地区", "地區", "region",
+    "来源", "來源", "source",
+    "备注", "備註", "remark",
+    "标签", "標籤", "tag",
+    "个性签名", "個性簽名", "signature", "whats up",
+    "朋友权限", "朋友權限",
+    "手机号", "手機號", "phone",
+    "昵称", "暱稱", "nickname",
+)
+
+#: 名片上的按钮/操作文案，别把它们当成名字。
+_PROFILE_BUTTON_TEXTS = frozenset({
+    "添加到通讯录", "新增到通訊錄", "add to contacts",
+    "发消息", "發消息", "send message", "message",
+    "搜索", "搜尋", "search", "取消", "cancel", "确定", "確定", "ok",
+    "更多", "more", "朋友圈", "moments",
+})
+
+
+def _looks_like_number(text: str) -> bool:
+    """一串数字/加号/横线 —— 手机号那行，不是名字。"""
+    stripped = text.replace("+", "").replace("-", "").replace(" ", "")
+    return bool(stripped) and stripped.isdigit()
+
+
+def _pick_profile_name(lines: list[str], number: str) -> str | None:
+    """从加好友名片的文本行里挑出昵称。纯函数，好测——真机上这张卡片没法在 CI 里模拟。
+
+    卡片长这样（顺序不保证，字段有无也不保证）::
+
+        张三
+        微信号：wxid_abc123
+        地区：广东 深圳
+        [添加到通讯录]
+
+    规则：带字段名的行里，只有「昵称：X」直接取 X；其余字段行、按钮文案、
+    搜的那个号码本身、纯数字行，全部排掉；剩下的第一行就是昵称。
+    """
+    fallback: str | None = None
+    for raw in lines:
+        line = str(raw or "").strip()
+        if not line or line == number or _looks_like_number(line):
+            continue
+        if line.casefold() in _PROFILE_BUTTON_TEXTS:
+            continue
+        folded = line.casefold()
+        label = next((p for p in _PROFILE_LABEL_PREFIXES if folded.startswith(p)), None)
+        if label is not None:
+            # 「昵称：张三」这种是明写的，最可信，直接用
+            if label in {"昵称", "暱稱", "nickname"}:
+                value = line[len(label):].lstrip("：: ").strip()
+                if value:
+                    return value
+            continue
+        if number and number in line:
+            continue  # 「手机号 138…」这类没带字段名、但含号码的行
+        if fallback is None:
+            fallback = line
+    return fallback
+
+
+def _profile_text_lines(pane: Any) -> list[str]:
+    """把名片上所有文本抓成行。控件树长什么样各版本不一样，所以宁可抓全了再挑。"""
+    lines: list[str] = []
+    controls = [pane]
+    controls.extend(_safe_call(lambda: pane.descendants(control_type="Text")) or [])
+    for control in controls:
+        text = _safe_call(getattr(control, "window_text", None))
+        for line in str(text or "").splitlines():
+            stripped = line.strip()
+            if stripped and stripped not in lines:
+                lines.append(stripped)
+    return lines
+
+
 def _collect_contact_search_matches(
     items: list[Any],
     query: str,

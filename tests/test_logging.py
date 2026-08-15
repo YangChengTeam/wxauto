@@ -64,6 +64,22 @@ class ChineseLogRendererTests(unittest.TestCase):
         self.assertIn("文件发送完成", files)
         self.assertIn("读取聊天记录", history)
 
+    def test_friend_add_line_shows_the_name_we_will_reply_with(self) -> None:
+        output = self.render(
+            "friend.add.done",
+            number="13800138000",
+            name="张三",
+            session_name="张三-仓库工",
+        )
+        self.assertEqual(
+            output,
+            "2026-08-08 17:30:00 [信息] 好友申请已提交：13800138000（张三-仓库工）",
+        )
 
+    def test_friend_add_line_survives_a_run_that_read_no_name(self) -> None:
+        output = self.render("friend.add.done", number="13800138000")
+        self.assertEqual(
+            output, "2026-08-08 17:30:00 [信息] 好友申请已提交：13800138000"
+        )
 if __name__ == "__main__":
     unittest.main()
