@@ -108,10 +108,10 @@ def main(argv: list[str] | None = None) -> int:
     from .auth import ClientAuth
     from .client_api import ClientApi
     from .config import UiSettings
-    from .status_reporter import StatusReporter
     from .logbuffer import LogBuffer, LogPipeline
     from .service import GatewayService, ServiceState
     from .single_instance import SingleInstance, raise_existing_window
+    from .status_reporter import StatusReporter
     from .tray import Tray
     from .window import WINDOW_TITLE, MainWindow
 
@@ -119,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     wechat_settings = load_settings(args.config)
     # 先把参数灌进环境变量再读配置——真实环境变量优先。
     # 只有一份参数：这台机器在「配置中心」里填的那份（客户端接口不下发配置）。
-    settings_store.apply_to_environ(settings_store.load(wechat_settings.data_dir))
+    settings_store.apply_to_environ(settings_store.effective(wechat_settings.data_dir))
     settings = UiSettings()
 
     # ★ 单实例：两个进程同时驱动同一个微信 = 同一条消息读两遍、回两遍，两边还各按各的
@@ -175,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
         # 那 15 秒里窗口一次都不重绘，用户看到的就是「点了保存，程序死了」。
         def before_start() -> None:
             settings_store.apply_to_environ(
-                settings_store.load(wechat_settings.data_dir), force=True
+                settings_store.effective(wechat_settings.data_dir), force=True
             )
 
         def done() -> None:
@@ -209,8 +209,30 @@ def main(argv: list[str] | None = None) -> int:
         window.logout()
 
     auth_client.set_revoked_hook(lambda: root.after(0, session_revoked))
+
+    def wechat_capability_status(probe: dict[str, Any]) -> str:
+        """微信连上之后，这台机器到底能干哪几件事（契约 §8 的 ``capabilityStatus``）。
+
+        直接复用网关那份能力表（`gateway/capabilities.py`，074）：它算的就是「当下真能做
+        哪几件」。**不另起一套判据**——两套迟早给出两个答案，而企业端只显示一个。
+        重型 import 要和探测串行（Windows 加载器锁，见 heavy_import.py）。
+        """
+        with HEAVY_IMPORT_LOCK:
+            from wxclient.gateway.capabilities import (
+                capability_status,
+                probe_capabilities,
+            )
+
+        return capability_status(probe_capabilities(
+            uia=probe,
+            allow_real_actions=args.allow_real_actions or UiSettings().allow_real_actions,
+            # 取文件通道由网关自己建（factory 里恒有），不是可配项。
+            has_file_channel=True,
+        ))
+
     reporter = StatusReporter(api, lambda: auth_client.token,
                               client_version=__version__,
+                              capability_check=wechat_capability_status,
                               on_revoked=auth_client.handle_revoked)
 
     def on_wechat_probe(probe: Any, error: BaseException | None) -> None:

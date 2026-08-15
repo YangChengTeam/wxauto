@@ -1,6 +1,6 @@
 """客户端登录与状态上报（不含 GUI，到处都能跑）。
 
-对的是 `docs/招聘分身_客户端认证与状态接口_v1.md`。这一层管的每件事都能「把人挡在门外」
+对的是 `docs/招聘分身_客户端认证与状态接口_v1.1.md`。这一层管的每件事都能「把人挡在门外」
 或者「放错人进来」，所以全都要测：
 
 ① 登录请求的形状——字段名、`clientType`、邮箱大小写、`replaceExistingSession`；
@@ -137,6 +137,27 @@ class LoginRequestTests(unittest.TestCase):
         self.assertTrue(payload["eventId"])
         self.assertTrue(payload["occurredAt"].endswith("Z"), "时间是 UTC ISO-8601")
         self.assertEqual(self.sent["token"], "tok")
+
+    def test_the_wechat_report_uses_the_contract_field_names(self) -> None:
+        """★ 字段名错一个（capability_status vs capabilityStatus）后端就只当没收到，
+        而这一格恰恰决定企业端显不显示「运行中」。"""
+        self.api.put_wechat_uia_status("tok", "connected",
+                                       instance={"processVersion": "4.0.1.15"},
+                                       capability_status="passed")
+
+        payload = self.sent["payload"]
+        self.assertEqual(self.sent["path"], "/recruitment-agent/client/wechat-uia/status")
+        self.assertEqual(payload["capabilityStatus"], "passed")
+        self.assertEqual(payload["wechatInstance"], {"processVersion": "4.0.1.15"})
+        self.assertNotIn("capability_status", payload)
+
+    def test_an_unchecked_connection_omits_the_capability_field(self) -> None:
+        """没算出能力档时**不发这个字段**（契约 §8：省略 = 服务端进 checking），
+        不许塞一个空串或者瞎猜一个 passed。"""
+        self.api.put_wechat_uia_status("tok", "connected")
+
+        self.assertNotIn("capabilityStatus", self.sent["payload"])
+
 
 
 class ErrorTranslationTests(unittest.TestCase):
@@ -449,6 +470,58 @@ class StatusReporterTests(unittest.TestCase):
                    if name == "client_status" and call["status"] == "offline"]
         self.assertEqual(len(offline), 1)
         self.assertEqual(offline[0]["reason"], "client_shutdown")
+
+    CONNECTED_PROBE = {"platform": "Windows", "uia_exposed": True,
+                       "selected_window": {"process_version": "4.0.1.15"}}
+
+    def test_connecting_also_says_what_this_machine_can_do(self) -> None:
+        """契约 §8：只有 ``capabilityStatus=passed`` 才让企业端进入「运行中」。
+
+        连上微信 ≠ 能干活（只走流程不真发、发不了文件都算连上了），所以这一档必须
+        跟着 connected 一起报——不然企业端会把一台什么都发不出去的机器显示成运行中。
+        """
+        reporter = StatusReporter(self.api, lambda: "tok", client_version="1.0.0",
+                                  capability_check=lambda probe: "passed")
+        self.addCleanup(reporter.stop)
+
+        reporter.wechat_probe(self.CONNECTED_PROBE)
+        self._drain(reporter)
+
+        posts = [call for name, call in self.api.calls if name == "wechat_status"]
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["status"], uia_status.CONNECTED)
+        self.assertEqual(posts[0]["capability_status"], "passed")
+
+    def test_a_changed_capability_is_reported_again(self) -> None:
+        """能力档变了要再说一次：微信没动，但「能不能真发」变了，企业端得知道。"""
+        answers = iter(["limited", "limited", "passed"])
+        reporter = StatusReporter(self.api, lambda: "tok", client_version="1.0.0",
+                                  capability_check=lambda probe: next(answers))
+        self.addCleanup(reporter.stop)
+
+        for _ in range(3):
+            reporter.wechat_probe(self.CONNECTED_PROBE)
+        self._drain(reporter)
+
+        levels = [call["capability_status"] for name, call in self.api.calls
+                  if name == "wechat_status"]
+        self.assertEqual(levels, ["limited", "passed"], "相同的档不重复报，变了才报")
+
+    def test_a_broken_capability_check_still_reports_the_connection(self) -> None:
+        """算不出能力表不该把「微信连上了」这条也一起吞掉。"""
+        def boom(probe: dict[str, Any]) -> str:
+            raise RuntimeError("探测炸了")
+
+        reporter = StatusReporter(self.api, lambda: "tok", client_version="1.0.0",
+                                  capability_check=boom)
+        self.addCleanup(reporter.stop)
+
+        reporter.wechat_probe(self.CONNECTED_PROBE)
+        self._drain(reporter)
+
+        posts = [call for name, call in self.api.calls if name == "wechat_status"]
+        self.assertEqual([call["status"] for call in posts], [uia_status.CONNECTED])
+        self.assertEqual(posts[0]["capability_status"], "")
 
     def test_nothing_is_reported_before_login(self) -> None:
         """没 Token 的时候（还没登录）不该往服务端打——那些请求只会得到 401。"""

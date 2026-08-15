@@ -49,7 +49,7 @@ python -m wxclient.gateway --account wxid_zhangsan_work --allow-real-actions   #
 ### 登录与状态上报
 
 打开界面要**先登录**：用劳小智的**邮箱 + 密码**登录业务后端的招聘分身客户端接口，
-不走邮箱验证码。契约见 [`docs/招聘分身_客户端认证与状态接口_v1.md`](docs/招聘分身_客户端认证与状态接口_v1.md)，
+不走邮箱验证码。契约见 [`docs/招聘分身_客户端认证与状态接口_v1.1.md`](docs/招聘分身_客户端认证与状态接口_v1.1.md)，
 客户端实现在 `wxclient/ui/client_api.py`。
 
 ```text
@@ -57,6 +57,7 @@ POST /recruitment-agent/client/auth/login          登录（不触发 OTP）
 POST /recruitment-agent/client/auth/logout         退出并撤销这台设备的 Token
 PUT  /recruitment-agent/client/status              在线 / 离线 / 异常
 PUT  /recruitment-agent/client/wechat-uia/status   本机微信 UIA 连接状态
+POST /recruitment-agent/client/session-ticket      换 AI 端短票（网关用）
 ```
 
 - **只有这一条登录路**。原来那个「本机账号」模式已删：服务端管不到的登录方式，
@@ -68,8 +69,9 @@ PUT  /recruitment-agent/client/wechat-uia/status   本机微信 UIA 连接状态
 - 「这个分身已在另一台电脑登录」不自动顶掉：弹一句问清是哪台机器，人点了确认才带
   `replaceExistingSession=true` 重来。
 - 「记住邮箱」只记邮箱，**永不记密码**。
-- 全新机器还没配业务端地址时，登录页上会多一格「服务器地址」——填一次就落进
-  `gateway.env`（和配置中心里那格是**同一个键**）。
+- 业务端地址**默认就是正式地址** `https://api.laoxiaozhi.cn`，装机不用抄；要连别的环境
+  在配置中心改（填过的值不会被默认值盖掉）。万一被清空，登录页上会多一格「服务器地址」
+  ——填一次就落进 `gateway.env`（和配置中心里那格是**同一个键**）。
 
 **没有心跳**（契约 §7）：在线状态全靠这台机器在**变化时**说一声，服务端不会按时间把
 online 改成 offline。所以正常退出前会先报一次 offline（最多等 3 秒），进程崩溃/断电时
@@ -77,13 +79,14 @@ online 改成 offline。所以正常退出前会先报一次 offline（最多等
 
 微信连接状态取自只读 UIA 探测（15 秒一拍）：微信没开、开了没登录、开了但控件树没暴露，
 是**三种不同的失败**，各给各的恢复引导；连过又断了报 `disconnected` 而不是 `failed`。
-相同状态不重复上报。
+相同状态不重复上报。连上时一并报 `capabilityStatus`（这台机器**到底能干哪几件事**，
+复用网关那份能力表）：只有 `passed` 会让企业端进入「运行中」，dry-run 机器如实报 `limited`。
 
 ### 参数
 
 参数只有一份：配置中心里改的，落 `<data_dir>/gateway.env`（真实环境变量仍优先，除非点了
 「保存并重启服务」）。**界面上一个凭证都没有**——换票用的是登录签发的客户端 Token
-（`POST /recruitment-agent/client/ai-ticket`，⚠️ 后端尚未实现，在那之前网关连不上 AI 端），
+（`POST /recruitment-agent/client/session-ticket`，请求体是空的——换谁的票由服务端从会话派生），
 微信号也不再手抄，用登录返回的分身 ID 记账。
 
 **登录之前一概不起服务**（用户 2026-08-15）：网关只在登录成功之后才起来。

@@ -1,6 +1,6 @@
 """招聘分身客户端 ↔ 业务后端的四个接口。
 
-契约见 `docs/招聘分身_客户端认证与状态接口_v1.md`（本文件是它的客户端实现，字段名、
+契约见 `docs/招聘分身_客户端认证与状态接口_v1.1.md`（本文件是它的客户端实现，字段名、
 枚举、错误码都以那份为准；**改动必须两边一起改**）。
 
 ```text
@@ -138,12 +138,16 @@ class ClientApi:
     def put_wechat_uia_status(self, token: str, status: str, *,
                               instance: dict[str, Any] | None = None,
                               failure: dict[str, Any] | None = None,
+                              capability_status: str = "",
                               event_id: str = "", occurred_at: str = "") -> dict[str, Any]:
         payload: dict[str, Any] = {
             "eventId": event_id or new_event_id(),
             "status": status,
             "occurredAt": occurred_at or now_iso(),
         }
+        if capability_status:
+            # 契约 §8：只有 passed 才让企业端进入「运行中」。
+            payload["capabilityStatus"] = capability_status
         if instance:
             payload["wechatInstance"] = instance
         if failure:

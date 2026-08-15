@@ -1,4 +1,4 @@
-"""换票：用**这台机器登录时拿到的客户端 Token**，换取该招聘专员的 60 秒短票。
+"""换票：用**这台机器登录时拿到的客户端 Token**，换取该招聘专员的短期 AI 会话票据。
 
 四条铁律（``CLAUDE.md`` §4.1）：
 1. 票不缓存、不落盘、不打日志；
@@ -8,12 +8,15 @@
 
 ★ 2026-08-15 换了凭证：原来用的是一把手抄进这台机器的 `internal key`（服务间共享密钥，
 所有装机的人都得抄一遍，撤销要改所有机器）。现在用客户端登录接口签发的、**按会话可撤销的**
-Token（`docs/招聘分身_客户端认证与状态接口_v1.md`）：退出登录、换设备、管理员撤销会话，
-这台机器立刻换不到票，也就立刻停手。
+Token（`docs/招聘分身_客户端认证与状态接口_v1.1.md` §5.3）：退出登录、换设备、管理员撤销
+会话，这台机器立刻换不到票，也就立刻停手。
 
-⚠️ 服务端的 `POST /recruitment-agent/client/ai-ticket` **尚未实现**（那份契约 §4 的清单里
-还没有它）。在它上线之前，这条路会稳定地 fail-closed：网关连不上 AI 端，日志里是一句
-「换票被拒绝」。这是**明知的缺口**，不要用「先临时读个环境变量」把它绕过去。
+契约里两处容易踩的点：
+
+* **请求体是空的**。换谁的票由服务端从会话派生（tenant/user/agent 全在 Token 背后），
+  客户端**不许**上传身份——传了也不作数，还会让人误以为这台机器能替别人换票。
+* **客户端必须先是 online**。显式报过 offline 或会话被撤销都换不到票（`CLIENT_NOT_ONLINE`）。
+  所以状态上报（`ui/status_reporter.py`）不是装饰，它是这条链路的前置条件。
 """
 
 from __future__ import annotations
@@ -21,18 +24,37 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import httpx
 import structlog
 
 _log = structlog.get_logger(__name__)
 
-TICKET_PATH = "/recruitment-agent/client/ai-ticket"
+TICKET_PATH = "/recruitment-agent/client/session-ticket"
+
+#: 契约 §5.3 的错误码 → 说人话。**分得开的失败要给不同的话**：
+#: 「额度用完」要去充值/等下月，「没权限」要找管理员，「不在线」自己会好——
+#: 全都说成「换票失败」的话，排障只能靠猜。
+MESSAGES = {
+    "CLIENT_TOKEN_REQUIRED": "这台机器还没登录，换不到票",
+    "CLIENT_TOKEN_INVALID": "客户端登录已失效，请重新登录",
+    "CLIENT_SESSION_REVOKED": "客户端登录已失效，请重新登录",
+    "EMPLOYEE_AI_MONTHLY_LIMIT_REACHED": "这位专员本月的 AI 额度已用完",
+    "EMPLOYEE_AI_PERMISSION_DENIED": "这个账号没有 AI 使用权限，请联系管理员",
+    "EMPLOYEE_AI_TOKEN_INACTIVE": "这个账号的 AI 通道已停用，请联系管理员",
+    "CLIENT_NOT_ONLINE": "业务端记的这台机器不在线，等状态上报同步后会自己恢复",
+    "EMPLOYEE_AI_PROVISIONING": "AI 通道正在开通，稍后重试",
+    "AI_CREDENTIAL_CONFIGURATION_ERROR": "AI 凭证服务配置不完整，请联系管理员",
+}
 
 
 class TicketError(RuntimeError):
     """换票失败。调用方必须停止该专员的自动化动作，不得继续。"""
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class TicketProvider(Protocol):
@@ -73,49 +95,58 @@ class ClientTokenTicketProvider:
             "authorization": f"Bearer {token}",
             "content-type": "application/json",
         }
-        # 字段名跟客户端接口一族保持 camelCase（契约 §3.3）。
-        payload = {"agentAccountId": wechat_account_id}
 
         try:
             if self._client is not None:
                 response = await self._client.post(
-                    url, headers=headers, json=payload, timeout=self._timeout
+                    url, headers=headers, json={}, timeout=self._timeout
                 )
             else:
                 async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    response = await client.post(url, headers=headers, json=payload)
+                    response = await client.post(url, headers=headers, json={})
         except Exception as exc:  # noqa: BLE001 —— 任何异常都必须 fail-closed
             # 不记 url 之外的任何细节，避免把凭证写进日志。
             _log.warning("换票请求失败", account=wechat_account_id, error=str(exc))
             raise TicketError(f"换票请求失败: {exc}") from exc
 
-        if response.status_code == 401:
-            # 会话被撤销 / Token 失效（契约 §7）。这是**要人重新登录**的那一类，
-            # 和「网络不通」不是一回事，日志里必须分得开。
-            _log.warning("客户端会话已失效，换不到票", account=wechat_account_id)
-            raise TicketError("客户端登录已失效，请重新登录")
         if response.status_code != 200:
+            code = _error_code(response)
+            text = MESSAGES.get(code) or f"换票被拒绝: HTTP {response.status_code}"
+            # 只记稳定错误码，不记服务端 message——那句话里可能带上下文。
             _log.warning(
-                "换票被拒绝", account=wechat_account_id, status=response.status_code
+                "换票被拒绝",
+                account=wechat_account_id,
+                status=response.status_code,
+                code=code or None,
             )
-            raise TicketError(f"换票被拒绝: HTTP {response.status_code}")
+            raise TicketError(text, code=code)
 
         try:
             body = response.json()
         except Exception as exc:  # noqa: BLE001
             raise TicketError("换票响应不是合法 JSON") from exc
 
-        # 两种写法都收：这一族接口是 camelCase，AI 端那边的既有字段是 snake_case，
-        # 上线时哪一种都不至于卡在一个下划线上。
+        # 契约 §5.3 的响应是 snake_case（`session_ticket`），和这一族接口的 camelCase
+        # 不同；两种都收，上线时不至于卡在一个下划线上。
         ticket = None
         if isinstance(body, dict):
-            ticket = body.get("sessionTicket") or body.get("session_ticket")
+            ticket = body.get("session_ticket") or body.get("sessionTicket")
         if not isinstance(ticket, str) or not ticket.strip():
-            raise TicketError("换票响应缺少 sessionTicket")
+            raise TicketError("换票响应缺少 session_ticket")
 
         # 只记「换到了」，绝不记票据内容。
         _log.info("已换取短票", account=wechat_account_id)
         return ticket.strip()
+
+
+def _error_code(response: Any) -> str:
+    """从错误信封（契约 §3.4）里取稳定错误码。取不到就空着，由状态码兜底。"""
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    return str(error.get("code") or "") if isinstance(error, dict) else ""
 
 
 class LocalFileTicketProvider:

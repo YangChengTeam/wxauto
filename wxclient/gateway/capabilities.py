@@ -49,6 +49,27 @@ CAPABILITY_OF_OP: dict[str, str] = {
 }
 
 
+#: 契约 §8 的 ``capabilityStatus`` 三档。
+CAPABILITY_PASSED = "passed"
+CAPABILITY_LIMITED = "limited"
+CAPABILITY_FAILED = "failed"
+
+
+def capability_status(caps: dict[str, Capability]) -> str:
+    """把能力表压成企业端要的那一档（契约 §8）。
+
+    ``passed`` 才会让聚合状态进入「运行中」，所以这里**不许往好了说**：
+    dry-run（只走流程不真发）下写类能力全是不可用，如实报 ``limited``——报 passed
+    的话，企业端显示「运行中」，而这台机器一条消息都不会真的发出去。
+    """
+    values = list(caps.values())
+    if not values or not any(cap.available for cap in values):
+        return CAPABILITY_FAILED
+    if all(cap.available for cap in values):
+        return CAPABILITY_PASSED
+    return CAPABILITY_LIMITED
+
+
 def capability_of(op: str, *, to_group: bool = False) -> str:
     """这个 op 用到哪项能力。发给群的私聊消息算「往群里发」——两者的开关是分开的。"""
     if op == "send_message" and to_group:

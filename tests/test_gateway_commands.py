@@ -23,6 +23,7 @@ from wxclient.gateway.capabilities import (
     CAP_READ,
     CAP_SEND_FILES,
     capability_of,
+    capability_status,
     probe_capabilities,
 )
 from wxclient.gateway.download import DownloadError, FileFetcher, FileRef
@@ -501,6 +502,17 @@ class CapabilityProbeTests(unittest.TestCase):
         caps = self._caps(supported_ops={"send_message"})
         self.assertTrue(caps[CAP_PRIVATE_MESSAGE].available)
         self.assertFalse(caps[CAP_MOMENTS].available)
+
+    def test_capability_status_never_talks_up_a_dry_run_machine(self) -> None:
+        """契约 §8：只有 ``passed`` 会让企业端显示「运行中」。
+
+        ★ 只走流程不真发的机器必须报 ``limited``——报 passed 的话，企业端说运行中，
+        而这台电脑一条消息都不会真的发出去。
+        """
+        self.assertEqual(capability_status(self._caps()), "passed")
+        self.assertEqual(capability_status(self._caps(allow_real_actions=False)), "limited")
+        self.assertEqual(capability_status(self._caps(has_file_channel=False)), "limited")
+        self.assertEqual(capability_status(self._caps(uia=None)), "failed")
 
     def test_group_message_is_its_own_capability(self) -> None:
         self.assertEqual(capability_of("send_message"), CAP_PRIVATE_MESSAGE)

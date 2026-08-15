@@ -309,12 +309,28 @@ class ClientTokenTicketTests(unittest.IsolatedAsyncioTestCase):
         def handler(request: httpx.Request) -> httpx.Response:
             seen["auth"] = request.headers.get("authorization")
             seen["path"] = request.url.path
-            return httpx.Response(200, json={"sessionTicket": "tkt-1"})
+            seen["body"] = json.loads(request.content.decode("utf-8") or "{}")
+            return httpx.Response(200, json={"session_ticket": "tkt-1",
+                                             "expires_at": "2026-08-15T08:35:00.000Z"})
 
         self.assertEqual(await self._provider(handler).mint("agent-1"), "tkt-1")
         self.assertEqual(seen["auth"], "Bearer tok",
                          "★ 用的是这台机器登录到的那把可撤销 Token，不是共享密钥")
-        self.assertEqual(seen["path"], "/recruitment-agent/client/ai-ticket")
+        self.assertEqual(seen["path"], "/recruitment-agent/client/session-ticket")
+
+    async def test_the_client_never_says_whose_ticket_it_wants(self) -> None:
+        """★ 请求体是空的（契约 §5.3）：换谁的票由服务端从会话派生。
+
+        客户端要是能传身份，「这台机器只能换自己的票」就成了一句空话。
+        """
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["body"] = json.loads(request.content.decode("utf-8") or "{}")
+            return httpx.Response(200, json={"session_ticket": "tkt-1"})
+
+        await self._provider(handler).mint("agent-1")
+        self.assertEqual(seen["body"], {})
 
     async def test_without_a_login_it_fails_closed(self) -> None:
         """★ 没登录就换不到票 = 一条消息都发不出去。这正是想要的：撤销会话即刻停手。"""
@@ -333,11 +349,33 @@ class ClientTokenTicketTests(unittest.IsolatedAsyncioTestCase):
             await self._provider(handler).mint("agent-1")
         self.assertIn("重新登录", str(caught.exception))
 
-    async def test_snake_case_response_is_also_accepted(self) -> None:
+    async def test_camel_case_response_is_also_accepted(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"session_ticket": "tkt-2"})
+            return httpx.Response(200, json={"sessionTicket": "tkt-2"})
 
         self.assertEqual(await self._provider(handler).mint("agent-1"), "tkt-2")
+
+    async def test_each_refusal_says_what_to_do_about_it(self) -> None:
+        """契约 §5.3 的错误码各有各的去处，不能全都说成「换票失败」。
+
+        额度用完要去充值、没权限要找管理员、不在线自己会好——说不清楚的话，
+        排障只能靠猜，而这条链路断了就等于这台机器一条消息都不回。
+        """
+        cases = {
+            "EMPLOYEE_AI_MONTHLY_LIMIT_REACHED": "额度",
+            "EMPLOYEE_AI_PERMISSION_DENIED": "权限",
+            "EMPLOYEE_AI_TOKEN_INACTIVE": "停用",
+            "CLIENT_NOT_ONLINE": "不在线",
+        }
+        for code, expected in cases.items():
+            with self.subTest(code=code):
+                def handler(request: httpx.Request, code: str = code) -> httpx.Response:
+                    return httpx.Response(409, json={"error": {"code": code}})
+
+                with self.assertRaises(TicketError) as caught:
+                    await self._provider(handler).mint("agent-1")
+                self.assertIn(expected, str(caught.exception))
+                self.assertEqual(caught.exception.code, code)
 
 
 class SettingsTests(unittest.TestCase):

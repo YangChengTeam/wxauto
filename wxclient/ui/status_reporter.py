@@ -40,10 +40,12 @@ class StatusReporter:
 
     def __init__(self, api: ClientApi, token: Callable[[], str], *,
                  client_version: str = "",
+                 capability_check: Callable[[dict[str, Any]], str] | None = None,
                  on_revoked: Callable[[], None] | None = None) -> None:
         self._api = api
         self._token = token
         self._client_version = client_version
+        self._capability_check = capability_check
         self._on_revoked = on_revoked
         self._lock = threading.Lock()
         self._client_status = ""
@@ -113,8 +115,15 @@ class StatusReporter:
 
     def wechat_probe(self, probe: dict[str, Any]) -> None:
         state = uia_status.classify(probe)
-        if state is not None:
-            self._wechat_state(state)
+        if state is None:
+            return
+        if state.status == uia_status.CONNECTED and self._capability_check is not None:
+            # 连上了还得说「能干哪几件事」：只有 passed 才让企业端进入「运行中」（契约 §8）。
+            try:
+                state = state.with_capability(self._capability_check(probe))
+            except Exception as exc:  # noqa: BLE001 - 算不出能力表不该拖垮状态上报
+                _log.warning("能力检测失败", error=str(exc)[:120])
+        self._wechat_state(state)
 
     def wechat_probe_failed(self, error: BaseException) -> None:
         self._wechat_state(uia_status.probe_failed(error))
@@ -133,9 +142,11 @@ class StatusReporter:
         try:
             self._api.put_wechat_uia_status(self._token(), state.status,
                                             instance=state.instance,
-                                            failure=state.failure)
+                                            failure=state.failure,
+                                            capability_status=state.capability_status)
             _log.info("已上报微信连接状态", status=state.status,
-                      failure=state.failure_code or None)
+                      failure=state.failure_code or None,
+                      capability=state.capability_status or None)
         except ApiError as exc:
             self._failed("微信连接状态", exc, lambda: self._reset_wechat(state, previous))
 

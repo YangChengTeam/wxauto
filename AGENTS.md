@@ -71,7 +71,7 @@
 
 ## 桌面端登录与状态上报（2026-08-15 起按正式契约）
 
-契约：[`docs/招聘分身_客户端认证与状态接口_v1.md`](docs/招聘分身_客户端认证与状态接口_v1.md)。
+契约：[`docs/招聘分身_客户端认证与状态接口_v1.1.md`](docs/招聘分身_客户端认证与状态接口_v1.1.md)。
 客户端实现分三块：`ui/client_api.py`（四个接口）、`ui/token_store.py`（DPAPI 存 Token）、
 `ui/status_reporter.py`（状态变化时上报）。**改任何一处都要和那份文档对齐，别就地发明字段。**
 
@@ -90,9 +90,13 @@
   是三种不同失败，各给各的恢复引导；连过又断报 `disconnected`。**拿不到的别编**——
   非 Windows 直接不上报；`accountRef`（防一个微信被两个分身占用）需要读微信自身账号，
   客户端现在没这个能力，**宁可不给也不编一个假的稳定标识**。
-- 换票改用客户端 Token（`gateway/ticket.py: ClientTokenTicketProvider`），internal key 已删。
-  ⚠️ `POST /recruitment-agent/client/ai-ticket` **后端尚未实现**，在那之前这条路稳定
-  fail-closed；**不要临时读个环境变量把它绕过去**。
+- **能力档**（契约 §8 `capabilityStatus`）跟 `connected` 一起报，直接复用网关那份能力表
+  （`gateway/capabilities.py: capability_status`）——**不另起一套判据**，两套迟早给出两个
+  答案。只有 `passed` 会让企业端显示「运行中」，所以 dry-run 机器必须如实报 `limited`。
+- 换票 `POST /recruitment-agent/client/session-ticket`（契约 §5.3，后端已实现），
+  用客户端 Token，internal key 已删。**请求体是空的**：换谁的票由服务端从会话派生，
+  客户端传身份不作数。前置条件是这台机器**当前是 online**（否则 `409 CLIENT_NOT_ONLINE`）
+  ——状态上报不是装饰，它是这条链路的开关。
 - 参数只有一份 `gateway.env`（客户端接口不下发配置，原 `gateway.remote.env` 那层已删）。
   界面上**一个凭证都没有**；微信号也不再手抄，用登录返回的 `agent.id` 记账。
 - 「记住邮箱」只记邮箱，永不记密码。

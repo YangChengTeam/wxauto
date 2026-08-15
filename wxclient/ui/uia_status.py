@@ -41,6 +41,17 @@ class UiaState:
     status: str
     failure_code: str = ""
     instance: dict[str, Any] | None = None
+    capability_status: str = ""
+    """契约 §8 的 ``capabilityStatus``：``passed`` / ``limited`` / ``failed``。
+
+    只在 ``connected`` 时有值。契约允许先报一个不带它的 `connected`（服务端进
+    `checking_capabilities`）、检测完再报一次；**我们直接在第一次就带上**——这台机器的
+    能力表是从同一份探测结果里算出来的（`gateway/capabilities.py`），本来就没有
+    「正在检测」那一段，硬造一个中间态只会让企业端多闪一下。
+    """
+
+    def with_capability(self, status: str) -> "UiaState":
+        return UiaState(self.status, self.failure_code, self.instance, status)
 
     @property
     def failure(self) -> dict[str, Any] | None:
@@ -54,9 +65,10 @@ class UiaState:
         }
 
     def same_as(self, other: "UiaState | None") -> bool:
-        """相同状态不重复上报（契约 §8）。失败码变了算不同状态——原因换了就得说。"""
-        return other is not None and (self.status, self.failure_code) == (
-            other.status, other.failure_code)
+        """相同状态不重复上报（契约 §8）。失败码或能力档变了算不同状态——原因换了就得说。"""
+        return other is not None and (
+            self.status, self.failure_code, self.capability_status) == (
+            other.status, other.failure_code, other.capability_status)
 
 
 def classify(probe: dict[str, Any]) -> UiaState | None:

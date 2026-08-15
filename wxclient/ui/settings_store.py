@@ -17,7 +17,7 @@ from pathlib import Path
 FILE_NAME = "gateway.env"
 
 # ★ 曾经还有一份 `gateway.remote.env`（后端下发、本机覆盖）。2026-08-15 删了：
-#   正式的客户端接口（`docs/招聘分身_客户端认证与状态接口_v1.md`）**不下发任何配置**，
+#   正式的客户端接口（`docs/招聘分身_客户端认证与状态接口_v1.1.md`）**不下发任何配置**，
 #   留着那一层只会让「我改的到底生不生效」有两个答案。参数只有这一份。
 
 
@@ -31,6 +31,7 @@ class Field:
     section: str = "conn"   # 归到哪一段，见 SECTIONS
     unit: str = ""          # 输入框右边贴着的单位（设计稿上「秒」是框内的一格）
     placeholder: str = ""   # 空着时框里的灰字。**只是提示，永远不会被当成值**
+    default: str = ""       # 没配过时**真正生效**的值（和 placeholder 不是一回事）
 
 
 @dataclass(frozen=True)
@@ -64,9 +65,14 @@ SECTIONS: tuple[Section, ...] = (
 #:      留作环境变量 `WXCLIENT_GATEWAY_LOCAL_TICKET_FILE`）。手抄凭证这件事到此为止。
 #: 这些键手工写进 gateway.env 依然生效（``render_env_text`` 会原样保留、``apply_to_environ``
 #: 会照灌），只是不再摆在人人都会点的界面上。
+#: 业务后端的正式地址。给了默认值，装机的人就不用抄一串域名——抄错的表现是
+#: 「登录一直转圈」，而人根本不知道该怀疑哪里。改这里要连 README 一起改。
+DEFAULT_BUSINESS_API_URL = "https://api.laoxiaozhi.cn"
+
 FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_BUSINESS_API_URL", "业务端地址",
-          "登录和换票都用它，如 https://<business-host>"),
+          "登录和换票都用它，默认已填好正式地址",
+          default=DEFAULT_BUSINESS_API_URL),
     Field("WXCLIENT_GATEWAY_AI_WS_URL", "AI 端地址", "wss://<ai-host>/v1/ws"),
     Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔",
           "多久看一次未读，下限 30 秒", section="sched", unit="秒"),
@@ -137,15 +143,16 @@ def effective(data_dir: Path, environ: dict[str, str] | None = None) -> dict[str
     """界面要显示的是「当前实际生效的值」，不是「文件里存了什么」。
 
     命令行 `set` 出来的参数在文件里没有，界面上却空着——用户会以为没配，
-    保存时再把空值写回去，等于悄悄把配置抹了。所以文件缺的键回落到环境变量。
+    保存时再把空值写回去，等于悄悄把配置抹了。所以文件缺的键回落到环境变量，
+    再回落到 ``Field.default``（有默认值的参数，界面上就该显示那个默认值）。
     """
     target = os.environ if environ is None else environ
     values = load(data_dir)
     for field in FIELDS:
         if not values.get(field.key):
-            from_env = target.get(field.key, "")
-            if from_env:
-                values[field.key] = from_env
+            values[field.key] = target.get(field.key, "") or field.default
+        if not values[field.key]:
+            values.pop(field.key, None)
     return values
 
 

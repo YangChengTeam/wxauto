@@ -832,6 +832,22 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(values["WXCLIENT_UI_ACCOUNTS"], "文件里的")  # 文件有值就以文件为准
         self.assertEqual(values["WXCLIENT_GATEWAY_AI_WS_URL"], "wss://env/v1/ws")
 
+    def test_the_business_address_is_filled_in_out_of_the_box(self) -> None:
+        """★ 装机的人不该去抄一串域名：抄错的表现是「登录一直转圈」，而人根本不知道
+        该怀疑地址。默认值就是正式地址，改了以文件/环境变量为准。
+        """
+        key = "WXCLIENT_GATEWAY_BUSINESS_API_URL"
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = Path(tmp)
+
+            fresh = settings_store.effective(data_dir, {})
+            self.assertEqual(fresh[key], settings_store.DEFAULT_BUSINESS_API_URL)
+            self.assertTrue(fresh[key].startswith("https://"), "凭证不得明文过网")
+
+            settings_store.save(data_dir, {key: "https://staging.example"})
+            self.assertEqual(settings_store.effective(data_dir, {})[key],
+                             "https://staging.example", "填过的地址不会被默认值盖掉")
+
     def test_no_credential_is_kept_in_the_settings_file(self) -> None:
         """★ 2026-08-15 起这份 env 文件里**一个凭证都没有**。
 
