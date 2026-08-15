@@ -20,6 +20,7 @@ class Tray:
         service: GatewayService,
         *,
         on_show: Callable[[], None],
+        on_plans: Callable[[], None],
         on_settings: Callable[[], None],
         on_quit: Callable[[], None],
         on_logout: Callable[[], None],
@@ -29,6 +30,7 @@ class Tray:
 
         self._service = service
         self._on_show = on_show
+        self._on_plans = on_plans
         self._on_settings = on_settings
         self._on_quit = on_quit
         self._on_logout = on_logout
@@ -37,12 +39,15 @@ class Tray:
         #   ① 「启动服务/停止服务」没了——服务只在登录之后才起（见 `ui/__main__`），
         #      留着「启动服务」等于给登录门开一条旁路；「停止服务」并进了「退出登录」。
         #   ② 「参数设置」改名「配置中心」，和窗口里的导航一致。
+        #   ③ 菜单和左侧导航一一对应：窗口里有几页，这儿就有几项（用户 2026-08-15：
+        #      「右下角菜单少了一个计划中心」）——少一项就等于托盘只能到一半的地方。
         self._icon = pystray.Icon(
             "lxz-wechat-gateway",
             icon=build_icon_image(service.state),
             title=self._title(),
             menu=pystray.Menu(
                 pystray.MenuItem("显示日志", self._show, default=True),
+                pystray.MenuItem("计划中心", self._plans),
                 pystray.MenuItem("配置中心", self._settings),
                 pystray.MenuItem("退出登录", self._logout, enabled=self._can_logout),
                 pystray.Menu.SEPARATOR,
@@ -84,6 +89,9 @@ class Tray:
         # 退出登录会停服务，而停机要等网关线程收口（最长 15s）——那件事由窗口丢到后台去做
         # （`MainWindow.logout`），托盘这边只负责把动作传过去，别在托盘线程上等。
         self._on_logout()
+
+    def _plans(self, *_args: Any) -> None:
+        self._on_plans()
 
     def _settings(self, *_args: Any) -> None:
         self._on_settings()

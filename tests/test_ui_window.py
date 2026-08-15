@@ -216,6 +216,15 @@ class WindowAdversarialTests(unittest.TestCase):
 
         self.assertIn("一条消息都不会回", self.window._watch_hint.cget("text"))
 
+    def test_the_selected_page_is_marked_with_a_green_bar(self) -> None:
+        """★ 暗纹背景上「深一档的底色」几乎看不出来，绿条才是「我在这儿」（`docs/main.png`）。"""
+        for page in ("log", "plans", "settings"):
+            self.window._show_page(page)
+
+            lit = [key for key, mark in self.window._nav_marks.items()
+                   if str(mark.cget("bg")) == theme.GREEN_BRIGHT]
+            self.assertEqual(lit, [page], f"停在 {page} 时只有它亮绿条")
+
     def test_locked_nav_refuses_the_settings_page(self) -> None:
         """转场期间「参数设置」点不动——托盘那条路也一样。"""
         self.window._locked = True
@@ -697,7 +706,7 @@ class LogLookTests(unittest.TestCase):
             "2026-08-15 13:29:32 [信息] 已读取本地联调票",
         )
 
-        warn_line, info_line = "1.0", "2.0"
+        warn_line, info_line = "1.0", "3.0"  # 中间第 2 行是分隔线
         self.assertIn("row_warn", self.table._text.tag_names(f"{warn_line}+2c"))
         self.assertIn("bar_warn", self.table._text.tag_names(warn_line))
         self.assertNotIn("row_warn", self.table._text.tag_names(f"{info_line}+2c"))
@@ -725,6 +734,67 @@ class LogLookTests(unittest.TestCase):
         self.assertTrue(ranges, "参数要单独打上 kv 标签才灰得掉")
         self.assertEqual(self.table._text.get(*ranges[:2]), 'account="zk_weixin"')
         self.assertEqual(self.table._text.tag_cget("kv", "foreground"), theme.TEXT_MUTED)
+
+    def test_one_log_is_one_line_and_the_rest_is_a_tooltip(self) -> None:
+        """★ 长日志换行会把屏幕吃光：四行一条，一屏就剩两条，扫不动了。
+
+        所以不换行、截断显示，整条内容改由悬停气泡给（用户 2026-08-15）。
+        """
+        long_message = "AI 端连接不可用" + "，重试" * 120
+        self._feed(f"2026-08-15 13:29:33 [警告] {long_message}")
+
+        self.assertEqual(str(self.table._text.cget("wrap")), "none", "不许换行")
+
+        record = self.table._record_at(1)
+        self.assertIsNotNone(record)
+        tip = self.table.tip_text(record)
+        self.assertIn(long_message, tip, "★ 截的是显示，气泡里必须是整条")
+        self.assertIn("WARN", tip)
+        self.assertIn("2026-08-15 13:29:33", tip)
+
+    def test_every_log_is_followed_by_a_divider_line(self) -> None:
+        """★ 「每条日志做好分割」：分隔线自己占一行，所以第 k 条在第 2k+1 行。"""
+        self._feed(
+            "2026-08-15 13:29:13 [警告] 第一条",
+            "2026-08-15 13:29:32 [信息] 第二条",
+        )
+
+        self.assertIn("sep", self.table._text.tag_names("2.0"))
+        self.assertIn("sep", self.table._text.tag_names("4.0"))
+        self.assertNotIn("sep", self.table._text.tag_names("1.0"))
+        self.assertEqual(self.table._text.tag_cget("sep", "background"), theme.ROW_LINE)
+        # ★ 行距不归零的话，这条「线」会有十几像素高，看着就是行与行之间空了一大块
+        self.assertEqual(str(self.table._text.tag_cget("sep", "spacing1")), "0")
+        self.assertEqual(str(self.table._text.tag_cget("sep", "spacing3")), "0")
+
+        self.assertEqual(self.table._record_at(1).message, "第一条")
+        self.assertIsNone(self.table._record_at(2), "分隔线那行不对应任何一条日志")
+        self.assertEqual(self.table._record_at(3).message, "第二条")
+
+    def test_the_severity_bar_is_a_thin_stripe_not_a_block(self) -> None:
+        """★ 用户 2026-08-15：「警告最左边的橙色粗了」——一个普通空格宽是它的两三倍。"""
+        import tkinter.font as tkfont
+
+        from wxclient.ui import logtable
+
+        bar = tkfont.Font(font=self.table._bar_font).measure(" ")
+        normal = tkfont.Font(font=theme.FONT_LOG).measure(" ")
+
+        self.assertLessEqual(bar, logtable._BAR_W)
+        self.assertGreater(bar, 0, "细归细，不能细到没有")
+        self.assertLess(bar, normal, "比正文的空格窄——原来就是拿它当竖条才显得粗")
+
+    def test_dropping_the_oldest_rows_keeps_lines_and_records_in_step(self) -> None:
+        """★ 一条日志占两个 Text 行，删的时候没成对删，气泡就会指到隔壁那条上。"""
+        from wxclient.ui.logtable import LogTable
+
+        table = LogTable(self.root, max_lines=2)
+        _KEEP_ALIVE.append(table)
+        table.append([self.parse(f"2026-08-15 13:29:1{i} [信息] 第{i}条") for i in range(4)])
+
+        self.assertEqual(len(table._shown), 2)
+        self.assertEqual(table._record_at(1).message, "第2条")
+        self.assertEqual(table._record_at(3).message, "第3条")
 
     def test_a_line_that_does_not_parse_still_shows_up_whole(self) -> None:
         """★ 拆不开的行（异常栈、第三方 print）不许被列渲染吃掉。"""
@@ -798,8 +868,8 @@ class TrayMenuTests(unittest.TestCase):
 
         return Tray(
             GatewayService(lambda: None),
-            on_show=lambda: None, on_settings=lambda: None, on_quit=lambda: None,
-            on_logout=lambda: None, can_logout=lambda: logged_in,
+            on_show=lambda: None, on_plans=lambda: None, on_settings=lambda: None,
+            on_quit=lambda: None, on_logout=lambda: None, can_logout=lambda: logged_in,
         )
 
     def _labels(self, tray) -> list[str]:
@@ -811,7 +881,8 @@ class TrayMenuTests(unittest.TestCase):
     def test_the_menu_matches_the_window(self) -> None:
         labels = self._labels(self._tray())
 
-        self.assertEqual(labels, ["显示日志", "配置中心", "退出登录", "退出"])
+        # ★ 窗口里有几页，托盘就得有几项（用户 2026-08-15：「右下角菜单少了一个计划中心」）
+        self.assertEqual(labels, ["显示日志", "计划中心", "配置中心", "退出登录", "退出"])
         self.assertNotIn("启动服务", labels, "★ 这一项曾经是登录门的旁路")
         self.assertNotIn("停止服务", labels, "并进「退出登录」了")
         self.assertNotIn("参数设置", labels, "跟着窗口改名叫配置中心")

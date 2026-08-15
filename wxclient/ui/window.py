@@ -81,6 +81,9 @@ _SPINNER = ("◐", "◓", "◑", "◒")
 #: 留给后端下发的计划。
 _PAGE_TITLES = {"log": "实时日志", "plans": "计划中心", "settings": "配置中心"}
 
+#: 左侧导航选中那根绿条的宽度（像素）。
+_NAV_MARK_W = 4
+
 
 class MainWindow:
     def __init__(
@@ -214,12 +217,22 @@ class MainWindow:
         self._divider(bar, pady=(24, 10))
 
         self._nav: dict[str, tk.Label] = {}
+        self._nav_marks: dict[str, tk.Frame] = {}
         for page, text in (("log", "实时日志"), ("plans", "计划中心"), ("settings", "配置中心")):
-            item = tk.Label(bar, text=text, font=theme.FONT_BODY, bg=theme.SIDEBAR_BG,
-                            fg=theme.SIDEBAR_TEXT, anchor="w", padx=28, pady=8, cursor="hand2")
-            item.pack(fill=tk.X)
+            # 选中的那一页在**最左边**立一根绿条（`docs/main.png`）。只靠深一档的底色
+            # 在这张暗纹背景上几乎看不出来，绿条才是「我在这儿」的那个信号。
+            row = tk.Frame(bar, bg=theme.SIDEBAR_BG)
+            row.pack(fill=tk.X)
+            mark = tk.Frame(row, bg=theme.SIDEBAR_BG, width=_NAV_MARK_W)
+            mark.pack(side=tk.LEFT, fill=tk.Y)
+            item = tk.Label(row, text=text, font=theme.FONT_BODY, bg=theme.SIDEBAR_BG,
+                            fg=theme.SIDEBAR_TEXT, anchor="w",
+                            padx=28 - _NAV_MARK_W, pady=8, cursor="hand2")
+            item.pack(side=tk.LEFT, fill=tk.X, expand=True)
             item.bind("<Button-1>", lambda _e, p=page: self._show_page(p))
+            row.bind("<Button-1>", lambda _e, p=page: self._show_page(p))
             self._nav[page] = item
+            self._nav_marks[page] = mark
 
         # ★ 底部**只有一个**「退出登录」（用户 2026-08-15：「退出登录和退出服务是一个意思」）。
         # 服务本来就只在登录之后才起（见 `__main__`），所以「不再用了」这件事只有一种表达：
@@ -624,16 +637,19 @@ class MainWindow:
         self._render_overlay()
 
     def _render_nav(self) -> None:
-        """转场态里「参数设置」变灰、鼠标不再变手型——点不动这件事要看得出来。"""
+        """转场态里「配置中心」变灰、鼠标不再变手型——点不动这件事要看得出来。"""
         for key, item in self._nav.items():
             disabled = self._locked and key == "settings"
             active = key == self._page and not disabled
+            row_bg = theme.SIDEBAR_ACTIVE_BG if active else theme.SIDEBAR_BG
             item.configure(
-                bg=theme.SIDEBAR_ACTIVE_BG if active else theme.SIDEBAR_BG,
+                bg=row_bg,
                 fg=theme.SIDEBAR_LINE if disabled
                 else (theme.SIDEBAR_TITLE if active else theme.SIDEBAR_TEXT),
                 cursor="" if disabled else "hand2",
             )
+            item.master.configure(bg=row_bg)
+            self._nav_marks[key].configure(bg=theme.GREEN_BRIGHT if active else row_bg)
 
     def _render_overlay(self) -> None:
         if self._locked and self._page == "settings":
@@ -883,6 +899,11 @@ class MainWindow:
         """
         self.show()
         self._show_page("log")
+
+    def open_plans(self) -> None:
+        """托盘「计划中心」：窗口露面 + 停在计划页。"""
+        self.show()
+        self._show_page("plans")
 
     def open_settings(self) -> None:
         """托盘「参数设置」：窗口露面，并且停在设置页。"""
