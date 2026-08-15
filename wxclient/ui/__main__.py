@@ -217,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
                     settings_store.merged(wechat_settings.data_dir), force=True
                 )
             _log.info("已拉取配置", source=config.source, keys=len(config.values),
-                      plans=len(config.plans), changed=changed)
+                      changed=changed)
             root.after(0, lambda: after_config(config, changed))
 
         window.set_busy("正在拉取参数")
@@ -225,7 +225,6 @@ def main(argv: list[str] | None = None) -> int:
 
     def after_config(config: Any, changed: bool) -> None:
         window.set_config_source(config.source)
-        window.set_plans(config.plans)
         window.set_busy("")
         if service.state is ServiceState.RUNNING and changed:
             # 参数变了就按新参数重来一遍：让「后端改了配置」和「这台机器上真的在按它跑」
@@ -250,7 +249,6 @@ def main(argv: list[str] | None = None) -> int:
         # 菜单点哪一项就落到哪一页：open_log/open_settings 自己负责「露面 + 切页」，
         # 别在这儿只 show()——那样点「显示日志」出来的可能还是上次停着的配置中心。
         on_show=lambda: root.after(0, window.open_log),
-        on_plans=lambda: root.after(0, window.open_plans),
         on_settings=lambda: root.after(0, window.open_settings),
         on_quit=lambda: root.after(0, lambda: shutdown(root, window, service, tray)),
         on_logout=lambda: root.after(0, logout_requested),

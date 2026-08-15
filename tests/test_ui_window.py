@@ -127,8 +127,8 @@ class WindowAdversarialTests(unittest.TestCase):
             self.window.open_log()
             self.window._render_busy()
 
-        # 只该有四个：日志页 + 计划中心 + 配置中心 + 遮罩
-        self.assertLessEqual(len(self.window._pages.winfo_children()), 4)
+        # 只该有三个：日志页 + 配置中心 + 遮罩
+        self.assertLessEqual(len(self.window._pages.winfo_children()), 3)
 
     def test_transition_covers_the_settings_page_instead_of_kicking_you_out(self) -> None:
         """★ 转场态停在参数页：盖住就行，别把人正在填的东西丢掉。"""
@@ -165,33 +165,33 @@ class WindowAdversarialTests(unittest.TestCase):
         self.window.open_settings()
         self.assertIs(self.window._config_page, page, "真点的时候直接用预热那个")
 
-    def test_the_nav_is_log_plans_config(self) -> None:
-        """★ 导航改名（用户 2026-08-15）：参数设置→配置中心，监听名单→计划中心。
+    def test_the_nav_is_just_log_and_config(self) -> None:
+        """★ 只剩两页（用户 2026-08-15：「计划中心不需要，是发给我们 agent 端的」）。
 
-        名单本来就是 AI 端说了算、本机改不了的，归进配置中心当只读的一节；腾出来的位置
-        留给后端下发的计划。侧栏那行仍然只报「几个会话」，名字不铺在侧栏上。
+        参数设置→配置中心；监听名单本来就是 AI 端说了算、本机改不了，归进配置中心当
+        只读的一节。计划归 AI 端排、经 WS 推给网关执行，桌面端不摆这一页。
         """
-        self.assertEqual([self.window._nav[key].cget("text") for key in ("log", "plans", "settings")],
-                         ["实时日志", "计划中心", "配置中心"])
+        self.assertEqual([item.cget("text") for item in self.window._nav.values()],
+                         ["实时日志", "配置中心"])
+        self.assertNotIn("plans", self.window._nav, "计划中心已删")
         self.assertNotIn("watch", self.window._nav, "监听名单不再是单独一项")
         self.assertFalse(hasattr(self.window, "_watch_label"), "侧栏不该再铺名单")
 
-        self.window._show_page("plans")
+        self.window._show_page("settings")
 
-        self.assertEqual(self.window._page, "plans")
-        self.assertEqual(self.window._heading.cget("text"), "计划中心")
-        self.assertEqual(self.window._plans_page.winfo_manager(), "pack")
+        self.assertEqual(self.window._page, "settings")
+        self.assertEqual(self.window._heading.cget("text"), "配置中心")
         self.assertEqual(self.window._log_page.winfo_manager(), "", "日志页要让位")
         # 日志页专属的那一排不该跟着跑出来
         self.assertEqual(self.window._filter_bar.winfo_manager(), "")
         self.assertEqual(self.window._live_dot.winfo_manager(), "")
 
-    def test_the_empty_plan_page_says_why_it_is_empty(self) -> None:
-        """空页不许空着不说话：得讲清计划是后端下发的、这台机器只负责显示和执行。"""
+    def test_a_page_that_no_longer_exists_falls_back_to_the_log(self) -> None:
+        """★ 托盘/快捷方式里可能还留着老入口，别把内容区留成一片白。"""
         self.window._show_page("plans")
-        hint = self.window._plans_hint.cget("text")
-        self.assertIn("还没有计划", hint)
-        self.assertIn("后端", hint)
+
+        self.assertEqual(self.window._page, "log")
+        self.assertEqual(self.window._log_page.winfo_manager(), "pack")
 
     def test_the_watch_list_lists_the_actual_names_inside_the_config_page(self) -> None:
         """名单是「谁会被自动回复」的唯一判据，配置中心里必须看得到具体是谁。"""
@@ -218,7 +218,7 @@ class WindowAdversarialTests(unittest.TestCase):
 
     def test_the_selected_page_is_marked_with_a_green_bar(self) -> None:
         """★ 暗纹背景上「深一档的底色」几乎看不出来，绿条才是「我在这儿」（`docs/main.png`）。"""
-        for page in ("log", "plans", "settings"):
+        for page in ("log", "settings", "log"):
             self.window._show_page(page)
 
             lit = [key for key, mark in self.window._nav_marks.items()
@@ -695,9 +695,13 @@ class LogLookTests(unittest.TestCase):
 
         tabs = [int(float(tab)) for tab in self.root.tk.splitlist(self.table._text.cget("tabs"))]
         pad = logtable._PAD_X
-        self.assertEqual(heads["级别"], pad + tabs[0], "「级别」要正对级别列")
-        self.assertEqual(heads["消息"], pad + tabs[1], "「消息」要正对消息列")
+        self.assertEqual(len(tabs), 3, "三列三个制表位——时间列也得有一个，见下一条")
+        self.assertEqual(heads["时间"], pad + tabs[0], "「时间」要正对时间列")
+        self.assertEqual(heads["级别"], pad + tabs[1], "「级别」要正对级别列")
+        self.assertEqual(heads["消息"], pad + tabs[2], "「消息」要正对消息列")
         self.assertLess(heads["时间"], heads["级别"], "时间列在最左边")
+        # ★ 用户 2026-08-15：「文字离左边不要贴着」——时间列要在色条右边空出一段
+        self.assertGreaterEqual(heads["时间"] - pad - self.table._bar_w, logtable._BAR_GAP)
 
     def test_a_warning_row_gets_both_a_wash_and_a_bar_and_an_info_row_gets_neither(self) -> None:
         """★ 设计稿上警告行是「浅橙底 + 左边一根橙竖条」，光换字色扫一眼看不出来。"""
@@ -710,8 +714,11 @@ class LogLookTests(unittest.TestCase):
         self.assertIn("row_warn", self.table._text.tag_names(f"{warn_line}+2c"))
         self.assertIn("bar_warn", self.table._text.tag_names(warn_line))
         self.assertNotIn("row_warn", self.table._text.tag_names(f"{info_line}+2c"))
-        for name in self.table._text.tag_names(info_line):
-            self.assertFalse(name.startswith("bar_"), f"普通行不该有竖条：{name}")
+        # 普通行行首那个空格也带 bar_ tag（★不带的话它按正文字号排版，宽出几像素，
+        # 时间列就跟警告行错开了），但它只压窄不着色——看上去仍然没有竖条。
+        self.assertNotIn("bar_warn", self.table._text.tag_names(info_line))
+        self.assertFalse(self.table._text.tag_cget("bar_info", "background"),
+                         "普通行不该有看得见的竖条")
 
         self.assertTrue(self.table._text.tag_cget("bar_warn", "background"))
         self.assertNotEqual(self.table._text.tag_cget("bar_warn", "background"),
@@ -763,6 +770,10 @@ class LogLookTests(unittest.TestCase):
         self.assertIn("sep", self.table._text.tag_names("4.0"))
         self.assertNotIn("sep", self.table._text.tag_names("1.0"))
         self.assertEqual(self.table._text.tag_cget("sep", "background"), theme.ROW_LINE)
+        # ★ 用户 2026-08-15：「分割线太粗」——正字号是「磅」，高 DPI 上会被放成三四像素；
+        # 负字号是「像素」，写多少就是多少
+        sep_size = int(self.table._text.tag_cget("sep", "font").split()[-1])
+        self.assertLess(sep_size, 0, "分隔线字号必须是负数（像素），否则 DPI 一高线就变粗")
         # ★ 行距不归零的话，这条「线」会有十几像素高，看着就是行与行之间空了一大块
         self.assertEqual(str(self.table._text.tag_cget("sep", "spacing1")), "0")
         self.assertEqual(str(self.table._text.tag_cget("sep", "spacing3")), "0")
@@ -868,7 +879,7 @@ class TrayMenuTests(unittest.TestCase):
 
         return Tray(
             GatewayService(lambda: None),
-            on_show=lambda: None, on_plans=lambda: None, on_settings=lambda: None,
+            on_show=lambda: None, on_settings=lambda: None,
             on_quit=lambda: None, on_logout=lambda: None, can_logout=lambda: logged_in,
         )
 
@@ -881,8 +892,9 @@ class TrayMenuTests(unittest.TestCase):
     def test_the_menu_matches_the_window(self) -> None:
         labels = self._labels(self._tray())
 
-        # ★ 窗口里有几页，托盘就得有几项（用户 2026-08-15：「右下角菜单少了一个计划中心」）
-        self.assertEqual(labels, ["显示日志", "计划中心", "配置中心", "退出登录", "退出"])
+        # ★ 窗口里有几页，托盘就得有几项——多一项会指向一个已经不存在的页
+        self.assertEqual(labels, ["显示日志", "配置中心", "退出登录", "退出"])
+        self.assertNotIn("计划中心", labels, "★ 那一页删了（计划归 AI 端），托盘得跟着删")
         self.assertNotIn("启动服务", labels, "★ 这一项曾经是登录门的旁路")
         self.assertNotIn("停止服务", labels, "并进「退出登录」了")
         self.assertNotIn("参数设置", labels, "跟着窗口改名叫配置中心")

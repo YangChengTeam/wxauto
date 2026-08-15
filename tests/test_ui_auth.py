@@ -137,7 +137,6 @@ class RemoteProviderTests(unittest.TestCase):
         """★ 后端多下发的键不该悄悄变成本机环境变量——那是一条没人看管的注入路径。"""
         provider = self._provider_returning({
             "settings": {"WXCLIENT_UI_ACCOUNTS": "zk_weixin", "PATH": "/evil/bin"},
-            "plans": [],
         })
 
         config = provider.fetch_config(auth.Identity(account="zhangsan", token="tok-1"))
@@ -145,15 +144,13 @@ class RemoteProviderTests(unittest.TestCase):
         self.assertEqual(config.values, {"WXCLIENT_UI_ACCOUNTS": "zk_weixin"})
         self.assertEqual(config.source, "后端")
 
-    def test_a_broken_plan_row_does_not_take_the_whole_page_down(self) -> None:
-        plans = auth.parse_plans([
-            {"id": "p1", "title": "每天早上问一次进度", "next_run_at": "09:00"},
-            {"id": "p2"},          # 没标题 —— 跳过
-            "这根本不是个对象",       # 跳过
-        ])
-
-        self.assertEqual([plan.id for plan in plans], ["p1"])
-        self.assertEqual(auth.parse_plans(None), ())
+    def test_the_client_no_longer_asks_for_or_parses_plans(self) -> None:
+        """★ 计划归 AI 端（用户 2026-08-15 裁决），桌面端连解析都不该留着——
+        留一个没人调的解析器，下一个人会以为「计划是从这条路下来的」。
+        """
+        self.assertFalse(hasattr(auth, "parse_plans"))
+        self.assertFalse(hasattr(auth, "Plan"))
+        self.assertNotIn("plans", auth.REMOTE_CONTRACT)
 
     def test_the_provider_is_chosen_by_whether_a_backend_is_configured(self) -> None:
         data_dir = Path(tempfile.mkdtemp())

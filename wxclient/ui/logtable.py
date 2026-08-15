@@ -45,6 +45,10 @@ _PAD_X = 14
 #: 列间距（像素）：时间列和级别列后面各留这么宽的空当。
 _GAP = 26
 
+#: 竖色条和右边文字之间的空当（像素）。没有它时间列会紧贴色条、整排字像是黏在左边框上
+#: （用户 2026-08-15：「文字离左边不要贴着」）。
+_BAR_GAP = 12
+
 #: 左边那根竖色条的目标粗细（像素）。Text 里的「竖条」其实是行首一个上了色的空格，
 #: 所以粗细 = 那个空格的字宽——用一个小号字体把它压到这么细（用户 2026-08-15：「橙色粗了」）。
 _BAR_W = 4
@@ -95,10 +99,15 @@ class LogTable(tk.Frame):
         mono_bold = tkfont.Font(font=(theme.MONO, theme.FONT_LOG[1], "bold"))
         self._bar_font = _bar_font(_BAR_W)
         self._bar_w = tkfont.Font(font=self._bar_font).measure(" ")
-        time_tab = self._bar_w + mono.measure(_TIME_SAMPLE) + _GAP
+        # 三个制表位：时间列起点（色条 + 空当）、级别列起点、消息列起点。
+        # ★时间列也要走制表位，不能「紧跟色条往后排」——色条那个空格在不同级别上宽度不一样
+        # （见下面 bar_ tag），紧跟着排就会一行一个起点，时间列参差不齐
+        # （用户 2026-08-15：「不同级别的信息对齐」）。
+        text_tab = self._bar_w + _BAR_GAP
+        time_tab = text_tab + mono.measure(_TIME_SAMPLE) + _GAP
         msg_tab = time_tab + mono_bold.measure(_LEVEL_SAMPLE) + _GAP
 
-        self._build_head(time_tab, msg_tab)
+        self._build_head(text_tab, time_tab, msg_tab)
 
         body = tk.Frame(self, bg=theme.CONTENT_BG)
         body.pack(fill=tk.BOTH, expand=True)
@@ -107,7 +116,7 @@ class LogTable(tk.Frame):
             # 不换行：一条日志一行，超出右边界的部分截掉，靠气泡看全（见 `_on_motion`）
             wrap=tk.NONE, relief=tk.FLAT, highlightthickness=0, bd=0,
             padx=_PAD_X, pady=6, spacing1=7, spacing3=8, cursor="arrow",
-            tabs=(str(time_tab), str(msg_tab)), insertwidth=0,
+            tabs=(str(text_tab), str(time_tab), str(msg_tab)), insertwidth=0,
         )
         self._scroll = tk.Scrollbar(body, orient=tk.VERTICAL, command=self._text.yview, width=12)
         self._text.configure(yscrollcommand=self._scroll.set)
@@ -117,29 +126,35 @@ class LogTable(tk.Frame):
         self._text.tag_configure("time", foreground=theme.TEXT_MUTED)
         self._text.tag_configure("msg", foreground=theme.TEXT, font=theme.FONT_BODY)
         self._text.tag_configure("kv", foreground=theme.TEXT_MUTED, font=theme.FONT_BODY)
-        # 分隔线：一整行只有一个空格，字体压到 1 号、上下留白清零，看到的就是一条 1px 细线。
+        # 分隔线：一整行只有一个空格，上下留白清零，看到的就是一条细线。
         # 行距（widget 上的 spacing1/spacing3）必须在这个 tag 上归零，否则这条线要占十几像素。
-        self._text.tag_configure("sep", background=theme.ROW_LINE, font=(theme.MONO, 1),
+        # ★字号用**负数**：Tk 里正数是「磅」，1 磅在 96 DPI 上就有 1.33 px，缩放一开更粗，
+        # 于是这条「1px 细线」实际画出来三四像素（用户 2026-08-15：「分割线太粗」）。
+        # 负数是「像素」，写多少就是多少，跟 DPI 无关。
+        self._text.tag_configure("sep", background=theme.ROW_LINE, font=(theme.MONO, -1),
                                  spacing1=0, spacing3=0)
         for severity, (color, row_bg) in _SEVERITY_STYLE.items():
             self._text.tag_configure(f"level_{severity}", foreground=color,
                                      font=(theme.MONO, theme.FONT_LOG[1], "bold"))
+            # 色条那个空格**每一级都要上 tag**：只给 warn/error 上的话，info/debug 的空格
+            # 会按正文字号排版（宽出好几像素），那一行的时间列就跟着右移，各级别对不齐。
+            # 不铺底色的级别只上字体、不上背景——看上去就是没有竖条。
+            self._text.tag_configure(f"bar_{severity}", font=self._bar_font,
+                                     **({"background": color} if row_bg else {}))
             if row_bg:
                 self._text.tag_configure(f"row_{severity}", background=row_bg)
-                self._text.tag_configure(f"bar_{severity}", background=color,
-                                         font=self._bar_font)
         # 只读，但要留着选中和 Ctrl+C——排障时能把日志贴给别人是刚需。
         self._text.configure(state=tk.DISABLED)
         self._text.bind("<Key>", self._swallow_keys)
         self._text.bind("<Motion>", self._on_motion)
         self._text.bind("<Leave>", lambda _e: self._hide_tip())
 
-    def _build_head(self, time_tab: int, msg_tab: int) -> None:
+    def _build_head(self, text_tab: int, time_tab: int, msg_tab: int) -> None:
         """表头。不跟着滚——滚上去之后没人记得住第二列是什么。"""
         head = tk.Frame(self, bg=theme.CONTENT_BG, height=34)
         head.pack(fill=tk.X)
         head.pack_propagate(False)
-        for text, offset in (("时间", self._bar_w), ("级别", time_tab), ("消息", msg_tab)):
+        for text, offset in (("时间", text_tab), ("级别", time_tab), ("消息", msg_tab)):
             tk.Label(head, text=text, font=theme.FONT_TABLE_HEAD, bg=theme.CONTENT_BG,
                      fg=theme.TEXT_MUTED).place(x=_PAD_X + offset, rely=0.5, anchor="w")
         tk.Frame(self, bg=theme.TABLE_HEAD_LINE, height=1).pack(fill=tk.X)
@@ -198,17 +213,17 @@ class LogTable(tk.Frame):
         for item in items:
             severity = item.severity
             row_bg = _SEVERITY_STYLE.get(severity, (None, None))[1]
-            start = self._text.index("end-1c")
-            # 行首这个空格就是左边那根竖色条：普通行不着色，看不出来
-            self._text.insert(tk.END, " ", (f"bar_{severity}",) if row_bg else ())
+            # 行首这个空格就是左边那根竖色条：普通行只压窄不着色，看不出来
+            self._text.insert(tk.END, " ", (f"bar_{severity}",))
             after_bar = self._text.index("end-1c")
-            self._text.insert(tk.END, f"{item.time or '':<19}\t", ("time",))
+            # 先跳到时间列的制表位，让文字和色条之间空出一段（列宽由制表位说了算，
+            # 所以时间不用再补空格对齐）
+            self._text.insert(tk.END, f"\t{item.time or ''}\t", ("time",))
             level = f"● {item.level}" if item.level else ""
             self._text.insert(tk.END, f"{level}\t", (f"level_{severity}",))
             self._insert_message(item.message)
             if row_bg:
                 self._text.tag_add(f"row_{severity}", after_bar, self._text.index("end-1c"))
-                self._text.tag_add(f"bar_{severity}", start, after_bar)
             # 每条日志后面跟一条分隔线（它自己占一个 Text 行，所以第 k 条日志在第 2k+1 行）
             self._text.insert(tk.END, " \n", ("sep",))
             self._shown.append(item)

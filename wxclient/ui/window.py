@@ -1,10 +1,10 @@
-"""主窗口：左侧深色状态栏 + 右侧内容区（实时日志 / 计划中心 / 配置中心三页）。
+"""主窗口：左侧深色状态栏 + 右侧内容区（实时日志 / 配置中心两页）。
 
 外观按 ``docs/main.png`` 设计稿（早先是 ``docs/wxui.png``）。关窗 = 缩回托盘，不停服务
 ——托盘程序的常规预期，也避免误关把网关一起带走；真要退出走左下角「退出服务」或托盘菜单。
 
 **登录是一道真门**：没登录之前 ``require_login()`` 会把登录页盖在整个窗口上，日志、
-配置、计划都看不到（``login_page.py``）。窗口本身照建不误——服务可能早就在跑了
+配置都看不到（``login_page.py``）。窗口本身照建不误——服务可能早就在跑了
 （开机自启用的是上次拉下来的参数），登录管的是「谁能看、谁能改」。
 
 窗口只显示状态、不判断状态：服务状态来自 ``GatewayService``，微信登录状态来自
@@ -75,11 +75,13 @@ _SPINNER = ("◐", "◓", "◑", "◒")
 
 #: 内容区各页的标题。加页在这里登记一条，别散在 _show_page 的分支里。
 #:
-#: 「参数设置」→「配置中心」、「监听名单」→「计划中心」是用户 2026-08-15 定的改法：
-#: 参数以后由后端下发（``auth.py``），这一页的职责从「填参数」变成「看这台机器按什么在跑」；
-#: 监听名单本来就是 AI 端推下来的、本机改不了，归到配置中心里当一节更合适，腾出来的位置
-#: 留给后端下发的计划。
-_PAGE_TITLES = {"log": "实时日志", "plans": "计划中心", "settings": "配置中心"}
+#: 「参数设置」→「配置中心」是用户 2026-08-15 定的改法：参数以后由后端下发（``auth.py``），
+#: 这一页的职责从「填参数」变成「看这台机器按什么在跑」；监听名单本来就是 AI 端推下来的、
+#: 本机改不了，归到配置中心里当一节。
+#:
+#: ★ 曾经还有一页「计划中心」，2026-08-15 用户裁决删掉：**计划归 AI 端**（几点做什么、
+#: 多久跟进一次由 AI 端排，指令经 WS 推下来），桌面端摆一页只会让人以为计划在这儿配。
+_PAGE_TITLES = {"log": "实时日志", "settings": "配置中心"}
 
 #: 标题底下那句话。空 = 这一页不摆副标题。
 _PAGE_SUBTITLES = {"settings": "管理连接、调度与启动设置"}
@@ -129,7 +131,6 @@ class MainWindow:
         self._pending_after: set[str] = set()  # 排着的 after 回调，destroy 时要撤掉
         self._login: Any = None  # 登录页盖在最上面时是它，登进来之后是 None
         self._identity: Any = None  # 当前登录的人（auth.Identity）
-        self._plans: tuple[Any, ...] = ()  # 后端下发的计划；这一版后端还没有，恒为空
         self._config_source = ""  # 参数是「后端」下发的还是「本机」填的，配置中心要说清
         self._logout_provider: Any = None  # 退出登录之后拿什么再登一次
         self._logout_callback: Any = None
@@ -221,7 +222,7 @@ class MainWindow:
 
         self._nav: dict[str, tk.Label] = {}
         self._nav_marks: dict[str, tk.Frame] = {}
-        for page, text in (("log", "实时日志"), ("plans", "计划中心"), ("settings", "配置中心")):
+        for page, text in (("log", "实时日志"), ("settings", "配置中心")):
             # 选中的那一页在**最左边**立一根绿条（`docs/main.png`）。只靠深一档的底色
             # 在这张暗纹背景上几乎看不出来，绿条才是「我在这儿」的那个信号。
             row = tk.Frame(bar, bg=theme.SIDEBAR_BG)
@@ -342,7 +343,6 @@ class MainWindow:
         self._pages.pack(fill=tk.BOTH, expand=True)
 
         self._log_page = self._build_log_page(self._pages)
-        self._plans_page = self._build_plans_page(self._pages)
         self._overlay = self._build_overlay(self._pages)
 
         footer = tk.Frame(content, bg=theme.FOOTER_BG, height=36)
@@ -434,44 +434,6 @@ class MainWindow:
         self._table.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 16))
         return page
 
-    def _build_plans_page(self, parent: tk.Misc) -> tk.Frame:
-        """计划中心。**这一版是空的**，而且空得有话说。
-
-        计划（几点做什么、多久跟进一次）以后由后端下发（``auth.py`` 的 ``plans`` 字段，
-        契约已经定好、客户端已经会解析）。后端还没有那一头，所以这页现在只会告诉你
-        「还没有计划」——比摆一个能点却什么都不会发生的「新建计划」按钮诚实。
-        本机不做计划编辑：一台机器一份本地计划，换台机器就对不上了。
-        """
-        page = tk.Frame(parent, bg=theme.CONTENT_BG)
-        self._plans_hint = tk.Label(page, text="", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
-                                    fg=theme.TEXT_MUTED, anchor="w", justify=tk.LEFT)
-        self._plans_hint.pack(fill=tk.X, padx=24, pady=(0, 12))
-        self._plans_box = tk.Frame(page, bg=theme.CONTENT_BG)
-        self._plans_box.pack(fill=tk.BOTH, expand=True, padx=24)
-        return page
-
-    def _render_plans_page(self) -> None:
-        if self._page != "plans":
-            return
-        if not self._plans:
-            self._plans_hint.configure(
-                text="还没有计划。计划由后端配置后下发到这台机器，这里只负责显示和执行。"
-            )
-        else:
-            self._plans_hint.configure(text=f"后端下发了 {len(self._plans)} 条计划。")
-        for child in self._plans_box.winfo_children():
-            child.destroy()
-        for plan in self._plans:
-            row = tk.Frame(self._plans_box, bg=theme.ROW_ALT_BG)
-            row.pack(fill=tk.X, pady=(0, 8))
-            tk.Label(row, text=plan.title, font=theme.FONT_BODY, bg=theme.ROW_ALT_BG,
-                     fg=theme.TEXT).pack(side=tk.LEFT, padx=14, pady=10)
-            tk.Label(row, text=plan.detail, font=theme.FONT_SMALL, bg=theme.ROW_ALT_BG,
-                     fg=theme.TEXT_MUTED).pack(side=tk.LEFT)
-            tk.Label(row, text=plan.next_run_at or ("已启用" if plan.enabled else "已停用"),
-                     font=theme.FONT_SMALL, bg=theme.ROW_ALT_BG,
-                     fg=theme.TEXT_MUTED).pack(side=tk.RIGHT, padx=14)
-
     def _build_watch_section(self, parent: tk.Misc) -> tk.Frame:
         """监听名单：AI 端推下来的会话名单，一行一个。**配置中心里的一节。**
 
@@ -533,6 +495,8 @@ class MainWindow:
     def _show_page(self, page: str) -> None:
         if page == "settings" and self._locked:
             return  # 转场态不给进参数页，见 _build_overlay
+        if page not in _PAGE_TITLES:
+            page = "log"  # 页删掉了（比如原来的计划中心），退回日志页，别把内容区留成一片白
         self._page = page
         for child in self._pages.winfo_children():
             child.pack_forget()
@@ -559,12 +523,8 @@ class MainWindow:
             self._filter_bar.pack_forget()
             for widget in self._header_actions.winfo_children():
                 widget.pack_forget()
-            if page == "settings":
-                self._ensure_settings_page().pack(fill=tk.BOTH, expand=True)
-                self._render_watch_page()
-            else:
-                self._plans_page.pack(fill=tk.BOTH, expand=True)
-                self._render_plans_page()
+            self._ensure_settings_page().pack(fill=tk.BOTH, expand=True)
+            self._render_watch_page()
         self._render_overlay()  # 每个分支都要摆一次：切走了就得把遮罩收掉
 
     def _prebuild_settings_page(self) -> None:
@@ -687,7 +647,7 @@ class MainWindow:
 
     def require_login(self, provider: Any, *, version: str = "",
                       on_authenticated: Callable[[Any], None] | None = None) -> None:
-        """把登录页盖在整个窗口上。登进来之前，日志/配置/计划一概看不到。
+        """把登录页盖在整个窗口上。登进来之前，日志和配置一概看不到。
 
         用 ``place`` 盖满而不是「先别建主窗口」：服务可能早就在跑了（开机自启用的是上次
         拉下来的参数），主窗口该建照建、状态照更新，只是没登录的人看不见。
@@ -774,11 +734,6 @@ class MainWindow:
             ServiceState.FAILED: "本地服务启动失败",
         }.get(state, "本地服务未启动")
         self._login.set_local_status(text, _STATE_COLOR.get(state, theme.GRAY))
-
-    def set_plans(self, plans: Any) -> None:
-        """后端下发的计划。这一版恒为空，接上后端就有东西了。"""
-        self._plans = tuple(plans or ())
-        self._render_plans_page()
 
     def set_config_source(self, source: str) -> None:
         self._config_source = source
@@ -918,11 +873,6 @@ class MainWindow:
         """
         self.show()
         self._show_page("log")
-
-    def open_plans(self) -> None:
-        """托盘「计划中心」：窗口露面 + 停在计划页。"""
-        self.show()
-        self._show_page("plans")
 
     def open_settings(self) -> None:
         """托盘「参数设置」：窗口露面，并且停在设置页。"""

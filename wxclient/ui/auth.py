@@ -51,13 +51,14 @@ POST {base}/desktop/login
 
 GET {base}/desktop/config      Authorization: Bearer <token>
     成功  200 {"settings": {"WXCLIENT_UI_ACCOUNTS": "zk_weixin", ...},
-               "plans": [{"id": "...", "title": "...", "detail": "...",
-                          "next_run_at": "...", "enabled": true}],
                "server_time": "2026-08-15T12:00:00Z"}
     失败  401 → 票过期，客户端会退回登录页
 
 settings 里只放 WXCLIENT_* 键；客户端原样落到 gateway.remote.env，本机在「配置中心」
 改过的同名键仍然盖过它（用户 2026-08-15 裁决：本地可以改、后端可下发）。
+
+★ 这里**不下发计划**：几点做什么、多久跟进一次归 AI 端排，指令经 WS 推给网关执行
+（用户 2026-08-15 裁决，桌面端的「计划中心」也是那次删掉的）。多下发的键客户端一律不认。
 """
 
 
@@ -84,22 +85,10 @@ class Identity:
 
 
 @dataclass(frozen=True)
-class Plan:
-    """后端下发的一条计划。这一版界面只负责显示，不在本机编辑。"""
-
-    id: str
-    title: str
-    detail: str = ""
-    next_run_at: str = ""
-    enabled: bool = True
-
-
-@dataclass(frozen=True)
 class RemoteConfig:
     """一次「取配置」的结果。"""
 
     values: dict[str, str] = field(default_factory=dict)
-    plans: tuple[Plan, ...] = ()
     source: str = ""  # 界面上要说清这份配置是哪来的：「后端」还是「本机」
     server_time: str = ""
 
@@ -194,7 +183,7 @@ class LocalAccountProvider:
 
     def fetch_config(self, identity: Identity) -> RemoteConfig:
         """本机模式没有下发这回事：配置就是「配置中心」里填的那份。"""
-        return RemoteConfig(values={}, plans=(), source=self.name)
+        return RemoteConfig(values={}, source=self.name)
 
 
 # ── 真后端 ────────────────────────────────────────────────────────
@@ -236,7 +225,6 @@ class RemoteProvider:
         values = {k: v for k, v in values.items() if k.startswith("WXCLIENT_")}
         return RemoteConfig(
             values=values,
-            plans=parse_plans(body.get("plans")),
             source=self.name,
             server_time=str(body.get("server_time") or ""),
         )
@@ -283,27 +271,6 @@ def _http_message(exc: Any) -> str:
     except Exception:  # noqa: BLE001 —— 拿不到细节就只报状态码
         detail = ""
     return f"后端拒绝了这次请求（HTTP {status}）" + (f"：{detail}" if detail else "")
-
-
-def parse_plans(raw: object) -> tuple[Plan, ...]:
-    """把后端下发的计划解析成 ``Plan``。烂数据跳过，不让一条脏记录把整页搞崩。"""
-    if not isinstance(raw, list):
-        return ()
-    plans: list[Plan] = []
-    for index, item in enumerate(raw):
-        if not isinstance(item, dict):
-            continue
-        title = str(item.get("title") or "").strip()
-        if not title:
-            continue
-        plans.append(Plan(
-            id=str(item.get("id") or f"plan-{index}"),
-            title=title,
-            detail=str(item.get("detail") or ""),
-            next_run_at=str(item.get("next_run_at") or ""),
-            enabled=bool(item.get("enabled", True)),
-        ))
-    return tuple(plans)
 
 
 def build_provider(data_dir: Path, environ: dict[str, str] | None = None) -> AuthProvider:
