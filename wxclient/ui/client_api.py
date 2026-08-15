@@ -80,6 +80,15 @@ class ApiError(RuntimeError):
     def session_exists(self) -> bool:
         return self.code == SESSION_EXISTS_CODE
 
+    @property
+    def bad_payload(self) -> bool:
+        """请求本身不合格——**同样的内容重发多少次都还是这个结果**。
+
+        用来把它和「网络抖了一下」分开：后者要重试，前者重试就是每 15 秒刷一条一样的
+        错误日志，把真正的问题埋掉。
+        """
+        return self.status == 400 or self.code == "VALIDATION_ERROR"
+
 
 def now_iso() -> str:
     """契约 §3.3 的时间格式：UTC ISO-8601 带毫秒和 Z。"""
@@ -203,7 +212,13 @@ def _from_http_error(exc: Any) -> ApiError:
             code = str(error.get("code") or "")
             message = str(error.get("message") or "")
             raw_details = error.get("details")
-            details = raw_details if isinstance(raw_details, dict) else {}
+            # 校验失败时服务端给的是一个**数组**（哪个字段错了），不是对象。
+            # 它恰恰是最该留下来的东西——2026-08-15 那次 400 就是靠它一眼看出
+            # 少了 wechatInstance.accountRef。
+            if isinstance(raw_details, dict):
+                details = raw_details
+            elif isinstance(raw_details, list):
+                details = {"fields": raw_details}
     except Exception:  # noqa: BLE001 - 拿不到信封就只剩状态码可说
         pass
     text = MESSAGES.get(code) or message or f"业务端拒绝了这次请求（HTTP {status}）"

@@ -111,13 +111,43 @@ def transition(previous: UiaState | None, current: UiaState) -> UiaState:
 def _instance(probe: dict[str, Any]) -> dict[str, Any] | None:
     """连上时能如实报的那点信息。
 
-    ★ 只给 `processVersion`。契约里的 `accountRef`（用来判「一个微信被两个分身占用」）
-    和 `nickname` 需要读到微信账号本身，而只读探测拿不到——客户端目前没有「读我自己的
-    昵称/wxid」这个能力，编一个「稳定标识」出来只会让服务端的占用检查形同虚设。
-    真要这条约束生效，得先在 `wechat_api` 里加一次性读取自身账号的能力。
+    `accountRef` / `accountMask` 由 `uia_probe.account` 从微信进程打开的账号目录算出来
+    （不碰界面，见那个模块）。
+
+    ★ 仍然**不给 `nickname`**：昵称只存在微信自己的加密库里，唯一的读法是点进「个人信息」
+    面板去驱动界面——那会在用户正用着微信时抢焦点，而 vendor 的那条路在微信 4.x 上还是坏的。
+    宁可少一个字段，也不拿分身名冒充微信昵称：企业端那一格是用来认「这台机器接的是哪个微信」的。
     """
     selected = probe.get("selected_window")
     version = ""
     if isinstance(selected, dict):
         version = str(selected.get("process_version") or "")
-    return {"processVersion": version} if version else None
+    instance: dict[str, Any] = {}
+    if version:
+        instance["processVersion"] = version
+    account = _account()
+    if account is not None:
+        instance["accountRef"] = account.account_ref
+        instance["accountMask"] = account.account_mask
+    return instance or None
+
+
+def _account() -> Any:
+    """当前微信账号。**查一次记住**——它在一次运行里不会变，而枚举进程打开的文件要 2 秒多，
+    15 秒一拍的探测扛不住每次都查。"""
+    global _ACCOUNT_CACHE
+    if _ACCOUNT_CACHE is _UNKNOWN:
+        from wxclient.uia_probe.account import probe_account
+
+        _ACCOUNT_CACHE = probe_account()
+    return _ACCOUNT_CACHE
+
+
+_UNKNOWN = object()
+_ACCOUNT_CACHE: Any = _UNKNOWN
+
+
+def forget_account() -> None:
+    """换了微信账号（重新登录微信）时清缓存。测试也用它。"""
+    global _ACCOUNT_CACHE
+    _ACCOUNT_CACHE = _UNKNOWN

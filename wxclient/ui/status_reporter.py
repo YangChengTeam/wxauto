@@ -67,8 +67,21 @@ class StatusReporter:
     def client_offline(self, reason: str = "client_shutdown") -> None:
         self._client(OFFLINE, reason)
 
+    def session_changed(self) -> None:
+        """换了一个会话（刚登录 / 刚退出）：忘掉去重记录。
+
+        ★ 去重是「这个状态我跟**服务端**说过了」。换了会话，那句话就作废了——不清的话，
+        重新登录后微信状态没变，我们会以为报过了，而新会话那边一直是空的。
+        """
+        with self._lock:
+            self._client_status = ""
+            self._wechat = None
+
     def shutdown(self, reason: str = "client_shutdown") -> None:
-        """退出前把 offline 送出去，**同步等**（有上限）。"""
+        """退出前把 offline 送出去，**同步等**（有上限）。
+
+        退出登录也走它：offline 必须在撤销会话**之前**送到（见 `ui/__main__.on_logout`）。
+        """
         with self._lock:
             if self._client_status == OFFLINE or not self._token():
                 return
@@ -158,14 +171,23 @@ class StatusReporter:
     # ── 公共 ─────────────────────────────────────────────────────
 
     def _failed(self, what: str, exc: ApiError, rollback: Callable[[], None]) -> None:
-        rollback()
         if exc.revoked:
+            rollback()
             _log.warning("客户端会话已被撤销")
             if self._on_revoked is not None:
                 self._on_revoked()
             return
+        if exc.bad_payload:
+            # ★ 请求本身不合格：**不回滚**。回滚等于每 15 秒把同一份不合格的内容再发一遍，
+            # 日志里刷出几百条一模一样的告警，真正的原因反而被埋掉（2026-08-15 真机上出过）。
+            # details 里是服务端指出的字段，必须留下来——不然只剩一句「填的内容格式不对」。
+            _log.warning(f"上报{what}被拒：内容不合格，先不重发", error=str(exc)[:120],
+                         code=exc.code or None, details=exc.details or None)
+            return
+        rollback()
         # 上报失败不是致命错：它只影响企业端那一格显示，不影响这台机器继续干活。
-        _log.warning(f"上报{what}失败", error=str(exc)[:120], code=exc.code or None)
+        _log.warning(f"上报{what}失败", error=str(exc)[:120], code=exc.code or None,
+                     details=exc.details or None)
 
     def _submit(self, job: Callable[[], None]) -> None:
         self._queue.put(job)

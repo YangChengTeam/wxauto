@@ -582,6 +582,28 @@ class LoginGateTests(unittest.TestCase):
         self.assertTrue(self._pump(lambda: bool(revoked)),
                         "★ 还要告诉服务端撤销这台设备的会话，否则企业端一直显示在线")
 
+    def test_the_stopping_notice_goes_away_after_logout(self) -> None:
+        """★ 2026-08-15 真机：退出登录后侧栏一直转圈「正在停止服务，请稍候」，停完也不消失。
+
+        原因是 logout 显式 set_busy 了一句，而这条路没有「停完了」的回调去清它——显式提示
+        优先级最高，于是它盖住了状态派生的提示，永远不落幕。
+        """
+        self.service.stop_async = lambda **_kwargs: None  # type: ignore[method-assign]
+        self.window.set_login_context(self.auth)
+        self.window.finish_login(self.auth.login("hr@example.com", "pw"))
+        self.service._snapshot = (ServiceState.RUNNING, None)
+
+        self.window.logout()
+        self.service._snapshot = (ServiceState.STOPPING, None)
+        self.window._render_busy()   # 真跑时是每秒一次的 _tick 在渲染
+        self.assertIn("正在停止服务", self.window._busy_label.cget("text"),
+                      "停机过程中该有提示——转场那几秒最像卡死")
+
+        self.service._snapshot = (ServiceState.STOPPED, None)
+        self.window._render_busy()
+        self.assertFalse(self.window._busy_label.winfo_manager(),
+                         "★ 停完了提示必须自己消失，不能一直挂在那儿")
+
     def test_the_sidebar_has_exactly_one_way_out(self) -> None:
         """摆两个按钮做同一件事，只会让人猜它们差在哪。"""
         labels = [child.cget("text") for child in self.window._sidebar.winfo_children()

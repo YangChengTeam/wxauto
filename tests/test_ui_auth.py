@@ -363,16 +363,39 @@ class UiaStatusTests(unittest.TestCase):
         assert state is not None
         self.assertEqual(state.failure_code, uia_status.WINDOW_UNAVAILABLE)
 
-    def test_exposed_uia_is_connected_and_carries_no_made_up_identity(self) -> None:
-        state = uia_status.classify({"platform": "Windows", "logged_in": True,
-                                     "uia_exposed": True,
-                                     "selected_window": {"process_version": "4.0.1.15"}})
-        assert state is not None
+    CONNECTED = {"platform": "Windows", "logged_in": True, "uia_exposed": True,
+                 "selected_window": {"process_version": "4.0.1.15"}}
+
+    def tearDown(self) -> None:
+        uia_status.forget_account()
+
+    def _with_account(self, account: Any) -> None:
+        """把「当前微信账号」按住，别让单测结果取决于跑测试这台机器上开没开微信。"""
+        uia_status._ACCOUNT_CACHE = account
+
+    def test_a_real_account_is_reported_as_an_opaque_ref(self) -> None:
+        from wxclient.uia_probe.account import WeChatAccount
+
+        self._with_account(WeChatAccount("wxid_6shq4q0wu92m12"))
+        state = uia_status.classify(self.CONNECTED)
+        assert state is not None and state.instance is not None
+
         self.assertEqual(state.status, uia_status.CONNECTED)
         self.assertIsNone(state.failure)
+        self.assertEqual(state.instance["processVersion"], "4.0.1.15")
+        self.assertNotIn("6shq4q0wu92m12", state.instance["accountRef"], "ref 必须不透明")
+        self.assertIn("****", state.instance["accountMask"])
+        self.assertNotIn("nickname", state.instance,
+                         "★ 昵称只在微信自己的加密库里，唯一读法是去点界面——"
+                         "拿不到就不给，绝不拿分身名冒充微信昵称")
+
+    def test_an_unknown_account_is_left_out_not_made_up(self) -> None:
+        """★ 读不到微信账号就别编一个「稳定标识」，那会让服务端的占用检查形同虚设。"""
+        self._with_account(None)
+        state = uia_status.classify(self.CONNECTED)
+        assert state is not None
+
         self.assertEqual(state.instance, {"processVersion": "4.0.1.15"})
-        self.assertNotIn("accountRef", state.instance or {},
-                         "★ 读不到微信账号就别编一个「稳定标识」，那会让服务端的占用检查形同虚设")
 
     def test_a_non_windows_machine_reports_nothing(self) -> None:
         """★ 在 Linux 上报「微信没找到」，等于往企业端灌一条不存在的事实。"""
@@ -523,6 +546,62 @@ class StatusReporterTests(unittest.TestCase):
         self.assertEqual([call["status"] for call in posts], [uia_status.CONNECTED])
         self.assertEqual(posts[0]["capability_status"], "")
 
+    def test_a_rejected_payload_is_not_hammered_every_tick(self) -> None:
+        """★ 2026-08-15 真机：服务端说「内容不合格」，我们每 15 秒把同一份内容再发一遍，
+        日志刷了几百条一模一样的告警，真正的原因（少了哪个字段）反而被埋掉。
+
+        内容不合格重发多少次都是同一个结果——**不回滚去重记录**，等内容变了再说。
+        """
+        self.api._error = ApiError("填的内容格式不对", code="VALIDATION_ERROR", status=400)
+        probe = {"platform": "Windows", "window_count": 0}
+
+        for _ in range(4):
+            self.reporter.wechat_probe(probe)
+        self._drain()
+
+        posts = [call for name, call in self.api.calls if name == "wechat_status"]
+        self.assertEqual(len(posts), 1, "同一份不合格的内容只发一次")
+
+    def test_a_transient_failure_is_still_retried(self) -> None:
+        """网络抖一下和内容不合格是两回事：前者必须重来，否则这个状态永远报不出去。"""
+        self.api._error = ApiError("连不上业务端")
+        probe = {"platform": "Windows", "window_count": 0}
+
+        self.reporter.wechat_probe(probe)
+        self._drain()
+        self.reporter.wechat_probe(probe)
+        self._drain()
+
+        posts = [call for name, call in self.api.calls if name == "wechat_status"]
+        self.assertEqual(len(posts), 2)
+
+    def test_signing_out_says_goodbye_before_the_token_dies(self) -> None:
+        """★ 2026-08-15 真机：退出登录时先撤销会话、后发 offline，那条上报吃 401，
+        界面于是弹一句「客户端会话已失效」——自己撤销了自己，看着像出事。
+
+        `shutdown()` 是**同步**的：它返回时 offline 已经送到，之后再撤销才安全。
+        """
+        self.reporter.shutdown("user_logout")
+
+        offline = [call for name, call in self.api.calls
+                   if name == "client_status" and call["status"] == "offline"]
+        self.assertEqual(len(offline), 1, "返回时就该已经送到，不是丢进队列等着")
+        self.assertEqual(offline[0]["reason"], "user_logout")
+
+    def test_a_new_session_starts_with_a_clean_slate(self) -> None:
+        """换了会话，去重记录必须清——不然重新登录后微信状态没变，
+        我们以为「报过了」，而新会话那边一直是空的。"""
+        probe = {"platform": "Windows", "window_count": 0}
+        self.reporter.wechat_probe(probe)
+        self._drain()
+
+        self.reporter.session_changed()
+        self.reporter.wechat_probe(probe)
+        self._drain()
+
+        posts = [call for name, call in self.api.calls if name == "wechat_status"]
+        self.assertEqual(len(posts), 2)
+
     def test_nothing_is_reported_before_login(self) -> None:
         """没 Token 的时候（还没登录）不该往服务端打——那些请求只会得到 401。"""
         reporter = StatusReporter(self.api, lambda: "", client_version="1.0.0")
@@ -534,6 +613,63 @@ class StatusReporterTests(unittest.TestCase):
 
         self.assertEqual(self.api.calls, [])
 
+
+class WeChatAccountTests(unittest.TestCase):
+    """契约 §8 的 `accountRef`：服务端拿它判「一个微信被两个分身占用」。"""
+
+    def _account(self, raw: str) -> Any:
+        from wxclient.uia_probe.account import WeChatAccount
+
+        return WeChatAccount(raw)
+
+    def test_the_same_wechat_gets_the_same_ref_on_any_machine(self) -> None:
+        """★ 目录名尾巴上的 `_c174` 是这台电脑这次安装的编号，不是账号的一部分。
+
+        留着它的话，同一个微信在两台电脑上算出两个 ref，服务端那条占用检查永远不会触发。
+        """
+        from wxclient.uia_probe.account import _INSTALL_SUFFIX
+
+        a = self._account(_INSTALL_SUFFIX.sub("", "wxid_6shq4q0wu92m12_c174"))
+        b = self._account(_INSTALL_SUFFIX.sub("", "wxid_6shq4q0wu92m12_c9"))
+        self.assertEqual(a.account_ref, b.account_ref)
+
+    def test_different_accounts_get_different_refs(self) -> None:
+        self.assertNotEqual(self._account("wxid_aaa").account_ref,
+                            self._account("wxid_bbb").account_ref)
+
+    def test_the_ref_does_not_leak_the_wxid(self) -> None:
+        """不透明是契约明写的：ref 里不许出现原文。"""
+        account = self._account("wxid_6shq4q0wu92m12")
+        self.assertNotIn("6shq4q0wu92m12", account.account_ref)
+        self.assertNotIn("6shq4q0wu92m12", account.account_mask)
+        self.assertIn("****", account.account_mask)
+
+    def test_two_wechats_on_one_machine_means_we_do_not_guess(self) -> None:
+        """★ 认不出该用哪个就不给——给错了等于把另一个人的微信记到这个分身头上。"""
+        import wxclient.uia_probe.account as mod
+
+        class FakeProc:
+            info = {"name": "Weixin.exe"}
+
+            def open_files(self):
+                class F:
+                    def __init__(self, path): self.path = path
+                return [F(r"C:\x\xwechat_files\wxid_aaa_c1\db\a.db"),
+                        F(r"C:\x\xwechat_files\wxid_bbb_c2\db\b.db")]
+
+        class FakePsutil:
+            @staticmethod
+            def process_iter(_fields): return [FakeProc()]
+
+        real = sys.modules.get("psutil")
+        sys.modules["psutil"] = FakePsutil  # type: ignore[assignment]
+        try:
+            self.assertIsNone(mod.probe_account())
+        finally:
+            if real is not None:
+                sys.modules["psutil"] = real
+            else:
+                del sys.modules["psutil"]
 
 if __name__ == "__main__":
     unittest.main()

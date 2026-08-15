@@ -262,13 +262,22 @@ def main(argv: list[str] | None = None) -> int:
     def on_authenticated(identity: Any) -> None:
         # 不在这里补一次 online：登录成功时服务端已经把客户端置成 online（契约 §7），
         # 客户端再报一遍只是多一条审计。
+        # 但去重记录要清：新会话那边什么都不知道，微信状态得重新说一遍。
+        reporter.session_changed()
         _log.info("已登录", user=identity.title, agent=identity.agent_id)
         start_service()
 
     def on_logout() -> None:
-        """退出登录：撤销服务端会话（契约 §6）。在后台线程上跑，由窗口那边丢过来。"""
-        reporter.client_offline("user_logout")
+        """退出登录：撤销服务端会话（契约 §6）。在后台线程上跑，由窗口那边丢过来。
+
+        ★ 顺序是硬的：**先把 offline 送到，再撤销会话**。反过来的话（2026-08-15 真机），
+        排队中的那条 offline 会拿着刚作废的 Token 出门，吃一个 401，于是界面弹一句
+        「客户端会话已失效」——听着像出事了，其实是自己撤销了自己。
+        所以这里用同步的 `shutdown()`（最多等 3 秒），不是丢进队列的 `client_offline()`。
+        """
+        reporter.shutdown("user_logout")
         auth_client.logout()
+        reporter.session_changed()
 
     def logout_requested() -> None:
         """托盘点了「退出登录」。真正的动作（停服务 + 回登录页）在窗口那边，

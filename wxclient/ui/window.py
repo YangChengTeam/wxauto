@@ -716,7 +716,12 @@ class MainWindow:
         self._identity = None
         self._render_identity()
         if self.service.state in {ServiceState.RUNNING, ServiceState.STARTING}:
-            self.set_busy("正在停止服务，请稍候")
+            # ★ 这里**不能** set_busy("正在停止服务")：显式提示优先级最高，而这条路没有
+            # 「停完了」的回调去把它清掉，于是停机结束、人都退回登录页了，侧栏还在转圈说
+            # 「正在停止服务，请稍候」（2026-08-15 真机上就是这样）。
+            # 停机本来就有提示：`_effective_busy_text()` 会照 STOPPING 状态自己出，
+            # 状态一变成 STOPPED 它自己就消失。
+            self.set_busy("")
             self.service.stop_async()
         self.require_login(self._logout_provider, version=self._version,
                            on_authenticated=self._logout_callback)
