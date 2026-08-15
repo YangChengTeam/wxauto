@@ -11,7 +11,7 @@ from collections.abc import Callable
 from typing import Any
 
 from .icons import build_icon_image
-from .service import GatewayService, ServiceState
+from .service import GatewayService
 
 
 class Tray:
@@ -22,6 +22,8 @@ class Tray:
         on_show: Callable[[], None],
         on_settings: Callable[[], None],
         on_quit: Callable[[], None],
+        on_logout: Callable[[], None],
+        can_logout: Callable[[], bool] | None = None,
     ) -> None:
         import pystray
 
@@ -29,15 +31,20 @@ class Tray:
         self._on_show = on_show
         self._on_settings = on_settings
         self._on_quit = on_quit
+        self._on_logout = on_logout
+        self._can_logout_extra = can_logout
+        # ★ 菜单跟着窗口一起改（用户 2026-08-15）：
+        #   ① 「启动服务/停止服务」没了——服务只在登录之后才起（见 `ui/__main__`），
+        #      留着「启动服务」等于给登录门开一条旁路；「停止服务」并进了「退出登录」。
+        #   ② 「参数设置」改名「配置中心」，和窗口里的导航一致。
         self._icon = pystray.Icon(
             "lxz-wechat-gateway",
             icon=build_icon_image(service.state),
             title=self._title(),
             menu=pystray.Menu(
                 pystray.MenuItem("显示日志", self._show, default=True),
-                pystray.MenuItem("启动服务", self._start, enabled=self._can_start),
-                pystray.MenuItem("停止服务", self._stop, enabled=self._can_stop),
-                pystray.MenuItem("参数设置", self._settings),
+                pystray.MenuItem("配置中心", self._settings),
+                pystray.MenuItem("退出登录", self._logout, enabled=self._can_logout),
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("退出", self._quit),
             ),
@@ -66,22 +73,17 @@ class Tray:
     def _title(self) -> str:
         return f"劳小智微信网关 · {self._service.label}"[:127]  # 悬浮提示有长度上限
 
-    def _can_start(self, _item: Any = None) -> bool:
-        return self._service.state not in {ServiceState.RUNNING, ServiceState.STARTING}
-
-    def _can_stop(self, _item: Any = None) -> bool:
-        return self._service.state in {ServiceState.RUNNING, ServiceState.STARTING}
+    def _can_logout(self, _item: Any = None) -> bool:
+        """没登录就没什么可退的——这一项是灰的。"""
+        return self._can_logout_extra is None or bool(self._can_logout_extra())
 
     def _show(self, *_args: Any) -> None:
         self._on_show()
 
-    def _start(self, *_args: Any) -> None:
-        self._service.start()
-
-    def _stop(self, *_args: Any) -> None:
-        # 停机要等网关线程收口（最长 15s）。在托盘线程上等 = 这段时间菜单点不动、
-        # 图标也不刷新，和卡死一样。丢后台，状态照旧靠 state 回调刷出来。
-        self._service.stop_async()
+    def _logout(self, *_args: Any) -> None:
+        # 退出登录会停服务，而停机要等网关线程收口（最长 15s）——那件事由窗口丢到后台去做
+        # （`MainWindow.logout`），托盘这边只负责把动作传过去，别在托盘线程上等。
+        self._on_logout()
 
     def _settings(self, *_args: Any) -> None:
         self._on_settings()

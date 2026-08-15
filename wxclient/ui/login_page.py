@@ -29,6 +29,10 @@ from .auth import AuthError, AuthProvider, Identity
 #: 左侧品牌面板占窗口宽度的比例。设计稿是 790/1570 ≈ 0.5。
 PANEL_RATIO = 0.5
 
+#: 改完窗口大小多久才重铺背景。铺一次要按新尺寸重采样整张图（几十毫秒），
+#: 拖动窗口边框时每一像素都铺一次会卡；等手停下来再铺。
+_BG_REDRAW_MS = 90
+
 HERO_PARTS = (("让", theme.SIDEBAR_TITLE), ("微信服务", theme.GREEN), ("稳定在线", theme.SIDEBAR_TITLE))
 HERO_SUB = "连接、监听与消息处理，一处完成"
 BRAND_LINE = "劳小智微信服务"
@@ -68,21 +72,40 @@ class LoginPage(tk.Frame):
         canvas = tk.Canvas(self, bg=theme.PANEL_BG, highlightthickness=0, bd=0)
         canvas.place(relx=0, rely=0, relwidth=PANEL_RATIO, relheight=1)
         self._canvas = canvas
+        self._bg_size = (0, 0)
+        self._bg_job: str | None = None
+        canvas.bind("<Configure>", self._on_panel_resize)
 
-        # 背景图是**预先切好尺寸的**（`assets/login-bg.png`，900x1000）：Tk 8.6 自带 PNG
-        # 解码，不用把 PIL 拉进启动路径（和启动动画一个道理，见 splash.py）。窗口比图大就
-        # 露出同色底，肉眼看不出来——底色是照着图的底色调平过的。
+    def _on_panel_resize(self, event: Any) -> None:
+        self._render_panel_text(event)  # 字立刻跟上，图慢一拍无所谓
+        size = (event.width, event.height)
+        if size == self._bg_size:
+            return
+        self._bg_size = size
+        if self._bg_job is not None:
+            try:
+                self.after_cancel(self._bg_job)
+            except tk.TclError:
+                pass
+        self._bg_job = self.after(_BG_REDRAW_MS, self._render_background)
+
+    def _render_background(self) -> None:
+        """把底图按 cover 铺满左栏（用户 2026-08-15：「应使用 background-size: cover」）。
+
+        原来是贴一张预先切好的图在左上角：面板宽高比和图对不上，于是能看到一条明显的
+        接缝，构图也只露出一角。现在按当前面板尺寸等比放大 + 居中裁剪，改窗口大小也跟着变。
+        """
+        self._bg_job = None
         from . import icons
 
-        path = icons.ASSETS / "login-bg.png"
-        if path.exists():
-            try:
-                self._photo = tk.PhotoImage(master=canvas, file=str(path))
-                canvas.create_image(0, 0, anchor="nw", image=self._photo)
-            except tk.TclError:
-                pass  # 图挂了不该让人登不上
-
-        canvas.bind("<Configure>", self._render_panel_text)
+        width, height = self._bg_size
+        photo = icons.cover_photo(self._canvas, icons.PANEL_BG_PATH, width, height)
+        if photo is None:
+            return  # 铺不上就是一块纯色面板，字照样看得清
+        self._photo = photo  # 必须自己留引用，否则被 GC 掉就成了一块空白
+        self._canvas.delete("bg")
+        self._canvas.create_image(0, 0, anchor="nw", image=photo, tags="bg")
+        self._canvas.tag_lower("bg")  # 图垫底，字压在上面
 
     def _render_panel_text(self, event: Any = None) -> None:
         """面板上的字跟着面板尺寸重排。**每次都重画，不做增量**——就四行字。"""
@@ -160,10 +183,10 @@ class LoginPage(tk.Frame):
         self._confirm = tk.StringVar()
         self._remember = tk.BooleanVar(value=bool(self._account.get()))
 
-        account_entry = self._field(form, "账号", self._account)
-        self._field(form, "密码", self._password, secret=True)
+        account_entry = self._field(form, "账号", self._account, placeholder="请输入账号")
+        self._field(form, "密码", self._password, secret=True, placeholder="请输入密码")
         if self._setup_mode:
-            self._field(form, "确认密码", self._confirm, secret=True)
+            self._field(form, "确认密码", self._confirm, secret=True, placeholder="再输一遍")
 
         row = tk.Frame(form, bg=theme.CONTENT_BG)
         row.pack(fill=tk.X, pady=(6, 0))
@@ -196,23 +219,69 @@ class LoginPage(tk.Frame):
         return "本机模式：账号和参数都在这台机器上" if self._provider.name == "本机" \
             else "已连上后端，可以登录"
 
-    def _field(self, parent: tk.Misc, label: str, var: tk.StringVar, *, secret: bool = False) -> tk.Entry:
+    def _field(self, parent: tk.Misc, label: str, var: tk.StringVar, *,
+               secret: bool = False, placeholder: str = "") -> tk.Entry:
+        """一行输入框：外面一圈 1px 边（聚焦变绿），里面是**唯一**一个白底 Entry。
+
+        ★ 原来的做法是拿一个灰底 Frame 当边框、Entry 只 ``fill=X`` 塞进去——Entry 撑不满
+        竖直方向，Frame 的灰底就从上下露出来一大块；密码框那个眼睛又是在 Entry 之后
+        ``side=RIGHT``，跟已经占满整行的 Entry 抢地方，于是整行错位。用户 2026-08-15
+        反馈的「文本框是乱的」就是这个。现在：**眼睛先占位，Entry 再 expand 吃掉剩下的**，
+        边框改用 Frame 自己的 highlight（不占内容区），上下留白靠 Entry 的 pady。
+        """
         tk.Label(parent, text=label, font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
                  fg=theme.TEXT).pack(anchor="w", pady=(0, 6))
-        box = tk.Frame(parent, bg=theme.FIELD_LINE, padx=1, pady=1)
+        box = tk.Frame(parent, bg=theme.FIELD_BG, highlightthickness=1,
+                       highlightbackground=theme.FIELD_LINE, highlightcolor=theme.FIELD_LINE)
         box.pack(fill=tk.X, pady=(0, 16))
-        entry = tk.Entry(box, textvariable=var, font=theme.FONT_INPUT, relief=tk.FLAT,
+
+        entry = tk.Entry(box, textvariable=var, font=theme.FONT_INPUT, relief=tk.FLAT, bd=0,
                          bg=theme.FIELD_BG, fg=theme.TEXT, insertbackground=theme.TEXT,
                          highlightthickness=0, show="*" if secret else "")
-        entry.pack(fill=tk.X, ipady=8, padx=10)
-        entry.bind("<Return>", lambda _e: self.submit())
         if secret:
             # 「显示密码」的眼睛：打错密码是登录失败里最常见的一种，能看一眼比重打三遍强。
-            eye = tk.Label(box, text="👁", font=theme.FONT_SMALL, bg=theme.FIELD_BG,
-                           fg=theme.TEXT_MUTED, cursor="hand2", padx=8)
-            eye.pack(side=tk.RIGHT, fill=tk.Y)
-            eye.bind("<Button-1>", lambda _e, e=entry: e.configure(show="" if e.cget("show") else "*"))
+            # **必须先 pack**：side=RIGHT 要在 Entry 吃掉整行之前把自己的位置占下来。
+            eye = tk.Label(box, text="👁", font=theme.FONT_INPUT, bg=theme.FIELD_BG,
+                           fg=theme.TEXT_MUTED, cursor="hand2")
+            eye.pack(side=tk.RIGHT, padx=(0, 12))
+            eye.bind("<Button-1>",
+                     lambda _e, e=entry: e.configure(show="" if e.cget("show") else "*"))
+        entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 8), pady=9)
+        entry.bind("<Return>", lambda _e: self.submit())
+
+        # 聚焦时边框变绿：设计稿上「当前在填哪一格」就是靠它标出来的。
+        entry.bind("<FocusIn>", lambda _e: box.configure(highlightbackground=theme.GREEN,
+                                                         highlightcolor=theme.GREEN), add="+")
+        entry.bind("<FocusOut>", lambda _e: box.configure(highlightbackground=theme.FIELD_LINE,
+                                                          highlightcolor=theme.FIELD_LINE), add="+")
+        if placeholder:
+            self._attach_placeholder(entry, var, placeholder)
         return entry
+
+    def _attach_placeholder(self, entry: tk.Entry, var: tk.StringVar, text: str) -> None:
+        """灰字提示。
+
+        ★ 用一个**盖在上面的 Label**，不往 StringVar 里塞占位文字——塞进去的话，
+        用户不点这一格直接回车，提交上去的账号就成了「请输入账号」。这种坑一旦埋下，
+        表现是「密码明明没打错却登不进去」，查起来极贵。
+        """
+        hint = tk.Label(entry.master, text=text, font=theme.FONT_INPUT,
+                        bg=theme.FIELD_BG, fg=theme.TEXT_MUTED)
+        hint.bind("<Button-1>", lambda _e: entry.focus_set())
+
+        def sync(*_args: object) -> None:
+            try:
+                if var.get() or entry.focus_get() is entry:
+                    hint.place_forget()
+                else:
+                    hint.place(in_=entry, x=1, rely=0.5, anchor="w")
+            except (tk.TclError, KeyError):
+                pass  # 控件正在销毁
+
+        var.trace_add("write", lambda *_: sync())
+        entry.bind("<FocusIn>", lambda _e: sync(), add="+")
+        entry.bind("<FocusOut>", lambda _e: sync(), add="+")
+        entry.after(0, sync)
 
     # ── 提交 ─────────────────────────────────────────────────────
 

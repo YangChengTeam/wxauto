@@ -91,16 +91,15 @@ class MainWindow:
         *,
         data_dir: Path,
         dry_run_notice: str = "",
-        on_quit: Callable[[], None],
         on_settings_saved: Callable[[bool], None] | None = None,
         on_refetch: Callable[[], None] | None = None,
         log_pipeline: Any = None,
+        probe_wechat: bool = True,
     ) -> None:
         self.root = root
         self.buffer = buffer
         self.service = service
         self.data_dir = Path(data_dir)
-        self._on_quit = on_quit
         self._settings_saved_callback = on_settings_saved
         self._refetch_callback = on_refetch
         self._log_pipeline = log_pipeline
@@ -149,7 +148,11 @@ class MainWindow:
         self.refresh_state()
         self._tick()
         self._pump_logs()
-        self._schedule_wechat_probe()
+        # 探测线程会 import pywinauto 去枚举微信窗口——单测里既不需要，也不该去碰真微信；
+        # 而且它一边跑一边触发 GC，GC 落在**非主线程**上回收 tk 对象时 Tcl 会直接 abort
+        # 整个进程（`Tcl_AsyncDelete`，真机上实测过）。测试传 probe_wechat=False 关掉。
+        if probe_wechat:
+            self._schedule_wechat_probe()
         # 参数页提前建好：建控件是「很多次小 Tcl 调用」，正是主线程抢不到 GIL 时最吃亏的活。
         # 真机实测空闲时也要 9ms，网关忙着读聊天记录时点下去就是肉眼可见的一顿。
         # 排在启动之后的空闲档期建，用户点的时候只剩 pack/unpack。
@@ -218,40 +221,47 @@ class MainWindow:
             item.bind("<Button-1>", lambda _e, p=page: self._show_page(p))
             self._nav[page] = item
 
-        quit_item = tk.Label(bar, text="退出服务", font=theme.FONT_BODY, bg=theme.SIDEBAR_BG,
-                             fg=theme.SIDEBAR_MUTED, cursor="hand2")
-        quit_item.pack(side=tk.BOTTOM, anchor="w", padx=28, pady=(0, 24))
-        quit_item.bind("<Button-1>", lambda _e: self._on_quit())
-
-        # 谁登的这台机器。**退出登录只关门、不停服务**——服务是常驻的，把它和登录绑在
-        # 一起等于「谁下班谁就把网关关了」。
-        self._who = tk.Label(bar, text="", font=theme.FONT_SMALL, bg=theme.SIDEBAR_BG,
-                             fg=theme.SIDEBAR_MUTED, anchor="w", justify=tk.LEFT)
-        self._logout_item = tk.Label(bar, text="退出登录", font=theme.FONT_SMALL,
+        # ★ 底部**只有一个**「退出登录」（用户 2026-08-15：「退出登录和退出服务是一个意思」）。
+        # 服务本来就只在登录之后才起（见 `__main__`），所以「不再用了」这件事只有一种表达：
+        # 退出登录 = 停掉网关 + 回到登录页。摆两个按钮做同一件事，只会让人猜它们差在哪。
+        # 真要关掉整个程序走托盘菜单「退出」。
+        self._logout_item = tk.Label(bar, text="退出登录", font=theme.FONT_BODY,
                                      bg=theme.SIDEBAR_BG, fg=theme.SIDEBAR_MUTED, cursor="hand2")
         self._logout_item.bind("<Button-1>", lambda _e: self.logout())
 
+        # 谁登的这台机器
+        self._who = tk.Label(bar, text="", font=theme.FONT_SMALL, bg=theme.SIDEBAR_BG,
+                             fg=theme.SIDEBAR_MUTED, anchor="w", justify=tk.LEFT)
+
     def _paint_sidebar_background(self, bar: tk.Frame) -> None:
-        """侧栏铺一层电路暗纹（``assets/sidebar-bg.png``，取自设计稿 ``docs/bg.png``）。
+        """侧栏铺一层电路暗纹（``assets/panel-bg.png``，取自设计稿 ``docs/bg.png``）。
 
         画布**先建**、用 place 铺满整条侧栏，后面那些 pack 出来的标签自然叠在它上面
         （tk 的叠放顺序就是创建顺序）。标签底色和图的底色是同一个 #1c1c1c，所以被盖住的
         只是纹路，看起来就是「字周围透出一点纹理」——正是设计稿的样子。
-        """
-        from . import icons
 
-        path = icons.ASSETS / "sidebar-bg.png"
-        if not path.exists():
-            return
-        try:
-            # master 必须显式给：不给的话图片挂在**第一个**创建的 Tk 解释器上，
-            # 同进程里再开一个窗口时就会 `image "pyimageN" doesn't exist`（真机测出来的）。
-            self._sidebar_photo = tk.PhotoImage(master=bar, file=str(path))
-        except tk.TclError:
-            return  # 图挂了就是一条纯色侧栏，不影响任何功能
+        图按 cover 铺（等比放大 + 居中裁剪，见 ``icons.cover_photo``），高度随窗口变，
+        所以跟着 ``<Configure>`` 重铺一次。
+        """
         canvas = tk.Canvas(bar, bg=theme.SIDEBAR_BG, highlightthickness=0, bd=0)
         canvas.place(x=0, y=0, relwidth=1, relheight=1)
-        canvas.create_image(0, 0, anchor="nw", image=self._sidebar_photo)
+        self._sidebar_canvas = canvas
+        self._sidebar_size = (0, 0)
+        canvas.bind("<Configure>", self._repaint_sidebar_background)
+
+    def _repaint_sidebar_background(self, event: Any) -> None:
+        from . import icons
+
+        size = (event.width, event.height)
+        if size == self._sidebar_size:
+            return
+        self._sidebar_size = size
+        photo = icons.cover_photo(self._sidebar_canvas, icons.PANEL_BG_PATH, *size)
+        if photo is None:
+            return  # 铺不上就是一条纯色侧栏，不影响任何功能
+        self._sidebar_photo = photo  # 自己留引用，被 GC 掉就成了空白
+        self._sidebar_canvas.delete("bg")
+        self._sidebar_canvas.create_image(0, 0, anchor="nw", image=photo, tags="bg")
 
     def _divider(self, parent: tk.Misc, pady: tuple[int, int] = (10, 16)) -> None:
         tk.Frame(parent, bg=theme.SIDEBAR_LINE, height=1).pack(fill=tk.X, padx=28, pady=pady)
@@ -668,11 +678,18 @@ class MainWindow:
         self._show_page("log")
 
     def logout(self) -> None:
-        """退出登录：只关门，**不停服务**。服务是常驻的，跟谁在看没关系。"""
+        """退出登录 = **停掉服务** + 回到登录页（用户 2026-08-15 把两件事合成了一件）。
+
+        停机要等网关线程收口（最长 15s），所以走 ``stop_async``——在 tk 线程上等的话，
+        这十几秒里窗口一次都不重绘，看起来就是点完卡死了。
+        """
         if self._login is not None or self._logout_provider is None:
             return
         self._identity = None
         self._render_identity()
+        if self.service.state in {ServiceState.RUNNING, ServiceState.STARTING}:
+            self.set_busy("正在停止服务，请稍候")
+            self.service.stop_async()
         self.require_login(self._logout_provider, version=self._version,
                            on_authenticated=self._logout_callback)
 
@@ -694,7 +711,9 @@ class MainWindow:
 
     def _render_identity(self) -> None:
         if self._identity is None:
-            self._who.configure(text="")  # 连文字一起抹掉：留着上一个人的名字比空着更糟
+            # 连文字一起抹掉：留着上一个人的名字比空着更糟。「退出登录」也跟着收起来——
+            # 没人登录的时候它没有意义（登录页正盖在上面）。
+            self._who.configure(text="")
             self._who.pack_forget()
             self._logout_item.pack_forget()
             return
@@ -702,8 +721,8 @@ class MainWindow:
         title = getattr(self._identity, "title", "") or getattr(self._identity, "account", "")
         self._who.configure(text=f"{title}\n{tenant}" if tenant else title)
         if not self._who.winfo_manager():
-            self._logout_item.pack(side=tk.BOTTOM, anchor="w", padx=28, pady=(0, 10))
-            self._who.pack(side=tk.BOTTOM, anchor="w", padx=28, pady=(0, 8))
+            self._logout_item.pack(side=tk.BOTTOM, anchor="w", padx=28, pady=(0, 24))
+            self._who.pack(side=tk.BOTTOM, anchor="w", padx=28, pady=(0, 10))
 
     def _sync_login_status(self) -> None:
         """登录页左下角那行「本地服务…」要说实话，跟着服务状态走。"""

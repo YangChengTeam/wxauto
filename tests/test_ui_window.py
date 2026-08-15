@@ -25,6 +25,35 @@ try:
 except Exception:  # noqa: BLE001 - 没有 Tk / 没有显示环境都算「跑不了」
     HAS_TK = False
 
+#: 建过的窗口一律**留到进程结束**，不让它们被 GC 掉。
+#:
+#: ★ 为什么：`MainWindow` 会起一条 `wx-ui-probe` 后台线程去探微信，那条线程握着 window
+#: （→ 握着 Tk 解释器）。用例结束后主线程一撒手，最后一个引用就落在探测线程上，等它跑完
+#: 释放时，`Tk.__del__` 就发生在**非主线程**——Tcl 直接 abort 整个进程
+#: （`Tcl_AsyncDelete: async handler deleted by the wrong thread`），连测试汇总都来不及打印。
+#: 窗口本身已经 destroy 过了，留个引用只是不让析构落到别的线程上。
+_KEEP_ALIVE: list = []
+
+
+def setUpModule() -> None:
+    """这一段关掉循环 GC。
+
+    ★ 真机上实测的坑：只要有**任何**后台线程在跑（服务状态轮询、微信探测），它一旦触发一次
+    循环回收，回收到的 tk 对象（控件之间全是引用环）就会在**非主线程**上析构，Tcl 当场
+    `Tcl_AsyncDelete: async handler deleted by the wrong thread` abort 整个进程——测试跑到
+    一半没了，连汇总都打不出来，看起来像「测试莫名其妙挂了」。
+    引用计数照常工作，关掉的只是环的回收；一轮测试多留几个窗口在内存里，无所谓。
+    """
+    import gc
+
+    gc.disable()
+
+
+def tearDownModule() -> None:
+    import gc
+
+    gc.enable()
+
 if HAS_TK:
     from wxclient.logging_config import configure_logging
     from wxclient.ui.logbuffer import LogBuffer, LogPipeline
@@ -78,11 +107,12 @@ class WindowAdversarialTests(unittest.TestCase):
         self.service = GatewayService(lambda: None)
         self.window = MainWindow(
             self.root, LogBuffer(), self.service,
-            data_dir=Path(tempfile.mkdtemp()), on_quit=lambda: None,
+            data_dir=Path(tempfile.mkdtemp()), probe_wechat=False,
         )
         self.addCleanup(self._teardown)
 
     def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.window)
         try:
             self.window.destroy()
         except tk.TclError:
@@ -196,7 +226,7 @@ class WindowAdversarialTests(unittest.TestCase):
         service = GatewayService(lambda: _EvilGateway())
         window = MainWindow(
             tk.Tk(), LogBuffer(), service,
-            data_dir=Path(tempfile.mkdtemp()), on_quit=lambda: None,
+            data_dir=Path(tempfile.mkdtemp()), probe_wechat=False,
         )
         self.addCleanup(window.destroy)
         service.start()
@@ -219,7 +249,7 @@ class WindowAdversarialTests(unittest.TestCase):
         )
         window = MainWindow(
             tk.Tk(), LogBuffer(), GatewayService(lambda: None),
-            data_dir=data_dir, on_quit=lambda: None,
+            data_dir=data_dir, probe_wechat=False,
         )
         self.addCleanup(window.destroy)
 
@@ -261,7 +291,7 @@ class StallWatchdogTests(unittest.TestCase):
         self.root.withdraw()
         self.window = MainWindow(
             self.root, self.buffer, GatewayService(lambda: None),
-            data_dir=Path(tempfile.mkdtemp()), on_quit=lambda: None,
+            data_dir=Path(tempfile.mkdtemp()), probe_wechat=False,
             log_pipeline=self.pipeline,
         )
         self.addCleanup(self.window.destroy)
@@ -313,12 +343,13 @@ class LoginGateTests(unittest.TestCase):
         self.root.withdraw()
         self.service = GatewayService(lambda: None)
         self.window = MainWindow(
-            self.root, LogBuffer(), self.service, data_dir=self.dir, on_quit=lambda: None,
+            self.root, LogBuffer(), self.service, data_dir=self.dir, probe_wechat=False,
         )
         self.provider = auth.LocalAccountProvider(self.dir)
         self.addCleanup(self._teardown)
 
     def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.window)
         try:
             self.window.destroy()
         except tk.TclError:
@@ -387,8 +418,13 @@ class LoginGateTests(unittest.TestCase):
         self.assertEqual(self.window._page, "log", "登进来落在实时日志")
         self.assertIn("zhangsan", self.window._who.cget("text"), "侧栏要说清是谁在用")
 
-    def test_logging_out_closes_the_door_again_without_stopping_the_service(self) -> None:
-        """★ 退出登录只关门。把服务一起停掉等于「谁下班谁就把网关关了」。"""
+    def test_logging_out_also_stops_the_service(self) -> None:
+        """★ 「退出登录和退出服务是一个意思，只留一个退出登录」（用户 2026-08-15）。
+
+        服务本来就只在登录之后才起，所以「不再用了」只有一种表达：退出登录 = 停网关 + 回登录页。
+        """
+        stopped: list[bool] = []
+        self.service.stop_async = lambda **_kwargs: stopped.append(True)  # type: ignore[method-assign]
         self.provider.create("zhangsan", "hunter2")
         self.window.set_login_context(self.provider)
         self.window.finish_login(self.provider.login("zhangsan", "hunter2"))
@@ -396,9 +432,17 @@ class LoginGateTests(unittest.TestCase):
 
         self.window.logout()
 
+        self.assertTrue(stopped, "退出登录必须把网关一起停掉")
         self.assertFalse(self.window.logged_in, "门要关回去")
         self.assertEqual(self.window._who.cget("text"), "", "身份要抹掉")
-        self.assertIs(self.service.state, ServiceState.RUNNING, "服务不许受影响")
+
+    def test_the_sidebar_has_exactly_one_way_out(self) -> None:
+        """摆两个按钮做同一件事，只会让人猜它们差在哪。"""
+        labels = [child.cget("text") for child in self.window._sidebar.winfo_children()
+                  if isinstance(child, tk.Label)]
+
+        self.assertIn("退出登录", labels)
+        self.assertNotIn("退出服务", labels)
 
     def test_remembering_the_account_never_remembers_the_password(self) -> None:
         from wxclient.ui import auth
@@ -426,11 +470,12 @@ class ConfigCenterTests(unittest.TestCase):
         self.root.withdraw()
         self.service = GatewayService(lambda: None)
         self.window = MainWindow(
-            self.root, LogBuffer(), self.service, data_dir=self.dir, on_quit=lambda: None,
+            self.root, LogBuffer(), self.service, data_dir=self.dir, probe_wechat=False,
         )
         self.addCleanup(self._teardown)
 
     def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.window)
         try:
             self.window.destroy()
         except tk.TclError:
@@ -499,6 +544,142 @@ class ConfigCenterTests(unittest.TestCase):
         self.assertEqual(self.window._banner.winfo_manager(), "pack")
         self.assertIn("AI 端连接异常", self.window._banner_title.cget("text"))
         self.assertIn("认证失败", self.window._banner_detail.cget("text"))
+
+
+@unittest.skipUnless(HAS_TK, "没有 tkinter / 显示环境，窗口层测不了")
+class LoginLookTests(unittest.TestCase):
+    """登录页那两处被用户当场指出来的毛病（2026-08-15）：背景没铺满、输入框是乱的。"""
+
+    def setUp(self) -> None:
+        from wxclient.ui import auth
+        from wxclient.ui.login_page import LoginPage
+
+        self.dir = Path(tempfile.mkdtemp())
+        provider = auth.LocalAccountProvider(self.dir)
+        provider.create("zhangsan", "hunter2")  # 设过账号 → 正常登录态（不是首次设置那一版）
+        self.root = tk.Tk()
+        self.root.geometry("1180x720")
+        self.page = LoginPage(self.root, provider,
+                              data_dir=self.dir, on_authenticated=lambda _i: None)
+        self.page.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.root.update()
+        self.addCleanup(self._teardown)
+
+    def _teardown(self) -> None:
+        _KEEP_ALIVE.extend([self.root, self.page])
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def test_the_background_covers_whatever_shape_the_panel_is(self) -> None:
+        """★ background-size: cover —— 等比放大到盖住，多的居中裁掉，别留接缝。
+
+        原来贴的是一张预先切死的图，面板宽高比和它对不上，左栏上方就是一道明显的横缝。
+        """
+        from wxclient.ui import icons
+
+        for width, height in ((590, 720), (300, 900), (1200, 300)):
+            photo = icons.cover_photo(self.root, icons.PANEL_BG_PATH, width, height)
+            self.assertIsNotNone(photo, "PIL 在的时候必须能铺")
+            self.assertEqual((photo.width(), photo.height()), (width, height),
+                             f"{width}x{height} 要正好铺满，不多不少")
+
+    def test_a_silly_size_does_not_crash_the_login_page(self) -> None:
+        from wxclient.ui import icons
+
+        self.assertIsNone(icons.cover_photo(self.root, icons.PANEL_BG_PATH, 0, 0))
+        self.assertIsNone(icons.cover_photo(self.root, Path("这文件不存在.png"), 100, 100))
+
+    def test_the_placeholder_never_becomes_the_account_you_submit(self) -> None:
+        """★ 灰字提示如果是塞进 StringVar 的，不点那一格直接回车，提交的账号就成了
+        「请输入账号」——表现是「密码明明没打错却登不进去」，查起来极贵。
+        """
+        self.root.update()
+
+        self.assertEqual(self.page._account.get(), "", "占位文字不许进变量")
+        self.assertEqual(self.page._password.get(), "")
+
+    def test_the_password_row_lays_the_eye_out_beside_the_entry(self) -> None:
+        """★ 「文本框是乱的」的真因：眼睛在已经占满整行的 Entry 之后才 side=RIGHT，
+        跟 Entry 抢地方，于是整行错位。这里盯的就是「眼睛先占位、Entry 再 expand」。
+        """
+        entries: list[tk.Entry] = []
+
+        def walk(widget: tk.Misc) -> None:
+            for child in widget.winfo_children():
+                if isinstance(child, tk.Entry):
+                    entries.append(child)
+                walk(child)
+
+        walk(self.page)
+        self.assertGreaterEqual(len(entries), 2, "至少有账号和密码两个输入框")
+
+        eyes = 0
+        for entry in entries:
+            info = entry.pack_info()
+            self.assertEqual(info["side"], "left")
+            # expand 有的 Tk 版本回字符串 "1"、有的回整数 1，别按类型比
+            self.assertTrue(int(info["expand"]), "输入框要吃掉这一行剩下的宽度")
+            # 决定布局的是**打包顺序**（pack_slaves），不是创建顺序（winfo_children）：
+            # side=RIGHT 要在 Entry expand 吃掉整行之前把自己那块占下来。
+            slaves = entry.master.pack_slaves()
+            for slave in slaves:
+                if isinstance(slave, tk.Label) and slave.cget("text") == "👁":
+                    eyes += 1
+                    self.assertLess(slaves.index(slave), slaves.index(entry),
+                                    "眼睛必须先 pack，先把右边那块占下来")
+                    self.assertEqual(slave.pack_info()["side"], "right")
+        self.assertEqual(eyes, 1, "正常登录态只有密码那一行有眼睛")
+
+
+try:
+    import pystray  # noqa: F401
+
+    HAS_TRAY = True
+except Exception:  # noqa: BLE001 - Linux 上没有托盘后端，整类跳过
+    HAS_TRAY = False
+
+
+@unittest.skipUnless(HAS_TK and HAS_TRAY, "没有托盘后端（pystray），托盘菜单测不了")
+class TrayMenuTests(unittest.TestCase):
+    """★ 托盘菜单要跟窗口一致（用户 2026-08-15：「右下角的菜单也要同步修改」）。
+
+    托盘是**绕过界面的第二条操作路**——窗口上撤掉的东西如果还留在这里，它就成了后门：
+    「启动服务」曾经可以在没登录的时候把网关起起来。
+    """
+
+    def _tray(self, logged_in: bool = True):
+        from wxclient.ui.service import GatewayService
+        from wxclient.ui.tray import Tray
+
+        return Tray(
+            GatewayService(lambda: None),
+            on_show=lambda: None, on_settings=lambda: None, on_quit=lambda: None,
+            on_logout=lambda: None, can_logout=lambda: logged_in,
+        )
+
+    def _labels(self, tray) -> list[str]:
+        import pystray
+
+        return [str(item.text) for item in tray._icon.menu
+                if item is not pystray.Menu.SEPARATOR]
+
+    def test_the_menu_matches_the_window(self) -> None:
+        labels = self._labels(self._tray())
+
+        self.assertEqual(labels, ["显示日志", "配置中心", "退出登录", "退出"])
+        self.assertNotIn("启动服务", labels, "★ 这一项曾经是登录门的旁路")
+        self.assertNotIn("停止服务", labels, "并进「退出登录」了")
+        self.assertNotIn("参数设置", labels, "跟着窗口改名叫配置中心")
+
+    def test_logging_out_is_greyed_out_until_you_are_logged_in(self) -> None:
+        def enabled(tray, text: str) -> bool:
+            item = next(item for item in tray._icon.menu if str(item.text) == text)
+            return bool(item.enabled)
+
+        self.assertFalse(enabled(self._tray(logged_in=False), "退出登录"))
+        self.assertTrue(enabled(self._tray(logged_in=True), "退出登录"))
 
 
 if __name__ == "__main__":

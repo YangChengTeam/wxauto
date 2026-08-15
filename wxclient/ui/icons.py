@@ -58,3 +58,36 @@ def build_icon_image(state: ServiceState, size: int = 64) -> Any:
         fill=(*status_color(state), 255),
     )
     return image
+
+
+PANEL_BG_PATH = ASSETS / "panel-bg.png"
+
+
+def cover_photo(master: Any, path: Path, width: int, height: int) -> Any | None:
+    """按 CSS ``background-size: cover`` 的规矩把图铺满一块区域：等比放大到刚好盖住，
+    多出来的居中裁掉。返回 tk 用的 PhotoImage；铺不了就返回 None（调用方退回纯色底）。
+
+    ★ 为什么必须运行时算：登录页左栏（约 590x720）和侧栏（300x高）宽高比差得远，
+    预先切好一张贴上去，要么拉不满、要么只看得到构图的一角——用户 2026-08-15 反馈的
+    「背景有问题，应使用 background-size: cover」正是这个。
+
+    用 PIL 而不是 tk 自带的缩放：``PhotoImage.zoom/subsample`` 只能整数倍，缩出来
+    要么糊要么跳。PIL 本来就在依赖里（托盘图标、pywechat 都用），而且这段发生在登录页
+    建出来之后，不在「双击到看见第一屏」那条要命的路径上（见 splash.py）。
+    """
+    if width <= 1 or height <= 1 or not path.exists():
+        return None
+    try:
+        from PIL import Image, ImageTk
+    except ImportError:
+        return None
+    try:
+        source = Image.open(path).convert("RGB")
+        scale = max(width / source.width, height / source.height)
+        size = (max(width, round(source.width * scale)), max(height, round(source.height * scale)))
+        resized = source.resize(size, Image.LANCZOS)
+        left, top = (resized.width - width) // 2, (resized.height - height) // 2
+        return ImageTk.PhotoImage(resized.crop((left, top, left + width, top + height)),
+                                  master=master)
+    except Exception:  # noqa: BLE001 - 背景铺不上不该让人登不进去
+        return None

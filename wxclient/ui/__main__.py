@@ -188,7 +188,6 @@ def main(argv: list[str] | None = None) -> int:
         service,
         data_dir=wechat_settings.data_dir,
         dry_run_notice=_dry_run_notice(args, settings),
-        on_quit=lambda: shutdown(root, window, service, tray),
         on_settings_saved=on_settings_saved,
         on_refetch=lambda: pull_config(window.identity),
         log_pipeline=log_pipeline,
@@ -233,31 +232,37 @@ def main(argv: list[str] | None = None) -> int:
             # 之间不留一段谁也说不清的窗口期。
             on_settings_saved(True)
         elif autostart and service.state in (ServiceState.STOPPED, ServiceState.FAILED):
+            # ★ 服务**只在这里**起：登录成功 + 参数到手，才轮到它跑。
             service.start()
 
     def on_authenticated(identity: Any) -> None:
         _log.info("已登录", account=identity.account, provider=provider.name)
         pull_config(identity)
 
+    def logout_requested() -> None:
+        """托盘点了「退出登录」。真正的动作（停服务 + 回登录页）在窗口那边，
+        它自己会把停机丢到后台线程去等。"""
+        window.show()
+        window.logout()
+
     tray = Tray(
         service,
         # 菜单点哪一项就落到哪一页：open_log/open_settings 自己负责「露面 + 切页」，
-        # 别在这儿只 show()——那样点「显示日志」出来的可能还是上次停着的设置页。
+        # 别在这儿只 show()——那样点「显示日志」出来的可能还是上次停着的配置中心。
         on_show=lambda: root.after(0, window.open_log),
         on_settings=lambda: root.after(0, window.open_settings),
         on_quit=lambda: root.after(0, lambda: shutdown(root, window, service, tray)),
+        on_logout=lambda: root.after(0, logout_requested),
+        can_logout=lambda: window.logged_in,  # 没登录时这一项直接是灰的
     )
 
     window.set_login_context(provider, version=__version__, on_authenticated=on_authenticated)
     window.require_login(provider, version=__version__, on_authenticated=on_authenticated)
 
-    # 上次拉下来的参数还在（或命令行直接给了微信号）→ 服务照常自启，不必等人来登录：
-    # 网关是常驻服务，登录管的是「谁能看、谁能改」，不是「服务要不要跑」。
-    # 反过来，一台**全新**的机器没有任何参数，那就只能等登录了——这时窗口必须露面，
-    # 否则用户看到的是一个缩在托盘里、什么都不干、也不说为什么的图标。
-    have_config = bool(args.account or settings_store.merged(wechat_settings.data_dir).get(
-        "WXCLIENT_UI_ACCOUNTS"))
-    show_window = args.show or not settings.start_hidden or not have_config
+    # ★ **登录之前一概不起服务**（用户 2026-08-15：「登录前不应该启动相关的服务，
+    # 登录之后才有」）。所以窗口一定要露面——不然就是一个缩在托盘里、什么都不干、
+    # 也不说为什么的图标。服务由 `after_config` 在拉到参数之后才起。
+    show_window = True
     revealed = False
 
     def reveal() -> None:
@@ -284,18 +289,13 @@ def main(argv: list[str] | None = None) -> int:
     tray.run_detached()
 
     autostart = settings.autostart and not args.no_autostart
-    if autostart and have_config:
-        splash.stage("正在装配网关…")
-        service.start()
-    else:
-        # 没参数就别空转一遍装配（必然失败，还要甩一屏错）。等登录拉到参数，
-        # `after_config` 会把它起起来。
-        root.after(0, reveal)
+    # 这里**只把界面交出去**，不碰服务：谁来用这台机器还不知道，参数也还没拉。
+    root.after(0, reveal)
     # 兜底：装配卡住（微信没登录、UIA 不可用）也不能让启动动画一直挡在屏幕中间。
     root.after(SPLASH_MAX_MS, reveal)
 
-    _log.info("桌面端已启动", real_actions=(args.allow_real_actions or settings.allow_real_actions),
-              autostart=autostart, have_config=have_config, login=provider.name)
+    _log.info("桌面端已启动，等登录", real_actions=(args.allow_real_actions or settings.allow_real_actions),
+              autostart=autostart, login=provider.name)
     try:
         root.mainloop()
     except KeyboardInterrupt:
