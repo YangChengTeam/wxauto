@@ -308,10 +308,13 @@ class MainWindow:
         # 副标题只有配置中心有（`docs/setting.png`）；没有的页面直接不占位，标题就不会被顶歪
         self._subtitle = tk.Label(title_box, text="", font=theme.FONT_SMALL,
                                   bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
-        self._live_dot = tk.Label(header, text="●", font=(theme.UI, 9),
+        # 日志页的「● 实时更新 · N 行」就是它那一页的副标题：和配置中心一样摆在标题下面
+        # 一行（用户 2026-08-15），而不是横着挤在标题右边。
+        self._live_row = tk.Frame(title_box, bg=theme.CONTENT_BG)
+        self._live_dot = tk.Label(self._live_row, text="●", font=(theme.UI, 8),
                                   bg=theme.CONTENT_BG, fg=theme.GREEN_BRIGHT)
-        self._live_dot.pack(side=tk.LEFT, padx=(12, 4))
-        self._live_text = tk.Label(header, text="实时更新", font=theme.FONT_SMALL,
+        self._live_dot.pack(side=tk.LEFT, padx=(0, 5))
+        self._live_text = tk.Label(self._live_row, text="实时更新", font=theme.FONT_SMALL,
                                    bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
         self._live_text.pack(side=tk.LEFT)
 
@@ -511,15 +514,13 @@ class MainWindow:
 
         # 「实时更新 · N 行」「级别过滤」「清空 / 打开日志」这一排只属于日志页
         if page == "log":
-            self._live_dot.pack(side=tk.LEFT, padx=(12, 4))
-            self._live_text.pack(side=tk.LEFT)
+            self._live_row.pack(anchor="w", pady=(2, 0))
             for widget in self._header_actions.winfo_children():
                 widget.pack(side=tk.RIGHT, padx=10)
             self._filter_bar.pack(side=tk.RIGHT, padx=(0, 18))
             self._log_page.pack(fill=tk.BOTH, expand=True)
         else:
-            self._live_dot.pack_forget()
-            self._live_text.pack_forget()
+            self._live_row.pack_forget()
             self._filter_bar.pack_forget()
             for widget in self._header_actions.winfo_children():
                 widget.pack_forget()

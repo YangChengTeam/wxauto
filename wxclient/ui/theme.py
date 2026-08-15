@@ -63,5 +63,6 @@ BANNER_BG = "#fff7ed"
 
 # 日志表（`docs/main.png`）：表头一条细线，警告/错误整行铺浅色底 + 左边一根竖色条
 TABLE_HEAD_LINE = "#e4e3e3"
+TABLE_ROW_LINE = "#f2f2f2"   # 行与行之间那条，比表头线淡得多——它只管「隔开」，不该抢眼
 WARN_ROW_BG = "#fdf7ee"
 ERROR_ROW_BG = "#fef2f2"

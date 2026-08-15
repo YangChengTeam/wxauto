@@ -69,6 +69,22 @@ _TIME_SAMPLE = "2026-08-15 13:29:13"
 _LEVEL_SAMPLE = "● DEBUG"
 
 
+def _sep_font() -> tuple[str, int]:
+    """分隔线用的字体：**行高最小的那个**。
+
+    分隔线是「一整行只有一个空格」，所以线有多粗 = 这个字体的行高有多高。字号写成负数是
+    「像素」（正数是磅，96 DPI 上 1 磅就 1.33px，缩放一开更粗），但即便 -1，各家字体的
+    行高也不一样：这台机器上 Consolas 是 3px、Arial/Tahoma 是 2px。现挑最小的那个，
+    别把「细线」写成一条 3px 的灰带（用户 2026-08-15 两次反馈「分割线太粗」）。
+    """
+    best, best_height = (theme.MONO, -1), tkfont.Font(font=(theme.MONO, -1)).metrics("linespace")
+    for family in ("Arial", "Tahoma", theme.UI):
+        height = tkfont.Font(font=(family, -1)).metrics("linespace")
+        if height < best_height:
+            best, best_height = (family, -1), height
+    return best
+
+
 def _bar_font(width: int) -> tuple[str, int]:
     """挑一个字号，让一个空格差不多正好 ``width`` 像素宽——竖条的粗细就是这个宽度。
 
@@ -131,7 +147,7 @@ class LogTable(tk.Frame):
         # ★字号用**负数**：Tk 里正数是「磅」，1 磅在 96 DPI 上就有 1.33 px，缩放一开更粗，
         # 于是这条「1px 细线」实际画出来三四像素（用户 2026-08-15：「分割线太粗」）。
         # 负数是「像素」，写多少就是多少，跟 DPI 无关。
-        self._text.tag_configure("sep", background=theme.ROW_LINE, font=(theme.MONO, -1),
+        self._text.tag_configure("sep", background=theme.TABLE_ROW_LINE, font=_sep_font(),
                                  spacing1=0, spacing3=0)
         for severity, (color, row_bg) in _SEVERITY_STYLE.items():
             self._text.tag_configure(f"level_{severity}", foreground=color,

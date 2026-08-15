@@ -184,7 +184,20 @@ class WindowAdversarialTests(unittest.TestCase):
         self.assertEqual(self.window._log_page.winfo_manager(), "", "日志页要让位")
         # 日志页专属的那一排不该跟着跑出来
         self.assertEqual(self.window._filter_bar.winfo_manager(), "")
-        self.assertEqual(self.window._live_dot.winfo_manager(), "")
+        self.assertEqual(self.window._live_row.winfo_manager(), "")
+
+    def test_the_log_page_puts_live_status_under_the_title(self) -> None:
+        """★ 用户 2026-08-15：日志页也照配置中心那样分两行，「实时更新」放到标题下面。
+
+        断言的是「同一个纵向盒子里、排在标题后面」——横着挤在标题右边就不满足。
+        """
+        self.window._show_page("log")
+
+        self.assertIs(self.window._live_row.master, self.window._heading.master)
+        slaves = self.window._heading.master.pack_slaves()
+        self.assertLess(slaves.index(self.window._heading), slaves.index(self.window._live_row))
+        self.assertEqual(str(self.window._live_row.pack_info()["side"]), "top")
+        self.assertIn("实时更新", self.window._live_text.cget("text"))
 
     def test_a_page_that_no_longer_exists_falls_back_to_the_log(self) -> None:
         """★ 托盘/快捷方式里可能还留着老入口，别把内容区留成一片白。"""
@@ -769,11 +782,22 @@ class LogLookTests(unittest.TestCase):
         self.assertIn("sep", self.table._text.tag_names("2.0"))
         self.assertIn("sep", self.table._text.tag_names("4.0"))
         self.assertNotIn("sep", self.table._text.tag_names("1.0"))
-        self.assertEqual(self.table._text.tag_cget("sep", "background"), theme.ROW_LINE)
-        # ★ 用户 2026-08-15：「分割线太粗」——正字号是「磅」，高 DPI 上会被放成三四像素；
-        # 负字号是「像素」，写多少就是多少
+        self.assertEqual(self.table._text.tag_cget("sep", "background"), theme.TABLE_ROW_LINE)
+        # ★ 用户 2026-08-15 两次反馈「分割线太粗」。两件事一起治：
+        # ① 正字号是「磅」，高 DPI 上会被放成三四像素；负字号是「像素」，写多少是多少；
+        # ② 即便都写 -1，各家字体的行高也不一样（这台机器上 Consolas 3px、Arial 2px），
+        #    所以要现挑行高最小的那个——线有多粗，就是这个字体的行高。
+        import tkinter.font as tkfont
+
+        from wxclient.ui import logtable
+
         sep_size = int(self.table._text.tag_cget("sep", "font").split()[-1])
         self.assertLess(sep_size, 0, "分隔线字号必须是负数（像素），否则 DPI 一高线就变粗")
+
+        height = tkfont.Font(font=logtable._sep_font()).metrics("linespace")
+        for family in ("Consolas", "Arial", "Tahoma"):
+            self.assertLessEqual(height, tkfont.Font(font=(family, -1)).metrics("linespace"),
+                                 f"{family} 的行高更小，就该用它")
         # ★ 行距不归零的话，这条「线」会有十几像素高，看着就是行与行之间空了一大块
         self.assertEqual(str(self.table._text.tag_cget("sep", "spacing1")), "0")
         self.assertEqual(str(self.table._text.tag_cget("sep", "spacing3")), "0")
