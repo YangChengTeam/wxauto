@@ -385,9 +385,10 @@ class UiaStatusTests(unittest.TestCase):
         self.assertEqual(state.instance["processVersion"], "4.0.1.15")
         self.assertNotIn("6shq4q0wu92m12", state.instance["accountRef"], "ref 必须不透明")
         self.assertIn("****", state.instance["accountMask"])
-        self.assertNotIn("nickname", state.instance,
-                         "★ 昵称只在微信自己的加密库里，唯一读法是去点界面——"
-                         "拿不到就不给，绝不拿分身名冒充微信昵称")
+        self.assertEqual(state.instance["nickname"], uia_status.UNKNOWN_NICKNAME,
+                         "★ 昵称只在微信自己的加密库里，读不到就填占位符 `-`（用户裁决）——"
+                         "服务端要求必填，但绝不拿分身名之类的东西冒充微信昵称，"
+                         "那会让企业端显示一个看着像真的、其实是假的微信身份")
 
     def test_an_unknown_account_is_left_out_not_made_up(self) -> None:
         """★ 读不到微信账号就别编一个「稳定标识」，那会让服务端的占用检查形同虚设。"""

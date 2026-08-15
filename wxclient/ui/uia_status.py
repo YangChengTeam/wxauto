@@ -26,6 +26,9 @@ NOT_LOGGED_IN = "WECHAT_UIA_ACCOUNT_NOT_LOGGED_IN"
 WINDOW_UNAVAILABLE = "WECHAT_UIA_WINDOW_UNAVAILABLE"
 CONNECTION_LOST = "WECHAT_UIA_CONNECTION_LOST"
 
+#: 读不到微信昵称时填的占位符（用户裁决 2026-08-15）。服务端要求这个字段必填。
+UNKNOWN_NICKNAME = "-"
+
 _MESSAGES = {
     PROCESS_NOT_FOUND: "未检测到正在运行的微信，请先打开并登录 PC 微信",
     NOT_LOGGED_IN: "PC 微信尚未登录，请完成微信登录后重新连接",
@@ -114,9 +117,11 @@ def _instance(probe: dict[str, Any]) -> dict[str, Any] | None:
     `accountRef` / `accountMask` 由 `uia_probe.account` 从微信进程打开的账号目录算出来
     （不碰界面，见那个模块）。
 
-    ★ 仍然**不给 `nickname`**：昵称只存在微信自己的加密库里，唯一的读法是点进「个人信息」
-    面板去驱动界面——那会在用户正用着微信时抢焦点，而 vendor 的那条路在微信 4.x 上还是坏的。
-    宁可少一个字段，也不拿分身名冒充微信昵称：企业端那一格是用来认「这台机器接的是哪个微信」的。
+    `nickname` 一律是占位符 ``-``（用户裁决 2026-08-15）：昵称只存在微信自己的加密库里，
+    唯一的读法是点进「个人信息」面板去驱动界面——那会在用户正用着微信时抢焦点，而 vendor
+    的那条路在微信 4.x 上还是坏的。服务端把这个字段设成了必填，所以给一个**一眼看得出是
+    「没读到」的占位符**，而不是拿分身名之类的东西冒充微信昵称——那会让企业端显示一个
+    看着像真的、其实是假的微信身份。哪天真能读到昵称了，把这里换掉即可。
     """
     selected = probe.get("selected_window")
     version = ""
@@ -129,6 +134,9 @@ def _instance(probe: dict[str, Any]) -> dict[str, Any] | None:
     if account is not None:
         instance["accountRef"] = account.account_ref
         instance["accountMask"] = account.account_mask
+        # 只在账号认出来了的时候给 nickname：认不出账号时这条 connected 本来就会被服务端
+        # 退回（accountRef 必填），单给一个占位昵称没有意义。
+        instance["nickname"] = UNKNOWN_NICKNAME
     return instance or None
 
 
