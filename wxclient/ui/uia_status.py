@@ -26,7 +26,8 @@ NOT_LOGGED_IN = "WECHAT_UIA_ACCOUNT_NOT_LOGGED_IN"
 WINDOW_UNAVAILABLE = "WECHAT_UIA_WINDOW_UNAVAILABLE"
 CONNECTION_LOST = "WECHAT_UIA_CONNECTION_LOST"
 
-#: 读不到微信昵称时填的占位符（用户裁决 2026-08-15）。服务端要求这个字段必填。
+#: 读不到的字段填的占位符（用户裁决 2026-08-15）。服务端把 wechatInstance 里的字段
+#: 都设成了必填，给一个**一眼看得出是「没读到」**的值，好过编一个像真的假值。
 UNKNOWN_NICKNAME = "-"
 
 _MESSAGES = {
@@ -128,10 +129,12 @@ def _instance(probe: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(selected, dict):
         version = str(selected.get("process_version") or "")
     instance: dict[str, Any] = {}
-    if version:
-        instance["processVersion"] = version
     account = _account()
     if account is not None:
+        # 服务端要求这三个字段都在（连 processVersion 也是必填），少一个整条 connected
+        # 就被退回、企业端永远进不了「运行中」。读不到的填 `-`，和昵称同一个约定：
+        # 一眼看得出是「没读到」，而不是一个编出来的版本号。
+        instance["processVersion"] = version or UNKNOWN_NICKNAME
         instance["accountRef"] = account.account_ref
         instance["accountMask"] = account.account_mask
         # 只在账号认出来了的时候给 nickname：认不出账号时这条 connected 本来就会被服务端

@@ -396,7 +396,46 @@ class UiaStatusTests(unittest.TestCase):
         state = uia_status.classify(self.CONNECTED)
         assert state is not None
 
-        self.assertEqual(state.instance, {"processVersion": "4.0.1.15"})
+        self.assertIsNone(state.instance)
+
+    def test_an_unreadable_version_does_not_sink_the_whole_report(self) -> None:
+        """★ 2026-08-15 真机：探测结果的对外投影漏了 process_version，于是
+        `wechatInstance.processVersion` 是 undefined，服务端每次退回 400——
+        微信明明连着，企业端却永远进不了「运行中」。
+
+        版本号读不到时填 `-`：服务端要求必填，少一个字段整条 connected 就白发。
+        """
+        from wxclient.uia_probe.account import WeChatAccount
+
+        self._with_account(WeChatAccount("wxid_aaa"))
+        state = uia_status.classify({"platform": "Windows", "logged_in": True,
+                                     "uia_exposed": True, "selected_window": {}})
+        assert state is not None and state.instance is not None
+
+        self.assertEqual(state.instance["processVersion"], uia_status.UNKNOWN_NICKNAME)
+        self.assertIn("accountRef", state.instance)
+
+    def test_the_probe_hands_over_the_wechat_version(self) -> None:
+        """★ 上报层只看得见探测结果**对外那份字典**里的键。版本号加在候选窗口上、
+        漏在投影里，正是那次 400 的真因——这条盯住这一层的交接。
+        """
+        if sys.platform != "win32":
+            self.skipTest("只在 Windows 上跑：探测要 pywinauto")
+        from wxclient.uia_probe import windows as win_probe
+
+        candidate = {"handle": 1, "process_version": "4.1.12.26", "score": 9,
+                     "process_name": "Weixin.exe", "title": "微信"}
+        real_find = win_probe._find_wechat_window_candidates
+        real_count = win_probe._count_descendants
+        win_probe._find_wechat_window_candidates = lambda: [candidate]
+        win_probe._count_descendants = lambda *a, **k: 61
+        try:
+            found = win_probe.find_wechat_windows(max_depth=2, max_nodes=10)
+        finally:
+            win_probe._find_wechat_window_candidates = real_find
+            win_probe._count_descendants = real_count
+
+        self.assertEqual(found[0]["process_version"], "4.1.12.26")
 
     def test_a_non_windows_machine_reports_nothing(self) -> None:
         """★ 在 Linux 上报「微信没找到」，等于往企业端灌一条不存在的事实。"""

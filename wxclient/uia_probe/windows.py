@@ -33,6 +33,10 @@ def find_wechat_windows(max_depth: int, max_nodes: int) -> list[dict[str, Any]]:
                 "process_id": candidate.get("process_id"),
                 "process_name": candidate.get("process_name"),
                 "process_path": candidate.get("process_path"),
+                # ★ 这份字典是探测结果**对外的形状**，上报层只看得见这里的键。
+                # 2026-08-15：版本号加进了候选窗口却漏在这一层，于是上报出去的
+                # wechatInstance.processVersion 一直是 undefined，服务端每次退回 400。
+                "process_version": candidate.get("process_version"),
                 "class_name": candidate.get("class_name"),
                 "uia_class_name": candidate.get("uia_class_name"),
                 "is_visible": candidate.get("is_visible"),
