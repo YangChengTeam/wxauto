@@ -81,6 +81,9 @@ _SPINNER = ("◐", "◓", "◑", "◒")
 #: 留给后端下发的计划。
 _PAGE_TITLES = {"log": "实时日志", "plans": "计划中心", "settings": "配置中心"}
 
+#: 标题底下那句话。空 = 这一页不摆副标题。
+_PAGE_SUBTITLES = {"settings": "管理连接、调度与启动设置"}
+
 #: 左侧导航选中那根绿条的宽度（像素）。
 _NAV_MARK_W = 4
 
@@ -296,9 +299,14 @@ class MainWindow:
 
         header = tk.Frame(content, bg=theme.CONTENT_BG)
         header.pack(fill=tk.X, padx=24, pady=(20, 12))
-        self._heading = tk.Label(header, text="实时日志", font=theme.FONT_HEADING,
+        title_box = tk.Frame(header, bg=theme.CONTENT_BG)
+        title_box.pack(side=tk.LEFT)
+        self._heading = tk.Label(title_box, text="实时日志", font=theme.FONT_HEADING,
                                  bg=theme.CONTENT_BG, fg=theme.TEXT)
-        self._heading.pack(side=tk.LEFT)
+        self._heading.pack(anchor="w")
+        # 副标题只有配置中心有（`docs/setting.png`）；没有的页面直接不占位，标题就不会被顶歪
+        self._subtitle = tk.Label(title_box, text="", font=theme.FONT_SMALL,
+                                  bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
         self._live_dot = tk.Label(header, text="●", font=(theme.UI, 9),
                                   bg=theme.CONTENT_BG, fg=theme.GREEN_BRIGHT)
         self._live_dot.pack(side=tk.LEFT, padx=(12, 4))
@@ -530,6 +538,12 @@ class MainWindow:
             child.pack_forget()
         self._render_nav()
         self._heading.configure(text=_PAGE_TITLES.get(page, _PAGE_TITLES["log"]))
+        subtitle = _PAGE_SUBTITLES.get(page, "")
+        if subtitle:
+            self._subtitle.configure(text=subtitle)
+            self._subtitle.pack(anchor="w", pady=(2, 0))
+        else:
+            self._subtitle.pack_forget()
 
         # 「实时更新 · N 行」「级别过滤」「清空 / 打开日志」这一排只属于日志页
         if page == "log":
@@ -576,11 +590,16 @@ class MainWindow:
         if self._config_page is None:
             from .settings_page import SettingsPage
 
-            self._config_page, inner = self._build_scroller(self._pages)
+            self._config_page = tk.Frame(self._pages, bg=theme.CONTENT_BG)
+            scroller, inner = self._build_scroller(self._config_page)
             self._settings_page = SettingsPage(
                 inner, self.data_dir, on_saved=self._on_settings_saved,
                 on_refetch=self._refetch_config,
             )
+            # ★ 动作条**先** pack（side=BOTTOM）再 pack 滚动区：反过来的话 expand 的滚动区
+            # 会把它挤出可视范围，参数一多就得先滚到底才找得到「保存」。
+            self._settings_page.build_action_bar(self._config_page).pack(side=tk.BOTTOM, fill=tk.X)
+            scroller.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
             self._settings_page.pack(fill=tk.X)
             self._build_watch_section(inner).pack(fill=tk.BOTH, expand=True, padx=24)
         else:

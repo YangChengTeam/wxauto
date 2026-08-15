@@ -27,7 +27,30 @@ class Field:
     label: str
     help: str = ""
     secret: bool = False
-    kind: str = "text"  # text | bool
+    kind: str = "text"      # text | bool | file
+    section: str = "conn"   # 归到哪一段，见 SECTIONS
+    unit: str = ""          # 输入框右边贴着的单位（设计稿上「秒」是框内的一格）
+    placeholder: str = ""   # 空着时框里的灰字。**只是提示，永远不会被当成值**
+
+
+@dataclass(frozen=True)
+class Section:
+    """配置中心的一段（`docs/setting.png`）：标题 + 一句说明，底下一条横线。
+
+    分段是给人看的，不影响存储——所有键仍然平铺在同一个 env 文件里。
+    """
+
+    key: str
+    title: str
+    desc: str
+    columns: int = 1  # 一行摆几组「标签 + 输入框 + 说明」
+
+
+SECTIONS: tuple[Section, ...] = (
+    Section("conn", "连接配置", "配置与 AI 端及业务端的连接信息"),
+    Section("sched", "调度配置", "配置消息读取与任务调度规则", columns=2),
+    Section("boot", "启动设置", "配置服务启动后的行为"),
+)
 
 
 #: 界面上只放**必须由这台机器的人来定**的参数（用户 2026-08-13：「配置简洁一点，不用搞一堆」）。
@@ -41,18 +64,28 @@ class Field:
 FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_UI_ACCOUNTS", "微信号", "要接管的微信号，多个用逗号分隔"),
     Field("WXCLIENT_GATEWAY_AI_WS_URL", "AI 端地址", "wss://<ai-host>/v1/ws"),
-    Field("WXCLIENT_GATEWAY_BUSINESS_API_URL", "业务端地址", "https://<business-host>，用于换票"),
+    Field("WXCLIENT_GATEWAY_BUSINESS_API_URL", "业务端地址", "https://<business-host>，用于换票",
+          placeholder="用于换票，可选"),
     Field("WXCLIENT_GATEWAY_INTERNAL_KEY", "内部 key", "网关唯一持有的凭证", secret=True),
-    Field("WXCLIENT_GATEWAY_LOCAL_TICKET_FILE", "本地票据文件", "仅联调用，与业务端地址二选一"),
-    Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔（秒）",
-          "多久看一次未读。太密会被微信当异常，下限 30 秒"),
-    Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔（秒）",
-          "单独的节拍，比读消息慢得多；0=不查。查到也不会自动通过"),
-    Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "如 09:00-21:00；窗外一概不动微信"),
-    Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "每小时发送上限"),
-    Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", kind="bool"),
-    Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", kind="bool"),
+    Field("WXCLIENT_GATEWAY_LOCAL_TICKET_FILE", "本地票据文件", "仅联调用，与业务端地址二选一",
+          kind="file"),
+    Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔",
+          "多久看一次未读，下限 30 秒", section="sched", unit="秒"),
+    Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔",
+          "单独的节拍，0=不查", section="sched", unit="秒"),
+    Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "如 09:00-21:00，窗外不动微信",
+          section="sched"),
+    Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "每小时发送上限", "防止消息风控",
+          section="sched"),
+    Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动自动运行服务",
+          kind="bool", section="boot"),
+    Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", "启动后最小化到系统托盘",
+          kind="bool", section="boot"),
 )
+
+
+def fields_of(section: str) -> tuple[Field, ...]:
+    return tuple(field for field in FIELDS if field.section == section)
 
 _TRUE = {"1", "true", "yes", "on", "是"}
 

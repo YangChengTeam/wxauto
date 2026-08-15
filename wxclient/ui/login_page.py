@@ -23,7 +23,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from . import auth, theme
+from . import auth, theme, widgets
 from .auth import AuthError, AuthProvider, Identity
 
 #: 左侧品牌面板占窗口宽度的比例。设计稿是 790/1570 ≈ 0.5。
@@ -249,39 +249,12 @@ class LoginPage(tk.Frame):
         entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(12, 8), pady=9)
         entry.bind("<Return>", lambda _e: self.submit())
 
-        # 聚焦时边框变绿：设计稿上「当前在填哪一格」就是靠它标出来的。
-        entry.bind("<FocusIn>", lambda _e: box.configure(highlightbackground=theme.GREEN,
-                                                         highlightcolor=theme.GREEN), add="+")
-        entry.bind("<FocusOut>", lambda _e: box.configure(highlightbackground=theme.FIELD_LINE,
-                                                          highlightcolor=theme.FIELD_LINE), add="+")
+        # 聚焦变绿的边框和灰字占位，和配置中心共用一份实现（`ui/widgets.py`）——
+        # 各写各的迟早写成两个样子。
+        widgets.focus_ring(box, entry)
         if placeholder:
-            self._attach_placeholder(entry, var, placeholder)
+            widgets.attach_placeholder(entry, var, placeholder)
         return entry
-
-    def _attach_placeholder(self, entry: tk.Entry, var: tk.StringVar, text: str) -> None:
-        """灰字提示。
-
-        ★ 用一个**盖在上面的 Label**，不往 StringVar 里塞占位文字——塞进去的话，
-        用户不点这一格直接回车，提交上去的账号就成了「请输入账号」。这种坑一旦埋下，
-        表现是「密码明明没打错却登不进去」，查起来极贵。
-        """
-        hint = tk.Label(entry.master, text=text, font=theme.FONT_INPUT,
-                        bg=theme.FIELD_BG, fg=theme.TEXT_MUTED)
-        hint.bind("<Button-1>", lambda _e: entry.focus_set())
-
-        def sync(*_args: object) -> None:
-            try:
-                if var.get() or entry.focus_get() is entry:
-                    hint.place_forget()
-                else:
-                    hint.place(in_=entry, x=1, rely=0.5, anchor="w")
-            except (tk.TclError, KeyError):
-                pass  # 控件正在销毁
-
-        var.trace_add("write", lambda *_: sync())
-        entry.bind("<FocusIn>", lambda _e: sync(), add="+")
-        entry.bind("<FocusOut>", lambda _e: sync(), add="+")
-        entry.after(0, sync)
 
     # ── 提交 ─────────────────────────────────────────────────────
 
