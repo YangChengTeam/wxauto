@@ -66,8 +66,10 @@ DEAD_BINARIES = ("PIL\\_avif", "PIL/_avif")
 a = Analysis(
     ["launcher.py"],
     pathex=["."],
-    datas=[("../wxclient/ui/assets/app.ico", "wxclient/ui/assets"),
-           ("../wxclient/ui/assets/app-256.png", "wxclient/ui/assets")],
+    # ★ 整个 assets 目录一起打，**不要逐个文件列**：漏掉一个的表现是「打出来的包少一张图」，
+    # 而代码对缺图都是优雅降级（背景变纯色、图标退回圆点），没人会看见报错——正是最难发现的
+    # 那类回归。（`tests/test_ui.py::PackagingTests` 会盯着这条。）
+    datas=[("../wxclient/ui/assets", "wxclient/ui/assets")],
     hiddenimports=hiddenimports,
     excludes=excludes,
     noarchive=False,

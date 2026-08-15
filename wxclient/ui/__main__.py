@@ -14,6 +14,8 @@ import time
 import tkinter as tk
 from typing import TYPE_CHECKING, Any
 
+from wxclient import __version__
+
 # ★ 模块级只留「把启动动画画出来」必需的这几样。**别在这儿 import 业务模块**——
 # `python -m wxclient.ui` 会先把它们全跑一遍，而在它们回来之前屏幕上一片空白。
 # 真机实测（源码模式，冷启动）：到看见启动动画 5.8 秒，其中 4.7 秒花在 import 上
@@ -103,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
     from wxclient.logging_config import configure_logging
 
     from . import settings_store
+    from .auth import build_provider
     from .config import UiSettings
     from .logbuffer import LogBuffer, LogPipeline
     from .service import GatewayService, ServiceState
@@ -112,8 +115,9 @@ def main(argv: list[str] | None = None) -> int:
 
     splash.stage("正在读取配置…")
     wechat_settings = load_settings(args.config)
-    # 先把上次在「参数设置」里填的值灌进环境变量，再读配置——真实环境变量优先
-    settings_store.apply_to_environ(settings_store.load(wechat_settings.data_dir))
+    # 先把参数灌进环境变量再读配置——真实环境变量优先。
+    # merged = 后端上次下发的那份打底 + 本机在「配置中心」改过的盖在上面（settings_store）。
+    settings_store.apply_to_environ(settings_store.merged(wechat_settings.data_dir))
     settings = UiSettings()
 
     # ★ 单实例：两个进程同时驱动同一个微信 = 同一条消息读两遍、回两遍，两边还各按各的
@@ -164,7 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         # 那 15 秒里窗口一次都不重绘，用户看到的就是「点了保存，程序死了」。
         def before_start() -> None:
             settings_store.apply_to_environ(
-                settings_store.load(wechat_settings.data_dir), force=True
+                settings_store.merged(wechat_settings.data_dir), force=True
             )
 
         def done() -> None:
@@ -186,8 +190,54 @@ def main(argv: list[str] | None = None) -> int:
         dry_run_notice=_dry_run_notice(args, settings),
         on_quit=lambda: shutdown(root, window, service, tray),
         on_settings_saved=on_settings_saved,
+        on_refetch=lambda: pull_config(window.identity),
         log_pipeline=log_pipeline,
     )
+
+    # ── 登录：这台机器归谁用，参数就按谁的来 ──────────────────
+    provider = build_provider(wechat_settings.data_dir)
+
+    def pull_config(identity: Any) -> None:
+        """登录后拉参数。**在后台线程上跑**——它要发网络请求，最长 8 秒。"""
+        if identity is None:
+            return
+
+        def work() -> None:
+            try:
+                config = provider.fetch_config(identity)
+            except Exception as exc:  # noqa: BLE001 - 拉不到不该把人挡在门外
+                _log.warning("拉取配置失败", error=str(exc)[:120])
+                root.after(0, lambda: window.set_busy(""))
+                return
+            changed = False
+            if config.values:
+                before = settings_store.load_remote(wechat_settings.data_dir)
+                settings_store.save_remote(wechat_settings.data_dir, config.values)
+                changed = before != config.values
+                settings_store.apply_to_environ(
+                    settings_store.merged(wechat_settings.data_dir), force=True
+                )
+            _log.info("已拉取配置", source=config.source, keys=len(config.values),
+                      plans=len(config.plans), changed=changed)
+            root.after(0, lambda: after_config(config, changed))
+
+        window.set_busy("正在拉取参数")
+        threading.Thread(target=work, name="wx-ui-config", daemon=True).start()
+
+    def after_config(config: Any, changed: bool) -> None:
+        window.set_config_source(config.source)
+        window.set_plans(config.plans)
+        window.set_busy("")
+        if service.state is ServiceState.RUNNING and changed:
+            # 参数变了就按新参数重来一遍：让「后端改了配置」和「这台机器上真的在按它跑」
+            # 之间不留一段谁也说不清的窗口期。
+            on_settings_saved(True)
+        elif autostart and service.state in (ServiceState.STOPPED, ServiceState.FAILED):
+            service.start()
+
+    def on_authenticated(identity: Any) -> None:
+        _log.info("已登录", account=identity.account, provider=provider.name)
+        pull_config(identity)
 
     tray = Tray(
         service,
@@ -198,7 +248,16 @@ def main(argv: list[str] | None = None) -> int:
         on_quit=lambda: root.after(0, lambda: shutdown(root, window, service, tray)),
     )
 
-    show_window = args.show or not settings.start_hidden
+    window.set_login_context(provider, version=__version__, on_authenticated=on_authenticated)
+    window.require_login(provider, version=__version__, on_authenticated=on_authenticated)
+
+    # 上次拉下来的参数还在（或命令行直接给了微信号）→ 服务照常自启，不必等人来登录：
+    # 网关是常驻服务，登录管的是「谁能看、谁能改」，不是「服务要不要跑」。
+    # 反过来，一台**全新**的机器没有任何参数，那就只能等登录了——这时窗口必须露面，
+    # 否则用户看到的是一个缩在托盘里、什么都不干、也不说为什么的图标。
+    have_config = bool(args.account or settings_store.merged(wechat_settings.data_dir).get(
+        "WXCLIENT_UI_ACCOUNTS"))
+    show_window = args.show or not settings.start_hidden or not have_config
     revealed = False
 
     def reveal() -> None:
@@ -225,15 +284,18 @@ def main(argv: list[str] | None = None) -> int:
     tray.run_detached()
 
     autostart = settings.autostart and not args.no_autostart
-    if autostart:
+    if autostart and have_config:
         splash.stage("正在装配网关…")
         service.start()
     else:
+        # 没参数就别空转一遍装配（必然失败，还要甩一屏错）。等登录拉到参数，
+        # `after_config` 会把它起起来。
         root.after(0, reveal)
     # 兜底：装配卡住（微信没登录、UIA 不可用）也不能让启动动画一直挡在屏幕中间。
     root.after(SPLASH_MAX_MS, reveal)
 
-    _log.info("桌面端已启动", real_actions=(args.allow_real_actions or settings.allow_real_actions), autostart=autostart)
+    _log.info("桌面端已启动", real_actions=(args.allow_real_actions or settings.allow_real_actions),
+              autostart=autostart, have_config=have_config, login=provider.name)
     try:
         root.mainloop()
     except KeyboardInterrupt:

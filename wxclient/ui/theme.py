@@ -41,3 +41,18 @@ FONT_HEADING = (UI, 14, "bold")
 FONT_BODY = (UI, 10)
 FONT_SMALL = (UI, 9)
 FONT_LOG = (MONO, 9)
+
+# 登录页（`docs/login.png`）：左边深色品牌面板 + 右边白色表单
+PANEL_BG = "#1c1c1c"          # 和背景图 `assets/login-bg.png` 的底色对齐，接缝看不出来
+PANEL_SUBTLE = "#9aa0a6"
+FIELD_BG = "#ffffff"
+FIELD_LINE = "#d9dde1"
+PILL_BG = "#f2f3f5"
+
+FONT_HERO = (UI, 30, "bold")
+FONT_LOGIN_TITLE = (UI, 22, "bold")
+FONT_INPUT = (UI, 11)
+FONT_BUTTON = (UI, 12, "bold")
+
+# 顶部告警条（`docs/main.png` 里那条橙色的）
+BANNER_BG = "#fff7ed"

@@ -69,12 +69,26 @@
 - `add_friend` 成功只代表**申请已发出**，不代表能发消息了。「现在能回了」的信号是
   `check_new_friends` 的 `items`（对方点了同意）。
 
+## 桌面端登录与参数下发（2026-08-15）
+
+- 界面**先登录后使用**：登录之前看不到日志/配置/计划。不许加「跳过登录」的开关。
+- 两个 provider，接口一样（`wxclient/ui/auth.py`）：配了 `WXCLIENT_UI_LOGIN_API_URL`
+  走后端（契约 `REMOTE_CONTRACT`：`POST /desktop/login` + `GET /desktop/config`，**后端待实现**），
+  没配走本机账号（scrypt 存哈希，首次运行当场设）。
+- 后端下发的参数落 `gateway.remote.env`（整份覆盖），本机改的落 `gateway.env`，
+  **同名键本机盖过后端**；和后端相同的值不在本机留副本，否则保存一次就把后端架空了。
+- token 只在内存里，不落盘；「记住账号」只记账号名。
+- 服务不等人登录：有上次的参数就照常自启；登录管的是「谁能看、谁能改」。
+- 界面三页：实时日志 / 计划中心（后端下发，现为空）/ 配置中心（参数 + 只读监听名单）。
+  名单权威仍在 AI 端（WS 推），桌面端不给编辑。
+
 ## 扩展方式
 
 - 新微信能力先加入 `wechat_api` 封装，再增加任务类型和 worker 分发，最后暴露给网关。
-- 桌面端只做「启动/停止服务 + 看日志 + 填参数」，**不得**在 `ui/` 里写任何业务判断、话术
-  或微信动作；它只调 `gateway`/`service` 的公开接口。可测逻辑放 `ui/logbuffer.py`、
-  `ui/service.py`、`ui/settings_store.py`，`ui/window.py` 与 `ui/tray.py` 只留 GUI 装配。
+- 桌面端只做「登录 + 启动/停止服务 + 看日志 + 看/改参数」，**不得**在 `ui/` 里写任何业务
+  判断、话术或微信动作；它只调 `gateway`/`service` 的公开接口。可测逻辑放 `ui/logbuffer.py`、
+  `ui/service.py`、`ui/settings_store.py`、`ui/auth.py`，`ui/window.py`、`ui/login_page.py`
+  与 `ui/tray.py` 只留 GUI 装配。
 - 不恢复独立调用客户端或大模型模块；若产品方向变化，应单独讨论架构。
   （2026-08-12：产品方向确认要桌面端，原「不做 GUI/托盘」的禁令按此收窄为上面一条。）
 - `gateway` 的常驻轮询循环是既定架构（入站只能轮询，见 `CLAUDE.md` §4.3），不属于被禁的

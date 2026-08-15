@@ -96,7 +96,7 @@ class WindowAdversarialTests(unittest.TestCase):
             self.window.open_log()
             self.window._render_busy()
 
-        # 只该有四个：日志页 + 监听名单页 + 设置页 + 遮罩
+        # 只该有四个：日志页 + 计划中心 + 配置中心 + 遮罩
         self.assertLessEqual(len(self.window._pages.winfo_children()), 4)
 
     def test_transition_covers_the_settings_page_instead_of_kicking_you_out(self) -> None:
@@ -110,8 +110,8 @@ class WindowAdversarialTests(unittest.TestCase):
         self.assertEqual((info.get("relwidth"), info.get("relheight")), ("1", "1"))
         order = self.window._pages.winfo_children()
         self.assertGreater(
-            order.index(self.window._overlay), order.index(self.window._settings_page),
-            "遮罩必须层叠在参数页之上，否则点击照样落到「保存并重启服务」上",
+            order.index(self.window._overlay), order.index(self.window._config_page),
+            "遮罩必须层叠在配置中心之上，否则点击照样落到「保存并重启服务」上",
         )
         self.assertTrue(self.window._overlay.bind("<Button-1>"), "遮罩要自己吞掉鼠标事件")
 
@@ -124,41 +124,50 @@ class WindowAdversarialTests(unittest.TestCase):
 
         所以启动后趁空闲先建好，用户点下去只剩 pack/unpack。
         """
-        self.assertIsNone(self.window._settings_page, "刚起来时还没建")
+        self.assertIsNone(self.window._config_page, "刚起来时还没建")
 
         self.window._prebuild_settings_page()
 
-        page = self.window._settings_page
+        page = self.window._config_page
         self.assertIsNotNone(page, "预热之后就该有了")
         self.assertEqual(page.winfo_manager(), "", "预热只建不显示")
         self.window.open_settings()
-        self.assertIs(self.window._settings_page, page, "真点的时候直接用预热那个")
+        self.assertIs(self.window._config_page, page, "真点的时候直接用预热那个")
 
-    def test_the_watch_list_lives_on_its_own_page_not_in_the_sidebar(self) -> None:
-        """★ 名单不再直接铺在侧栏「监听」下面，改成点「监听名单」才看（用户 2026-08-14）。
+    def test_the_nav_is_log_plans_config(self) -> None:
+        """★ 导航改名（用户 2026-08-15）：参数设置→配置中心，监听名单→计划中心。
 
-        理由：名字一多就把整条侧栏顶下去，而多数时候没人在看。侧栏那行只留「几个会话」。
+        名单本来就是 AI 端说了算、本机改不了的，归进配置中心当只读的一节；腾出来的位置
+        留给后端下发的计划。侧栏那行仍然只报「几个会话」，名字不铺在侧栏上。
         """
-        self.assertIn("watch", self.window._nav, "左边要有「监听名单」这一项")
-        self.assertEqual(self.window._nav["watch"].cget("text"), "监听名单")
+        self.assertEqual([self.window._nav[key].cget("text") for key in ("log", "plans", "settings")],
+                         ["实时日志", "计划中心", "配置中心"])
+        self.assertNotIn("watch", self.window._nav, "监听名单不再是单独一项")
         self.assertFalse(hasattr(self.window, "_watch_label"), "侧栏不该再铺名单")
 
-        self.window._show_page("watch")
+        self.window._show_page("plans")
 
-        self.assertEqual(self.window._page, "watch")
-        self.assertEqual(self.window._heading.cget("text"), "监听名单")
-        self.assertEqual(self.window._watch_page.winfo_manager(), "pack")
+        self.assertEqual(self.window._page, "plans")
+        self.assertEqual(self.window._heading.cget("text"), "计划中心")
+        self.assertEqual(self.window._plans_page.winfo_manager(), "pack")
         self.assertEqual(self.window._log_page.winfo_manager(), "", "日志页要让位")
         # 日志页专属的那一排不该跟着跑出来
         self.assertEqual(self.window._filter_bar.winfo_manager(), "")
         self.assertEqual(self.window._live_dot.winfo_manager(), "")
 
-    def test_the_watch_page_lists_the_actual_names(self) -> None:
-        """名单是「谁会被自动回复」的唯一判据，页上必须看得到具体是谁。"""
+    def test_the_empty_plan_page_says_why_it_is_empty(self) -> None:
+        """空页不许空着不说话：得讲清计划是后端下发的、这台机器只负责显示和执行。"""
+        self.window._show_page("plans")
+        hint = self.window._plans_hint.cget("text")
+        self.assertIn("还没有计划", hint)
+        self.assertIn("后端", hint)
+
+    def test_the_watch_list_lists_the_actual_names_inside_the_config_page(self) -> None:
+        """名单是「谁会被自动回复」的唯一判据，配置中心里必须看得到具体是谁。"""
         from wxclient.ui.service import GatewayStatus
 
         self.window.service._status = GatewayStatus(watched=("张三", "李四", "王五"))
-        self.window._show_page("watch")
+        self.window._show_page("settings")
 
         body = self.window._watch_text.get("1.0", "end-1c")
         for name in ("张三", "李四", "王五"):
@@ -167,7 +176,7 @@ class WindowAdversarialTests(unittest.TestCase):
 
     def test_an_empty_watch_list_says_nothing_will_be_answered(self) -> None:
         """空名单分两种，别混为一谈：没起服务是正常的，**跑着却空**才是要命的。"""
-        self.window._show_page("watch")
+        self.window._show_page("settings")
         self.assertIn("没在跑", self.window._watch_hint.cget("text"), "没启动时别吓人")
 
         # 跑起来了、名单却是空的：意味着一条消息都不会回，必须说出来
@@ -286,6 +295,210 @@ class StallWatchdogTests(unittest.TestCase):
         self.assertTrue(self._stalled(), "真卡了必须留痕")
         lines = self.buffer.snapshot()
         self.assertTrue(any("stalled_ms" in line for line in lines), f"要带上卡了多久：{lines[-3:]}")
+
+
+@unittest.skipUnless(HAS_TK, "没有 tkinter / 显示环境，窗口层测不了")
+class LoginGateTests(unittest.TestCase):
+    """★ 登录是一道真门（用户 2026-08-15：「用户需要登录 登录之后 获取参数」）。
+
+    门的定义只有一条：**没登录就看不见东西**。所以这里测的不是「登录页画得好不好看」，
+    而是「它有没有真的挡在前面」「密码错了会不会放人进来」「退出登录之后门有没有关回去」。
+    """
+
+    def setUp(self) -> None:
+        from wxclient.ui import auth
+
+        self.dir = Path(tempfile.mkdtemp())
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.service = GatewayService(lambda: None)
+        self.window = MainWindow(
+            self.root, LogBuffer(), self.service, data_dir=self.dir, on_quit=lambda: None,
+        )
+        self.provider = auth.LocalAccountProvider(self.dir)
+        self.addCleanup(self._teardown)
+
+    def _teardown(self) -> None:
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+    def _pump(self, predicate, timeout: float = 5.0) -> bool:
+        """跑**真的** mainloop 直到条件成立。
+
+        ⚠️ 不能写成 ``while: root.update()``：登录结果是从后台线程 ``after`` 回来的，
+        而 ``after`` 跨线程只有在 mainloop 真在跑的时候才成立，否则直接
+        ``RuntimeError: main thread is not in main loop``——测出来的是测试自己的毛病。
+        （同一个坑在量 GIL 那次也踩过，见 memory「量 GIL 必须用真 mainloop」。）
+        """
+        deadline = time.monotonic() + timeout
+        done = {"ok": False}
+
+        def check() -> None:
+            if predicate():
+                done["ok"] = True
+                self.root.quit()
+            elif time.monotonic() > deadline:
+                self.root.quit()
+            else:
+                self.root.after(20, check)
+
+        self.root.after(20, check)
+        self.root.mainloop()
+        return done["ok"]
+
+    def test_a_fresh_machine_asks_you_to_set_an_account_first(self) -> None:
+        self.window.require_login(self.provider)
+
+        self.assertFalse(self.window.logged_in, "还没登录")
+        login = self.window._login
+        self.assertTrue(login._setup_mode, "第一次要设账号，不是登录")
+        self.assertEqual(login._button.cget("text"), "设置并进入")
+        self.assertIs(self.root.winfo_children()[-1], login, "登录页要压在最上面")
+        self.assertEqual(login.place_info().get("relwidth"), "1", "要盖满整个窗口")
+
+    def test_the_wrong_password_keeps_you_out_and_says_why(self) -> None:
+        self.provider.create("zhangsan", "hunter2")
+        self.window.require_login(self.provider)
+        login = self.window._login
+        login._account.set("zhangsan")
+        login._password.set("这不是密码")
+
+        login.submit()
+
+        self.assertTrue(self._pump(lambda: bool(login._error.cget("text"))), "错误要显示出来")
+        self.assertEqual(login._error.cget("text"), "账号或密码不对")
+        self.assertFalse(self.window.logged_in, "★ 密码错了绝不能放进来")
+        self.assertEqual(login._account.get(), "zhangsan", "账号别给人清掉，改密码再来就行")
+
+    def test_logging_in_takes_the_door_away_and_shows_who_you_are(self) -> None:
+        self.provider.create("zhangsan", "hunter2")
+        seen = []
+        self.window.require_login(self.provider, on_authenticated=seen.append)
+        login = self.window._login
+        login._account.set("zhangsan")
+        login._password.set("hunter2")
+
+        login.submit()
+
+        self.assertTrue(self._pump(lambda: self.window.logged_in), "登录之后门要撤掉")
+        self.assertEqual([identity.account for identity in seen], ["zhangsan"])
+        self.assertEqual(self.window._page, "log", "登进来落在实时日志")
+        self.assertIn("zhangsan", self.window._who.cget("text"), "侧栏要说清是谁在用")
+
+    def test_logging_out_closes_the_door_again_without_stopping_the_service(self) -> None:
+        """★ 退出登录只关门。把服务一起停掉等于「谁下班谁就把网关关了」。"""
+        self.provider.create("zhangsan", "hunter2")
+        self.window.set_login_context(self.provider)
+        self.window.finish_login(self.provider.login("zhangsan", "hunter2"))
+        self.service._snapshot = (ServiceState.RUNNING, None)
+
+        self.window.logout()
+
+        self.assertFalse(self.window.logged_in, "门要关回去")
+        self.assertEqual(self.window._who.cget("text"), "", "身份要抹掉")
+        self.assertIs(self.service.state, ServiceState.RUNNING, "服务不许受影响")
+
+    def test_remembering_the_account_never_remembers_the_password(self) -> None:
+        from wxclient.ui import auth
+
+        self.provider.create("zhangsan", "hunter2")
+        self.window.require_login(self.provider)
+        login = self.window._login
+        login._account.set("zhangsan")
+        login._password.set("hunter2")
+        login._remember.set(True)
+
+        login.submit()
+        self.assertTrue(self._pump(lambda: self.window.logged_in))
+
+        raw = (self.dir / auth.UI_STATE_FILE).read_text(encoding="utf-8")
+        self.assertIn("zhangsan", raw)
+        self.assertNotIn("hunter2", raw)
+
+
+@unittest.skipUnless(HAS_TK, "没有 tkinter / 显示环境，窗口层测不了")
+class ConfigCenterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.service = GatewayService(lambda: None)
+        self.window = MainWindow(
+            self.root, LogBuffer(), self.service, data_dir=self.dir, on_quit=lambda: None,
+        )
+        self.addCleanup(self._teardown)
+
+    def _teardown(self) -> None:
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+    def test_saving_does_not_freeze_every_pushed_value_into_a_local_override(self) -> None:
+        """★ 这是最容易埋进去、又最难发现的一个坑。
+
+        配置中心一保存就把满屏的值全写进本机文件的话，十几个键会**全部**变成「本机覆盖」，
+        从此后端下发什么都不生效——而界面上一切正常（值确实对，只是冻在了保存那一刻）。
+        本机文件里只该躺着「这台机器上的人真改过的那几个」。
+        """
+        from wxclient.ui import settings_store
+
+        settings_store.save_remote(self.dir, {
+            "WXCLIENT_UI_ACCOUNTS": "后端给的",
+            "WXCLIENT_GATEWAY_AI_WS_URL": "wss://后端/ws",
+        })
+        page = self.window._ensure_settings_page() and self.window._settings_page
+
+        kept = page._drop_same_as_remote({
+            "WXCLIENT_UI_ACCOUNTS": "后端给的",      # 没动过 → 不该留在本机
+            "WXCLIENT_GATEWAY_AI_WS_URL": "wss://本机/ws",  # 真改了 → 留
+            "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": "20",    # 后端压根没下发 → 留
+        })
+
+        self.assertEqual(kept, {
+            "WXCLIENT_GATEWAY_AI_WS_URL": "wss://本机/ws",
+            "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": "20",
+        })
+
+    def test_an_overridden_row_shows_what_the_backend_had(self) -> None:
+        from wxclient.ui import settings_store
+
+        settings_store.save_remote(self.dir, {"WXCLIENT_UI_ACCOUNTS": "后端给的"})
+        settings_store.save(self.dir, {"WXCLIENT_UI_ACCOUNTS": "本机改的"})
+
+        self.window._ensure_settings_page()
+        mark = self.window._settings_page._marks["WXCLIENT_UI_ACCOUNTS"]
+
+        self.assertIn("本机已改", mark.cget("text"))
+        self.assertIn("后端给的", mark.cget("text"))
+
+    def test_a_secret_override_never_prints_the_backend_value(self) -> None:
+        """★ internal key 是网关唯一的凭证，界面上任何地方都不该把它铺出来。"""
+        from wxclient.ui import settings_store
+
+        settings_store.save_remote(self.dir, {"WXCLIENT_GATEWAY_INTERNAL_KEY": "后端的密钥"})
+        settings_store.save(self.dir, {"WXCLIENT_GATEWAY_INTERNAL_KEY": "本机的密钥"})
+
+        self.window._ensure_settings_page()
+        mark = self.window._settings_page._marks["WXCLIENT_GATEWAY_INTERNAL_KEY"]
+
+        self.assertIn("本机已改", mark.cget("text"))
+        self.assertNotIn("后端的密钥", mark.cget("text"))
+
+    def test_the_banner_only_shows_up_when_something_is_actually_wrong(self) -> None:
+        self.service._snapshot = (ServiceState.RUNNING, None)
+        self.service._status = GatewayStatus(connected=1, accounts=1)
+        self.window.refresh_state()
+        self.assertEqual(self.window._banner.winfo_manager(), "", "一切正常时不占地方")
+
+        self.service._status = GatewayStatus(connected=0, accounts=1, connect_error="认证失败")
+        self.window.refresh_state()
+
+        self.assertEqual(self.window._banner.winfo_manager(), "pack")
+        self.assertIn("AI 端连接异常", self.window._banner_title.cget("text"))
+        self.assertIn("认证失败", self.window._banner_detail.cget("text"))
 
 
 if __name__ == "__main__":

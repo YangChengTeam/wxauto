@@ -758,6 +758,23 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("console=False", spec)
         self.assertNotIn("console=True", spec)
 
+    def test_every_asset_gets_bundled(self) -> None:
+        """★ assets 要整目录打进去，别逐个文件列。
+
+        逐个列的下场：新加一张图忘了登记 → 打出来的包少一张，而代码对缺图全是优雅降级
+        （背景变纯色、图标退回圆点），既不报错也不崩，只有人肉眼看出来「怎么和开发机不一样」。
+        """
+        spec = self.SPEC.read_text(encoding="utf-8")
+        assets = Path(__file__).resolve().parent.parent / "wxclient/ui/assets"
+
+        self.assertIn('("../wxclient/ui/assets", "wxclient/ui/assets")', spec,
+                      "整个目录一起打")
+        for asset in assets.iterdir():
+            if asset.is_file():
+                # 「单独列一行」长这样：("../wxclient/ui/assets/app.ico", "wxclient/ui/assets")
+                self.assertNotIn(f'assets/{asset.name}", "wxclient/ui/assets"', spec,
+                                 f"{asset.name} 不该再单独列进 datas，目录已经覆盖了")
+
 
 class SettingsStoreTests(unittest.TestCase):
     def test_round_trip_keeps_values(self) -> None:
