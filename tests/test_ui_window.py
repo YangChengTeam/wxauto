@@ -951,7 +951,8 @@ class TrayMenuTests(unittest.TestCase):
         labels = self._labels(self._tray())
 
         # ★ 窗口里有几页，托盘就得有几项——多一项会指向一个已经不存在的页
-        self.assertEqual(labels, ["显示日志", "配置中心", "退出登录", "退出"])
+        # ★ 菜单名和窗口导航逐字一致（用户 2026-08-15：「显示日志」改叫「实时日志」）
+        self.assertEqual(labels, ["实时日志", "配置中心", "退出登录", "退出"])
         self.assertNotIn("计划中心", labels, "★ 那一页删了（计划归 AI 端），托盘得跟着删")
         self.assertNotIn("启动服务", labels, "★ 这一项曾经是登录门的旁路")
         self.assertNotIn("停止服务", labels, "并进「退出登录」了")

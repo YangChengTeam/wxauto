@@ -541,8 +541,8 @@ class MainWindow:
 
         早先是每次切页 ``SettingsPage(...)`` 新建一个、旧的只 ``pack_forget()``——控件一直
         挂在 ``_pages`` 底下不销毁，来回切几十次就攒几十份。改销毁也不行：保存那条路径是
-        ``_save() → on_saved() → _show_page("log")``，销毁完回到 ``_save()`` 还要拿
-        ``parent=self`` 弹提示框，父控件已经没了会直接抛 TclError。复用 + reload 两头都躲开。
+        ``_save() → on_saved() → …``，回到 ``_save()`` 还要拿 ``parent=self`` 弹提示框，
+        父控件已经没了会直接抛 TclError。复用 + reload 两头都躲开。
 
         ``SettingsPage`` 的 import 仍然留在这儿：它拖着 ``tkinter.messagebox``，
         启动时不进设置页就不该为它付这份钱。
@@ -633,9 +633,14 @@ class MainWindow:
             self._overlay.place_forget()
 
     def _on_settings_saved(self, restart: bool) -> None:
+        """保存完**留在配置中心**（用户 2026-08-15）。
+
+        原来会跳到实时日志页——想法是「重启的过程在日志里看」，但代价是人被踹出正在改的
+        那一页：接着想改第二项就得自己再点回来，改完还要确认刚填的存没存住。重启进度左侧
+        状态栏本来就在报（正在启动→运行中），想看日志点一下就到，不必替人做这个决定。
+        """
         if self._settings_saved_callback is not None:
             self._settings_saved_callback(restart)
-        self._show_page("log")
 
     # ── 登录门 ────────────────────────────────────────────────────
 
@@ -855,9 +860,9 @@ class MainWindow:
         self.open_data_dir()
 
     def open_log(self) -> None:
-        """托盘「显示日志」：窗口露面，**并且停在日志页**。
+        """托盘「实时日志」：窗口露面，**并且停在日志页**。
 
-        只 deiconify 是不够的——上次要是停在参数设置页，点「显示日志」弹出来的还是设置页，
+        只 deiconify 是不够的——上次要是停在配置中心，点「实时日志」弹出来的还是配置中心，
         看起来就是菜单点了不算数。
         """
         self.show()

@@ -125,6 +125,23 @@ class ConfigLookTests(unittest.TestCase):
         self.assertIs(bar.master, page, "★ 它必须挂在页面上，不能挂在滚动区里面")
         self.assertIn("仅保存", self._labels(bar))
 
+    def test_saving_keeps_you_on_the_page_you_were_editing(self) -> None:
+        """★ 保存完不许把人踹到实时日志页（用户 2026-08-15）。
+
+        接着改第二项还得自己点回来，还得再确认一遍刚填的存没存住。重启进度侧栏在报，
+        想看日志点一下就到，不必替人做这个决定。
+        """
+        window = MainWindow(tk.Toplevel(self.root), LogBuffer(), GatewayService(lambda: None),
+                            data_dir=self.dir, probe_wechat=False)
+        _KEEP_ALIVE.append(window)
+        window._show_page("settings")
+
+        window._on_settings_saved(False)
+        self.assertEqual(window._page, "settings", "「仅保存」之后还在配置中心")
+
+        window._on_settings_saved(True)
+        self.assertEqual(window._page, "settings", "「保存并重启服务」之后也是")
+
     def test_the_footer_says_saved_only_when_it_really_is(self) -> None:
         """★ 「所有更改均已保存」是句承诺。碰过就报「未保存」、改回原样还赖着不认，
         人就会开始不信这行字，那它还不如不写。

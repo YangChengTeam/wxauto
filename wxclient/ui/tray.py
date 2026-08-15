@@ -36,7 +36,8 @@ class Tray:
         # ★ 菜单跟着窗口一起改（用户 2026-08-15）：
         #   ① 「启动服务/停止服务」没了——服务只在登录之后才起（见 `ui/__main__`），
         #      留着「启动服务」等于给登录门开一条旁路；「停止服务」并进了「退出登录」。
-        #   ② 「参数设置」改名「配置中心」，和窗口里的导航一致。
+        #   ② 菜单名和窗口左侧导航**逐字一致**（「显示日志」→「实时日志」、「参数设置」→
+        #      「配置中心」，用户 2026-08-15）：同一个地方在两处叫两个名字，人就得自己去对。
         #   ③ 菜单和左侧导航一一对应：窗口里有几页，这儿就有几项——少一项就等于托盘只能
         #      到一半的地方；多一项则会指向一个已经不存在的页（「计划中心」删掉时就是连着
         #      这儿一起删的，计划归 AI 端）。
@@ -45,7 +46,7 @@ class Tray:
             icon=build_icon_image(service.state),
             title=self._title(),
             menu=pystray.Menu(
-                pystray.MenuItem("显示日志", self._show, default=True),
+                pystray.MenuItem("实时日志", self._show, default=True),
                 pystray.MenuItem("配置中心", self._settings),
                 pystray.MenuItem("退出登录", self._logout, enabled=self._can_logout),
                 pystray.Menu.SEPARATOR,
