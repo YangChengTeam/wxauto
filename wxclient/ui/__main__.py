@@ -103,12 +103,13 @@ def self_check(report_path: str) -> int:
     2026-08-16 一天之内撞了两次：`logger/logging.conf` 没被收进去、`win32ui` 被 excludes
     砍掉了，两次的表现都是「微信明明开着，界面说找不到微信」。
 
-    所以这里跑的就是那条最脆的链：import 重活 → 真调一次 `probe_wechat_uia()`。
-    **探测结果是什么无所谓**（打包机上可能压根没开微信），只要它别抛异常、
-    别返回「探测炸了」那种 reason 就算过。
+    所以这里跑的就是那条最脆的链：import 重活 → 真调一次 `probe_wechat_uia()`
+    → 真出一张图（PIL 的 Tk 桥）。**结果是什么无所谓**（打包机上可能压根没开微信），
+    只要它别抛异常、别返回「探测炸了」那种 reason 就算过。
     """
     lines: list[str] = []
     ok = True
+    ok = _check_images(lines) and ok
     try:
         from wxclient.uia_probe import probe_wechat_uia
         from wxclient.uia_probe.probe import PROBE_BROKEN_REASON
@@ -130,6 +131,40 @@ def self_check(report_path: str) -> int:
     lines.append("OK" if ok else "NOT OK")
     Path(report_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0 if ok else 1
+
+
+def _check_images(lines: list[str]) -> bool:
+    """真出一张图：`PIL.ImageTk` 要靠一个 C 扩展（`_imagingtk`）和一个 Tk 解释器。
+
+    这一段单独拎出来，是因为它**只在冻结包里会缺**：源码跑一定有，装到别人机器上少一个
+    `.pyd` 就是弹框上一块空白、登录页背景一片白，而且不抛到眼前——`logo_photo` 自己
+    吞异常（一个图标不该让弹框弹不出来）。所以让自检去问它「你到底出没出来」。
+
+    窗口是 withdraw 的，全程看不见。
+    """
+    import tkinter as tk
+
+    root = None
+    try:
+        from . import icons
+
+        root = tk.Tk()
+        root.withdraw()
+        photo = icons.logo_photo(root, 26)
+        lines.append(f"logo={'ok' if photo is not None else 'none'}")
+        if photo is None:
+            lines.append("FAIL 图出不来——多半是 PIL 的 Tk 桥（_imagingtk）没被收进包")
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001 - 自检本来就是来抓这个的
+        lines.append(f"FAIL 图像自检 {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        if root is not None:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:

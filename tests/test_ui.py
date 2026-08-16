@@ -908,6 +908,36 @@ class RealActionsTests(unittest.TestCase):
                       self._notice(env={"WXCLIENT_UI_ALLOW_REAL_ACTIONS": "0"}))
 
 
+class SelfCheckTests(unittest.TestCase):
+    """★ `--self-check` 是「冻结包缺东西」这一类问题的唯一闸（打包时 build.py 会跑它）。
+
+    2026-08-16 一天撞两次（logger/logging.conf 没收进去、win32ui 被 excludes 砍掉），
+    表现都是「装到别人机器上才炸」。所以它必须覆盖**每一条只在冻结包里会断的链**。
+    """
+
+    def test_it_also_proves_an_image_can_be_rendered(self) -> None:
+        """★ PIL 的 Tk 桥（_imagingtk）是个 C 扩展，最容易被打包漏掉。
+
+        漏了的表现是弹框上一块空白、登录页背景一片白，而且**不抛到眼前**——
+        `logo_photo` 自己吞异常（一个图标不该让弹框弹不出来）。所以得由自检去问它。
+        """
+        from wxclient.ui import __main__ as main_mod
+
+        lines: list[str] = []
+        self.assertTrue(main_mod._check_images(lines), f"图像自检没过：{lines}")
+        self.assertIn("logo=ok", lines)
+
+    def test_a_broken_image_pipeline_fails_the_check(self) -> None:
+        """出不来图就得判失败——否则这道闸等于没有。"""
+        from wxclient.ui import __main__ as main_mod
+        from wxclient.ui import icons
+
+        lines: list[str] = []
+        with mock.patch.object(icons, "logo_photo", lambda *_a, **_k: None):
+            self.assertFalse(main_mod._check_images(lines))
+        self.assertTrue(any("FAIL" in line for line in lines), "得说清是哪儿断了")
+
+
 class NoSystemDialogsTests(unittest.TestCase):
     """★ 界面里不许再出现系统弹框（用户 2026-08-16）。
 
