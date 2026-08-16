@@ -875,6 +875,39 @@ class SettingsDefaultsTests(unittest.TestCase):
         GatewaySettings().validate_for_start()
 
 
+class RealActionsTests(unittest.TestCase):
+    """★ 默认就真的发消息，右下角那句 dry-run 提示因此不出现（用户 2026-08-16）。
+
+    要点是**怎么让它不出现**：靠把档位改成真发，不是把提示藏起来。dry-run 下每条写指令
+    照样回 done，AI 端会照着告诉用户「已经发过去了」——这时候还不提示，就成了骗人。
+    """
+
+    def _notice(self, *, env: dict[str, str] | None = None) -> str:
+        import argparse
+
+        from wxclient.ui.__main__ import _dry_run_notice
+        from wxclient.ui.config import UiSettings
+
+        args = argparse.Namespace(allow_real_actions=False)
+        with mock.patch.dict(os.environ, env or {}, clear=False):
+            return _dry_run_notice(args, UiSettings())
+
+    def test_real_actions_are_on_by_default(self) -> None:
+        from wxclient.ui.config import UiSettings
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WXCLIENT_UI_ALLOW_REAL_ACTIONS", None)
+            self.assertTrue(UiSettings().allow_real_actions)
+
+    def test_no_dry_run_banner_by_default(self) -> None:
+        self.assertEqual(self._notice(), "")
+
+    def test_the_banner_comes_back_when_dry_run_is_switched_on(self) -> None:
+        """★ 提示只随档位出现或消失。哪天有人想「把这句话删掉」，先看这条测试。"""
+        self.assertIn("不会真的发消息",
+                      self._notice(env={"WXCLIENT_UI_ALLOW_REAL_ACTIONS": "0"}))
+
+
 class ProbeReasonTests(unittest.TestCase):
     """★ 探测失败时界面上摆的是人话，不是异常原文。
 
