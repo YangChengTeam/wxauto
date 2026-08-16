@@ -115,16 +115,25 @@ class TokenStore:
         """这台机器上的 Token 能不能活过重启。Linux 上是 False，界面据此说实话。"""
         return self._protector.available
 
-    def load(self) -> StoredSession | None:
-        if self._memory is not None:
-            return self._memory
+    def _read_raw(self) -> dict[str, Any] | None:
+        """磁盘上那份 JSON。读不到就是 None——这台机器上没登录过，或者文件坏了。"""
         if not self._protector.available or not self.path.exists():
             return None
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
-            token = self._protector.unprotect(str(raw.get("token_protected") or ""))
-        except Exception:  # noqa: BLE001 - 文件坏了/换了 Windows 账号：当成没登录过
+        except Exception:  # noqa: BLE001 - 文件坏了/权限没了：当成没登录过
             return None
+        return raw if isinstance(raw, dict) else None
+
+    def load(self) -> StoredSession | None:
+        if self._memory is not None:
+            # 记着的那份不够用（Token 解不开、没有分身）就照样回 None——但**留着**它，
+            # `credentials()` 还要从里面取邮箱和密码去自动重登。
+            return self._memory if self._memory.usable else None
+        raw = self._read_raw()
+        if raw is None:
+            return None
+        token = self._unprotect_optional(raw.get("token_protected"))
         session = StoredSession(
             token=token,
             password=self._unprotect_optional(raw.get("password_protected")),
@@ -146,11 +155,8 @@ class TokenStore:
         """
         if self._memory is not None:
             return self._memory.email, self._memory.password
-        if not self._protector.available or not self.path.exists():
-            return "", ""
-        try:
-            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
-        except Exception:  # noqa: BLE001 - 文件坏了：当成没记过
+        raw = self._read_raw()
+        if raw is None:
             return "", ""
         return str(raw.get("email") or ""), self._unprotect_optional(raw.get("password_protected"))
 

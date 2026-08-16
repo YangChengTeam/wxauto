@@ -80,30 +80,6 @@ class ApiError(RuntimeError):
     def session_exists(self) -> bool:
         return self.code == SESSION_EXISTS_CODE
 
-    @property
-    def bad_payload(self) -> bool:
-        """请求本身不合格——**同样的内容重发多少次都还是这个结果**。
-
-        用来把它和「网络抖了一下」分开：后者要重试，前者重试就是每 15 秒刷一条一样的
-        错误日志，把真正的问题埋掉。
-        """
-        return self.status == 400 or self.code == "VALIDATION_ERROR"
-
-    @property
-    def permanent(self) -> bool:
-        """重发同样的内容也不会变的失败——**别重试**。
-
-        除了 400，状态上报还会碰到两种 409：
-        * `EVENT_ID_CONFLICT`：这个幂等键已经被另一条内容用掉了（服务端 2026-08-15 起
-          会这么回）。同一个键换内容重发一百次也还是它。
-        * `WECHAT_UIA_ACCOUNT_IN_USE`：这个微信已经被别的分身占着，契约表里明写
-          `retryable=false`。得有人去把那边断开，不是这台机器等一等就能好的。
-
-        判成瞬时错误的代价是每 15 秒重发一次、日志里刷出几百条一模一样的告警，
-        真正的原因反而被埋掉。
-        """
-        return self.bad_payload or self.status == 409
-
 
 def now_iso() -> str:
     """契约 §3.3 的时间格式：UTC ISO-8601 带毫秒和 Z。"""

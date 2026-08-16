@@ -227,7 +227,9 @@ class LoginPage(tk.Frame):
         self._password.set(password)
         self._pill_text.configure(text="正在用记住的账号登录…")
         # 等界面先画出来：自动登录要发网络请求，人总得先看见这一页在做什么。
-        self.after(60, lambda: self._start(email, password, replace=False))
+        # 走 `submit()` 而不是直接 `_start`：地址校验、去空格、防重复点击那几条，
+        # 自动登录该和人点「登录」走同一条路。
+        self.after(60, self.submit)
 
     def _pill_default(self) -> str:
         """顶上那颗胶囊。**只说这台机器上确定的事**——地址配没配、Token 能不能存住，
@@ -388,12 +390,8 @@ class LoginPage(tk.Frame):
             pass
 
     def _succeeded(self, identity: Identity) -> None:
-        # 勾了就连登录状态一起记（Token 已由 `ClientAuth.login` 加密落盘），
-        # 没勾就把邮箱也一并忘掉——两件事必须同进同退，不然「不记住」只忘一半。
-        if self._remember.get():
-            auth.remember_account(self._data_dir, identity.email)
-        else:
-            auth.forget_account(self._data_dir)
+        # 记不记（Token、密码、邮箱三样）全由 `ClientAuth.login(remember=…)` 一处决定，
+        # 这里不再补第二处落盘——分两处写过一次，结果是「不记住」只忘一半。
         self._set_busy(False)
         self._on_authenticated(identity)
 

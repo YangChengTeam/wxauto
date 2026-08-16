@@ -62,10 +62,9 @@ def capability_status(caps: dict[str, Capability]) -> str:
     dry-run（只走流程不真发）下写类能力全是不可用，如实报 ``limited``——报 passed
     的话，企业端显示「运行中」，而这台机器一条消息都不会真的发出去。
     """
-    values = list(caps.values())
-    if not values or not any(cap.available for cap in values):
+    if not any(cap.available for cap in caps.values()):
         return CAPABILITY_FAILED
-    if all(cap.available for cap in values):
+    if all(cap.available for cap in caps.values()):
         return CAPABILITY_PASSED
     return CAPABILITY_LIMITED
 

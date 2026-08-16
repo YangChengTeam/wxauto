@@ -20,6 +20,8 @@ from dataclasses import dataclass
 
 import structlog
 
+from .constants import WECHAT_PROCESS_NAMES
+
 _log = structlog.get_logger(__name__)
 
 #: 账号数据目录长这样：`…\xwechat_files\wxid_6shq4q0wu92m12_c174\…`
@@ -31,8 +33,6 @@ _SHARED_DIRS = {"all_users", "applet", "cache"}
 #: 必须去掉：同一个微信在两台电脑上登录时后缀不同，留着的话 accountRef 会算出两个值，
 #: 服务端那条「一个微信只能被一个分身占用」就永远不会触发。
 _INSTALL_SUFFIX = re.compile(r"_c\d+$")
-
-_PROCESS_NAMES = {"weixin.exe", "wechat.exe"}
 
 #: 哈希加一个固定前缀（不是每台机器一份盐）——同一个微信在哪台电脑上都要算出同一个值。
 _REF_NAMESPACE = "lxz-wechat-account:v1:"
@@ -71,7 +71,7 @@ def probe_account() -> WeChatAccount | None:
 
     names: set[str] = set()
     for proc in psutil.process_iter(["name"]):
-        if (proc.info.get("name") or "").lower() not in _PROCESS_NAMES:
+        if (proc.info.get("name") or "").lower() not in WECHAT_PROCESS_NAMES:
             continue
         try:
             for handle in proc.open_files():

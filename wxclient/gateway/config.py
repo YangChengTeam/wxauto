@@ -9,6 +9,8 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from ..endpoints import DEFAULT_BUSINESS_API_URL
+
 
 class GatewaySettings(BaseSettings):
     """网关运行参数，env 前缀 ``WXCLIENT_GATEWAY_``。"""
@@ -19,8 +21,12 @@ class GatewaySettings(BaseSettings):
     ai_ws_url: str = ""
     """劳小智 AI 服务的 WS 门，如 ``wss://host/v1/ws``。"""
 
-    business_api_url: str = ""
-    """业务后端基址。登录（`ui/client_api.py`）和换票（`ticket.py`）都用它。"""
+    business_api_url: str = DEFAULT_BUSINESS_API_URL
+    """业务后端基址。登录（`ui/client_api.py`）和换票（`ticket.py`）都用它。
+
+    ★ 默认值在这里，不在配置中心的字段表里：不然「有没有默认值」就取决于是谁启动的
+    ——从界面进来的有，`python -m wxclient.gateway` 直接起的没有。
+    """
 
     # ── 联调用的本地票据来源（生产必须留空；界面上没有这一项，只认环境变量）──
     local_ticket_file: Path | None = None

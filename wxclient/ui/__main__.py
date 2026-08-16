@@ -44,10 +44,19 @@ class _LazyLogger:
 _log = _LazyLogger()
 
 
+def _real_actions(args: argparse.Namespace, settings: UiSettings) -> bool:
+    """这台机器会不会**真的**动微信。命令行的 `--allow-real-actions` 压过配置文件。
+
+    ★ 这句判断此前在四个地方各写了一遍（提示语、装配网关、算能力表、启动日志）。
+    它决定的是同一件事，写成四份的后果是改判据时漏掉一处——而漏掉的那处会去
+    告诉用户「已经发出去了」，实际一条都没发。
+    """
+    return bool(args.allow_real_actions or settings.allow_real_actions)
+
+
 def _dry_run_notice(args: argparse.Namespace, settings: UiSettings) -> str:
     """不会真的发消息时给的提示；正常（真实发送）返回空串，界面上不显示任何档位。"""
-    real = args.allow_real_actions or settings.allow_real_actions
-    return "" if real else "⚠ 当前只走流程、不会真的发消息"
+    return "" if _real_actions(args, settings) else "⚠ 当前只走流程、不会真的发消息"
 
 
 #: Windows 任务栏用它给窗口分组、挑图标。不设的话我们只是「某个 python.exe」，
@@ -158,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         accounts = args.account or ([identity.account] if identity else "") or current.accounts
         return build_gateway(
             accounts=accounts,
-            allow_real_actions=args.allow_real_actions or current.allow_real_actions,
+            allow_real_actions=_real_actions(args, current),
             config_path=args.config,
             gateway_db=args.gateway_db,
             client_token=lambda: auth_client.token,
@@ -218,6 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         重型 import 要和探测串行（Windows 加载器锁，见 heavy_import.py）。
         """
         with HEAVY_IMPORT_LOCK:
+            from wxclient.gateway import COMMANDS
             from wxclient.gateway.capabilities import (
                 capability_status,
                 probe_capabilities,
@@ -225,9 +235,12 @@ def main(argv: list[str] | None = None) -> int:
 
         return capability_status(probe_capabilities(
             uia=probe,
-            allow_real_actions=args.allow_real_actions or UiSettings().allow_real_actions,
+            allow_real_actions=_real_actions(args, UiSettings()),
             # 取文件通道由网关自己建（factory 里恒有），不是可配项。
             has_file_channel=True,
+            # ★ 和 `gateway/factory.py` 传同一份 op 白名单：不传的话这里默认「所有 op 都支持」，
+            # 于是同一台机器上，企业端看到的是 passed、网关自己算出来的是 limited。
+            supported_ops=set(COMMANDS),
         ))
 
     reporter = StatusReporter(api, lambda: auth_client.token,
@@ -352,7 +365,7 @@ def main(argv: list[str] | None = None) -> int:
     root.after(SPLASH_MAX_MS, reveal)
 
     _log.info("桌面端已启动",
-              real_actions=(args.allow_real_actions or settings.allow_real_actions),
+              real_actions=_real_actions(args, settings),
               autostart=autostart, logged_in=restored is not None)
     try:
         root.mainloop()

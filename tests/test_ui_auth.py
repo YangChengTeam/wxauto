@@ -18,6 +18,7 @@ import time
 import tempfile
 import unittest
 import urllib.error
+from unittest import mock
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -474,12 +475,22 @@ class UiaStatusTests(unittest.TestCase):
     CONNECTED = {"platform": "Windows", "logged_in": True, "uia_exposed": True,
                  "selected_window": {"process_version": "4.0.1.15"}}
 
-    def tearDown(self) -> None:
-        uia_status.forget_account()
+    def setUp(self) -> None:
+        # 注册在最前 = 跑在最后（addCleanup 是后进先出）：等 `_with_account` 的补丁
+        # 撤掉、`_account` 变回那个带 lru_cache 的真函数，再去清缓存。
+        self.addCleanup(uia_status.forget_account)
 
     def _with_account(self, account: Any) -> None:
-        """把「当前微信账号」按住，别让单测结果取决于跑测试这台机器上开没开微信。"""
-        uia_status._ACCOUNT_CACHE = account
+        """把「当前微信账号」按住，别让单测结果取决于跑测试这台机器上开没开微信。
+
+        ★ 按住的是 `_account` 这个**查询本身**，不是某个模块全局。2026-08-16 账号缓存
+        改成「按微信进程号失效」（`lru_cache`）之后，往模块里写一个全局等于什么都没按住
+        ——真机上跑测试时它会照样去枚举进程，于是「读不到账号」这条用例拿到的是本机
+        真微信的账号，测试通过与否取决于跑测试的人开没开微信。
+        """
+        patcher = mock.patch.object(uia_status, "_account", lambda _pids: account)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_a_real_account_is_reported_as_an_opaque_ref(self) -> None:
         from wxclient.uia_probe.account import WeChatAccount
@@ -497,6 +508,42 @@ class UiaStatusTests(unittest.TestCase):
                          "★ 昵称只在微信自己的加密库里，读不到就填占位符 `-`（用户裁决）——"
                          "服务端要求必填，但绝不拿分身名之类的东西冒充微信昵称，"
                          "那会让企业端显示一个看着像真的、其实是假的微信身份")
+
+    def test_a_wechat_relogin_makes_us_re_read_the_account(self) -> None:
+        """★ 微信退出登录、换个号再进来 → accountRef 必须跟着换。
+
+        账号缓存原来是「查一次就再也不查」的模块全局：换号之后这台机器还在报上一个号的
+        ref，而服务端「一个微信只能被一个分身占用」正是按它判的——被占住的会是一个早就
+        不在这台电脑上的账号。现在缓存的键是微信进程号，换号自然重认一次。
+
+        同时守住另一头：**进程没变就别反复认**。枚举进程打开的文件在真机上要 2 秒多，
+        而探测是 15 秒一拍。
+        """
+        from wxclient.uia_probe.account import WeChatAccount
+
+        uia_status.forget_account()
+        seen: list[str] = []
+
+        def probe() -> Any:
+            seen.append("call")
+            return WeChatAccount(f"wxid_{len(seen)}")
+
+        def ref_for(pid: int) -> str:
+            probe_result = {**self.CONNECTED,
+                            "selected_window": {"process_version": "4.0.1.15",
+                                                "process_id": pid}}
+            state = uia_status.classify(probe_result)
+            assert state is not None and state.instance is not None
+            return str(state.instance["accountRef"])
+
+        with mock.patch("wxclient.uia_probe.account.probe_account", probe):
+            before = ref_for(100)
+            self.assertEqual(ref_for(100), before, "同一批进程应当命中缓存")
+            self.assertEqual(len(seen), 1, "同一批进程不该反复枚举")
+            after = ref_for(200)
+
+        self.assertEqual(len(seen), 2, "进程换了就该重认一次")
+        self.assertNotEqual(before, after)
 
     def test_an_unknown_account_is_left_out_not_made_up(self) -> None:
         """★ 读不到微信账号就别编一个「稳定标识」，那会让服务端的占用检查形同虚设。"""

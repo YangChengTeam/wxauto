@@ -169,8 +169,8 @@ class StatusReporter:
         self._wechat_state(state)
 
     def wechat_probe_failed(self, error: BaseException) -> None:
-        if not self._token():
-            return
+        # 这条不用像上面那样先挡一道：`probe_failed` 只是拼一个 UiaState，
+        # 没登录的判断由 `_wechat_state` 一处统一管。
         self._wechat_state(uia_status.probe_failed(error))
 
     def _wechat_state(self, state: UiaState) -> None:
@@ -181,8 +181,7 @@ class StatusReporter:
             if state.same_as(self._wechat):
                 return  # 相同状态不重复上报（契约 §8）
             previous, self._wechat = self._wechat, state
-            event_id = self._event_id(
-                "wechat", (state.status, state.failure_code, state.capability_status))
+            event_id = self._event_id("wechat", state.identity)
         self._submit(lambda: self._put_wechat(state, previous, event_id))
 
     def _put_wechat(self, state: UiaState, previous: UiaState | None,
@@ -208,6 +207,23 @@ class StatusReporter:
 
     # ── 公共 ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _permanent(exc: ApiError) -> bool:
+        """重发同样的内容也不会变的失败——**别重试**。
+
+        ★ 这条判断留在上报这一层，不放进 `ApiError`：同样是 409，在别的接口上意思正相反——
+        登录的 `ACTIVE_CLIENT_SESSION_EXISTS` 是「问过人再带 replace 重来」，换票的
+        `CLIENT_NOT_ONLINE` 是「等状态同步就自己好」，两个都该重试。按状态码一刀切写进
+        共用的错误类型，第一个照着用的调用方就会拿到错答案。
+
+        状态上报这条路上只有三种：内容不合格（400）、幂等键撞了、微信被别的分身占着
+        （契约表里写明 `retryable=false`）。判成瞬时错误的代价是每 15 秒重发一次、
+        日志刷出几百条一模一样的告警，真正的原因反而被埋掉。
+        """
+        return exc.status == 400 or exc.code in {
+            "VALIDATION_ERROR", "EVENT_ID_CONFLICT", "WECHAT_UIA_ACCOUNT_IN_USE",
+        }
+
     def _failed(self, what: str, exc: ApiError, rollback: Callable[[], None]) -> None:
         if exc.revoked:
             rollback()
@@ -215,7 +231,7 @@ class StatusReporter:
             if self._on_revoked is not None:
                 self._on_revoked()
             return
-        if exc.permanent:
+        if self._permanent(exc):
             # ★ 重发同样的内容也不会变：**不回滚**。回滚等于每 15 秒把同一份内容再发一遍，
             # 日志里刷出几百条一模一样的告警，真正的原因反而被埋掉（2026-08-15 真机上出过）。
             # details 里是服务端指出的字段，必须留下来——不然只剩一句「填的内容格式不对」。

@@ -179,7 +179,11 @@ class ClientAuth:
             # 没有分身就没有「用哪个身份记账」，往下跑只会记出一堆无主数据。
             raise AuthError("业务端没返回招聘分身信息，请联系管理员")
         self._identity = identity
+        # 勾了就把「下次还认得这台机器」需要的东西一次记全：加密会话（Token+密码）
+        # 和登录框里预填的邮箱。★ 这两件必须同进同退——分在两处写，「不记住」就会
+        # 只忘一半（2026-08-16 复查：原来一半在这里、一半在登录页的 `_succeeded`）。
         if remember:
+            remember_account(self.data_dir, identity.email)
             self.store.save(StoredSession(
                 token=identity.token,
                 session_id=identity.session_id,
@@ -194,6 +198,7 @@ class ClientAuth:
             # 上一次可能是勾着记住登的，这次明确说了不记住，就得把旧的清掉——
             # 否则「不记住」只对这次生效，下次打开还是自动进去了。
             self.store.clear()
+            forget_account(self.data_dir)
         return identity
 
     def logout(self) -> None:
@@ -232,13 +237,17 @@ def build_auth(data_dir: Path, base_url: str, *, client_version: str = "") -> Cl
     return ClientAuth(base_url, data_dir, client_version=client_version)
 
 
-# ── 上次登录的邮箱（登录框里预填，和「记不记登录状态」是两件事）───────
+# ── 上次登录的邮箱（登录框里预填）──────────────────────────────────
 
 UI_STATE_FILE = "console-ui.json"
 
 
 def remember_account(data_dir: Path, email: str) -> None:
-    """记住上次登录的邮箱。**只记邮箱，永不记密码**——密码存在本机等于没有密码。"""
+    """记住上次登录的邮箱，给登录框预填用。**这个文件里只有邮箱，没有凭证**——
+    Token 和密码在 `token_store` 那份 DPAPI 密文里，明文文件一个字节都不许沾。
+
+    由 `ClientAuth.login(remember=True)` 一处调用，和加密会话同进同退。
+    """
     path = Path(data_dir) / UI_STATE_FILE
     try:
         path.parent.mkdir(parents=True, exist_ok=True)

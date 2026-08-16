@@ -10,7 +10,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import Any
 
 NOT_CONNECTED = "not_connected"
@@ -55,7 +56,18 @@ class UiaState:
     """
 
     def with_capability(self, status: str) -> "UiaState":
-        return UiaState(self.status, self.failure_code, self.instance, status)
+        return replace(self, capability_status=status)
+
+    @property
+    def identity(self) -> tuple[str, str, str]:
+        """「算不算同一件事」的那几个字段。**只此一份**。
+
+        两个地方要用它：去重（同一件事不重复上报）和幂等键（同一件事重试沿用同一个
+        eventId）。分开写两份的话，哪天多一个身份字段而只改了一处，两边就会对同一次
+        变化给出不同答案——去重说「变了」、幂等键说「没变」，服务端拿 409 顶回来。
+        ``instance`` 不在其中：微信版本号变了不值得再报一次。
+        """
+        return (self.status, self.failure_code, self.capability_status)
 
     @property
     def failure(self) -> dict[str, Any] | None:
@@ -70,9 +82,7 @@ class UiaState:
 
     def same_as(self, other: "UiaState | None") -> bool:
         """相同状态不重复上报（契约 §8）。失败码或能力档变了算不同状态——原因换了就得说。"""
-        return other is not None and (
-            self.status, self.failure_code, self.capability_status) == (
-            other.status, other.failure_code, other.capability_status)
+        return other is not None and self.identity == other.identity
 
 
 def classify(probe: dict[str, Any]) -> UiaState | None:
@@ -124,41 +134,51 @@ def _instance(probe: dict[str, Any]) -> dict[str, Any] | None:
     「没读到」的占位符**，而不是拿分身名之类的东西冒充微信昵称——那会让企业端显示一个
     看着像真的、其实是假的微信身份。哪天真能读到昵称了，把这里换掉即可。
     """
+    account = _account(_wechat_pids(probe))
+    if account is None:
+        # 认不出账号时这条 connected 本来就会被服务端退回（accountRef 必填），
+        # 单给一个占位昵称没有意义——干脆不带 wechatInstance。
+        return None
     selected = probe.get("selected_window")
-    version = ""
+    version = str(selected.get("process_version") or "") if isinstance(selected, dict) else ""
+    # 服务端要求这四个字段都在（连 processVersion 也是必填），少一个整条 connected
+    # 就被退回、企业端永远进不了「运行中」。读不到的填 `-`，和昵称同一个约定：
+    # 一眼看得出是「没读到」，而不是一个编出来的版本号。
+    return {
+        "processVersion": version or UNKNOWN_NICKNAME,
+        "accountRef": account.account_ref,
+        "accountMask": account.account_mask,
+        "nickname": UNKNOWN_NICKNAME,
+    }
+
+
+def _wechat_pids(probe: dict[str, Any]) -> tuple[int, ...]:
+    """这一拍看到的微信进程号。**它就是账号缓存的键**。
+
+    ★ 原来缓存是个「查一次就再也不查」的模块全局：微信退出登录、换个号再登进来，
+    进程换了，我们却还在报上一个账号的 accountRef——而服务端那条「一个微信只能被一个
+    分身占用」正是按它判的。按进程号做键，换号自然重认一次，不用谁记得去清缓存。
+    """
+    pids: set[int] = set()
+    windows = probe.get("windows")
+    for window in windows if isinstance(windows, list) else []:
+        if isinstance(window, dict):
+            pids.add(int(window.get("process_id") or 0))
+    selected = probe.get("selected_window")
     if isinstance(selected, dict):
-        version = str(selected.get("process_version") or "")
-    instance: dict[str, Any] = {}
-    account = _account()
-    if account is not None:
-        # 服务端要求这三个字段都在（连 processVersion 也是必填），少一个整条 connected
-        # 就被退回、企业端永远进不了「运行中」。读不到的填 `-`，和昵称同一个约定：
-        # 一眼看得出是「没读到」，而不是一个编出来的版本号。
-        instance["processVersion"] = version or UNKNOWN_NICKNAME
-        instance["accountRef"] = account.account_ref
-        instance["accountMask"] = account.account_mask
-        # 只在账号认出来了的时候给 nickname：认不出账号时这条 connected 本来就会被服务端
-        # 退回（accountRef 必填），单给一个占位昵称没有意义。
-        instance["nickname"] = UNKNOWN_NICKNAME
-    return instance or None
+        pids.add(int(selected.get("process_id") or 0))
+    return tuple(sorted(pid for pid in pids if pid))
 
 
-def _account() -> Any:
-    """当前微信账号。**查一次记住**——它在一次运行里不会变，而枚举进程打开的文件要 2 秒多，
-    15 秒一拍的探测扛不住每次都查。"""
-    global _ACCOUNT_CACHE
-    if _ACCOUNT_CACHE is _UNKNOWN:
-        from wxclient.uia_probe.account import probe_account
+@lru_cache(maxsize=1)
+def _account(_pids: tuple[int, ...]) -> Any:
+    """当前微信账号。**同一批进程只认一次**——枚举进程打开的文件在真机上要 2 秒多，
+    15 秒一拍的探测扛不住每拍都查。参数只当缓存键用，故意不读。"""
+    from wxclient.uia_probe.account import probe_account
 
-        _ACCOUNT_CACHE = probe_account()
-    return _ACCOUNT_CACHE
-
-
-_UNKNOWN = object()
-_ACCOUNT_CACHE: Any = _UNKNOWN
+    return probe_account()
 
 
 def forget_account() -> None:
-    """换了微信账号（重新登录微信）时清缓存。测试也用它。"""
-    global _ACCOUNT_CACHE
-    _ACCOUNT_CACHE = _UNKNOWN
+    """丢掉账号缓存（测试用；生产靠进程号变化自然失效）。"""
+    _account.cache_clear()

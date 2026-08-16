@@ -14,6 +14,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..endpoints import DEFAULT_BUSINESS_API_URL
+
 FILE_NAME = "gateway.env"
 
 # ★ 曾经还有一份 `gateway.remote.env`（后端下发、本机覆盖）。2026-08-15 删了：
@@ -65,9 +67,6 @@ SECTIONS: tuple[Section, ...] = (
 #:      留作环境变量 `WXCLIENT_GATEWAY_LOCAL_TICKET_FILE`）。手抄凭证这件事到此为止。
 #: 这些键手工写进 gateway.env 依然生效（``render_env_text`` 会原样保留、``apply_to_environ``
 #: 会照灌），只是不再摆在人人都会点的界面上。
-#: 业务后端的正式地址。给了默认值，装机的人就不用抄一串域名——抄错的表现是
-#: 「登录一直转圈」，而人根本不知道该怀疑哪里。改这里要连 README 一起改。
-DEFAULT_BUSINESS_API_URL = "https://api.laoxiaozhi.cn"
 
 FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_BUSINESS_API_URL", "业务端地址",
@@ -149,10 +148,11 @@ def effective(data_dir: Path, environ: dict[str, str] | None = None) -> dict[str
     target = os.environ if environ is None else environ
     values = load(data_dir)
     for field in FIELDS:
-        if not values.get(field.key):
-            values[field.key] = target.get(field.key, "") or field.default
-        if not values[field.key]:
-            values.pop(field.key, None)
+        value = values.get(field.key) or target.get(field.key, "") or field.default
+        if value:
+            values[field.key] = value
+        else:
+            values.pop(field.key, None)  # 三处都没有：当成没配过，别在界面上留个空键
     return values
 
 
