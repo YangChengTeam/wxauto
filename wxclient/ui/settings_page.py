@@ -17,9 +17,8 @@ from __future__ import annotations
 import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
-from tkinter import messagebox
 
-from . import settings_store, theme, widgets
+from . import dialog, settings_store, theme, widgets
 from .settings_store import FIELDS, SECTIONS, Field, Section
 
 _MASK = "········"
@@ -325,13 +324,15 @@ class SettingsPage(tk.Frame):
         try:
             path = settings_store.save(self.data_dir, values)
         except OSError as exc:
-            messagebox.showerror("保存失败", f"写入 {settings_store.FILE_NAME} 失败：{exc}", parent=self)
+            dialog.tell(self, "保存失败",
+                        f"写入 {settings_store.FILE_NAME} 失败：{exc}", tone="error")
             return
         self._values = settings_store.effective(self.data_dir)
         self._render_dirty()
         if self.on_saved is not None:
             self.on_saved(restart)
-        messagebox.showinfo(
+        dialog.tell(
+            self,
             "已保存",
             f"参数已写入：\n{path}\n\n"
             + (
@@ -339,5 +340,4 @@ class SettingsPage(tk.Frame):
                 if restart
                 else "下次启动服务时生效。"
             ),
-            parent=self,
         )

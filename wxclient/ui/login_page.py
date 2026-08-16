@@ -386,7 +386,7 @@ class LoginPage(tk.Frame):
         顶掉之后旧设备上没执行完的动作不会转过来（服务端明写不转移），所以这句话必须
         让人看见「是哪台机器、最后一次活动是什么时候」，而不是一句轻飘飘的「确定吗」。
         """
-        from tkinter import messagebox
+        from . import dialog
 
         self._set_busy(False)
         if not details.get("canReplace", True):
@@ -395,11 +395,12 @@ class LoginPage(tk.Frame):
         where = str(details.get("deviceName") or "另一台电脑")
         seen = str(details.get("lastSeenAt") or "")
         detail = f"最后活动：{seen}\n\n" if seen else ""
-        if not messagebox.askyesno(
+        if not dialog.ask(
+            self,
             "切换到这台电脑？",
             f"这个招聘分身正在「{where}」上登录。\n{detail}"
             "切换过来会让那台电脑立即退出登录，它上面还没执行的动作不会转移过来。",
-            parent=self,
+            confirm="切换过来", cancel="不切换",
         ):
             self._show_error("没有切换，仍在另一台电脑上登录")
             return
