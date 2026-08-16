@@ -273,6 +273,52 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "uia.operation_probe":
         status = "可用" if payload.get("uia_exposed") else "不可用"
         return f"微信 UIA 探测完成：{status}，原因：{payload.get('reason') or '-'}"
+    if event == "uia.operation_probe.after_restore":
+        status = "可用" if payload.get("uia_exposed") else "仍不可用"
+        return (
+            f"微信被最小化了，已把窗口拉起来重新探测：{status}"
+            + (f"，原因：{payload.get('reason')}" if payload.get("reason") else "")
+        )
+
+    # ── 发送后的落地核对（真机上「以为发了其实没发」全靠这几条留痕）──────
+    if event == "message.send.stuck_in_input":
+        return (
+            f"消息卡在输入框里没发出去：「{payload.get('friend') or '-'}」，"
+            f"输入框里还剩 {payload.get('left', 0)} 个字，对方没有收到"
+        )
+    if event == "message.send.input_state":
+        return f"发送前后核对输入框：还剩 {payload.get('text', 0)} 个字"
+    if event == "message.send.input_probe_failed":
+        return f"读不到输入框，这次发没发出去判定不了：{payload.get('error') or '-'}"
+    if event == "message.send.retry_failed":
+        return f"补按发送键失败，按「没发出去」处理：{payload.get('error') or '-'}"
+    if event == "files.send.input_state":
+        return (
+            f"发送前后核对输入框：还剩文字 {payload.get('text', 0)} 个字、"
+            f"附件 {payload.get('children', 0)} 个"
+        )
+    if event == "files.send.input_probe_failed":
+        return f"读不到输入框，这次发没发出去判定不了：{payload.get('error') or '-'}"
+    if event == "files.send.retry_send":
+        return f"文件还在输入框里，第 {payload.get('attempt', 0)} 次补按发送键：{payload.get('key') or '-'}"
+    if event == "files.send.retry_failed":
+        return f"补按发送键失败，按「没发出去」处理：{payload.get('error') or '-'}"
+
+    if event == "window.restored":
+        forced = "（强制）" if payload.get("forced") else ""
+        return f"已把微信窗口拉回前台{forced}"
+    if event == "window.restore_failed":
+        return f"拉起微信窗口失败：{payload.get('error') or '-'}"
+
+    if event == "task.yielded":
+        return f"微信任务让出这一轮，稍后接着做：{task_type} #{task_id}"
+    if event == "worker.lease_lost":
+        # 租约丢了 = 这条任务可能已经被另一个执行器接走，**再往下写就是两个人同时操作微信**。
+        return (
+            f"执行器租约丢失，已停手：任务 #{_short_id(payload.get('task_id'))}"
+            f"（执行器租约 {'在' if payload.get('worker_lease') else '丢'}、"
+            f"任务租约 {'在' if payload.get('task_lease') else '丢'}）"
+        )
     if event == "wechat.driver.unknown":
         return f"忽略未知微信驱动：{payload.get('driver') or '-'}"
     if event == "collect_visible_messages.collected":

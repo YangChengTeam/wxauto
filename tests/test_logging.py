@@ -142,3 +142,50 @@ class DailyLogFileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoEnglishLeaksTests(ChineseLogRendererTests):
+    """★ 实时日志页是给招聘专员看的：任何一条落到默认分支的英文事件名都会原样摆到他面前。
+
+    2026-08-16 盘点时有 13 条是这样漏出去的（真机上见过
+    `message.send.stuck_in_input，friend="王建国"，left=5`）。
+    """
+
+    def test_every_emitted_event_has_a_chinese_sentence(self) -> None:
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent / "wxclient"
+        emitted: set[str] = set()
+        call = re.compile(
+            r'\b\w*log(?:ger)?\w*\.(?:debug|info|warning|error|critical|exception)'
+            r'\(\s*"([a-z0-9_.]+)"'
+        )
+        for path in root.rglob("*.py"):
+            if "__pycache__" in str(path) or path.name == "logging_config.py":
+                continue
+            emitted |= set(call.findall(path.read_text(encoding="utf-8")))
+
+        config = (root / "logging_config.py").read_text(encoding="utf-8")
+        rendered = set(re.findall(r'event == "([^"]+)"', config))
+
+        self.assertFalse(emitted - rendered,
+                         f"这些事件没有中文句子，会原样印英文：{sorted(emitted - rendered)}")
+        self.assertFalse(rendered - emitted,
+                         f"这些分支已经没人发了，删掉免得误导：{sorted(rendered - emitted)}")
+
+    def test_a_message_stuck_in_the_input_box_says_so_plainly(self) -> None:
+        output = self.render("message.send.stuck_in_input", friend="王建国", left=5)
+
+        self.assertIn("卡在输入框里没发出去", output)
+        self.assertIn("王建国", output)
+        self.assertIn("对方没有收到", output)
+
+    def test_a_lost_lease_says_which_lease_was_lost(self) -> None:
+        output = self.render("worker.lease_lost", worker_id="w-1", task_id="12345678-abcd",
+                             worker_lease=False, task_lease=True)
+
+        self.assertIn("租约丢失，已停手", output)
+        self.assertIn("#12345678", output)
+        self.assertIn("执行器租约 丢", output)
+        self.assertIn("任务租约 在", output)
