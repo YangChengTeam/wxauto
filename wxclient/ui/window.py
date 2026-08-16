@@ -166,6 +166,7 @@ class MainWindow:
         self._logout_callback: Any = None
         self._logout_action: Any = None  # 退出登录时向服务端撤销会话
         self._logging_out = False  # 正在退出登录（转圈中）；防连点，也防重复排定时器
+        self._quit_action: Callable[[], None] | None = None  # 点 × 真退出时走它
         self._version = ""
 
         root.title(WINDOW_TITLE)
@@ -173,7 +174,7 @@ class MainWindow:
         root.geometry("1180x720")
         root.minsize(900, 560)
         root.configure(bg=theme.CONTENT_BG)
-        root.protocol("WM_DELETE_WINDOW", self.hide)
+        root.protocol("WM_DELETE_WINDOW", self.close_requested)
 
         self._build_sidebar()
         self._build_content()
@@ -818,6 +819,32 @@ class MainWindow:
 
     def hide(self) -> None:
         self.root.withdraw()
+
+    def set_quit_action(self, action: Callable[[], None] | None) -> None:
+        """点 × 要真退出时走什么。由 `ui/__main__.py` 接到和托盘「退出」同一条收尾上。"""
+        self._quit_action = action
+
+    def close_requested(self) -> None:
+        """点窗口右上角的 ×。**登没登录，这一下的意思是不一样的。**
+
+        * 登进来了 → 缩回托盘。网关正替人干活，关窗口只是不想一直看着它。
+        * 还在登录页 → **真退出**（用户 2026-08-16）。这时候什么都没在跑，缩进托盘只剩
+          一个点开还是让你登录的图标：人以为关掉了，其实进程还在，开机自启下次还会再来
+          一个。「关掉一个什么都不做的窗口」应该就是关掉它。
+
+        退出走的是和托盘「退出」同一条路（`__main__.shutdown`）——该送的下线状态照送，
+        网关该收的尾照收，不是把窗口一销了事。
+        """
+        if self.logged_in:
+            self.hide()
+            return
+        if self._quit_action is None:
+            # 没接退出动作（单测里的窗口就是这样）。**宁可什么都不做也别偷偷缩起来**：
+            # 缩起来会让「点了 × 却没退出」变回一个没人看得见的 bug，而这里不响至少
+            # 是当场就能发现的。真机上接没接由 tests/test_ui.py 的一条源码断言看着。
+            _log.warning("登录页上点了关闭，但没有接退出动作")
+            return
+        self._quit_action()
 
     def begin_shutdown(self) -> bool:
         """进入退出中：立刻把界面切成「正在停止…」。已经在退了返回 False。

@@ -342,16 +342,23 @@ def main(argv: list[str] | None = None) -> int:
         window.show()
         window.logout()
 
+    def quit_requested() -> None:
+        """真退出：托盘「退出」和登录页上点 × 都走这一条，收尾只有一份。"""
+        shutdown(root, window, service, tray, reporter)
+
     tray = Tray(
         service,
         # 菜单点哪一项就落到哪一页：open_log/open_settings 自己负责「露面 + 切页」，
         # 别在这儿只 show()——那样点「实时日志」出来的可能还是上次停着的配置中心。
         on_show=lambda: root.after(0, window.open_log),
         on_settings=lambda: root.after(0, window.open_settings),
-        on_quit=lambda: root.after(0, lambda: shutdown(root, window, service, tray, reporter)),
+        on_quit=lambda: root.after(0, quit_requested),
         on_logout=lambda: root.after(0, logout_requested),
         can_logout=lambda: window.logged_in,  # 没登录时这一项直接是灰的
     )
+    # 登录页上点 × = 真退出（用户 2026-08-16）。WM_DELETE_WINDOW 本来就在 tk 线程上，
+    # 不用再 after 绕一圈。登进来之后点 × 还是缩托盘，判断在 window.close_requested 里。
+    window.set_quit_action(quit_requested)
 
     # ★ **登录之前一概不起服务**（用户 2026-08-15：「登录前不应该启动相关的服务，
     # 登录之后才有」）。所以窗口一定要露面——不然就是一个缩在托盘里、什么都不干、

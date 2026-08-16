@@ -503,6 +503,58 @@ class LoginGateTests(unittest.TestCase):
         self.root.mainloop()
         return done["ok"]
 
+    def _click_the_x(self) -> None:
+        """**照窗口管理器的路走一遍**：取出注册在 WM_DELETE_WINDOW 上的那条命令再执行它。
+
+        不直接调 `window.close_requested()`——那样测不到「× 到底接的是哪个方法」。
+        接错了（比如还接在 `hide` 上）本条会当场红，而直接调的写法一路绿到上线。
+        """
+        command = self.root.tk.call("wm", "protocol", self.root._w, "WM_DELETE_WINDOW")
+        self.assertTrue(command, "× 上没接任何东西")
+        self.root.tk.eval(command)
+
+    def _reveal(self) -> None:
+        """把窗口露出来。**没有这一步，「缩起来了没有」这类断言全是假的**——
+        setUp 里就 withdraw 过一次，断言 withdrawn 不管代码怎么写都成立。
+        """
+        self.root.deiconify()
+        self.root.update()
+        self.assertEqual(self.root.state(), "normal", "前提没成立：窗口没露出来")
+
+    def test_closing_the_window_on_the_login_page_really_quits(self) -> None:
+        """★ 还没登录时点 × = 退出程序，不是缩托盘（用户 2026-08-16）。
+
+        缩托盘的后果是「人以为关掉了，进程还在」——而登录页上根本没有任何东西在跑，
+        留一个图标只是让人下次开机发现它又在了。
+        """
+        quits: list[int] = []
+        self.window.set_quit_action(lambda: quits.append(1))
+        self.window.require_login(self.auth)
+        self._reveal()
+
+        self._click_the_x()
+        self.root.update()
+
+        self.assertEqual(quits, [1], "登录页上点 × 要走真退出")
+        self.assertEqual(self.root.state(), "normal",
+                         "窗口别自己先藏起来——藏了就等于又缩了一次托盘")
+
+    def test_closing_the_window_after_login_still_hides_it(self) -> None:
+        """★ 反面：登进来之后点 × 还是缩托盘。网关正替人干活，关窗口只是不想看着它。
+
+        没有这一条，上面那条测试可以靠「× 一律退出」通过——而那会把正在跑的网关关掉。
+        """
+        quits: list[int] = []
+        self.window.set_quit_action(lambda: quits.append(1))
+        self.window.finish_login(self.auth.login("hr@example.com", "pw"))
+        self._reveal()
+
+        self._click_the_x()
+        self.root.update()
+
+        self.assertEqual(quits, [], "登进来了就不该退出程序")
+        self.assertEqual(self.root.state(), "withdrawn", "缩回托盘")
+
     def test_the_door_covers_the_whole_window(self) -> None:
         self.window.require_login(self.auth)
 

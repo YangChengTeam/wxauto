@@ -908,6 +908,30 @@ class RealActionsTests(unittest.TestCase):
                       self._notice(env={"WXCLIENT_UI_ALLOW_REAL_ACTIONS": "0"}))
 
 
+class CloseOnLoginPageTests(unittest.TestCase):
+    """★ 登录页上点 × 要**真退出**（用户 2026-08-16）。
+
+    这里只能验「接线在不在」——点击行为要真 Tk，在 `tests/test_ui_window.py` 里。
+    分开验是有理由的：`window.close_requested` 没接到退出动作时**什么都不做**，
+    真机上的表现就是「点 × 没反应」。所以接线本身得有人看着。
+    """
+
+    def _main_source(self) -> str:
+        from wxclient.ui import __main__ as main_mod
+
+        return Path(main_mod.__file__).read_text(encoding="utf-8")
+
+    def test_the_window_gets_a_quit_action(self) -> None:
+        self.assertIn("window.set_quit_action(", self._main_source())
+
+    def test_the_x_and_the_tray_quit_share_one_shutdown(self) -> None:
+        """两个入口收的是同一份尾：漏掉 reporter.shutdown() 的那个会让企业端
+        一直显示这台机器在线。"""
+        source = self._main_source()
+        self.assertIn("window.set_quit_action(quit_requested)", source)
+        self.assertIn("on_quit=lambda: root.after(0, quit_requested)", source)
+
+
 class ProbeReasonTests(unittest.TestCase):
     """★ 探测失败时界面上摆的是人话，不是异常原文。
 
