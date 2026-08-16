@@ -577,10 +577,85 @@ class LoginGateTests(unittest.TestCase):
         self.window.logout()
 
         self.assertTrue(stopped, "退出登录必须把网关一起停掉")
-        self.assertFalse(self.window.logged_in, "门要关回去")
-        self.assertEqual(self.window._who.cget("text"), "", "身份要抹掉")
-        self.assertTrue(self._pump(lambda: bool(revoked)),
+        self.assertEqual(self.window._who.cget("text"), "", "身份要立刻抹掉")
+        # ★ 服务还在跑着，这时候**先别切页**（用户 2026-08-16：「加一个 Loading，
+        # 等服务退出后再退出登录界面」）。原来点完立刻就切，人已经在登录页上了，
+        # 后台还在停机、还在撤会话——这时候重新登进去，撞上的是一个正在关的服务。
+        self.assertTrue(self.window.logged_in, "服务没停下来之前不该把登录页放出来")
+        self.assertIn("正在退出登录", self.window._busy_label.cget("text"),
+                      "转场那几秒最像卡死，得转圈说一句")
+
+        self.service._snapshot = (ServiceState.STOPPED, None)
+        self.assertTrue(self._pump(lambda: not self.window.logged_in), "停完了才回登录页")
+        self.assertTrue(revoked,
                         "★ 还要告诉服务端撤销这台设备的会话，否则企业端一直显示在线")
+
+    def test_one_click_logout_does_not_log_you_straight_back_in(self) -> None:
+        """★ 真机 2026-08-16：**第一次**点退出登录又弹回主界面，第二次才退得出去。
+
+        真因是赌线程时序：撤销会话（顺带清掉记住的密码）丢在后台线程，而登录页在同一拍
+        就建起来了。第一次点的时候密码还没被清掉，登录页一出来就「自动登录」又登回去了；
+        第二次点时存储已经空了，才显得正常。
+
+        现在有两道：`ClientAuth.logout` 立刻清本机，登录页那边还有一道显式的
+        `allow_autologin=False`。**一道管状态，一道管意图**——只靠前者仍然是在赌时序。
+        """
+        self.service.stop_async = lambda **_kwargs: None  # type: ignore[method-assign]
+        self.window.set_login_context(self.auth, on_logout=self.auth.logout)
+        self.window.require_login(self.auth)
+        login = self.window._login
+        login._account.set("hr@example.com")
+        login._password.set("pw")
+        login._remember.set(True)
+        login.submit()
+        self.assertTrue(self._pump(lambda: self.window.logged_in), "先得登进去")
+        self.assertEqual(self.auth.remembered_login(), ("hr@example.com", "pw"),
+                         "前提：勾了「记住登录状态」，密码确实存下来了")
+
+        self.window.logout()
+
+        self.assertTrue(self._pump(lambda: not self.window.logged_in), "要回到登录页")
+        self.assertFalse(self.window._login._allow_autologin,
+                         "★ 主动退出来的这一页，自动登录必须是关的")
+        # 再等几拍：自动登录是 after(60) 排的，真有的话这段时间足够把人送回主界面。
+        self.assertFalse(self._pump(lambda: self.window.logged_in, timeout=1.0),
+                         "★ 一次就该退干净，不许被自动登录又送回主界面")
+
+    def test_the_switch_alone_stops_autologin(self) -> None:
+        """★ 单独验那道开关：**凭据还在**，也不许自动登录。
+
+        不这么验的话，上面那条端到端用例其实是被「存储已经清空了」兜住的——开关删掉它
+        照样绿，而那正是这个 bug 原来的样子（赌线程时序）。这里让凭据留着，只关开关。
+        """
+        from wxclient.ui.login_page import LoginPage
+
+        self.window.require_login(self.auth)
+        login = self.window._login
+        login._account.set("hr@example.com")
+        login._password.set("pw")
+        login._remember.set(True)
+        login.submit()
+        self.assertTrue(self._pump(lambda: self.window.logged_in))
+        self.assertEqual(self.auth.remembered_login(), ("hr@example.com", "pw"),
+                         "前提：凭据确实还在")
+
+        page = LoginPage(self.root, self.auth, data_dir=self.dir,
+                         on_authenticated=lambda _identity: None,
+                         allow_autologin=False)
+        self.addCleanup(page.destroy)
+
+        self.assertEqual(page._password.get(), "",
+                         "★ 关了就是关了：密码不该被填回去，更不该自己提交")
+        self.assertEqual(self.api.calls.count("login"), 1, "不许再发一次登录请求")
+
+    def test_reopening_the_app_still_autologins(self) -> None:
+        """★ 关掉自动登录只针对「主动退出」这一条路，别把功能整个关死了。
+
+        正常开机那一路（`require_login` 不传参）该照样拿记住的账号密码登进去。
+        """
+        self.window.require_login(self.auth)
+
+        self.assertTrue(self.window._login._allow_autologin)
 
     def test_the_stopping_notice_goes_away_after_logout(self) -> None:
         """★ 2026-08-15 真机：退出登录后侧栏一直转圈「正在停止服务，请稍候」，停完也不消失。
@@ -596,10 +671,13 @@ class LoginGateTests(unittest.TestCase):
         self.window.logout()
         self.service._snapshot = (ServiceState.STOPPING, None)
         self.window._render_busy()   # 真跑时是每秒一次的 _tick 在渲染
-        self.assertIn("正在停止服务", self.window._busy_label.cget("text"),
-                      "停机过程中该有提示——转场那几秒最像卡死")
+        self.assertTrue(self.window._busy_label.cget("text"),
+                        "停机过程中该有提示——转场那几秒最像卡死")
 
+        # ★ 2026-08-16 起这句提示是 logout 显式设的，所以**必须有人负责清掉**：
+        # `_finish_logout` 在切回登录页的同一拍 set_busy("")。
         self.service._snapshot = (ServiceState.STOPPED, None)
+        self.assertTrue(self._pump(lambda: not self.window.logged_in), "停完了回登录页")
         self.window._render_busy()
         self.assertFalse(self.window._busy_label.winfo_manager(),
                          "★ 停完了提示必须自己消失，不能一直挂在那儿")

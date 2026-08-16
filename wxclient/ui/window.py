@@ -57,6 +57,13 @@ _log = structlog.get_logger(__name__)
 #: 界面卡多久算「卡了一下」，要记一笔。心跳本身是 1 秒一次，留 0.6 秒余量给正常抖动。
 _STALL_WARN_SECONDS = 0.6
 
+#: 退出登录时转圈那句话，以及等它结束的节奏。
+#: 轮询而不是回调：停机走的是后台线程，而这里只能在 tk 线程上动控件。
+LOGOUT_BUSY_TEXT = "正在退出登录，等服务停下来…"
+LOGOUT_POLL_MS = 200
+#: 等不到也得放人走——**退不出去比多等几秒严重得多**。停机上限本身是 15s，留点余量。
+LOGOUT_TIMEOUT_SECONDS = 20.0
+
 #: 启动多久之后偷偷把参数页建好。要等过启动最忙的那一段，又要赶在用户去点之前。
 _SETTINGS_PREBUILD_MS = 3000
 
@@ -158,6 +165,7 @@ class MainWindow:
         self._logout_provider: Any = None  # 退出登录之后拿什么再登一次
         self._logout_callback: Any = None
         self._logout_action: Any = None  # 退出登录时向服务端撤销会话
+        self._logging_out = False  # 正在退出登录（转圈中）；防连点，也防重复排定时器
         self._version = ""
 
         root.title(WINDOW_TITLE)
@@ -671,7 +679,8 @@ class MainWindow:
     # ── 登录门 ────────────────────────────────────────────────────
 
     def require_login(self, provider: Any, *, version: str = "",
-                      on_authenticated: Callable[[Any], None] | None = None) -> None:
+                      on_authenticated: Callable[[Any], None] | None = None,
+                      allow_autologin: bool = True) -> None:
         """把登录页盖在整个窗口上。登进来之前，日志和配置一概看不到。
 
         用 ``place`` 盖满而不是「先别建主窗口」：服务可能早就在跑了（开机自启用的是上次
@@ -687,7 +696,8 @@ class MainWindow:
                 on_authenticated(identity)
 
         self._login = LoginPage(self.root, provider, data_dir=self.data_dir,
-                                on_authenticated=done, version=version)
+                                on_authenticated=done, version=version,
+                                allow_autologin=allow_autologin)
         self._login.place(relx=0, rely=0, relwidth=1, relheight=1)
         self._login.lift()
 
@@ -702,28 +712,68 @@ class MainWindow:
     def logout(self) -> None:
         """退出登录 = **停掉服务** + 回到登录页（用户 2026-08-15 把两件事合成了一件）。
 
-        停机要等网关线程收口（最长 15s），所以走 ``stop_async``——在 tk 线程上等的话，
-        这十几秒里窗口一次都不重绘，看起来就是点完卡死了。
+        整个过程是异步的，但**要等它真结束了再把登录页放出来**（用户 2026-08-16）：
+        停机要等网关线程收口（最长 15s），撤销服务端会话是一次网络调用。原来点完立刻就
+        切页，于是人已经在登录页上了，后台还在停机、还在撤会话——这时候重新登进去，撞上
+        的是一个正在关的服务。现在点完先转圈说「正在退出登录…」，两件事都落地再切页。
+
+        **在 tk 线程上等是不行的**：那十几秒里窗口一次都不重绘，看起来就是点完卡死了。
+        所以用定时器轮询，界面照样能动。
         """
         if self._login is not None or self._logout_provider is None:
             return
-        # 撤销服务端那边的会话（契约 §6）。**丢到后台线程**：它是一次网络调用，
-        # 在 tk 线程上等就是「点了退出登录，窗口白一片」。
+        if self._logging_out:
+            return  # 连点两下不该走两遍
+        self._logging_out = True
+
+        # 撤销服务端那边的会话（契约 §6）。**丢到后台线程**：它是一次网络调用。
+        revoked = threading.Event()
         if self._logout_action is not None:
-            threading.Thread(target=self._logout_action, name="wx-ui-logout",
-                             daemon=True).start()
+            threading.Thread(target=self._run_logout_action, args=(revoked,),
+                             name="wx-ui-logout", daemon=True).start()
+        else:
+            revoked.set()
+
         self._identity = None
         self._render_identity()
+        # ★ 这句提示这次**有人负责清掉**（`_finish_logout`），所以敢显式设。
+        # 2026-08-15 踩过反面：设了却没有「完事」的回调，于是人都退回登录页了，
+        # 侧栏还在转圈说「正在停止服务，请稍候」。
+        self.set_busy(LOGOUT_BUSY_TEXT)
         if self.service.state in {ServiceState.RUNNING, ServiceState.STARTING}:
-            # ★ 这里**不能** set_busy("正在停止服务")：显式提示优先级最高，而这条路没有
-            # 「停完了」的回调去把它清掉，于是停机结束、人都退回登录页了，侧栏还在转圈说
-            # 「正在停止服务，请稍候」（2026-08-15 真机上就是这样）。
-            # 停机本来就有提示：`_effective_busy_text()` 会照 STOPPING 状态自己出，
-            # 状态一变成 STOPPED 它自己就消失。
-            self.set_busy("")
             self.service.stop_async()
+        self._await_logout(revoked, time.monotonic() + LOGOUT_TIMEOUT_SECONDS)
+
+    def _run_logout_action(self, revoked: threading.Event) -> None:
+        try:
+            self._logout_action()
+        except Exception as exc:  # noqa: BLE001 - 撤不掉也得让人退出去
+            _log.warning("撤销客户端会话失败", error=str(exc)[:120])
+        finally:
+            revoked.set()
+
+    def _await_logout(self, revoked: threading.Event, deadline: float) -> None:
+        """等「服务停了」和「会话撤了」都落地，再把登录页放出来。
+
+        **超时也要放人走**：退不出去比多等几秒严重得多。等不到的那几种情况
+        （网关卡在收口、业务端连不上）不该把人锁在一个已经登出的界面里。
+        """
+        service_settled = self.service.state not in {
+            ServiceState.RUNNING, ServiceState.STARTING, ServiceState.STOPPING,
+        }
+        if (revoked.is_set() and service_settled) or time.monotonic() >= deadline:
+            self._finish_logout()
+            return
+        self._later(LOGOUT_POLL_MS, lambda: self._await_logout(revoked, deadline))
+
+    def _finish_logout(self) -> None:
+        self._logging_out = False
+        self.set_busy("")
+        # ★ `allow_autologin=False`：这是人**主动**退的，别让登录页拿记住的密码又登回去。
+        # 「第一次点退出登录又弹回主界面」就是这么来的，见 `login_page._maybe_autologin`。
         self.require_login(self._logout_provider, version=self._version,
-                           on_authenticated=self._logout_callback)
+                           on_authenticated=self._logout_callback,
+                           allow_autologin=False)
 
     def set_login_context(self, provider: Any, *, version: str = "",
                           on_authenticated: Callable[[Any], None] | None = None,

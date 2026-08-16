@@ -54,12 +54,15 @@ class LoginPage(tk.Frame):
         data_dir: Path,
         on_authenticated: Callable[[Identity], None],
         version: str = "",
+        allow_autologin: bool = True,
     ) -> None:
         super().__init__(parent, bg=theme.CONTENT_BG)
         self._auth = auth_client
         self._data_dir = Path(data_dir)
         self._on_authenticated = on_authenticated
         self._version = version
+        #: 刚点完「退出登录」的那一次必须传 False，见 `_maybe_autologin`。
+        self._allow_autologin = allow_autologin
         self._busy = False
         self._photo: tk.PhotoImage | None = None
         #: 没配业务端地址就得当场填一个，否则登录请求根本发不出去。
@@ -219,7 +222,15 @@ class LoginPage(tk.Frame):
 
         自动登录**失败就停在这一页**，把话摆出来、密码留在框里让人改——不重试：
         密码错了重试一百次也是错的，而账号有 5 次连续失败就锁 15 分钟的闸。
+
+        ★ `allow_autologin=False` 由「退出登录」那条路传进来，**这是一条硬开关，不是优化**。
+        2026-08-16 真机报的「第一次点退出登录又弹回主界面、第二次才退得出去」就是没有它：
+        退出登录时撤销会话是丢到后台线程做的，而登录页在同一拍就建起来了——谁先跑完看运气。
+        第一次点的时候密码还没被清掉，这一页刚出来就自动又登回去了；第二次点时存储已经空了，
+        才显得「正常」。**靠「存储恰好被清空了」来阻止自动登录，本质上是在赌线程时序。**
         """
+        if not self._allow_autologin:
+            return
         email, password = self._auth.remembered_login()
         if not (email and password):
             return
