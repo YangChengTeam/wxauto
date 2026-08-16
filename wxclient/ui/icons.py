@@ -60,6 +60,26 @@ def build_icon_image(state: ServiceState, size: int = 64) -> Any:
     return image
 
 
+def logo_photo(master: Any, size: int) -> Any | None:
+    """品牌图标缩到 ``size`` 见方，给界面里的小图标位用（弹框标题、以后别处也能用）。
+
+    和 `cover_photo` 一样走 PIL：`PhotoImage.subsample` 只能整数倍，256 缩到 24 缩不出来
+    ——要么 32（差一圈）要么糊。返回 None 表示这台机器上取不到图，调用方**只放标题**，
+    别留一块空白占位（那看起来像图裂了）。
+    """
+    if size <= 0 or not PNG_PATH.exists():
+        return None
+    try:
+        from PIL import Image, ImageTk
+    except ImportError:
+        return None
+    try:
+        image = Image.open(PNG_PATH).convert("RGBA").resize((size, size), Image.LANCZOS)
+        return ImageTk.PhotoImage(image, master=master)
+    except Exception:  # noqa: BLE001 - 一个图标而已，不该让弹框弹不出来
+        return None
+
+
 PANEL_BG_PATH = ASSETS / "panel-bg.png"
 
 

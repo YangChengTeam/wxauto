@@ -1452,6 +1452,37 @@ class DialogTests(unittest.TestCase):
 
         self.assertIsNone(dialog.cancel)
 
+    def test_it_carries_the_app_logo(self) -> None:
+        """★ 用户 2026-08-16「弹框可以加上应用 logo」——一眼看出这是劳小智弹的。"""
+        from wxclient.ui import dialog as dialog_mod
+
+        dialog = self._dialog()
+        self.addCleanup(dialog.top.destroy)
+
+        self.assertIsNotNone(dialog.logo, "图标没加载上")
+        self.assertEqual(dialog.logo.width(), dialog_mod.LOGO_SIZE)
+        labels = [w for w in dialog.top.winfo_children()[0].winfo_children()[0].winfo_children()
+                  if isinstance(w, tk.Label)]
+        self.assertTrue(any(str(w.cget("image")) for w in labels), "★ 图标得真挂到界面上")
+
+    def test_a_missing_logo_does_not_leave_a_hole(self) -> None:
+        """★ 取不到图就只放标题。留一块空占位比没有更糟——看起来像图裂了。"""
+        from wxclient.ui import dialog as dialog_mod
+
+        with mock.patch.object(dialog_mod.icons, "logo_photo", lambda *_a, **_k: None):
+            dialog = self._dialog()
+        self.addCleanup(dialog.top.destroy)
+
+        self.assertIsNone(dialog.logo)
+        head = dialog.top.winfo_children()[0].winfo_children()[0]
+        self.assertEqual(len(head.winfo_children()), 1, "只剩标题那一个控件")
+
+    def test_the_accent_says_how_bad_it_is(self) -> None:
+        from wxclient.ui import theme
+
+        self.assertEqual(self._dialog(tone="error").accent.cget("bg"), theme.RED)
+        self.assertEqual(self._dialog().accent.cget("bg"), theme.GREEN)
+
     def test_it_uses_the_app_palette_not_the_system_one(self) -> None:
         from wxclient.ui import theme
 

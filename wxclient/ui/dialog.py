@@ -23,10 +23,12 @@ from __future__ import annotations
 
 import tkinter as tk
 
-from . import theme
+from . import icons, theme
 
 #: 弹框宽度。文字靠 wraplength 折行，高度由内容撑。
 WIDTH = 460
+#: 标题左边那枚应用图标的边长（用户 2026-08-16「弹框可以加上应用 logo」）。
+LOGO_SIZE = 26
 #: 正文最多折到多宽（左右各留 28 的内边距）。
 WRAP = WIDTH - 56
 
@@ -52,11 +54,20 @@ class _Dialog:
 
         head = tk.Frame(body, bg=theme.CONTENT_BG)
         head.pack(fill=tk.X, padx=28, pady=(22, 0))
-        # 一条竖色条当「这是什么级别的事」的标记：出错是红的，其余是绿的。
-        tk.Frame(head, bg=theme.RED if tone == "error" else theme.GREEN,
-                 width=3, height=18).pack(side=tk.LEFT, padx=(0, 10))
+        # 应用图标：一眼看出「这是劳小智弹的」。**取不到就只放标题**——
+        # 留一块空占位比没有更糟，看起来像图裂了。引用要自己留住，否则被 GC 掉就是块空白。
+        self.logo = icons.logo_photo(self.top, LOGO_SIZE)
+        if self.logo is not None:
+            tk.Label(head, image=self.logo, bg=theme.CONTENT_BG).pack(side=tk.LEFT,
+                                                                     padx=(0, 10))
         tk.Label(head, text=title, font=theme.FONT_HEADING, bg=theme.CONTENT_BG,
                  fg=theme.TEXT, anchor="w").pack(side=tk.LEFT)
+
+        # 标题下面一小截色条：「这是什么级别的事」——出错是红的，其余是绿的。
+        # 和安装向导竖幅上那截短线同一个手法（`packaging/make_wizard_images.py`）。
+        self.accent = tk.Frame(body, bg=theme.RED if tone == "error" else theme.GREEN,
+                               width=30, height=2)
+        self.accent.pack(anchor="w", padx=28, pady=(12, 0))
 
         tk.Label(body, text=message, font=theme.FONT_BODY, bg=theme.CONTENT_BG,
                  fg=theme.TEXT_MUTED, justify=tk.LEFT, anchor="w",
