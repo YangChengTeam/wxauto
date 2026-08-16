@@ -100,11 +100,43 @@ online 改成 offline。所以正常退出前会先报一次 offline（最多等
 
 ## 打包
 
+**发给用户的是安装包，不是一个目录。** 一条命令打完：
+
 ```bat
 pip install -e .[build]
+python packaging\build.py
+:: 产物：dist\劳小智微信助手_v<版本>_安装包.exe
+```
+
+它按顺序做四件事：生成两张图（启动首屏 + 安装向导竖幅，都按 `theme.py` 画）→ PyInstaller
+打 onedir → Inno Setup 把 onedir 包成安装程序 → 自检产物在不在、多大。改 `installer.iss`
+时用 `--skip-exe` 跳过最慢的那步。只要 onedir 不要安装包的话：
+
+```bat
 pyinstaller --noconfirm packaging\lxz-wechat-gateway.spec
 :: 产物：dist\劳小智微信助手\劳小智微信助手.exe
 ```
+
+### 安装包（`packaging/installer.iss`，Inno Setup 6）
+
+打包机上要先装 [Inno Setup 6](https://jrsoftware.org/isdl.php)（中文语言文件随仓库带，
+官方安装包里没有）。安装包本身：中文向导、自带品牌配图、**桌面快捷方式**、开始菜单项、
+控制面板里的卸载入口。
+
+三条定下来的事，改之前先读 `installer.iss` 顶上的理由：
+
+| 决定 | 为什么 |
+|---|---|
+| **按用户装，不提权**（装到 `%LOCALAPPDATA%\Programs\`） | 招聘专员那台电脑多半没有管理员密码；更要紧的是 UIA 要求和微信**权限级别相同**，提权装、提权跑的结果是连不上微信，而报错只说「无法访问微信窗口」 |
+| **安装包里不做开机自启** | 程序自己的「启动设置」里有这一项。两处都能改 = 「到底开没开」有两个答案 |
+| **卸载不默认删数据** | 数据目录里是登录状态、参数和日志。卸载多半只是为了装新版，默默删掉等于让人重登重配一遍 |
+
+★ **快捷方式必须直接指向 exe。** 指向 `.bat` / `wscript some.vbs` / `python.exe` 的表现是
+每次打开先闪一个黑窗——2026-08 真机上为这个排查过一轮，当时怀疑是打包的问题，真凶是
+手工建的快捷方式指错了东西。`tests/test_ui.py::InstallerTests` 盯着这条。
+
+**还没有代码签名。** 所以首次运行会撞上 SmartScreen 的「已保护你的电脑」，要点「更多信息
+→ 仍要运行」。要去掉这一屏得买代码签名证书（OV/EV），在 `installer.iss` 里配 `SignTool`。
 
 **onedir 不是 onefile。** onefile 每次双击都要把整包解压到 `%TEMP%` 再跑，冷启动白等
 好几秒（杀软扫这个解压过程尤其慢）。要「一个文件发给客户」就打安装包或压缩包，别让

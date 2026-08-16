@@ -776,6 +776,84 @@ class PackagingTests(unittest.TestCase):
                                  f"{asset.name} 不该再单独列进 datas，目录已经覆盖了")
 
 
+class InstallerTests(unittest.TestCase):
+    """安装包的硬约束。这几条在没装 Inno Setup 的机器上也守得住——判的是 iss 文本。"""
+
+    ROOT = Path(__file__).resolve().parent.parent
+    ISS = ROOT / "packaging/installer.iss"
+    BUILD = ROOT / "packaging/build.py"
+
+    def setUp(self) -> None:
+        self.iss = self.ISS.read_text(encoding="utf-8")
+
+    def test_desktop_shortcut_points_at_the_exe(self) -> None:
+        """★ 桌面快捷方式必须**直接指 exe**。
+
+        2026-08 真机上排查过一轮「每次打开先闪一个黑窗」，当时怀疑是打包的问题，
+        真凶是快捷方式挂在 `wscript.exe some.vbs` 上（更早的版本挂过 .bat）。
+        .bat 必然拉起 cmd 窗口，python.exe 是控制台版，中间套一层 vbs 则让「进程到底
+        是谁」在任务管理器里对不上号。安装包是这条最后的闸——它建的快捷方式没人会去改。
+        """
+        icons = [line for line in self.iss.splitlines()
+                 if line.startswith("Name:") and "autodesktop" in line]
+        self.assertEqual(len(icons), 1, "桌面快捷方式应当只有一条")
+        self.assertIn('Filename: "{app}\\{#AppExe}"', icons[0])
+        for forbidden in (".bat", ".vbs", ".cmd", "wscript", "python.exe", "cmd.exe"):
+            self.assertNotIn(forbidden, icons[0], f"快捷方式不许经过 {forbidden}")
+
+    def test_installs_without_elevation(self) -> None:
+        """★ 不许要管理员权限。
+
+        不是图省事：用 UIA 驱动微信要求两个程序**权限级别相同**（客户端契约 §8 的
+        `WECHAT_UIA_PERMISSION_DENIED`）。微信是普通权限跑的，我们提权装、提权跑，
+        结果是连不上微信，而报错只说「无法访问微信窗口」——没人查得到是装的时候埋的。
+        """
+        self.assertIn("PrivilegesRequired=lowest", self.iss)
+        self.assertIn("DefaultDirName={localappdata}", self.iss)
+
+    def test_uninstall_keeps_user_data_unless_asked(self) -> None:
+        """★ 卸载不默认删数据（登录状态、参数、日志）。卸载多半只是为了装新版。"""
+        self.assertIn("MB_DEFBUTTON2", self.iss, "那个问框的默认答案必须是「否」")
+        self.assertNotIn("[UninstallDelete]", self.iss,
+                         "别用 UninstallDelete 无条件删数据目录，要人明确点头")
+
+    def test_app_id_is_fixed(self) -> None:
+        """★ AppId 是产品身份，升级安装靠它认出「装过的是同一个」。改了 = 装成两份。"""
+        self.assertRegex(self.iss, r"AppId=\{\{[0-9A-F-]{36}")
+
+    def test_version_has_a_single_source(self) -> None:
+        """版本号只来自 `wxclient/__init__.py`：iss 里除了兜底默认值不许再写一个。"""
+        self.assertIn("#define AppVersion", self.iss, "只允许出现 #ifndef 的兜底默认值")
+        self.assertIn("AppVersion={#AppVersion}", self.iss)
+        self.assertIn("__version__", self.BUILD.read_text(encoding="utf-8"))
+
+    def test_build_script_and_iss_agree_on_the_output_name(self) -> None:
+        """★ 产物文件名两处都写了一遍，对不上的表现是「打完了说没找到包」。
+
+        这条本来要跑五分钟的打包才暴露，放在单测里两毫秒就知道。
+        """
+        self.assertIn("OutputBaseFilename={#AppName}_v{#AppVersion}_安装包", self.iss)
+        self.assertIn('f"{APP_NAME}_v{version}_安装包.exe"',
+                      self.BUILD.read_text(encoding="utf-8"))
+
+    def test_wizard_images_are_ours(self) -> None:
+        """★ 向导用自己的图，不用 Inno 自带那张蓝色抽象图（装谁都长一样）。
+
+        三个尺寸都要在：只给一张的表现是 125%/150% 缩放的新电脑上糊成一片。
+        """
+        self.assertIn("WizardImageFile=assets\\wizard-large.bmp", self.iss)
+        assets = self.ROOT / "packaging/assets"
+        for stem in ("wizard-large", "wizard-small"):
+            for suffix in ("", "@1.5x", "@2x"):
+                path = assets / f"{stem}{suffix}.bmp"
+                self.assertTrue(path.exists(), f"缺 {path.name}，跑 packaging/make_wizard_images.py")
+
+    def test_chinese_wizard(self) -> None:
+        """中文向导。Inno 官方包里没有中文，语言文件是随仓库带的，别指望打包机上有。"""
+        self.assertIn("languages\\ChineseSimplified.isl", self.iss)
+        self.assertTrue((self.ROOT / "packaging/languages/ChineseSimplified.isl").exists())
+
+
 class SettingsStoreTests(unittest.TestCase):
     def test_round_trip_keeps_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

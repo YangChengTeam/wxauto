@@ -134,7 +134,7 @@
 
 ## 测试与打包
 
-- 修改后运行 `python -m ruff check wxclient tests`。
+- 修改后运行 `python -m ruff check wxclient tests packaging`。
 - 运行 `python -m unittest discover -s tests -v`。
 - 网关单体 exe 尚未做；`[build]` extra 里的 PyInstaller 为它预留（见 `README.md`「打包」）。
   真做时打包必须包含 `third_party/pywechat/pyweixin` 和其所需的 `logger/logging.conf`。

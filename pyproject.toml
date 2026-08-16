@@ -43,3 +43,9 @@ build = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["wxclient*"]
+
+[tool.ruff.lint.per-file-ignores]
+# 打包脚本要先把仓库根塞进 sys.path，才能 `from wxclient.ui import theme`——
+# 它们是拿 `python packaging/xxx.py` 直接跑的，不是被 import 的模块，没有别的办法。
+# 所以这两个文件里 import 必然排在那行 sys.path.insert 后面（E402）。
+"packaging/*.py" = ["E402"]
