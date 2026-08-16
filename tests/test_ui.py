@@ -908,6 +908,52 @@ class RealActionsTests(unittest.TestCase):
                       self._notice(env={"WXCLIENT_UI_ALLOW_REAL_ACTIONS": "0"}))
 
 
+class StdlibShadowGuardTests(unittest.TestCase):
+    """★ 仓库根多一个和标准库重名的 .py，打包就会炸得看不出原因（2026-08-16 真机）。
+
+    当时报的是 `SubprocessDiedError: Child process died calling
+    discover_hook_directories()`——跟「多了个 enum.py」这个真因毫无关系。
+    所以这一条在 build.py 开头就拦。
+    """
+
+    def _build_module(self):
+        """按路径加载 packaging/build.py。
+
+        ★ 不能写 `from packaging import build`：`packaging` 是 PyPI 上的知名库，
+        site-packages 里就有一个，import 到的会是**它**而不是这个目录。
+        """
+        import importlib.util
+
+        path = Path(__file__).resolve().parent.parent / "packaging" / "build.py"
+        spec = importlib.util.spec_from_file_location("_lxz_build", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_a_shadowing_file_stops_the_build(self) -> None:
+        build = self._build_module()
+        self.assertIn("enum", sys.stdlib_module_names, "前提：enum 确实是标准库")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "enum.py").write_text("", encoding="utf-8")
+            (root / "wxclient.py").write_text("", encoding="utf-8")  # 不重名的不该被拦
+            with self.assertRaises(SystemExit) as caught:
+                build.check_no_stdlib_shadows(root)
+
+        message = str(caught.exception)
+        self.assertIn("enum.py", message)
+        self.assertNotIn("wxclient.py", message, "只拦和标准库重名的")
+        self.assertIn("挪走或删掉", message, "得说清楚怎么办")
+
+    def test_a_clean_repo_passes(self) -> None:
+        build = self._build_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "setup.py").write_text("", encoding="utf-8")
+            build.check_no_stdlib_shadows(root)  # 不该抛
+
+
 class CloseOnLoginPageTests(unittest.TestCase):
     """★ 登录页上点 × 要**真退出**（用户 2026-08-16）。
 

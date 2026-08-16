@@ -21,6 +21,9 @@
 砍掉了），两次的表现都是「微信明明开着，界面说找不到微信」。所以这一步失败 = 不出包。
 
 版本号唯一来源是 `wxclient/__init__.py` 的 ``__version__``，不在这里也不在 iss 里另写一份。
+
+开工前还会先看一眼仓库根有没有和标准库重名的 .py（见 `check_no_stdlib_shadows`）——
+这一条是被真事教出来的，理由写在那个函数上。
 """
 
 from __future__ import annotations
@@ -93,6 +96,23 @@ def self_check(exe: Path) -> None:
             )
 
 
+def check_no_stdlib_shadows(root: Path = REPO) -> None:
+    """仓库根上有没有跟标准库重名的 .py。有就当场停，别让 PyInstaller 去撞。
+
+    ★ 2026-08-16 真机上撞过：往仓库根丢了个临时的 `enum.py`，PyInstaller 的隔离子进程
+    把仓库根放进 sys.path，于是它 import 到的 `enum` 是那一个，Python 连 site 模块都起
+    不来。报出来的是 `SubprocessDiedError: Child process died calling
+    discover_hook_directories()`——跟真正的原因（多了个文件）八竿子打不着，查了十分钟。
+    """
+    shadows = sorted(p.name for p in root.glob("*.py")
+                     if p.stem in sys.stdlib_module_names)
+    if shadows:
+        raise SystemExit(
+            f"仓库根上这些文件和标准库重名：{'、'.join(shadows)}\n"
+            "PyInstaller 会 import 到它们而不是标准库，打包必炸。挪走或删掉再来。"
+        )
+
+
 def run(argv: list[str], *, cwd: Path) -> None:
     print(f"\n$ {' '.join(str(a) for a in argv)}\n", flush=True)
     result = subprocess.run(argv, cwd=cwd)
@@ -112,6 +132,9 @@ def main() -> int:
     version = app_version()
     onedir = DIST / APP_NAME
     print(f"== {APP_NAME} {version} ==")
+
+    # ⓪ 仓库根干不干净（临时文件和标准库重名的话，后面那步会炸得看不出原因）
+    check_no_stdlib_shadows()
 
     # ① 图
     run([sys.executable, str(PACKAGING / "make_splash.py")], cwd=REPO)
