@@ -908,6 +908,54 @@ class RealActionsTests(unittest.TestCase):
                       self._notice(env={"WXCLIENT_UI_ALLOW_REAL_ACTIONS": "0"}))
 
 
+class NoSystemDialogsTests(unittest.TestCase):
+    """★ 界面里不许再出现系统弹框（用户 2026-08-16）。
+
+    系统弹框是**另一个程序的东西**：灰底、宋体、系统按钮、屏幕正中蹦出来。人正在这个
+    窗口里做事，冷不丁弹一个长得不一样的框，第一反应是「这是谁弹的」。
+    自己那份在 `wxclient/ui/dialog.py`，行为测试在 `test_ui_window.DialogTests`。
+    """
+
+    def test_no_ui_module_imports_messagebox(self) -> None:
+        ui_dir = Path(__file__).resolve().parent.parent / "wxclient" / "ui"
+        offenders = []
+        for path in sorted(ui_dir.glob("*.py")):
+            if path.name == "dialog.py":
+                continue  # 它的文档里提到这个名字，是在说「替掉的就是它」
+            text = path.read_text(encoding="utf-8")
+            if "messagebox" in text:
+                offenders.append(path.name)
+        self.assertEqual(offenders, [], "★ 这些还在用系统弹框，改走 ui/dialog.py")
+
+
+class TrayAfterLoginTests(unittest.TestCase):
+    """★ 托盘只在登录之后露面（用户 2026-08-16：「登录之后才启动托盘，Loading 中不好
+    出现这个」）。
+
+    这里按接线验「谁调、什么时候调」；`Tray` 自己的开关行为在
+    `tests/test_ui_window.py::TrayLifecycleTests`。
+    """
+
+    def _main_source(self) -> str:
+        from wxclient.ui import __main__ as main_mod
+
+        return Path(main_mod.__file__).read_text(encoding="utf-8")
+
+    def test_the_tray_does_not_come_up_during_startup(self) -> None:
+        source = self._main_source()
+        self.assertNotIn("tray.run_detached()", source,
+                         "★ 启动时不许直接把托盘拉起来——那正是 Loading 里冒出图标的原因")
+        self.assertNotIn('splash.stage("正在启动托盘', source, "连这句进度都不该有了")
+
+    def test_login_starts_it_and_logout_takes_it_away(self) -> None:
+        """两头都要：只在登录时起、退出登录不收，人就退回了登录页而图标还挂着。"""
+        source = self._main_source()
+        starts = source.count("tray.start()")
+        self.assertEqual(starts, 2,
+                         "★ 两条登录路各一次：新登录（on_authenticated）和恢复上次登录")
+        self.assertIn("tray.stop()", source)
+
+
 class StdlibShadowGuardTests(unittest.TestCase):
     """★ 仓库根多一个和标准库重名的 .py，打包就会炸得看不出原因（2026-08-16 真机）。
 

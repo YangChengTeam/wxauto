@@ -12,9 +12,11 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 try:
     import tkinter as tk
@@ -1242,6 +1244,336 @@ class TrayMenuTests(unittest.TestCase):
 
         self.assertFalse(enabled(self._tray(logged_in=False), "退出登录"))
         self.assertTrue(enabled(self._tray(logged_in=True), "退出登录"))
+
+
+@unittest.skipUnless(HAS_TK, "没有 Tk")
+class WindowSizeTests(unittest.TestCase):
+    """★ 默认窗口大一点（用户 2026-08-16），但**不能大过屏幕**。
+
+    大过屏幕不是「不好看」：标题栏被顶到屏幕外之后，窗口既拖不动也缩不了。
+    """
+
+    def test_the_default_is_bigger_than_it_used_to_be(self) -> None:
+        from wxclient.ui import window as window_mod
+
+        geometry = window_mod.initial_geometry(1920, 1080)
+        size = geometry.split("+")[0]
+        width, height = (int(n) for n in size.split("x"))
+
+        self.assertEqual((width, height), window_mod.DEFAULT_SIZE, "屏幕够大就按默认给")
+        self.assertGreater(width, 1180, "★ 比改之前那个 1180 宽")
+
+    def test_it_never_grows_past_a_small_screen(self) -> None:
+        from wxclient.ui import window as window_mod
+
+        geometry = window_mod.initial_geometry(1366, 768)
+        size, x, y = geometry.split("+")
+        width, height = (int(n) for n in size.split("x"))
+
+        self.assertLessEqual(width, 1366 - window_mod.SCREEN_MARGIN, "得给屏幕留边")
+        self.assertLessEqual(height, 768 - window_mod.SCREEN_MARGIN)
+        self.assertGreaterEqual((width, height), window_mod.MIN_SIZE,
+                                "但也不许缩到比最小尺寸还小")
+        self.assertEqual((int(x), int(y)), ((1366 - width) // 2, (768 - height) // 2),
+                         "居中：原来不给位置，Windows 会往左上角级联着摆")
+
+    def test_a_tiny_screen_keeps_the_window_usable(self) -> None:
+        """★ 屏幕小到放不下最小尺寸时，宁可超出屏幕也不缩——缩到那份上界面自己就挤坏了。"""
+        from wxclient.ui import window as window_mod
+
+        geometry = window_mod.initial_geometry(800, 600)
+        width, height = (int(n) for n in geometry.split("+")[0].split("x"))
+
+        self.assertEqual((width, height), window_mod.MIN_SIZE)
+
+
+@unittest.skipUnless(HAS_TK, "没有 Tk")
+class WatchSectionTests(unittest.TestCase):
+    """★「同步名单」按钮的样式要和别处一致（绿框绿字，用户 2026-08-16）。
+
+    ⚠️ 它**功能还没接上**：点了会明说「同步接口还没接上」。样式一致 ≠ 假装能用——
+    真正防它变成假按钮的是那句话，所以这里两条一起验。
+    """
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.window = MainWindow(self.root, LogBuffer(), GatewayService(lambda: None),
+                                 data_dir=self.dir, probe_wechat=False)
+        self.addCleanup(self._teardown)
+
+    def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.window)
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+    def _sync_button(self):
+        page = self.window._build_watch_section(self.root)
+        self.addCleanup(page.destroy)
+        found = [w for w in page.winfo_children()[0].winfo_children()
+                 if isinstance(w, tk.Label) and w.cget("text") == "同步名单"]
+        self.assertEqual(len(found), 1, "找不到「同步名单」按钮")
+        return found[0]
+
+    def test_it_looks_like_the_other_outline_buttons(self) -> None:
+        button = self._sync_button()
+
+        self.assertEqual(button.cget("fg"), theme.GREEN, "★ 绿字，和别处一样")
+        self.assertEqual(str(button.cget("highlightbackground")), theme.GREEN, "★ 绿框")
+        self.assertEqual(str(button.cget("cursor")), "hand2")
+
+    def test_it_still_tells_the_truth_when_clicked(self) -> None:
+        """★ 长得能用，点下去必须说实话——不然就是个假按钮。"""
+        button = self._sync_button()  # 顺带把那一节建出来（提示标签在里面）
+        # 点击本身在这个窗口站上发不出去（窗口从不真映射），所以分两步验：
+        # ① 按钮确实绑了点击；② 绑的那件事说的是实话。
+        self.assertTrue(button.bind("<Button-1>"), "按钮没绑点击")
+
+        self.window._sync_watchlist()
+
+        self.assertIn("还没接上", self.window._watch_hint.cget("text"))
+
+
+class _StubParent:
+    """假的父窗口几何。真窗口在 SSH 会话里全是 1×1，拿它验居中等于什么都没验。"""
+
+    def __init__(self, *, rootx: int, rooty: int, width: int, height: int) -> None:
+        self._values = {"rootx": rootx, "rooty": rooty, "width": width, "height": height}
+
+    def winfo_ismapped(self) -> int:
+        return 1
+
+    def winfo_rootx(self) -> int:
+        return self._values["rootx"]
+
+    def winfo_rooty(self) -> int:
+        return self._values["rooty"]
+
+    def winfo_width(self) -> int:
+        return self._values["width"]
+
+    def winfo_height(self) -> int:
+        return self._values["height"]
+
+
+@unittest.skipUnless(HAS_TK, "没有 Tk")
+class DialogTests(unittest.TestCase):
+    """★ 自己画的弹框（用户 2026-08-16：「弹框改成自定义的和界面视觉风格一致，
+    在这个窗口的中心」）。
+
+    这里守三件：落在**父窗口**中心（不是屏幕中心）、模态、以及「没明确点确定」一律回 False。
+    """
+
+    def setUp(self) -> None:
+        self.root = tk.Tk()
+        self.root.geometry("900x600+120+80")
+        self.root.update_idletasks()
+        self.addCleanup(self._teardown)
+
+    def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.root)
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _dialog(self, *, cancel: str | None = "取消", tone: str = "info"):
+        from wxclient.ui import dialog
+
+        return dialog._Dialog(self.root, "标题", "正文" * 40,
+                              confirm="确定", cancel=cancel, tone=tone)
+
+    def test_it_lands_on_the_middle_of_its_own_window(self) -> None:
+        """★ 不是屏幕正中：人正在这个窗口里做事，弹框跑到别处等于让视线跳一次。"""
+        self.root.deiconify()
+        self.root.update()
+        if not self.root.winfo_ismapped():
+            self.skipTest("这个窗口站不真映射窗口，父窗口几何是假的")
+        dialog = self._dialog()
+        self.addCleanup(dialog.top.destroy)
+
+        dialog.center()
+        dialog.top.update_idletasks()
+
+        expected_x = self.root.winfo_rootx() + (
+            self.root.winfo_width() - dialog.top.winfo_reqwidth()) // 2
+        self.assertAlmostEqual(dialog.top.winfo_x(), max(0, expected_x), delta=2)
+
+    def test_an_unmapped_parent_falls_back_to_the_screen(self) -> None:
+        """★ 窗口缩在托盘里时父窗口是 1×1 的假坐标，照它摆弹框会飞到左上角。"""
+        self.root.withdraw()
+        self.root.update()
+        dialog = self._dialog()
+        self.addCleanup(dialog.top.destroy)
+
+        dialog.center()
+
+        self.assertNotEqual(dialog.top.geometry().split("+")[1:], ["0", "0"])
+
+    def test_the_centering_maths(self) -> None:
+        """★ 居中算得对不对，不能只靠上面那条——SSH 会话的窗口站不真映射窗口，
+        那条会整条跳过（真机上跑测试时就是这样）。这里把父窗口的几何喂进去算。
+        """
+        dialog = self._dialog()
+        self.addCleanup(dialog.top.destroy)
+        dialog.parent = _StubParent(rootx=200, rooty=100, width=900, height=600)
+
+        dialog.center()
+
+        width = dialog.top.winfo_reqwidth()
+        height = dialog.top.winfo_reqheight()
+        _, x, y = dialog.top.geometry().split("+")
+        self.assertEqual(int(x), 200 + (900 - width) // 2)
+        self.assertEqual(int(y), 100 + (600 - height) // 2)
+
+    def test_closing_without_confirming_means_no(self) -> None:
+        """★ 弹框问的都是有后果的事（顶掉别人的登录）。Esc / 关掉 / 取消，一律回 False。"""
+        dialog = self._dialog()
+
+        dialog._close(False)
+
+        self.assertFalse(dialog.result)
+
+    def test_escape_is_wired_up(self) -> None:
+        """自画标题栏就没有右上角那个 ×，Esc 是唯一的键盘退路——它必须绑上。"""
+        dialog = self._dialog()
+        self.addCleanup(dialog.top.destroy)
+
+        self.assertTrue(dialog.top.bind("<Escape>"), "★ Esc 没绑，这个框就只能用鼠标关")
+        self.assertTrue(dialog.top.bind("<Return>"))
+
+    def test_a_telling_dialog_has_no_cancel_button(self) -> None:
+        """只是告诉一声的框不该摆一个「取消」——取消什么？"""
+        dialog = self._dialog(cancel=None)
+        self.addCleanup(dialog.top.destroy)
+
+        self.assertIsNone(dialog.cancel)
+
+    def test_it_uses_the_app_palette_not_the_system_one(self) -> None:
+        from wxclient.ui import theme
+
+        dialog = self._dialog()
+        self.addCleanup(dialog.top.destroy)
+
+        self.assertEqual(dialog.confirm.cget("bg"), theme.GREEN_DEEP,
+                         "确认按钮和登录页那颗同一个绿")
+        self.assertTrue(dialog.top.overrideredirect(),
+                        "★ 系统标题栏是灰的，和这套白底界面接不上")
+
+
+class _StubIcon:
+    """假的 pystray.Icon。**不许在测试里 run 真的**——那会在打包机右下角真弹出一个图标，
+
+    而且 `run()` 是个消息循环，停不掉就把测试挂死。
+    """
+
+    def __init__(self) -> None:
+        self.runs = 0
+        self.stops = 0
+        self.icon: Any = None
+        self.title = ""
+        self.menu: list = []
+        self._alive = threading.Event()
+
+    def run(self) -> None:
+        self.runs += 1
+        self._alive.wait(5)  # 假装是个消息循环
+
+    def stop(self) -> None:
+        self.stops += 1
+        self._alive.set()
+
+    def update_menu(self) -> None:
+        pass
+
+
+@unittest.skipUnless(HAS_TK and HAS_TRAY, "没有托盘后端（pystray），托盘测不了")
+class TrayLifecycleTests(unittest.TestCase):
+    """★ 托盘图标只在登录之后露面（用户 2026-08-16：「登录之后才启动托盘，
+    Loading 中不好出现这个」）。
+
+    这里测的是 `Tray` 自己的开关行为；「谁来调、什么时候调」在
+    `tests/test_ui.py::TrayAfterLoginTests` 里按接线验。
+    """
+
+    def _tray(self):
+        from wxclient.ui.service import GatewayService
+        from wxclient.ui.tray import Tray
+
+        tray = Tray(
+            GatewayService(lambda: None),
+            on_show=lambda: None, on_settings=lambda: None,
+            on_quit=lambda: None, on_logout=lambda: None,
+        )
+        tray._icon = _StubIcon()  # 换掉真 Icon：测试不许在打包机上真弹图标
+        self.addCleanup(tray.stop)
+        return tray
+
+    def _wait(self, predicate, timeout: float = 3.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def test_a_fresh_tray_is_not_showing_yet(self) -> None:
+        """★ 建出来 ≠ 露面。启动那一路会先建好它，但登录之前不许出现在右下角。"""
+        tray = self._tray()
+
+        self.assertFalse(tray.running)
+        self.assertEqual(tray._icon.runs, 0, "★ 没人调 start()，就不该跑起来")
+
+    def test_starting_twice_only_shows_one_icon(self) -> None:
+        """恢复登录 + 登录回调可能都调到——重复调必须是空操作，否则右下角两个图标。"""
+        tray = self._tray()
+
+        tray.start()
+        self.assertTrue(self._wait(lambda: tray._icon.runs == 1))
+        tray.start()
+
+        self.assertTrue(tray.running)
+        self.assertEqual(tray._icon.runs, 1)
+
+    def test_stopping_without_starting_is_harmless(self) -> None:
+        """登录页上点 × 退出程序时会走到 `tray.stop()`，那会儿托盘根本没起过。"""
+        tray = self._tray()
+
+        tray.stop()  # 不该抛
+
+        self.assertEqual(tray._icon.stops, 0)
+
+    def test_refresh_does_nothing_while_hidden(self) -> None:
+        """★ 服务状态回调来自网关线程。托盘没露面时去动一个没 run 起来的 Icon，
+        炸出来的异常和「状态刷新」毫无关系，查起来极贵。"""
+        tray = self._tray()
+
+        tray.refresh()
+
+        self.assertIsNone(tray._icon.icon, "没露面就别碰它")
+
+    def test_logging_back_in_brings_the_icon_back(self) -> None:
+        """★ 退出登录 → 再登录：图标得回来。
+
+        pystray 的 Icon 停过之后 run 不起来（win32 那边窗口已经销毁），所以 `start()`
+        必须**重建**一个。少了这一步，第二次登录之后右下角就永远空着。
+        """
+        tray = self._tray()
+        tray.start()
+        self.assertTrue(self._wait(lambda: tray._icon.runs == 1))
+        first = tray._icon
+
+        tray.stop()
+        self.assertEqual(first.stops, 1)
+        with mock.patch.object(tray, "_build_icon", _StubIcon):
+            tray.start()
+            self.assertTrue(self._wait(lambda: tray._icon.runs == 1))
+
+        self.assertIsNot(tray._icon, first, "★ 必须是新建的那一个")
+        self.assertTrue(tray.running)
 
 
 if __name__ == "__main__":
