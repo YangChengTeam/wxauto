@@ -67,6 +67,15 @@ LOGOUT_TIMEOUT_SECONDS = 20.0
 #: 启动多久之后偷偷把参数页建好。要等过启动最忙的那一段，又要赶在用户去点之前。
 _SETTINGS_PREBUILD_MS = 3000
 
+#: 默认窗口大小。**这一版特意放大**（用户 2026-08-16「默认窗口宽度大一点」）——
+#: 日志表一行信息量不小（时间 / 会话 / 动作 / 结果），窄了就得横向挤，看一眼变成看半天。
+DEFAULT_SIZE = (1360, 820)
+#: 再小就没法用了：左侧导航 + 日志表至少要这么宽，配置中心那几行至少要这么高。
+MIN_SIZE = (900, 560)
+#: 距屏幕边缘留白。放大之后必须挡住「比屏幕还大」这种情况——1366×768 的笔记本上，
+#: 一个 1360×820 的窗口标题栏会被顶出屏幕，人连拖都拖不回来。
+SCREEN_MARGIN = 80
+
 #: 转场态（服务正在起/正在停）的提示语。这几秒里任何「再点一下」都只会把事情搞乱，
 #: 所以界面自己进入 busy：侧栏转圈说明在干什么，参数页盖住不给改。
 _TRANSITION_TEXT = {
@@ -116,6 +125,22 @@ def _initials(name: str) -> str:
     if not text:
         return "?"
     return text[:2].upper() if text.isascii() else text[-2:]
+
+
+def initial_geometry(screen_width: int, screen_height: int) -> str:
+    """开窗多大、摆在哪。**按屏幕算，不写死**。
+
+    写死的坏处不是「不好看」，是**打不开**：默认值一旦比屏幕大，标题栏会被顶到屏幕外，
+    窗口既拖不动也缩不了。所以先按 `DEFAULT_SIZE` 要，要不到就退到屏幕减两边留白，
+    但不小于 `MIN_SIZE`（比这更小界面自己就挤坏了，宁可让它超出屏幕）。
+
+    顺手居中：原来不给位置，Windows 按级联规则往左上角摆，第二次打开还会往右下挪一格。
+    """
+    width = max(MIN_SIZE[0], min(DEFAULT_SIZE[0], screen_width - SCREEN_MARGIN * 2))
+    height = max(MIN_SIZE[1], min(DEFAULT_SIZE[1], screen_height - SCREEN_MARGIN * 2))
+    x = max(0, (screen_width - width) // 2)
+    y = max(0, (screen_height - height) // 2)
+    return f"{width}x{height}+{x}+{y}"
 
 
 class MainWindow:
@@ -171,8 +196,8 @@ class MainWindow:
 
         root.title(WINDOW_TITLE)
         self._apply_window_icon()
-        root.geometry("1180x720")
-        root.minsize(900, 560)
+        root.geometry(initial_geometry(root.winfo_screenwidth(), root.winfo_screenheight()))
+        root.minsize(*MIN_SIZE)
         root.configure(bg=theme.CONTENT_BG)
         root.protocol("WM_DELETE_WINDOW", self.close_requested)
 
@@ -432,8 +457,8 @@ class MainWindow:
 
         名单是「谁会被自动回复」的唯一判据（069 fail-closed），所以必须看得见**具体是谁**。
         名单从两条路来：这台机器上加的好友，和以后从线上同步下来的那份——所以这里留了一个
-        「同步名单」的位置（用户 2026-08-15）。**后端那头还没有**，按钮是灰的，点了会说清
-        为什么，不会假装同步过一次。
+        「同步名单」的位置（用户 2026-08-15）。**后端那头还没有**：按钮和别处长得一样
+        （用户 2026-08-16 要求），但点了会说清为什么，不会假装同步过一次。
         """
         page = tk.Frame(parent, bg=theme.CONTENT_BG)
 
@@ -449,7 +474,10 @@ class MainWindow:
         self._watch_next = tk.Label(head, text="", font=theme.FONT_SMALL,
                                     bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
         self._watch_next.pack(side=tk.RIGHT, padx=(0, 14))
-        widgets.ghost_button(head, "同步名单", self._sync_watchlist, enabled=False).pack(
+        # ★ 样式和别处的描边按钮一致（绿框绿字，用户 2026-08-16）。**功能仍然没接上**——
+        # 点了会明说「同步接口还没接上」（`_sync_watchlist`），所以它不是一个假装能用的
+        # 按钮：长得一样，但按下去说的是实话。
+        widgets.ghost_button(head, "同步名单", self._sync_watchlist).pack(
             side=tk.RIGHT, padx=(0, 14))
 
         self._watch_hint = tk.Label(page, text="", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
@@ -576,10 +604,10 @@ class MainWindow:
 
         早先是每次切页 ``SettingsPage(...)`` 新建一个、旧的只 ``pack_forget()``——控件一直
         挂在 ``_pages`` 底下不销毁，来回切几十次就攒几十份。改销毁也不行：保存那条路径是
-        ``_save() → on_saved() → …``，回到 ``_save()`` 还要拿 ``parent=self`` 弹提示框，
+        ``_save() → on_saved() → …``，回到 ``_save()`` 还要拿自己当父控件弹提示框，
         父控件已经没了会直接抛 TclError。复用 + reload 两头都躲开。
 
-        ``SettingsPage`` 的 import 仍然留在这儿：它拖着 ``tkinter.messagebox``，
+        ``SettingsPage`` 的 import 仍然留在这儿：它是整页控件里最重的一份，
         启动时不进设置页就不该为它付这份钱。
         """
         if self._config_page is None:
