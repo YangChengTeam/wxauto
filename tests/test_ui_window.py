@@ -103,10 +103,29 @@ class _NoDiskProtector(Protector):
     name = "test"
 
 
-def make_auth(data_dir: Path, api: StubApi, *, base_url: str = "https://business.test"):
+class _DiskProtector(Protector):
+    """会**落盘**的假加密（倒序）。只给「关掉客户端再打开」那类用例用——
+
+    默认的 `_NoDiskProtector` 一个字节都不写，重开之后当然什么都读不到，
+    拿它验「重开还记不记得密码」验的是测试自己（2026-08-16 就这么红过一次）。
+    """
+
+    available = True
+    name = "test-disk"
+
+    def protect(self, plain: str) -> str:
+        return plain[::-1]
+
+    def unprotect(self, blob: str) -> str:
+        return blob[::-1]
+
+
+def make_auth(data_dir: Path, api: StubApi, *, base_url: str = "https://business.test",
+              persist: bool = False):
     api.base_url = base_url  # ClientAuth.configured 看的就是它
+    protector = _DiskProtector() if persist else _NoDiskProtector()
     return auth_module.ClientAuth(base_url, data_dir, client_version="test",
-                                  api=api, store=TokenStore(data_dir, _NoDiskProtector()))
+                                  api=api, store=TokenStore(data_dir, protector))
 
 
 def settings_store_fields():
@@ -645,12 +664,13 @@ class LoginGateTests(unittest.TestCase):
     def test_one_click_logout_does_not_log_you_straight_back_in(self) -> None:
         """★ 真机 2026-08-16：**第一次**点退出登录又弹回主界面，第二次才退得出去。
 
-        真因是赌线程时序：撤销会话（顺带清掉记住的密码）丢在后台线程，而登录页在同一拍
-        就建起来了。第一次点的时候密码还没被清掉，登录页一出来就「自动登录」又登回去了；
-        第二次点时存储已经空了，才显得正常。
+        真因是赌线程时序：撤销会话（当时会顺带清掉记住的密码）丢在后台线程，而登录页在
+        同一拍就建起来了。第一次点的时候密码还没被清掉，登录页一出来就「自动登录」又登
+        回去了；第二次点时存储已经空了，才显得正常。
 
-        现在有两道：`ClientAuth.logout` 立刻清本机，登录页那边还有一道显式的
-        `allow_autologin=False`。**一道管状态，一道管意图**——只靠前者仍然是在赌时序。
+        ★ 2026-08-16 起密码**故意留着**（要回填进密码框），「存储恰好空了」这层运气没了。
+        挡住自动登录的是两道显式开关：这一页的 `allow_autologin=False`（管这一次的意图）
+        和落盘的 `auto_login=False`（管跨重启的意图）。这条用例因此比原来更值钱。
         """
         self.service.stop_async = lambda **_kwargs: None  # type: ignore[method-assign]
         self.window.set_login_context(self.auth, on_logout=self.auth.logout)
@@ -674,7 +694,7 @@ class LoginGateTests(unittest.TestCase):
                          "★ 一次就该退干净，不许被自动登录又送回主界面")
 
     def test_the_switch_alone_stops_autologin(self) -> None:
-        """★ 单独验那道开关：**凭据还在**，也不许自动登录。
+        """★ 单独验那道开关：**凭据还在、密码也照样回填**，但不许自动登录。
 
         不这么验的话，上面那条端到端用例其实是被「存储已经清空了」兜住的——开关删掉它
         照样绿，而那正是这个 bug 原来的样子（赌线程时序）。这里让凭据留着，只关开关。
@@ -696,9 +716,38 @@ class LoginGateTests(unittest.TestCase):
                          allow_autologin=False)
         self.addCleanup(page.destroy)
 
-        self.assertEqual(page._password.get(), "",
-                         "★ 关了就是关了：密码不该被填回去，更不该自己提交")
-        self.assertEqual(self.api.calls.count("login"), 1, "不许再发一次登录请求")
+        self.assertEqual(page._password.get(), "pw",
+                         "★ 密码该回填——记住登录状态就是为了别再打一遍（用户 2026-08-16）")
+        self.assertEqual(self.api.calls.count("login"), 1,
+                         "★ 但**不许自己提交**：填好了等人点「登录」")
+
+    def test_reopening_after_a_manual_logout_fills_the_password_but_waits(self) -> None:
+        """★ 退出登录之后**重开客户端**这一路（用户 2026-08-16）。
+
+        这一路 `allow_autologin` 是 True（没人刚点退出，是全新一次启动），挡住自动登录的
+        只剩落盘的那个标记。所以这条用例验的正是「跨重启」那一半：
+        密码填好了摆在框里，但**没有**自己登进去。
+        """
+        from wxclient.ui.login_page import LoginPage
+
+        # 这条必须用**会落盘**的存储：验的就是「关掉再打开还记不记得」。
+        first = make_auth(self.dir, self.api, persist=True)
+        first.login("hr@example.com", "pw")
+        first.logout()  # 人自己点的退出
+
+        # 重开：新的 ClientAuth 从磁盘读，没有 Token 可 restore，于是建登录页
+        reopened = make_auth(self.dir, self.api, persist=True)
+        self.assertIsNone(reopened.restore(), "前提：Token 已经作废了")
+        page = LoginPage(self.root, reopened, data_dir=self.dir,
+                         on_authenticated=lambda _identity: None)
+        self.addCleanup(page.destroy)
+
+        self.assertEqual(page._account.get(), "hr@example.com")
+        self.assertEqual(page._password.get(), "pw", "★ 密码要回填")
+        self.assertTrue(page._allow_autologin, "前提：这一路的开关是开的，靠的是落盘那个标记")
+        self.assertFalse(self._pump(lambda: self.api.calls.count("login") > 1, timeout=1.0),
+                         "★ 但别自己登回去——他刚亲手退出来的")
+        self.assertEqual(self.api.calls.count("login"), 1, "只有一开始那次人工登录")
 
     def test_reopening_the_app_still_autologins(self) -> None:
         """★ 关掉自动登录只针对「主动退出」这一条路，别把功能整个关死了。

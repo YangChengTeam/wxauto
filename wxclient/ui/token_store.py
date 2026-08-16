@@ -18,10 +18,17 @@ Credential Manager 或 DPAPI 保存，**禁止写入明文配置文件和日志*
 整个企业端（工资、合同、人才库）。所以它配了三条硬约束：
 
 * 只在人**明确勾上「记住登录状态」**时才写；取消勾选连旧的一起清掉。
-* 只用于「本机 Token 没了但人没变」这一种情况下的自动重登（`ui/login_page.py`）。
+* 只用于「把密码回填进登录框」和「本机 Token 没了但人没变」时的自动重登
+  （`ui/login_page.py`）。
 * **会话被撤销（管理员撤、被别的设备顶掉、账号停用）时和 Token 一起清掉**——见
   `auth.ClientAuth.handle_revoked`。不清的话，管理员刚撤销，这台机器转头拿密码
   自己又登回来了，契约 §2.2「立即失效」就成了一句空话。
+
+★ 2026-08-16 改：**人自己点「退出登录」不再清密码**（用户要求「记住登录状态应该也记住
+密码，把密码回填到密码框」）。走 `forget_session()`：Token 和会话作废，邮箱密码留着，
+外加落一个 ``auto_login=False``。那个标记是这条改动的配套，不是可选项——没有它，
+「退出登录」只在本次运行里成立，客户端一重开就拿着记住的密码自己登回去了。
+撤销那条路仍然是 `clear()`，全清；管控的刹车不跟着这条便利改动松。
 """
 
 from __future__ import annotations
@@ -169,6 +176,16 @@ class TokenStore:
         except Exception:  # noqa: BLE001
             return ""
 
+    def auto_login_allowed(self) -> bool:
+        """这台机器上「记住的账号」还准不准自动登一次。
+
+        默认准。只有人**自己点过退出登录**才会变成 False（`forget_session`），而且这个
+        「不准」要跨重启活着——否则退出登录就只是本次运行里的事，重开客户端又自己登回去了。
+        重新登一次（`save`）就再把它翻回 True。
+        """
+        raw = self._read_raw()
+        return bool(raw.get("auto_login", True)) if raw is not None else True
+
     def save(self, session: StoredSession) -> None:
         self._memory = session
         if not self._protector.available:
@@ -178,6 +195,31 @@ class TokenStore:
         data["token_protected"] = self._protector.protect(session.token)
         if session.password:
             data["password_protected"] = self._protector.protect(session.password)
+        # 人刚亲手登进来，自动登录的闸自然重新打开（上一次可能是主动退出登录关掉的）。
+        data["auto_login"] = True
+        self._write(data)
+
+    def forget_session(self) -> None:
+        """退出登录：**Token 和会话作废，记住的邮箱密码留着**（用户 2026-08-16）。
+
+        留着是为了把密码回填进登录框——勾了「记住登录状态」的人要的就是别再打一遍。
+        同时落 ``auto_login=False``：填好了等他点「登录」，别自己登回去。这两件是一套，
+        少一件就成了「点了退出登录，重开又在里面」。
+
+        没有密码可留（没勾过记住）就退化成 `clear()`——留一份只剩邮箱的文件没有意义。
+        """
+        raw = self._read_raw()
+        self._memory = None
+        if raw is None or not raw.get("password_protected"):
+            self.clear()
+            return
+        raw.pop("token_protected", None)
+        raw["session_id"] = ""
+        raw["auto_login"] = False
+        self._write(raw)
+
+    def _write(self, data: dict[str, Any]) -> None:
+        """原子写这份 JSON。**写临时文件再 replace**——中途断电不会留下半份读不出来的。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

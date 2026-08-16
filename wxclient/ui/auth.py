@@ -134,11 +134,20 @@ class ClientAuth:
         """记住的（邮箱，密码）。两个都有才够自动登录一次（`ui/login_page.py`）。
 
         为什么记了 Token 还要记密码：Token 会**没**——换了 Windows 账号、数据目录被清、
-        文件损坏。那几种情况下人没变、授权也没变，却要重打一遍密码。勾了「记住登录状态」
-        的人要的就是别再打（用户 2026-08-15）。
+        文件损坏、自己点了退出登录。那几种情况下人没变、授权也没变，却要重打一遍密码。
+        勾了「记住登录状态」的人要的就是别再打（用户 2026-08-15、2026-08-16）。
         ★ 但**被撤销**不算这种情况：`handle_revoked` 会把密码一起清掉，见下面。
         """
         return self.store.credentials()
+
+    @property
+    def autologin_allowed(self) -> bool:
+        """记住的账号准不准**自动**登一次。
+
+        自己点过退出登录就不准了（跨重启有效）——密码照样回填进框，但要他自己点「登录」。
+        「不用再打密码」和「别替我做登录这个决定」是两件事，这里把它们分开。
+        """
+        return self.store.auto_login_allowed()
 
     def login(self, email: str, password: str, *, replace_existing: bool = False,
               remember: bool = True) -> Identity:
@@ -202,20 +211,25 @@ class ClientAuth:
         return identity
 
     def logout(self) -> None:
-        """退出登录。**先把 Token 捏在手里，再清本机，最后告诉服务端。**
+        """退出登录。**先把 Token 捏在手里，再作废本机会话，最后告诉服务端。**
 
         三步的顺序都有理由：
 
         * Token 先存进局部变量——本机清干净之后还得拿它去调撤销接口。
-        * 本机**立刻**清。只要那份还在，登录页的「自动登录」就可能拿着记住的密码把人又
-          登回去（2026-08-16 真机上的「第一次点退出登录又弹回主界面」正是这么来的）。
-          登录页那边现在也有一道显式开关，两道都要：一道管意图，一道管状态。
+        * 本机**立刻**作废。Token 和会话必须当场没（`forget_session`），拖着的话登录页
+          的自动登录就可能把人又登回去（2026-08-16 真机上的「第一次点退出登录又弹回
+          主界面」正是这么来的）。
         * 撤销请求**一定要发**，而且发不出去也不能拦着人退出。漏发的后果是企业端一直
           显示这台机器在线，而它已经没有 Token 去纠正了——只能去企业端手工撤销那条会话。
+
+        ★ 作废的是**会话**，不是记住的账号：勾了「记住登录状态」的话，邮箱密码留在
+        DPAPI 那份密文里，下次登录页直接把密码回填进框（用户 2026-08-16）。别自己登回去
+        这件事由 `forget_session()` 落的 ``auto_login=False`` 管，跨重启有效。
+        被撤销走的是另一条路（`handle_revoked`），那条仍然全清。
         """
         token = self.token
         self._identity = None
-        self.store.clear()
+        self.store.forget_session()
         if token:
             try:
                 self.api.logout(token)

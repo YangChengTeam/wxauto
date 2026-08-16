@@ -70,7 +70,7 @@ class LoginPage(tk.Frame):
 
         self._build_panel()
         self._build_form()
-        self._maybe_autologin()
+        self._prefill()
 
     # ── 左：品牌面板 ─────────────────────────────────────────────
 
@@ -208,17 +208,35 @@ class LoginPage(tk.Frame):
 
     # ── 自动登录 ─────────────────────────────────────────────────
 
-    def _maybe_autologin(self) -> None:
-        """勾过「记住登录状态」的机器：把邮箱密码填回去并**直接登一次**。
+    def _prefill(self) -> None:
+        """把记住的邮箱和密码填回框里，然后决定要不要顺手登一次。
+
+        ★ **回填和自动登录是两件事**（用户 2026-08-16：「记住登录状态应该也记住密码，
+        把密码回填到密码框」）。原来只有自动登录那一条路会填密码，于是人自己点退出登录
+        之后回到登录页，密码框是空的——「记住登录状态」勾着，却还是要重打一遍。
+        现在：**记住了就一定填**；登不登由 `_maybe_autologin` 单独判断。
+        """
+        email, password = self._auth.remembered_login()
+        if email:
+            self._account.set(email)
+        if password:
+            self._password.set(password)
+            self._button.focus_set()  # 两个框都满了，光标该落在「登录」上
+        self._maybe_autologin(bool(email and password))
+
+    def _maybe_autologin(self, has_credentials: bool) -> None:
+        """勾过「记住登录状态」的机器：**直接登一次**。
 
         什么时候会走到这儿：Token 还在的话，`ClientAuth.restore()` 早就把人放进去了，
         压根不会建这个登录页。所以走到这儿意味着**Token 没了而人没变**——换了 Windows
         账号、数据目录被清、文件损坏、重装。那几种情况下让人再打一遍密码纯属白折腾。
 
-        ★ 走不到这儿的两种情况，都是故意的：
-        * **主动退出登录** → `store.clear()`，密码也没了，下次要自己输（他就是想下来）。
-        * **会话被撤销** → 同上（见 `auth.ClientAuth.handle_revoked`）。不这么做的话，
-          管理员刚把这台机器撤掉，它转头自己登回来了。
+        ★ 不自动登的三种情况，都是故意的：
+        * **刚点完退出登录**（`allow_autologin=False`）→ 见本方法末尾那段。
+        * **上次是人自己退的**（`auth.autologin_allowed` 为 False，跨重启有效）→ 密码
+          照样回填进框，但要他自己点一下「登录」。他就是想下来，别替他又上去。
+        * **会话被撤销** → `handle_revoked` 连密码一起清了（见 `auth.ClientAuth`），
+          这里连填都没得填。不这么做的话，管理员刚把这台机器撤掉，它转头自己登回来了。
 
         自动登录**失败就停在这一页**，把话摆出来、密码留在框里让人改——不重试：
         密码错了重试一百次也是错的，而账号有 5 次连续失败就锁 15 分钟的闸。
@@ -229,13 +247,12 @@ class LoginPage(tk.Frame):
         第一次点的时候密码还没被清掉，这一页刚出来就自动又登回去了；第二次点时存储已经空了，
         才显得「正常」。**靠「存储恰好被清空了」来阻止自动登录，本质上是在赌线程时序。**
         """
-        if not self._allow_autologin:
+        if not (self._allow_autologin and has_credentials):
             return
-        email, password = self._auth.remembered_login()
-        if not (email and password):
+        if not self._auth.autologin_allowed:
+            # 上次是人自己点的退出登录。密码已经填好了，等他点「登录」——
+            # 「不用再打密码」和「替他做登录这个决定」是两回事。
             return
-        self._account.set(email)
-        self._password.set(password)
         self._pill_text.configure(text="正在用记住的账号登录…")
         # 等界面先画出来：自动登录要发网络请求，人总得先看见这一页在做什么。
         # 走 `submit()` 而不是直接 `_start`：地址校验、去空格、防重复点击那几条，

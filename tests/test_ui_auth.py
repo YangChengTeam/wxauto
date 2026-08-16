@@ -399,13 +399,53 @@ class ClientAuthTests(unittest.TestCase):
 
         self.assertEqual(self.store.credentials(), ("", ""))
 
-    def test_logging_out_forgets_the_password(self) -> None:
-        """人自己点了退出——他就是想下来，别替他记着怎么再上去。"""
+    def test_logging_out_keeps_the_password_but_not_the_session(self) -> None:
+        """★ 2026-08-16 反转过一次：退出登录**不再清密码**（用户「记住登录状态应该也
+        记住密码，把密码回填到密码框」）。
+
+        原来的规矩是「人自己点了退出，就别替他记着怎么再上去」。现在分成两件：
+        **凭据留着**（下次登录页把密码填好），**会话作废**（Token 当场没）。
+        「别替他做登录这个决定」交给 `auto_login=False`，见下一条。
+        """
         self.auth.login("hr@example.com", "pw-secret")
 
         self.auth.logout()
 
-        self.assertEqual(TokenStore(self.dir, MemoryProtector()).credentials(), ("", ""))
+        fresh = TokenStore(self.dir, MemoryProtector())
+        self.assertEqual(fresh.credentials(), ("hr@example.com", "pw-secret"),
+                         "密码要留着回填")
+        self.assertIsNone(fresh.load(), "★ 但会话必须作废：Token 不能还能用")
+
+    def test_logging_out_switches_autologin_off_for_good(self) -> None:
+        """★ 那个标记必须**跨重启**活着。
+
+        少了它，「退出登录」就只在本次运行里成立：客户端一重开，`restore()` 拿不到
+        Token → 建登录页 → 拿着留下来的密码自动登回去。人点那一下就白点了。
+        """
+        self.auth.login("hr@example.com", "pw-secret")
+        self.assertTrue(self.auth.autologin_allowed, "前提：刚登进来是准的")
+
+        self.auth.logout()
+
+        self.assertFalse(TokenStore(self.dir, MemoryProtector()).auto_login_allowed(),
+                         "★ 重开客户端读到的也得是「不准自动登」")
+
+    def test_logging_in_again_turns_autologin_back_on(self) -> None:
+        """人亲手登了一次，闸就该重新打开——否则「退出登录」一次，自动登录永久残废。"""
+        self.auth.login("hr@example.com", "pw-secret")
+        self.auth.logout()
+
+        self.auth.login("hr@example.com", "pw-secret")
+
+        self.assertTrue(TokenStore(self.dir, MemoryProtector()).auto_login_allowed())
+
+    def test_logging_out_without_a_remembered_password_leaves_no_file(self) -> None:
+        """没勾过「记住登录状态」：退出之后不该留下一份只剩邮箱的残文件。"""
+        self.auth.login("hr@example.com", "pw-secret", remember=False)
+
+        self.auth.logout()
+
+        self.assertFalse((self.dir / "client-session.json").exists())
 
     def test_a_revoked_session_forgets_the_password_as_well(self) -> None:
         """★ 撤销的理由可能是管理员手工撤、账号停用、别的设备顶掉了这台。
