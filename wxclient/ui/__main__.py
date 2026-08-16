@@ -322,6 +322,10 @@ def main(argv: list[str] | None = None) -> int:
         # 但去重记录要清：新会话那边什么都不知道，微信状态得重新说一遍。
         reporter.session_changed()
         _log.info("已登录", user=identity.title, agent=identity.agent_id)
+        # ★ 托盘**到这一刻才露面**（用户 2026-08-16：「登录之后才启动托盘，Loading 中
+        # 不好出现这个」）。启动动画还在转、人还停在登录页时，那个图标什么都代表不了：
+        # 服务没起，菜单里三项有两项点了没用。
+        tray.start()
         start_service()
 
     def on_logout() -> None:
@@ -335,6 +339,9 @@ def main(argv: list[str] | None = None) -> int:
         reporter.shutdown("user_logout")
         auth_client.logout()
         reporter.session_changed()
+        # 退回登录页 = 回到「托盘不该在」的那个状态。再登进来时 `on_authenticated`
+        # 会重新起一个（`Tray.start` 会重建 Icon，停过的那个 run 不起来）。
+        tray.stop()
 
     def logout_requested() -> None:
         """托盘点了「退出登录」。真正的动作（停服务 + 回登录页）在窗口那边，
@@ -392,9 +399,6 @@ def main(argv: list[str] | None = None) -> int:
 
     service.set_state_listener(on_state_change)
 
-    splash.stage("正在启动托盘…")
-    tray.run_detached()
-
     autostart = settings.autostart and not args.no_autostart
 
     # 上次登录过就直接接上（Token 不过期，契约 §2.2）——每天重开都要重登一遍是白折腾。
@@ -405,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
     if restored is not None:
         window.finish_login(restored)
         reporter.client_online("client_start")
+        # 上次登录还算数 = 已经是登录态，托盘照样该在（和 `on_authenticated` 同一条理由）。
+        tray.start()
         root.after(0, start_service)
     else:
         window.require_login(auth_client, version=__version__,
