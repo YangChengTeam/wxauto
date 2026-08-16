@@ -14,3 +14,8 @@ from __future__ import annotations
 #: 业务后端的正式地址。给了默认值，装机的人就不用抄一串域名——抄错的表现是
 #: 「登录一直转圈」，而人根本不知道该怀疑哪里。改这里要连 README 一起改。
 DEFAULT_BUSINESS_API_URL = "https://api.laoxiaozhi.cn"
+
+#: 劳小智 AI 服务的 WS 门。同样给默认值：2026-08-16 装完安装包第一次登录，网关当场
+#: 报「WXCLIENT_GATEWAY_AI_WS_URL 必填」——干净的机器上没有 gateway.env，而这一项
+#: 以前只在开发机手抄的那份文件里有。**装完就该能用**，不该要人先去配置中心抄地址。
+DEFAULT_AI_WS_URL = "wss://worker.laoxiaozhi.cn/agent-ws/v1/ws"

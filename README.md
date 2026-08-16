@@ -142,13 +142,21 @@ pyinstaller --noconfirm packaging\lxz-wechat-gateway.spec
 好几秒（杀软扫这个解压过程尤其慢）。要「一个文件发给客户」就打安装包或压缩包，别让
 用户天天付解压的钱。
 
-包大小 **61.8 MB / 1702 个文件**，双击到窗口出来 **4.5 秒**（2026-08-14 真机实测；
-2026-08-13 那版是 125.8 MB / 1835 个文件 / 12.3 秒）。砍的都是「一处都没 import」的整块：
+包大小约 **68 MB**，双击到窗口出来 **4.5 秒**（2026-08-14 真机实测那版是 61.8 MB /
+1702 文件；2026-08-13 那版是 125.8 MB / 12.3 秒）。砍的都是「一处都没 import」的整块：
 OpenCV 138MB（`pyautogui → pyscreeze` 拖进来，只有模糊图像匹配 `confidence=` 才用得上，
 本仓找元素走 UIA 控件树）、numpy+openblas 28MB、cryptography 9.2MB、PIL 的 AVIF 编解码器
-7.8MB、Pythonwin 6.7MB、aioquic 全家 4.6MB，逐条理由写在 spec 的 `excludes` 里。
+7.8MB、aioquic 全家 4.6MB，逐条理由写在 spec 的 `excludes` 里。
 **要做图像匹配就得先把 `cv2` 那行删掉；要做语音消息就得先把 `numpy/soundfile/sounddevice`
 那行删掉**（对应地，`third_party/pywechat` 里那两处音频 import 已改成用到时再 import）。
+
+⚠️ **`excludes` 的依据不能是「grep 不到有人 import」。** 那只看得见我们自己的 import，
+看不见依赖自己的。2026-08-16 就为这个赔了一轮：`win32ui`（6.7MB）被按这个理由砍掉，
+可 **pywinauto 要用它**，于是打包版里 `from pywinauto import Desktop` 直接
+ModuleNotFoundError——**UIA 探测一次都没成功过**，而源码跑一切正常。同一天还撞到
+`logger/logging.conf` 这个数据文件没被收进去（PyInstaller 只收 .py）。两次的表现一模一样：
+微信明明开着，界面说找不到微信。**加名字前必须打包、安装、真跑一遍**——`build.py`
+现在会自动跑打出来的 exe 的 `--self-check`（真 import 重活 + 真探一次微信），不过不出包。
 
 启动动画分两段接力：PyInstaller 的 `Splash` 先顶一张静态首屏（双击到 Python 起来那 1~2 秒
 tkinter 还不存在），Python 一起来由 `wxclient/ui/splash.py` 那个会动的接手并把它关掉。

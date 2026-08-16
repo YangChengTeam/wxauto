@@ -10,9 +10,21 @@
 #
 # 图标一份管到底：exe、桌面快捷方式、任务栏、右下角托盘都用 wxclient/ui/assets/app.ico。
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 hiddenimports = collect_submodules("pystray") + collect_submodules("comtypes")
+
+# ★ site-packages 里那个叫 `logger` 的顶层包**必须连它的 logging.conf 一起打**。
+#
+# 2026-08-16 装完安装包实测：微信明明开着三个进程，界面却一直说找不到微信。日志里是
+#   FileNotFoundError: ...\_internal\logger\logging.conf doesn't exist
+# 它是 pywinauto 那条 import 链上的东西，`logger/__init__.py` 在**被 import 的那一刻**就
+# `logging.config.fileConfig(os.path.join(os.path.dirname(__file__), 'logging.conf'))`。
+# PyInstaller 只收 .py，不收这个 .conf——于是冻结包里 `from pywinauto import Desktop`
+# 直接抛异常，**整个 UIA 探测在打包版里一次都没成功过**，而源码跑起来一切正常。
+#
+# 这类 bug 只有装完真机跑才看得见：单测、源码启动、甚至 onedir 目录里双击都可能碰不到。
+DATA_ONLY_PACKAGES = ("logger",)
 
 # 用不上的大件别装箱。这些要么是别的库顺手拖进来的可选依赖，要么是开发期才用的东西：
 # 装进包里只会让体积变大、扫毒变慢，运行时一行都不会执行。
@@ -48,9 +60,13 @@ excludes = [
     "cryptography",
     # HTTP/3 全家桶：httpx 用的是 h11/httpcore 那条路，aioquic 没人 import。
     "aioquic", "pylsqpack",
-    # Pythonwin（win32ui.pyd + mfc140u.dll 共 6.7MB）：pywin32 的 GUI 部分，我们只用
-    # win32api/win32gui/win32clipboard 那几个模块。
-    "Pythonwin", "win32ui", "win32uiole",
+    # ★ 这里**曾经**砍掉 Pythonwin / win32ui / win32uiole（6.7MB），理由是「本仓只用
+    #   win32api/win32gui/win32clipboard」。2026-08-16 装完真机跑才发现砍错了：
+    #   **pywinauto 自己要 win32ui**，冻结包里 `from pywinauto import Desktop` 直接
+    #   ModuleNotFoundError，整个 UIA 探测一次都成功不了——而源码跑一切正常。
+    #   教训写在这儿：excludes 的依据不能是「grep 不到有人 import」，那只看得见**我们**的
+    #   import，看不见依赖自己的。加名字前必须打一个包、装上、真跑一遍（`build.py`
+    #   现在会自动做这件事，见它的自检那一步）。
     # 打包机 env 里装着、被顺手收进来的：类型检查器、另一套 HTTP 栈、.NET 桥、
     # httpx 的可选压缩后端（缺了它只是不宣告 br/zstd，功能不受影响）。
     "mypy", "aiohttp", "pythonnet", "clr", "zstandard", "brotli", "bcrypt",
@@ -69,7 +85,10 @@ a = Analysis(
     # ★ 整个 assets 目录一起打，**不要逐个文件列**：漏掉一个的表现是「打出来的包少一张图」，
     # 而代码对缺图都是优雅降级（背景变纯色、图标退回圆点），没人会看见报错——正是最难发现的
     # 那类回归。（`tests/test_ui.py::PackagingTests` 会盯着这条。）
-    datas=[("../wxclient/ui/assets", "wxclient/ui/assets")],
+    datas=[
+        ("../wxclient/ui/assets", "wxclient/ui/assets"),
+        *[item for pkg in DATA_ONLY_PACKAGES for item in collect_data_files(pkg)],
+    ],
     hiddenimports=hiddenimports,
     excludes=excludes,
     noarchive=False,

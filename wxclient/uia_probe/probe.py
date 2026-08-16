@@ -3,8 +3,24 @@ from __future__ import annotations
 import platform
 from typing import Any
 
+import structlog
+
 from .constants import MIN_UIA_EXPOSED_DESCENDANTS, UIA_LOGIN_CLASSES, UIA_MAIN_CLASSES
 from .windows import find_wechat_windows
+
+_log = structlog.get_logger(__name__)
+
+#: 状态格放得下多少字。它和「已连接 · 欠 N 批」那几行并排，长了会把整栏撑歪。
+#: ★ 所有 `reason` 都**照这个长度写**，而不是写长了再截——
+#: 2026-08-16 真机上界面那格显示的是「UIA 探测失败：Z:\」：异常原文是一条路径，
+#: 被截到 12 个字符就只剩一个盘符。对人零信息，还把安装路径漏了出去。
+STATUS_CELL_BUDGET = 12
+
+#: 探测炸了时给人看的那一句。**不许把异常原文摆上去**：它可能是一条路径、一个 COM
+#: HRESULT、一段英文堆栈，三种都不是坐在这台电脑前的人能拿来做点什么的东西。
+#: 怎么恢复由上报层那份失败码表告诉企业端（契约 §8 的 `failure.message`），
+#: 真正的原因（异常类型 + 原文）进日志——那儿才是排障该去的地方。
+PROBE_BROKEN_REASON = "微信读取异常"
 
 
 def probe_wechat_uia(max_depth: int = 10, max_nodes: int = 5000) -> dict[str, Any]:
@@ -21,12 +37,18 @@ def probe_wechat_uia(max_depth: int = 10, max_nodes: int = 5000) -> dict[str, An
     try:
         windows = find_wechat_windows(max_depth=max_depth, max_nodes=max_nodes)
     except Exception as exc:
+        # 异常原文进日志、不进界面：它可能是一条路径、一个 COM HRESULT、一段英文堆栈，
+        # 三种都不是坐在这台电脑前的人能拿来做点什么的东西。
+        _log.warning("微信 UIA 探测异常", error_type=type(exc).__name__,
+                     error=str(exc)[:300])
         return {
             "platform": "Windows",
             "logged_in": False,
             "login_window": False,
             "uia_exposed": False,
-            "reason": f"UIA 探测失败：{exc}",
+            "reason": PROBE_BROKEN_REASON,
+            # 给上报层和诊断用；**界面不读这个键**。
+            "error_detail": f"{type(exc).__name__}: {exc}"[:300],
         }
 
     classified_windows = [_classify_wechat_window(window) for window in windows]

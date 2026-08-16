@@ -1026,9 +1026,15 @@ class MainWindow:
             elif probe.get("login_window"):
                 status = ("待扫码", theme.ORANGE)
             else:
-                status = (str(probe.get("reason") or "未登录")[:12], theme.GRAY)
+                # 不截断：`reason` 那几句是**照这格的宽度写**的（见
+                # `uia_probe.probe.STATUS_CELL_BUDGET`）。截断出来的半句话比不显示更糟
+                # ——「UIA 探测失败：Z:\」就是这么来的。
+                status = (str(probe.get("reason") or "未登录"), theme.GRAY)
         except Exception as exc:  # noqa: BLE001 - 探测失败只影响这一格显示
-            status = (f"探测失败：{type(exc).__name__}"[:16], theme.GRAY)
+            # 连 probe 都没进去（import 就炸了）：这里同样不摆异常原文，只说状态。
+            _log.warning("微信探测线程异常", error_type=type(exc).__name__,
+                         error=str(exc)[:300])
+            status = ("微信读取异常", theme.GRAY)
             self._report_probe(None, exc)
         finally:
             self._probe_lock.release()

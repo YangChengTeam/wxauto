@@ -775,6 +775,132 @@ class PackagingTests(unittest.TestCase):
                 self.assertNotIn(f'assets/{asset.name}", "wxclient/ui/assets"', spec,
                                  f"{asset.name} 不该再单独列进 datas，目录已经覆盖了")
 
+    def test_the_logger_config_file_gets_bundled(self) -> None:
+        """★ pywinauto 那条链上的 `logger` 包要连它的 logging.conf 一起打。
+
+        2026-08-16 装完安装包实测：微信开着三个进程，界面却一直说找不到微信。真因是
+        `logger/__init__.py` 一被 import 就去读同目录的 `logging.conf`，而 PyInstaller
+        只收 .py 不收 .conf——冻结包里 `from pywinauto import Desktop` 直接抛
+        FileNotFoundError，**整个 UIA 探测在打包版里一次都没成功过**，源码跑却一切正常。
+
+        只有「装完在真机上跑」才暴露得出来，所以把它钉在这儿。
+        """
+        spec = self.SPEC.read_text(encoding="utf-8")
+        self.assertIn("collect_data_files", spec)
+        self.assertIn('DATA_ONLY_PACKAGES = ("logger",)', spec)
+
+    def test_win32ui_is_not_excluded(self) -> None:
+        """★ 别再把 `win32ui` 砍掉——**pywinauto 自己要用它**。
+
+        2026-08-16 装完真机跑才发现：excludes 里砍它的依据是「本仓 grep 不到有人 import」，
+        可那只看得见我们的 import，看不见依赖自己的。冻结包里的表现是
+        `from pywinauto import Desktop` → ModuleNotFoundError，UIA 探测一次都成功不了。
+        """
+        spec = self.SPEC.read_text(encoding="utf-8")
+        excludes = spec.split("excludes = [", 1)[1].split("]", 1)[0]
+        for name in ('"win32ui"', '"Pythonwin"', '"win32uiole"'):
+            self.assertNotIn(name, excludes, f"{name} 砍不得：pywinauto 要用")
+
+    def test_the_build_verifies_the_package_it_just_made(self) -> None:
+        """★ 打完包必须真跑一次 `--self-check`。
+
+        缺模块、缺数据文件这一类，源码跑和单测都抓不到——只有装到别人机器上真去驱动
+        微信那一刻才炸。一天之内撞了两次（logger/logging.conf、win32ui）之后加的这道闸。
+        """
+        build = (Path(__file__).resolve().parent.parent
+                 / "packaging/build.py").read_text(encoding="utf-8")
+        self.assertIn("--self-check", build)
+        self.assertIn("def self_check(exe: Path)", build)
+
+        from wxclient.ui.__main__ import build_parser
+
+        args = build_parser().parse_args(["--self-check", "report.txt"])
+        self.assertEqual(args.self_check, "report.txt")
+
+
+class SettingsDefaultsTests(unittest.TestCase):
+    """★ 配置中心不许出现空格子。
+
+    2026-08-16 装完安装包第一次打开就是这个：干净机器上没有 gateway.env，于是「连接配置 /
+    调度配置 / 启动设置」全空着，第一次登录直接「网关启动失败：AI_WS_URL 必填」。而这些
+    参数**运行时本来就有默认值**，只是界面不知道——人看到的是「什么都没配」，实际是
+    「配好了只是没显示」。
+    """
+
+    def test_every_field_has_a_default(self) -> None:
+        for field in settings_store.FIELDS:
+            self.assertNotEqual(field.default, "", f"{field.key} 没有默认值，界面上会是空的")
+
+    def test_defaults_match_the_settings_that_actually_run(self) -> None:
+        """★ 界面上写的默认值必须和真正生效的那份一致。
+
+        两处各写一份，对不上的后果特别阴：界面显示 60 秒，实际按 300 秒跑，
+        而两边都「没配置错」。这里去比对 `GatewaySettings` / `UiSettings` 本尊。
+        """
+        from wxclient.gateway.config import GatewaySettings
+        from wxclient.ui.config import UiSettings
+
+        gateway = GatewaySettings()
+        ui = UiSettings()
+        expected = {
+            "WXCLIENT_GATEWAY_BUSINESS_API_URL": gateway.business_api_url,
+            "WXCLIENT_GATEWAY_AI_WS_URL": gateway.ai_ws_url,
+            "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": int(gateway.poll_interval_seconds),
+            "WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS":
+                int(gateway.friend_check_interval_seconds),
+            "WXCLIENT_GATEWAY_ACTIVE_HOURS": gateway.active_hours,
+            "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": gateway.max_sends_per_hour,
+            "WXCLIENT_UI_AUTOSTART": ui.autostart,
+            "WXCLIENT_UI_START_HIDDEN": ui.start_hidden,
+        }
+        for field in settings_store.FIELDS:
+            want = expected[field.key]
+            if field.kind == "bool":
+                self.assertEqual(settings_store.as_bool(field.default), want, field.key)
+            else:
+                self.assertEqual(field.default, str(want), field.key)
+
+    def test_a_clean_machine_shows_every_value(self) -> None:
+        """全新装的机器（没有 gateway.env、没有环境变量）也要每一项都有值。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            values = settings_store.effective(Path(tmp), {})
+
+        for field in settings_store.FIELDS:
+            self.assertTrue(values.get(field.key), f"{field.key} 在干净机器上是空的")
+
+    def test_the_gateway_starts_on_a_clean_machine(self) -> None:
+        """★ 装完就能用：干净机器上 `validate_for_start` 不该拦下来。"""
+        from wxclient.gateway.config import GatewaySettings
+
+        GatewaySettings().validate_for_start()
+
+
+class ProbeReasonTests(unittest.TestCase):
+    """★ 探测失败时界面上摆的是人话，不是异常原文。
+
+    2026-08-16 真机上那格显示的是「UIA 探测失败：Z:\\」——异常原文是一条路径，
+    被状态格截到 12 个字符就只剩一个盘符。对人零信息，还把安装路径漏了出去。
+    """
+
+    def test_the_broken_reason_fits_the_status_cell(self) -> None:
+        from wxclient.uia_probe.probe import PROBE_BROKEN_REASON, STATUS_CELL_BUDGET
+
+        self.assertLessEqual(len(PROBE_BROKEN_REASON), STATUS_CELL_BUDGET,
+                             "写长了会被截成半句话——照这个宽度写，别指望截断")
+
+    def test_the_reason_is_not_the_exception_text(self) -> None:
+        from wxclient.uia_probe import probe as probe_mod
+
+        source = Path(probe_mod.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('f"UIA 探测失败：{exc}"', source,
+                         "异常原文只进日志和 error_detail，不进 reason")
+
+    def test_the_window_does_not_truncate_the_reason(self) -> None:
+        source = (Path(__file__).resolve().parent.parent
+                  / "wxclient/ui/window.py").read_text(encoding="utf-8")
+        self.assertNotIn('probe.get("reason") or "未登录")[:12]', source,
+                         "别再截断了：截出来的半句话比不显示更糟")
+
 
 class InstallerTests(unittest.TestCase):
     """安装包的硬约束。这几条在没装 Inno Setup 的机器上也守得住——判的是 iss 文本。"""

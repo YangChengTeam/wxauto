@@ -14,7 +14,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..endpoints import DEFAULT_BUSINESS_API_URL
+from ..endpoints import DEFAULT_AI_WS_URL, DEFAULT_BUSINESS_API_URL
 
 FILE_NAME = "gateway.env"
 
@@ -68,23 +68,34 @@ SECTIONS: tuple[Section, ...] = (
 #: 这些键手工写进 gateway.env 依然生效（``render_env_text`` 会原样保留、``apply_to_environ``
 #: 会照灌），只是不再摆在人人都会点的界面上。
 
+#: ★ 每一项都必须有 `default`——**界面上不许出现空格子**。
+#:
+#: 2026-08-16 装完安装包第一次打开就是这个问题：干净机器上没有 gateway.env，于是
+#: 「连接配置 / 调度配置 / 启动设置」全是空的，网关当场报「AI_WS_URL 必填」。而这些
+#: 参数**运行时明明有默认值**（在 `GatewaySettings` / `UiSettings` 里），只是界面不知道，
+#: 于是人看到的是「什么都没配」，实际上是「配好了只是没显示」——最坏的一种不一致。
+#:
+#: 值抄自那两个 Settings 类，但**不在这里 import 它们**：那会把 pydantic 拉进桌面端
+#: 启动最早的几秒（启动慢的老问题，见 `ui/__main__.py` 顶上的说明）。
+#: 抄漏了由 `tests/test_ui.py::SettingsDefaultsTests` 当场判死——它会去比对两边。
 FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_BUSINESS_API_URL", "业务端地址",
           "登录和换票都用它，默认已填好正式地址",
           default=DEFAULT_BUSINESS_API_URL),
-    Field("WXCLIENT_GATEWAY_AI_WS_URL", "AI 端地址", "wss://<ai-host>/v1/ws"),
+    Field("WXCLIENT_GATEWAY_AI_WS_URL", "AI 端地址", "默认已填好正式地址",
+          default=DEFAULT_AI_WS_URL),
     Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔",
-          "多久看一次未读，下限 30 秒", section="sched", unit="秒"),
+          "多久看一次未读，下限 30 秒", section="sched", unit="秒", default="60"),
     Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔",
-          "单独的节拍，0=不查", section="sched", unit="秒"),
+          "单独的节拍，0=不查", section="sched", unit="秒", default="900"),
     Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "如 09:00-21:00，窗外不动微信",
-          section="sched"),
+          section="sched", default="09:00-21:00"),
     Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "每小时发送上限", "防止消息风控",
-          section="sched"),
+          section="sched", default="30"),
     Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动自动运行服务",
-          kind="bool", section="boot"),
+          kind="bool", section="boot", default="1"),
     Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", "启动后最小化到系统托盘",
-          kind="bool", section="boot"),
+          kind="bool", section="boot", default="1"),
 )
 
 

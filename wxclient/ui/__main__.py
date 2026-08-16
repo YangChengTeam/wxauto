@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from wxclient import __version__
@@ -88,11 +89,54 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gateway-db", help="网关状态库路径")
     parser.add_argument("--no-autostart", action="store_true", help="开窗后不自动启动服务")
     parser.add_argument("--show", action="store_true", help="启动时直接显示日志窗口")
+    parser.add_argument("--self-check", metavar="报告文件",
+                        help="不开窗，只把重活 import 一遍并跑一次微信探测，结果写进这个文件；"
+                             "打包后用它验包（见 packaging/build.py）")
     return parser
+
+
+def self_check(report_path: str) -> int:
+    """不开窗，把冻结包最容易缺东西的那条路真跑一遍。**打包后必跑。**
+
+    为什么非要有这么个东西：包缺一个模块或一个数据文件，源码跑、单测跑、甚至在打包机上
+    双击 onedir 里的 exe 都可能不报错——只有装到别人机器上、真去驱动微信那一刻才炸。
+    2026-08-16 一天之内撞了两次：`logger/logging.conf` 没被收进去、`win32ui` 被 excludes
+    砍掉了，两次的表现都是「微信明明开着，界面说找不到微信」。
+
+    所以这里跑的就是那条最脆的链：import 重活 → 真调一次 `probe_wechat_uia()`。
+    **探测结果是什么无所谓**（打包机上可能压根没开微信），只要它别抛异常、
+    别返回「探测炸了」那种 reason 就算过。
+    """
+    lines: list[str] = []
+    ok = True
+    try:
+        from wxclient.uia_probe import probe_wechat_uia
+        from wxclient.uia_probe.probe import PROBE_BROKEN_REASON
+
+        probe = probe_wechat_uia()
+        reason = str(probe.get("reason") or "")
+        lines.append(f"probe_reason={reason}")
+        lines.append(f"logged_in={probe.get('logged_in')}")
+        detail = probe.get("error_detail")
+        if detail:
+            lines.append(f"error_detail={detail}")
+        if reason == PROBE_BROKEN_REASON:
+            ok = False
+            lines.append("FAIL 探测抛异常了——包里缺东西（看上面的 error_detail）")
+    except Exception as exc:  # noqa: BLE001 - 自检本来就是来抓这个的
+        ok = False
+        lines.append(f"FAIL {type(exc).__name__}: {exc}")
+
+    lines.append("OK" if ok else "NOT OK")
+    Path(report_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return 0 if ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.self_check:
+        # 自检要在**开窗之前**：它不需要界面，而且冻结包里 tk 起不来的话反而遮住真因。
+        return self_check(args.self_check)
 
     # ── 第一件事：把启动动画画出来 ────────────────────────────────
     # 下面那一堆 import 要花几秒（冷启动更久），在它们回来之前屏幕上必须已经有东西。

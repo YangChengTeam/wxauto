@@ -9,7 +9,7 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from ..endpoints import DEFAULT_BUSINESS_API_URL
+from ..endpoints import DEFAULT_AI_WS_URL, DEFAULT_BUSINESS_API_URL
 
 
 class GatewaySettings(BaseSettings):
@@ -18,8 +18,12 @@ class GatewaySettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="WXCLIENT_GATEWAY_", extra="ignore")
 
     # ── 对端地址 ──
-    ai_ws_url: str = ""
-    """劳小智 AI 服务的 WS 门，如 ``wss://host/v1/ws``。"""
+    ai_ws_url: str = DEFAULT_AI_WS_URL
+    """劳小智 AI 服务的 WS 门，如 ``wss://host/v1/ws``。
+
+    ★ 和 ``business_api_url`` 一样带默认值：干净机器上装完就能用。没有默认值那一版，
+    装完第一次登录直接是「网关启动失败：WXCLIENT_GATEWAY_AI_WS_URL 必填」。
+    """
 
     business_api_url: str = DEFAULT_BUSINESS_API_URL
     """业务后端基址。登录（`ui/client_api.py`）和换票（`ticket.py`）都用它。
