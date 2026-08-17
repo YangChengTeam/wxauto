@@ -24,7 +24,7 @@ import structlog
 
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 
-from . import logline, theme, widgets
+from . import dialog, logline, theme, widgets
 from .logbuffer import LogBuffer
 from .logfeed import FLUSH_MS, LogFeed, is_log_on_screen
 from .logtable import LEVEL_FILTERS, LogTable
@@ -186,6 +186,8 @@ class MainWindow:
         self._debug_page: Any = None   # 调试会话（`debug_page.py`），进那一页才建
         self._debug_actions: Any = None  # 它在标题栏右边那一组（● AI 已连接 · 新会话）
         self._watch_card: Any = None  # 监听名单那张卡片，跟着配置中心一起建
+        #: 正在请 AI 端移出的会话名 → 那次请求的 Future（tk 线程读，别在别处改）。
+        self._watch_removing: dict[str, Any] = {}
         self._locked = False  # 转场态：由 _sync_transition_lock() 每拍现场核对，别手动改
         self._last_tick: float | None = None  # 卡顿看门狗的上一拍时刻
         self._ticks = 0  # 心跳计数：头两拍不报卡顿，理由见 _watch_for_stalls
@@ -519,6 +521,48 @@ class MainWindow:
             fg=theme.ORANGE,
         )
 
+    def _ask_remove_watched(self, name: str) -> None:
+        """「移出」：先问一句，再请 AI 端删。
+
+        ★ 问的这一句要说清后果和归属：删掉之后**他再来消息不会被自动回复**；名单的权威
+        在 AI 端，所以这里是「请 AI 端删」，删完新名单推回来、这一行才会消失——
+        不在本机先把行删掉装成功（那样下一次推送又会把它带回来，看起来像「删不掉」）。
+        """
+        if name in self._watch_removing:
+            return  # 上一次还没有回话，别排第二条
+        if not dialog.ask(
+            self, "移出监听名单",
+            f"移出「{name}」之后，他再发消息就不会被自动回复了。\n\n"
+            "名单由 AI 端保管，这里会请 AI 端删掉；删完新名单会自动同步回这台电脑。",
+            confirm="移出", cancel="取消",
+        ):
+            return
+        try:
+            future = self.service.remove_watched(name)
+        except Exception as exc:  # noqa: BLE001 - 服务没起/连不上都要说人话
+            dialog.tell(self, "没能移出", str(exc), tone="error")
+            return
+        self._watch_removing[name] = future
+        self._watch_shown = None  # 逼下一拍重画，让这一行显示「正在移出…」
+
+    def _poll_watch_removals(self) -> None:
+        """看看那几条「移出」有没有回话。**跑在 tk 线程的心跳里**——后台只放值，这里只读值。"""
+        for name, future in list(self._watch_removing.items()):
+            if not future.done():
+                continue
+            del self._watch_removing[name]
+            self._watch_shown = None
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001 - 超时/断线照原样说出来
+                dialog.tell(self, "没能移出", f"{name}：{exc}", tone="error")
+                continue
+            removed = list(result.get("removed") or []) if isinstance(result, dict) else []
+            if not removed:
+                # AI 端说它本来就不在名单上。**别当成删成功**——那会让人以为改过了。
+                dialog.tell(self, "没有变化",
+                            f"AI 端说「{name}」本来就不在自动回复名单里。")
+
     def _render_watch_page(self) -> None:
         """把名单铺到页面上。停在配置中心时每秒刷一次——名单是 AI 端随时会改的。"""
         if self._page != "settings" or self._watch_card is None:
@@ -570,6 +614,22 @@ class MainWindow:
                  fg=theme.TEXT).pack(side=tk.LEFT)
         tk.Label(row, text="微信会话", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
                  fg=theme.TEXT_MUTED).pack(side=tk.LEFT, padx=(14, 0))
+
+        if name in self._watch_removing:
+            # 请求还在路上。**不提前把这一行抹掉**——AI 端还没说删掉了，抹了就是假装。
+            tk.Label(row, text="正在移出…", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                     fg=theme.ORANGE).pack(side=tk.RIGHT, padx=(0, 16))
+            return
+
+        # ★「移出」放在最右：名单是白名单，删掉 = 从此不再自动回他，是有后果的动作，
+        # 所以点了先问一句（`_ask_remove_watched`），而且**删在 AI 端**——本机删只能撑到
+        # 下一次推送（名单推一次覆盖一次），删了立刻又回来，那是假的删除。
+        remove = tk.Label(row, text="移出", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                          fg=theme.TEXT_MUTED, cursor="hand2")
+        remove.pack(side=tk.RIGHT, padx=(0, 16))
+        remove.bind("<Button-1>", lambda _e, n=name: self._ask_remove_watched(n))
+        remove.bind("<Enter>", lambda _e, w=remove: w.configure(fg=theme.RED))
+        remove.bind("<Leave>", lambda _e, w=remove: w.configure(fg=theme.TEXT_MUTED))
 
         tk.Label(row, text="监听中", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
                  fg=theme.TEXT_MUTED).pack(side=tk.RIGHT, padx=(0, 16))
@@ -1109,6 +1169,7 @@ class MainWindow:
             self._rows["watch"].configure(text="名单是空的", fg=theme.ORANGE)
         else:
             self._rows["watch"].configure(text=f"{len(watched)} 个会话", fg=theme.GREEN)
+        self._poll_watch_removals()
         self._render_watch_page()  # 停在配置中心时跟着刷；不在那页是个空操作
 
         self._live_dot.configure(fg=theme.GREEN if state is ServiceState.RUNNING else theme.GRAY)

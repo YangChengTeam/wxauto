@@ -517,6 +517,17 @@ class GatewayRunner:
         client = await self._pool.acquire(self._accounts[0])
         await client.interrupt(session_id)
 
+    async def remove_watched(self, name: str) -> dict[str, Any]:
+        """把一个会话移出自动回复名单（配置中心里点的那个删除）。
+
+        走常驻那条 WS，删在 AI 端；删完 AI 端会立刻把新名单推回来，本机名单跟着变
+        （`_on_push` → `Watchlist.apply_push`），界面不用自己去改那份列表。
+        """
+        if not self._accounts:
+            raise AgentWsError("这台机器上没有可用的微信账号")
+        client = await self._pool.acquire(self._accounts[0])
+        return await client.remove_watchlist([name])
+
     def set_command_listener(
         self, listener: Callable[[dict[str, Any]], None] | None
     ) -> None:

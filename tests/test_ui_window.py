@@ -60,7 +60,13 @@ if HAS_TK:
     from wxclient.logging_config import configure_logging
     from wxclient.ui import theme
     from wxclient.ui.logbuffer import LogBuffer, LogPipeline
-    from wxclient.ui.service import GatewayService, GatewayStatus, ServiceState
+    from wxclient.ui import window as window_module
+    from wxclient.ui.service import (
+        GatewayService,
+        GatewayStatus,
+        ServiceNotRunning,
+        ServiceState,
+    )
     from wxclient.ui.window import MainWindow
 
 if True:  # 这几样不碰 Tk，没有显示环境也 import 得动
@@ -1337,6 +1343,120 @@ class WatchSectionTests(unittest.TestCase):
         self.window._sync_watchlist()
 
         self.assertIn("还没接上", self.window._watch_hint.cget("text"))
+
+
+@unittest.skipUnless(HAS_TK, "没有 Tk")
+class WatchRemovalTests(unittest.TestCase):
+    """把会话移出监听名单（用户 2026-08-17：「监听名单可以进行删除，有确认框」）。
+
+    ★ 三条不许破：
+      ① **先问一句**——名单是白名单，删掉 = 从此不再自动回他；
+      ② **删在 AI 端**（069 权威在那儿）。本机把行抹掉是假的：名单推一次覆盖一次，
+         下一次推送又把他带回来，用户看到的是「删了又回来」；
+      ③ AI 端说「本来就不在名单里」时，**不许当成删成功**。
+    """
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.service = GatewayService(lambda: None)
+        self.window = MainWindow(self.root, LogBuffer(), self.service,
+                                 data_dir=self.dir, probe_wechat=False)
+        self.window._build_watch_section(self.root)
+        self.calls: list[str] = []
+        self.future: Any = _DoneFuture({"removed": ["候选人-王建国"], "watching": 0})
+        self.service.remove_watched = self._remove  # type: ignore[method-assign]
+        self.addCleanup(self._teardown)
+
+    def _remove(self, name: str):
+        self.calls.append(name)
+        return self.future
+
+    def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.window)
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+    def test_cancelling_the_confirm_changes_nothing(self) -> None:
+        with mock.patch.object(window_module.dialog, "ask", return_value=False) as ask:
+            self.window._ask_remove_watched("候选人-王建国")
+
+        ask.assert_called_once()
+        self.assertEqual(self.calls, [], "点了取消还去删，那这个框就是个摆设")
+        self.assertEqual(self.window._watch_removing, {})
+
+    def test_confirming_asks_the_ai_side_and_waits_for_it(self) -> None:
+        self.future = _PendingFuture()
+        with mock.patch.object(window_module.dialog, "ask", return_value=True):
+            self.window._ask_remove_watched("候选人-王建国")
+
+        self.assertEqual(self.calls, ["候选人-王建国"])
+        self.assertIn("候选人-王建国", self.window._watch_removing,
+                      "★ 还没回话就不算删掉了——这一行得停在「正在移出…」")
+
+    def test_a_no_op_removal_is_not_reported_as_success(self) -> None:
+        self.future = _DoneFuture({"removed": [], "watching": 3})
+        with mock.patch.object(window_module.dialog, "ask", return_value=True), \
+             mock.patch.object(window_module.dialog, "tell") as tell:
+            self.window._ask_remove_watched("查无此人")
+            self.window._poll_watch_removals()
+
+        tell.assert_called_once()
+        self.assertIn("本来就不在", tell.call_args.args[2])
+
+    def test_a_failure_is_told_as_a_failure(self) -> None:
+        self.future = _FailedFuture(RuntimeError("AI 端连不上"))
+        with mock.patch.object(window_module.dialog, "ask", return_value=True), \
+             mock.patch.object(window_module.dialog, "tell") as tell:
+            self.window._ask_remove_watched("候选人-王建国")
+            self.window._poll_watch_removals()
+
+        self.assertEqual(self.window._watch_removing, {}, "失败了也要把这一条收掉")
+        self.assertIn("AI 端连不上", tell.call_args.args[2])
+
+    def test_the_service_being_down_says_so_instead_of_throwing(self) -> None:
+        def boom(_name: str):
+            raise ServiceNotRunning("服务没在运行，名单改不了")
+
+        self.service.remove_watched = boom  # type: ignore[method-assign]
+        with mock.patch.object(window_module.dialog, "ask", return_value=True), \
+             mock.patch.object(window_module.dialog, "tell") as tell:
+            self.window._ask_remove_watched("候选人-王建国")
+
+        self.assertIn("名单改不了", tell.call_args.args[2])
+
+
+class _DoneFuture:
+    def __init__(self, value: Any) -> None:
+        self._value = value
+
+    def done(self) -> bool:
+        return True
+
+    def result(self) -> Any:
+        return self._value
+
+
+class _PendingFuture:
+    def done(self) -> bool:
+        return False
+
+    def result(self) -> Any:  # pragma: no cover - 不该被调到
+        raise AssertionError("还没完成")
+
+
+class _FailedFuture:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def done(self) -> bool:
+        return True
+
+    def result(self) -> Any:
+        raise self._exc
 
 
 @unittest.skipUnless(HAS_TK, "没有 Tk")

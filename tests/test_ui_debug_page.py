@@ -71,22 +71,37 @@ class DebugPageTests(unittest.TestCase):
         self.assertNotIn("微信助手", AI_NAME)
         self.assertIn(AI_NAME, PLACEHOLDER)
 
-        names = [child.cget("text") for child in _walk(self.page._list)
+        texts = [child.cget("text") for child in _walk(self.page._list)
                  if isinstance(child, tk.Label)]
-        self.assertIn(AI_NAME, names, "开场白那一行要署 AI 端的名字")
-        self.assertNotIn("微信助手", " ".join(names))
+        self.assertIn(AI_NAME, texts, "开场白那一行要署 AI 端的名字")
+        self.assertNotIn("微信助手", " ".join(texts))
+
+    def test_the_opening_has_no_try_this_line(self) -> None:
+        """★ 开场只留一句话——底下那行「试试：给张三…」用户砍了（2026-08-17）。"""
+        texts = " ".join(child.cget("text") for child in _walk(self.page._list)
+                         if isinstance(child, tk.Label))
+        self.assertNotIn("试试", texts)
+        self.assertNotIn("张三", texts)
 
     # ── 头像 ──────────────────────────────────────────────────────
 
-    def test_the_avatar_is_drawn_not_the_brand_icon(self) -> None:
-        """★ 头像走 `bot_avatar_photo`，**不许**再拿品牌图标缩小了当头像。"""
-        with mock.patch.object(debug_page_module.icons, "bot_avatar_photo") as bot, \
-             mock.patch.object(debug_page_module.icons, "logo_photo") as logo:
-            bot.return_value = None
+    def test_the_avatar_is_the_brand_logo_at_full_size(self) -> None:
+        """★ 头像 = 品牌 logo，而且**摆得下整张图**（用户 2026-08-17：「显示不全，一条线」）。
+
+        真因是那一格 `pack_propagate(False)` 只给了 width：高度退回默认 1px，
+        图被裁成一条横线。所以这里断言的是**那一格的高度**，不是「调了哪个函数」。
+        """
+        with mock.patch.object(debug_page_module.icons, "logo_photo") as logo:
+            logo.return_value = None
             self.page._say_ai("在的")
 
-        bot.assert_called_once()
-        logo.assert_not_called()
+        logo.assert_called_once()
+        self.assertEqual(logo.call_args.args[1], debug_page_module._AVATAR)
+
+        row = self.page._list.winfo_children()[-1]
+        holder = row.winfo_children()[0]
+        self.assertGreaterEqual(holder.cget("height"), debug_page_module._AVATAR,
+                                "头像那一格没给高度 → 图会被裁成一条线")
 
     # ── 「说真话」──────────────────────────────────────────────────
 

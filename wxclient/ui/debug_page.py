@@ -58,13 +58,9 @@ CARD_LINE = "#e6e8eb"
 #: 转圈那三个点的帧。跟着心跳走，一秒转两圈左右。
 _DOT_FRAMES = ((1, 0, 0), (0, 1, 0), (0, 0, 1), (0, 1, 0))
 
-#: 空会话时的开场白。**照能力清单写**，别举一个网关做不到的例子。
+#: 空会话时的开场白。**只此一句**——底下那行「试试：给张三…」被用户砍了
+#: （2026-08-17）：举例子是教学，而这一页是给会用的人排障用的。
 _GREETING = "你好，我是小智。你可以直接描述要完成的任务。"
-_EXAMPLES = (
-    "给张三发条消息，问他明天上午十点能不能来面试",
-    "发一条朋友圈，招 3 个电子厂普工，日结 180",
-    "看看有没有新的好友申请",
-)
 
 
 class DebugPage(tk.Frame):
@@ -93,7 +89,6 @@ class DebugPage(tk.Frame):
         self._my_mark: tk.Label | None = None    # 这一轮自己那句话右边的下场标记
         self._build()
         self._say_ai(_GREETING)
-        self._say_hint("试试：" + "；".join(_EXAMPLES))
         self._pump()
 
     # ── 版式 ──────────────────────────────────────────────────────
@@ -385,18 +380,20 @@ class DebugPage(tk.Frame):
     def _say_ai(self, text: str) -> tk.Label:
         row = tk.Frame(self._list, bg=theme.CONTENT_BG)
         row.pack(fill=tk.X, pady=(14, 2), anchor="w")
-        avatar = tk.Frame(row, bg=theme.CONTENT_BG, width=_INDENT)
+        # ★ 头像那一格**宽高都要给**（2026-08-17 用户：「图片显示不全，一条线」）。
+        # `pack_propagate(False)` 的意思是「别按内容算尺寸」，只给了 width 的话高度就退回
+        # 默认的 1px —— 图被裁成一条横线，正是屏幕上看到的那样。
+        avatar = tk.Frame(row, bg=theme.CONTENT_BG, width=_INDENT, height=_AVATAR)
         avatar.pack(side=tk.LEFT, anchor="n")
         avatar.pack_propagate(False)
-        # 头像是画出来的机器人脸，**不是品牌图标**——理由见 icons.bot_avatar_photo
-        photo = icons.bot_avatar_photo(self, _AVATAR)
+        photo = icons.logo_photo(self, _AVATAR)
         if photo is not None:
             label = tk.Label(avatar, image=photo, bg=theme.CONTENT_BG)
             label._photo = photo  # 自己留引用，被 GC 掉就成了空白
-            label.pack(anchor="n")
+            label.pack(anchor="nw")
         else:
             tk.Label(avatar, text="智", font=(theme.UI, 10, "bold"),
-                     bg=theme.CONTENT_BG, fg=theme.GREEN).pack(anchor="n")
+                     bg=theme.CONTENT_BG, fg=theme.GREEN).pack(anchor="nw")
         col = tk.Frame(row, bg=theme.CONTENT_BG)
         col.pack(side=tk.LEFT, fill=tk.X, expand=True)
         head = tk.Frame(col, bg=theme.CONTENT_BG)

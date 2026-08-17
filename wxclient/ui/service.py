@@ -259,6 +259,17 @@ class GatewayService:
             gateway.runner.debug_turn(text, on_delta=on_delta, on_stage=on_stage), loop
         )
 
+    def remove_watched(self, name: str) -> Future[Any]:
+        """把一个会话移出自动回复名单，返回一个还没完成的 Future（界面在心跳里问它）。
+
+        删在 AI 端（名单权威在那儿）；删完新名单会被推回来，本机那份跟着变。
+        """
+        with self._lock:
+            loop, gateway = self._loop, self._gateway
+        if loop is None or gateway is None or self.state is not ServiceState.RUNNING:
+            raise ServiceNotRunning("服务没在运行，名单改不了")
+        return asyncio.run_coroutine_threadsafe(gateway.runner.remove_watched(name), loop)
+
     def interrupt_debug(self) -> None:
         """停掉调试会话正在跑的那一轮。丢到网关线程上做，界面不等它。"""
         with self._lock:

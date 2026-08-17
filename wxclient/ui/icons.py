@@ -112,38 +112,3 @@ def cover_photo(master: Any, path: Path, width: int, height: int) -> Any | None:
     except Exception:  # noqa: BLE001 - 背景铺不上不该让人登不进去
         return None
 
-
-def bot_avatar_photo(master: Any, size: int = 34) -> Any | None:
-    """AI 那一侧的头像：一张圆脸机器人（照 `docs/chat.png`）。
-
-    ★ **别拿品牌图标当头像。** 2026-08-17 真机截图里就是这个：`logo_photo` 是细线条的
-    橙色标志，缩到 26px 只剩几道红杠，用户第一眼说的是「图像是红线」。品牌图标是给
-    托盘/任务栏那种「认应用」的位置用的，头像要的是「认说话的人」。
-
-    画而不是切图：一张 PNG 只对一个尺寸清楚，头像以后可能跟着 DPI 变。4 倍超采样再缩，
-    tk 自己画的圆在 34px 上锯齿很明显。取不到 PIL 就返回 None，调用方退回文字头像。
-    """
-    if size <= 0:
-        return None
-    try:
-        from PIL import Image, ImageDraw, ImageTk
-    except ImportError:
-        return None
-    try:
-        ss = 4
-        edge = (154, 161, 171, 255)   # 描边：比正文浅，不跟文字抢
-        ink = (61, 68, 77, 255)       # 五官
-        box = size * ss
-        image = Image.new("RGBA", (box, box), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(image)
-        u = box / 100                 # 百分比坐标，换尺寸不用重算
-        draw.ellipse((3 * u, 3 * u, 97 * u, 97 * u), outline=edge, width=max(1, int(4 * u)))
-        draw.line((50 * u, 22 * u, 50 * u, 32 * u), fill=ink, width=max(1, int(4 * u)))
-        draw.ellipse((45 * u, 15 * u, 55 * u, 25 * u), fill=ink)          # 天线
-        draw.ellipse((30 * u, 40 * u, 42 * u, 52 * u), fill=ink)          # 左眼
-        draw.ellipse((58 * u, 40 * u, 70 * u, 52 * u), fill=ink)          # 右眼
-        draw.arc((34 * u, 50 * u, 66 * u, 74 * u), start=20, end=160,
-                 fill=ink, width=max(1, int(4 * u)))                      # 嘴
-        return ImageTk.PhotoImage(image.resize((size, size), Image.LANCZOS), master=master)
-    except Exception:  # noqa: BLE001 - 一个头像而已，不该让整页渲不出来
-        return None
