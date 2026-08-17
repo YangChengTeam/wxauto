@@ -42,7 +42,7 @@ _BG_REDRAW_MS = 90
 
 HERO_PARTS = (("让", theme.SIDEBAR_TITLE), ("微信服务", theme.GREEN_DEEP), ("稳定在线", theme.SIDEBAR_TITLE))
 HERO_SUB = "连接、监听与消息处理，一处完成"
-BRAND_LINE = "劳小智微信服务"
+BRAND_LINE = "劳小智微信助手"
 
 
 class LoginPage(tk.Frame):

@@ -40,7 +40,7 @@ _STATE_TEXT = {
 
 #: 窗口标题。抽成常量是因为单实例守卫要靠它把已有窗口拽到前台
 #: （`single_instance.raise_existing_window`）——两处写死迟早对不上。
-WINDOW_TITLE = "劳小智微信服务"
+WINDOW_TITLE = "劳小智微信助手"
 
 _STATE_COLOR = {
     ServiceState.RUNNING: theme.GREEN,
@@ -97,10 +97,13 @@ _SPINNER = ("◐", "◓", "◑", "◒")
 #:
 #: ★ 曾经还有一页「计划中心」，2026-08-15 用户裁决删掉：**计划归 AI 端**（几点做什么、
 #: 多久跟进一次由 AI 端排，指令经 WS 推下来），桌面端摆一页只会让人以为计划在这儿配。
-_PAGE_TITLES = {"log": "实时日志", "settings": "配置中心"}
+_PAGE_TITLES = {"log": "实时日志", "debug": "调试会话", "settings": "配置中心"}
 
 #: 标题底下那句话。空 = 这一页不摆副标题。
-_PAGE_SUBTITLES = {"settings": "管理连接、调度与启动设置"}
+_PAGE_SUBTITLES = {
+    "settings": "管理连接、调度与启动设置",
+    "debug": "直接跟 AI 端说话，看它给这台电脑下什么指令",
+}
 
 #: 左侧导航选中那根绿条的宽度（像素）。
 _NAV_MARK_W = 4
@@ -180,6 +183,7 @@ class MainWindow:
         self._page = "log"
         self._settings_page: Any = None  # 懒建一次、复用；每次进页 reload() 重读磁盘上的值
         self._config_page: Any = None  # 配置中心的外壳（可滚动）：参数表 + 监听名单一节
+        self._debug_page: Any = None   # 调试会话（`debug_page.py`），进那一页才建
         self._watch_card: Any = None  # 监听名单那张卡片，跟着配置中心一起建
         self._locked = False  # 转场态：由 _sync_transition_lock() 每拍现场核对，别手动改
         self._last_tick: float | None = None  # 卡顿看门狗的上一拍时刻
@@ -252,7 +256,7 @@ class MainWindow:
         self._sidebar = bar
         self._paint_sidebar_background(bar)
 
-        tk.Label(bar, text="微信服务", font=theme.FONT_TITLE, bg=theme.SIDEBAR_BG,
+        tk.Label(bar, text="微信助手", font=theme.FONT_TITLE, bg=theme.SIDEBAR_BG,
                  fg=theme.SIDEBAR_TITLE).pack(anchor="w", padx=28, pady=(26, 18))
 
         self._status_label = tk.Label(bar, text="", font=theme.FONT_STATUS,
@@ -280,7 +284,7 @@ class MainWindow:
 
         self._nav: dict[str, tk.Label] = {}
         self._nav_marks: dict[str, tk.Frame] = {}
-        for page, text in (("log", "实时日志"), ("settings", "配置中心")):
+        for page, text in (("log", "实时日志"), ("debug", "调试会话"), ("settings", "配置中心")):
             # 选中的那一页在**最左边**立一根绿条（`docs/main.png`）。只靠深一档的底色
             # 在这张暗纹背景上几乎看不出来，绿条才是「我在这儿」的那个信号。
             row = tk.Frame(bar, bg=theme.SIDEBAR_BG)
@@ -303,10 +307,26 @@ class MainWindow:
         self._logout_item = tk.Label(bar, text="退出登录", font=theme.FONT_BODY,
                                      bg=theme.SIDEBAR_BG, fg=theme.SIDEBAR_MUTED, cursor="hand2")
         self._logout_item.bind("<Button-1>", lambda _e: self.logout())
+        # 悬停变绿：它一直是灰的，和旁边那些**只是标签**的静态文字长得一模一样，
+        # 唯一「这是个能点的东西」的信号只有鼠标形状——而手型要移上去才看得见，
+        # 等于要先猜对了才有反馈。退出登录本身不轻（停服务 + 撤会话），
+        # 更不该让人靠试出来。（正在退出时不再变色：那时候它已经点不动了。）
+        self._logout_item.bind("<Enter>", lambda _e: self._hover_logout(True))
+        self._logout_item.bind("<Leave>", lambda _e: self._hover_logout(False))
 
         # 谁登的这台机器
         self._who = tk.Label(bar, text="", font=theme.FONT_SMALL, bg=theme.SIDEBAR_BG,
                              fg=theme.SIDEBAR_MUTED, anchor="w", justify=tk.LEFT)
+
+    def _hover_logout(self, on: bool) -> None:
+        """鼠标进/出「退出登录」。正在退出登录时保持灰——点不动的东西不该有悬停反馈。"""
+        if self._destroyed:
+            return
+        color = theme.GREEN_BRIGHT if (on and not self._logging_out) else theme.SIDEBAR_MUTED
+        try:
+            self._logout_item.configure(fg=color)
+        except tk.TclError:
+            pass  # 控件已经没了（正在销毁），悬停这点小事不值得炸出来
 
     def _paint_sidebar_background(self, bar: tk.Frame) -> None:
         """侧栏铺一层电路暗纹（``assets/panel-bg.png``，取自设计稿 ``docs/bg.png``）。
@@ -586,8 +606,11 @@ class MainWindow:
             self._filter_bar.pack_forget()
             for widget in self._header_actions.winfo_children():
                 widget.pack_forget()
-            self._ensure_settings_page().pack(fill=tk.BOTH, expand=True)
-            self._render_watch_page()
+            if page == "debug":
+                self._ensure_debug_page().pack(fill=tk.BOTH, expand=True)
+            else:
+                self._ensure_settings_page().pack(fill=tk.BOTH, expand=True)
+                self._render_watch_page()
         self._render_overlay()  # 每个分支都要摆一次：切走了就得把遮罩收掉
 
     def _prebuild_settings_page(self) -> None:
@@ -598,6 +621,18 @@ class MainWindow:
             self._ensure_settings_page()
         except tk.TclError:
             pass
+
+    def _ensure_debug_page(self) -> Any:
+        """调试会话只建一次。**进页不重置**——上一轮说了什么正是要回看的东西。
+
+        和配置中心一样惰性建：它 import 的 `debug_page` 会连带把 `gateway.debugchat` 拉进来，
+        不进这一页就不该为它付这份钱。
+        """
+        if self._debug_page is None:
+            from .debug_page import DebugPage
+
+            self._debug_page = DebugPage(self._pages, self.service)
+        return self._debug_page
 
     def _ensure_settings_page(self) -> Any:
         """设置页只建一次，之后每次进页重读磁盘上的值。

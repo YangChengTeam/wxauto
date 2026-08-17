@@ -11,9 +11,10 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -27,6 +28,10 @@ if TYPE_CHECKING:  # 只为类型标注，别在这儿真 import
 _log = structlog.get_logger(__name__)
 
 GatewayBuilder = Callable[[], "Gateway"]
+
+
+class ServiceNotRunning(RuntimeError):
+    """要用的能力得在服务跑着时才有（调试会话就是一例）。"""
 
 
 class ServiceState(str, Enum):
@@ -225,6 +230,38 @@ class GatewayService:
         thread = threading.Thread(target=run, name=name, daemon=True)
         thread.start()
         return thread
+
+    # ── 调试会话（`ui/debug_page.py`）─────────────────────────────
+
+    def debug_turn(
+        self, text: str, *, on_delta: Callable[[str], None] | None = None
+    ) -> Future[Any]:
+        """把一句话发给 AI 端，返回一个**还没完成的 Future**。
+
+        ★ 不阻塞、也不回调 UI：调用方（界面）自己在心跳里 `future.done()` 问一句就行。
+        这是本仓一贯的跨线程办法——后台线程只放值，tk 线程只读值，谁都不去动对方的东西
+        （`window._probe_wechat` 是同一个路数）。回调进来还得再解决「回调跑在网关线程上、
+        却要动控件」，那正是 2026-08-13 卡死的形状。
+
+        `on_delta` 会在**网关线程**上被调用（流式增量），所以界面那头传进来的必须是
+        线程安全的东西（一个 `queue.Queue.put` 就够），绝不能直接改控件。
+        """
+        with self._lock:
+            loop, gateway = self._loop, self._gateway
+        if loop is None or gateway is None or self.state is not ServiceState.RUNNING:
+            raise ServiceNotRunning("服务没在运行，先在左边把它起起来")
+        return asyncio.run_coroutine_threadsafe(
+            gateway.runner.debug_turn(text, on_delta=on_delta), loop
+        )
+
+    def reset_debug_session(self) -> None:
+        """丢掉调试会话的上下文，下一句从头说起。**碰库，别在 UI 线程上直接调**——
+        这里丢到后台线程去做（界面那边不需要等它的结果）。"""
+        with self._lock:
+            gateway = self._gateway
+        if gateway is None:
+            return
+        self._in_background("wx-svc-debug-reset", gateway.runner.reset_debug_session, None)
 
     def uptime_seconds(self) -> float | None:
         """服务已经跑了多久；没在跑返回 None。

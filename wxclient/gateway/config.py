@@ -37,6 +37,14 @@ class GatewaySettings(BaseSettings):
 
     # ── 对话 ──
     task_type: str = "wechat_reply"
+
+    debug_task_type: str = "wechat_ops"
+    """「调试会话」那一页用的 task_type（066 的人话→指令卡）。
+
+    和入站回复分开是因为两者要的是不同的东西：入站给的是一段聊天记录、要的是一句回复；
+    调试会话给的是一句指令（「给张三发条消息」「发朋友圈」）、要的是一张指令卡。
+    拿 ``wechat_reply`` 去说「发朋友圈」，AI 端只会**当成候选人在说话**并拟一句回复。"""
+
     turn_timeout_seconds: float = 180.0
     """一轮对话的上限。AI 端整轮常在 20–30s，留足余量。"""
 

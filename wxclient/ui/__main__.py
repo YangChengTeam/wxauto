@@ -219,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
         splash.close()
         root.update()  # 动画得真的消失：这条路径不进 mainloop，没人替它重绘
         raise_existing_window(WINDOW_TITLE)
-        print("劳小智微信服务已经在运行了（同一台机器只能开一个）。", file=sys.stderr)
+        print("劳小智微信助手已经在运行了（同一台机器只能开一个）。", file=sys.stderr)
         return 0
 
     buffer = LogBuffer(capacity=settings.log_lines)

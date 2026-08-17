@@ -37,13 +37,21 @@ from .schedule import ScheduleLoop, parse_schedule_at
 from .sessions import GatewayStore
 from .ticket import TicketProvider
 from .watchlist import PUSH_EVENT, Watchlist
-from .wsclient import AgentWsClient, AgentWsError, Unauthorized
+from .wsclient import AgentWsClient, AgentWsError, TurnResult, Unauthorized
 
 _log = structlog.get_logger(__name__)
 
 #: 建连/保活的节拍。线上 nginx 对 /agent-ws 配的是 600s 空闲上限，30s 一拍既够续命，
 #: 也让「连接已经死了」最多 30s 就被发现（而不是攒到第一条真消息上）。
 KEEPALIVE_INTERVAL_SECONDS = 30.0
+
+#: 调试会话在会话表里占的「对端」。前后各两条下划线，撞不上任何真实 wxid。
+#: 存进同一张表是为了让它和真实会话一样**长命**——关掉窗口再打开，上下文还在。
+DEBUG_PEER_ID = "__debug__"
+
+#: 这轮告诉 AI 端「我在跟谁说话」用的名字（078 拿它当关系记忆的键）。
+#: 明写成调试，免得调试时说的话被记成某个真实联系人的关系记忆。
+DEBUG_PEER_LABEL = "调试会话"
 
 #: 退出时最多等在途的一轮收口多久。超了就放弃那一轮——丢一轮远好过界面卡住不动。
 SHUTDOWN_DRAIN_SECONDS = 3.0
@@ -390,9 +398,12 @@ class GatewayRunner:
         return None
 
     async def _ensure_session(
-        self, client: AgentWsClient, account_id: str, peer_id: str
+        self, client: AgentWsClient, account_id: str, peer_id: str, task_type: str | None = None
     ) -> str:
-        """取该联系人的长命会话；没有就建，有就在本连接上接回来一次。"""
+        """取该联系人的长命会话；没有就建，有就在本连接上接回来一次。
+
+        ``task_type`` 只在**新建**时用得上（接回来的会话是什么类型就是什么类型），
+        默认走入站回复那一种；调试会话传自己的（见 ``debug_turn``）。"""
         session_id = self._store.get_session(account_id, peer_id)
         if session_id and self._pool.needs_resume(account_id, session_id):
             try:
@@ -406,10 +417,61 @@ class GatewayRunner:
                 self._pool.mark_resumed(account_id, session_id)
 
         if not session_id:
-            session_id = await client.start_session(self._settings.task_type)
+            session_id = await client.start_session(task_type or self._settings.task_type)
             self._store.put_session(account_id, peer_id, session_id)
             self._pool.mark_resumed(account_id, session_id)
         return session_id
+
+    async def debug_turn(
+        self, text: str, *, on_delta: Callable[[str], None] | None = None
+    ) -> TurnResult:
+        """调试会话：把一句人话发给 AI 端，**不经过微信、也不往微信发东西**。
+
+        这是「调试会话」那一页的后端。走的路和线上完全一样，只是入口不同：
+
+            界面输入框 → 本方法 → 常驻那条 WS → AI 端 wechat_ops → 指令卡
+                       → AI 端按 tenant+user 找回**同一条**连接下发 wechat.command
+                       → `_on_push` → `_dispatch_commands` → 队列串行执行
+
+        最后那半截一个字都没改：指令怎么下来、怎么守门、怎么回执，和线上一模一样。
+        所以这一页测出来的东西是**真的**——它不是一条给调试用的旁路。
+
+        ★ 为什么不复用 `handle_turn`：那条路末尾是 `self._sender.deliver(...)`，
+        会把回复真的发到某个微信联系人那儿去。调试会话没有「对方」，产出只回界面。
+
+        断线只重试一次，和对话轮同一个规矩：重试不了就把错误如实交给界面，
+        别把「AI 端连不上」显示成「AI 端没话说」。
+        """
+        if not self._accounts:
+            raise AgentWsError("这台机器上没有可用的微信账号")
+        account_id = self._accounts[0]
+        for attempt in (1, 2):
+            try:
+                client = await self._pool.acquire(account_id)
+                session_id = await self._ensure_session(
+                    client, account_id, DEBUG_PEER_ID, self._settings.debug_task_type
+                )
+                return await client.send_message(
+                    session_id,
+                    text,
+                    extra={"wechat": {"peer": DEBUG_PEER_LABEL, "funnel": "debug"}},
+                    on_delta=on_delta,
+                )
+            except Unauthorized:
+                self._store.drop_session(account_id, DEBUG_PEER_ID)
+                await self._pool.invalidate(account_id)
+                if attempt == 2:
+                    raise
+            except AgentWsError:
+                await self._pool.invalidate(account_id)
+                if attempt == 2:
+                    raise
+        raise AgentWsError("调试会话未能完成")  # 走不到；让类型检查看得出这里一定有产出
+
+    def reset_debug_session(self) -> None:
+        """把调试会话丢掉，下一句重新开一轮新的（界面上的「新会话」）。"""
+        for account_id in self._accounts:
+            self._store.drop_session(account_id, DEBUG_PEER_ID)
 
     @staticmethod
     def _turn_meta(peer_id: str, messages: Sequence[InboundMessage]) -> dict[str, Any]:
