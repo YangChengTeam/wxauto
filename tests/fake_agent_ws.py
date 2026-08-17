@@ -50,6 +50,8 @@ class FakeAgentServer:
             cards=[{"type": "info", "body": {"kind": "wechat_reply", "reply_segments": ["你好"]}}],
         )
         self.sessions: set[str] = set()
+        self.watchlist: set[str] = set()
+        """这位员工的监听名单。桌面端可以请求把谁移出去（`wechat.watchlist.remove`）。"""
         self.received: list[dict[str, Any]] = []
         """收到的所有客户端帧，供断言。"""
         self._server: Any = None
@@ -127,6 +129,21 @@ class FakeAgentServer:
                     })
                     continue
                 await self._emit(websocket, ack, "session.resumed", {"session_id": session_id})
+                continue
+
+            if op == "wechat.watchlist.remove":
+                # 和真 AI 端同一份契约（`ws/wechatChannel.ts::handleWatchlistRemove`）：
+                # 真删 → 立刻把新名单推回来 → 再回一帧说清删掉了哪几个。
+                names = [str(n) for n in (data.get("names") or []) if str(n).strip()]
+                removed = [n for n in names if n in self.watchlist]
+                for name in removed:
+                    self.watchlist.discard(name)
+                if removed:
+                    await self._emit(websocket, None, "wechat.watchlist",
+                                     {"only": sorted(self.watchlist), "never": []})
+                await self._emit(websocket, ack, "wechat.watchlist.removed",
+                                 {"removed": removed, "watching": len(self.watchlist),
+                                  "blocked": 0})
                 continue
 
             if op == "message.send":
