@@ -654,6 +654,33 @@ class SplashTests(unittest.TestCase):
 
         self.assertLess(LOGO_PX, 2 * (RING_RADIUS - RING_WIDTH))
 
+    def test_both_frames_draw_the_logo_at_the_same_size(self) -> None:
+        """★ 静态首屏和动图的图标必须一样大（用户 2026-08-17：交接时图标会变一下大小）。
+
+        真因是两边缩图的能力不一样：PIL 想缩多大缩多大，tk 只能**整数倍**
+        （`PhotoImage.subsample`——启动那一刻不能为了一张图去 import PIL）。
+        LOGO_PX=56 时 tk 缩出来是 256//56=4 倍 → 64，静态图却是精确的 56。
+        所以 LOGO_PX 必须整除源图边长。
+        """
+        from wxclient.ui.splash_style import LOGO_PX, LOGO_SOURCE_PX
+
+        self.assertEqual(LOGO_SOURCE_PX % LOGO_PX, 0,
+                         "★ 除不尽 → tk 缩出来不是 LOGO_PX，交接时图标会变大小")
+        # tk 那边实际会缩成多大：和 splash.py `_place_icon` 里同一条算法
+        factor = max(1, LOGO_SOURCE_PX // LOGO_PX)
+        self.assertEqual(LOGO_SOURCE_PX // factor, LOGO_PX)
+
+    def test_the_source_icon_is_the_size_we_think_it_is(self) -> None:
+        """★ 上面那条整除约束是照 LOGO_SOURCE_PX 算的——它得和真实资产对得上，
+        否则约束守的是一个想象中的数字。"""
+        from PIL import Image
+
+        from wxclient.ui.splash_style import LOGO_SOURCE_PX
+
+        png = Path(__file__).resolve().parent.parent / "wxclient/ui/assets/app-256.png"
+        with Image.open(png) as image:
+            self.assertEqual(image.size, (LOGO_SOURCE_PX, LOGO_SOURCE_PX))
+
     def test_frozen_first_frame_is_shipped_and_matches_the_animated_one(self) -> None:
         """冻结包那张静态首屏要在，且和会动的那个同尺寸——否则接力时会「跳一下」。"""
         from PIL import Image

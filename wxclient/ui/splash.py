@@ -172,7 +172,9 @@ class Splash:
             return
         try:
             image = tk.PhotoImage(file=str(icon_png))   # Tk 8.6 自带 PNG，不用 PIL
-            factor = max(1, image.width() // LOGO_PX)   # 256 → 64 这一档（整数倍缩）
+            # 整数倍缩。LOGO_PX 保证整除源图边长（见 splash_style），所以这里缩出来
+            # **正好是 LOGO_PX**，和 PIL 画的静态首屏一样大——除不尽就会大小不一致。
+            factor = max(1, image.width() // LOGO_PX)
             self._photo = image.subsample(factor, factor)
             self._canvas.create_image(cx, cy, image=self._photo)
         except tk.TclError:
