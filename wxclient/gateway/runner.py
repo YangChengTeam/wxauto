@@ -170,6 +170,8 @@ class GatewayRunner:
         self._capabilities = capabilities
         self._reported_capabilities: dict[str, dict[str, Any]] | None = None
         self._command_tasks: set[asyncio.Task[None]] = set()
+        self._debug_session_id: str | None = None
+        self._command_listener: Callable[[dict[str, Any]], None] | None = None
         self._pool = ConnectionPool(
             ws_url=settings.ai_ws_url,
             ticket_provider=ticket_provider,
@@ -234,7 +236,35 @@ class GatewayRunner:
         if ev == PACING_EVENT:
             self._apply_pacing(data)
             return
+        if ev == "card.update":
+            self._on_card_update(data)
+            return
         _log.debug("收到未处理的推送事件", ev=ev)
+
+    def _on_card_update(self, data: dict[str, Any]) -> None:
+        """指令回执（`kind=wechat_command_result`）。转给听众，并留一条日志。
+
+        日志这条是**新加的**：在此之前，一条指令有没有真下发下来、失败在哪一步，
+        本机日志里一个字都没有——AI 端知道（它那边记了 `no wechat gateway online`），
+        而拿着这台电脑的人什么都看不到。
+        """
+        card = data.get("card")
+        body = card.get("body") if isinstance(card, dict) else None
+        if not isinstance(body, dict) or body.get("kind") != "wechat_command_result":
+            return
+        status = str(body.get("status") or "")
+        reason = str(body.get("reason") or "")
+        if status in {"rejected", "failed", "unsupported", "no_gateway"}:
+            _log.warning("指令没能执行", op=body.get("op"), status=status, reason=reason)
+        else:
+            _log.info("指令回执", op=body.get("op"), status=status)
+        listener = self._command_listener
+        if listener is None:
+            return
+        try:
+            listener(dict(body))
+        except Exception as exc:  # noqa: BLE001 - 界面出错不该掀翻读循环
+            _log.warning("指令回执回调异常", error=str(exc))
 
     def _apply_pacing(self, data: dict[str, Any]) -> None:
         """AI 端下发节拍（``wechat.pacing``）：让它按业务状态调快慢。
@@ -423,7 +453,11 @@ class GatewayRunner:
         return session_id
 
     async def debug_turn(
-        self, text: str, *, on_delta: Callable[[str], None] | None = None
+        self,
+        text: str,
+        *,
+        on_delta: Callable[[str], None] | None = None,
+        on_stage: Callable[[dict[str, Any]], None] | None = None,
     ) -> TurnResult:
         """调试会话：把一句人话发给 AI 端，**不经过微信、也不往微信发东西**。
 
@@ -451,11 +485,13 @@ class GatewayRunner:
                 session_id = await self._ensure_session(
                     client, account_id, DEBUG_PEER_ID, self._settings.debug_task_type
                 )
+                self._debug_session_id = session_id
                 return await client.send_message(
                     session_id,
                     text,
                     extra={"wechat": {"peer": DEBUG_PEER_LABEL, "funnel": "debug"}},
                     on_delta=on_delta,
+                    on_stage=on_stage,
                 )
             except Unauthorized:
                 self._store.drop_session(account_id, DEBUG_PEER_ID)
@@ -468,8 +504,34 @@ class GatewayRunner:
                     raise
         raise AgentWsError("调试会话未能完成")  # 走不到；让类型检查看得出这里一定有产出
 
+    async def interrupt_debug(self) -> None:
+        """打断调试会话正在跑的那一轮（界面上的「停止」）。
+
+        打断只是让 AI 端别再往下算了；**已经下发出去的指令不会被撤回**——那些已经在
+        本机队列里排着，撤回它们要另一套（也更危险）的机制。所以界面上这个按钮说的是
+        「停止」，不是「撤销」。
+        """
+        session_id = self._debug_session_id
+        if not session_id or not self._accounts:
+            return
+        client = await self._pool.acquire(self._accounts[0])
+        await client.interrupt(session_id)
+
+    def set_command_listener(
+        self, listener: Callable[[dict[str, Any]], None] | None
+    ) -> None:
+        """登记「指令回执来了」的听众（调试会话那一页用）。
+
+        ★ 回执**不回到那一轮里**（066：一轮早就 done 了，指令还在跑）。它以
+        `card.update` 单独推回来，此前无人认领 → 只记一条 debug 日志就丢了。
+        这正是「界面说已下发、然后再无下文」的由来：连**没下发成功**的那条理由
+        （「微信端没有在线的网关」）也一起被吞了。
+        """
+        self._command_listener = listener
+
     def reset_debug_session(self) -> None:
         """把调试会话丢掉，下一句重新开一轮新的（界面上的「新会话」）。"""
+        self._debug_session_id = None
         for account_id in self._accounts:
             self._store.drop_session(account_id, DEBUG_PEER_ID)
 

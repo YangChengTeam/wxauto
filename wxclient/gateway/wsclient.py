@@ -74,6 +74,7 @@ class _Turn:
     cards: list[dict[str, Any]] = field(default_factory=list)
     chunks: list[str] = field(default_factory=list)
     on_delta: Callable[[str], None] | None = None
+    on_stage: Callable[[dict[str, Any]], None] | None = None
 
     def finish(self, *, elapsed_ms: int | None = None, error: dict | None = None) -> None:
         if self.future.done():
@@ -182,6 +183,7 @@ class AgentWsClient:
         refs: list[dict[str, Any]] | None = None,
         extra: dict[str, Any] | None = None,
         on_delta: Callable[[str], None] | None = None,
+        on_stage: Callable[[dict[str, Any]], None] | None = None,
     ) -> TurnResult:
         """发一轮并等到收口。
 
@@ -197,7 +199,8 @@ class AgentWsClient:
             payload.update(extra)
 
         loop = asyncio.get_running_loop()
-        turn = _Turn(session_id=session_id, future=loop.create_future(), on_delta=on_delta)
+        turn = _Turn(session_id=session_id, future=loop.create_future(), on_delta=on_delta,
+                     on_stage=on_stage)
         self._turns[session_id] = turn
         try:
             await self._send("message.send", payload)
@@ -337,7 +340,13 @@ class AgentWsClient:
             state = data.get("state")
             if state == "done":
                 turn.finish(elapsed_ms=_as_int(data.get("elapsed_ms")))
-            # running / retrying / stage 等只是进度，不收口。
+                return True
+            # running / working / retrying 只是进度，不收口。带 stage 的那种要往上报：
+            # 055 的 `stage.text` 是「它这会儿在干哪一阶」的**唯一**可显示信号，
+            # 丢了的话长任务在界面上就只剩一个干转的圈。
+            stage = data.get("stage")
+            if isinstance(stage, dict) and turn.on_stage is not None:
+                turn.on_stage(stage)
             return True
 
         if ev == "error":

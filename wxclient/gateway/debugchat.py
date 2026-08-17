@@ -91,3 +91,59 @@ def _dump(value: Any) -> str:
         return json.dumps(value, ensure_ascii=False, indent=2)
     except (TypeError, ValueError):
         return str(value)
+
+
+#: 回执状态 → 界面上那一行的（人话, 是不是好结果）。
+#: 未列出的状态一律当「还在路上」处理——**不臆断成功**。
+_RESULT_LABELS = {
+    "received": ("已收到，排队中", None),
+    "scheduled": ("已排期，到点执行", None),
+    "running": ("正在执行", None),
+    "sent": ("已下发", None),
+    "ok": ("执行成功", True),
+    "success": ("执行成功", True),
+    "done": ("执行成功", True),
+    "settled": ("已办好", True),
+    "skipped": ("按守门规则跳过", False),
+    "rejected": ("没有下发", False),
+    "unsupported": ("这台电脑做不了", False),
+    "failed": ("执行失败", False),
+    "no_gateway": ("没有在线的网关", False),
+}
+
+
+@dataclass(frozen=True)
+class DebugReceipt:
+    """一条指令回执，已经是可以直接摆出来的形态。"""
+
+    command_id: str
+    op: str
+    status: str
+    label: str
+    ok: bool | None
+    """True=成功，False=没做成，None=中间态（还在路上）。"""
+    reason: str = ""
+
+    @property
+    def settled(self) -> bool:
+        return self.ok is not None
+
+
+def format_receipt(body: Any) -> DebugReceipt | None:
+    """把 `kind=wechat_command_result` 的卡体翻成 :class:`DebugReceipt`。
+
+    ★ 认不出的状态**不当成功**：这一页存在的全部意义就是「到底做没做」，
+    把不认识的状态涂成绿勾，等于把「不知道」显示成「成了」。
+    """
+    if not isinstance(body, dict) or body.get("kind") != "wechat_command_result":
+        return None
+    status = str(body.get("status") or "").strip()
+    label, ok = _RESULT_LABELS.get(status, (status or "状态不明", None))
+    return DebugReceipt(
+        command_id=str(body.get("command_id") or ""),
+        op=str(body.get("op") or ""),
+        status=status,
+        label=label,
+        ok=ok,
+        reason=str(body.get("reason") or ""),
+    )

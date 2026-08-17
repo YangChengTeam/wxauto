@@ -112,6 +112,7 @@ class GatewayService:
         self._restarting = False
         # ★ 状态快照 + 专职轮询线程：界面读快照，真正去问网关（可能查库、可能等锁）的
         #   活全在这条线程上。它卡多久都只卡自己，主线程照旧每秒重绘。
+        self._command_listener: Callable[[dict], None] | None = None
         self._status = GatewayStatus()
         self._poller = threading.Thread(target=self._poll_status, name="wx-svc-status", daemon=True)
         self._poller.start()
@@ -234,7 +235,11 @@ class GatewayService:
     # ── 调试会话（`ui/debug_page.py`）─────────────────────────────
 
     def debug_turn(
-        self, text: str, *, on_delta: Callable[[str], None] | None = None
+        self,
+        text: str,
+        *,
+        on_delta: Callable[[str], None] | None = None,
+        on_stage: Callable[[dict], None] | None = None,
     ) -> Future[Any]:
         """把一句话发给 AI 端，返回一个**还没完成的 Future**。
 
@@ -251,8 +256,28 @@ class GatewayService:
         if loop is None or gateway is None or self.state is not ServiceState.RUNNING:
             raise ServiceNotRunning("服务没在运行，先在左边把它起起来")
         return asyncio.run_coroutine_threadsafe(
-            gateway.runner.debug_turn(text, on_delta=on_delta), loop
+            gateway.runner.debug_turn(text, on_delta=on_delta, on_stage=on_stage), loop
         )
+
+    def interrupt_debug(self) -> None:
+        """停掉调试会话正在跑的那一轮。丢到网关线程上做，界面不等它。"""
+        with self._lock:
+            loop, gateway = self._loop, self._gateway
+        if loop is None or gateway is None:
+            return
+        asyncio.run_coroutine_threadsafe(gateway.runner.interrupt_debug(), loop)
+
+    def set_command_listener(self, listener: Callable[[dict], None] | None) -> None:
+        """登记指令回执的听众。**回调跑在网关线程上**——界面那头只准往队列里放东西。
+
+        服务没在跑时先记着：等它起来（`_run` 里装配完 runner）再挂上去，
+        不然「先打开调试会话页、后启动服务」这条路径就永远收不到回执。
+        """
+        with self._lock:
+            self._command_listener = listener
+            gateway = self._gateway
+        if gateway is not None:
+            gateway.runner.set_command_listener(listener)
 
     def reset_debug_session(self) -> None:
         """丢掉调试会话的上下文，下一句从头说起。**碰库，别在 UI 线程上直接调**——
@@ -362,6 +387,10 @@ class GatewayService:
 
         with self._lock:
             self._gateway = gateway
+            listener = self._command_listener
+        # 页面可能在服务起来之前就登记过听众（见 set_command_listener）
+        if listener is not None:
+            gateway.runner.set_command_listener(listener)
         try:
             gateway.runtime.start()
             self._set_state(ServiceState.RUNNING, None)

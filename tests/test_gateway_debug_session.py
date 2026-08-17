@@ -21,7 +21,12 @@ from wxclient.gateway import (
     GatewayStore,
     LocalFileTicketProvider,
 )
-from wxclient.gateway.debugchat import DebugReply, format_turn, summarize_command
+from wxclient.gateway.debugchat import (
+    DebugReply,
+    format_receipt,
+    format_turn,
+    summarize_command,
+)
 from wxclient.gateway.runner import DEBUG_PEER_ID
 
 T0 = datetime(2026, 8, 17, 14, 0, 0, tzinfo=timezone.utc)
@@ -150,6 +155,70 @@ class DebugSessionTests(unittest.IsolatedAsyncioTestCase):
                 await runner.stop()
         self.assertFalse(result.ok)
         self.assertIn("太快了", format_turn(result).error)
+
+
+class CommandReceiptTests(unittest.TestCase):
+    """★ 回执必须能浮到界面上——这一页存在的全部意义就是「到底做没做」。"""
+
+    def test_a_rejected_command_reaches_the_listener_with_its_reason(self) -> None:
+        """2026-08-17 真机：AI 端回的是「没有在线的网关」，界面上却只有一句「已下发」。
+
+        病根有两处，这条钉住其中一处：回执走 `card.update` 单独推回来，
+        **不在那一轮里**（一轮早就 done 了），此前无人认领 → 只记一条 debug 日志就丢了。
+        """
+        seen: list[dict] = []
+        runner = _bare_runner()
+        runner.set_command_listener(seen.append)
+        runner._on_push("acc", "card.update", {
+            "session_id": "s1",
+            "card": {"card_id": "c1", "body": {
+                "kind": "wechat_command_result", "command_id": "cmd_1",
+                "op": "send_message", "status": "rejected",
+                "reason": "微信端没有在线的网关：请确认那台电脑上的劳小智微信助手正在运行",
+            }},
+        })
+        self.assertEqual(len(seen), 1)
+        receipt = format_receipt(seen[0])
+        self.assertIsNotNone(receipt)
+        self.assertIs(receipt.ok, False)
+        self.assertEqual(receipt.label, "没有下发")
+        self.assertIn("没有在线的网关", receipt.reason)
+
+    def test_an_unknown_status_is_never_painted_as_success(self) -> None:
+        """认不出的状态留在中间态。涂成绿勾＝把「不知道」显示成「成了」。"""
+        receipt = format_receipt({"kind": "wechat_command_result", "op": "post_moments",
+                                  "status": "some_new_state"})
+        self.assertIsNone(receipt.ok)
+        self.assertFalse(receipt.settled)
+
+    def test_success_is_success(self) -> None:
+        receipt = format_receipt({"kind": "wechat_command_result", "op": "send_message",
+                                  "status": "ok"})
+        self.assertIs(receipt.ok, True)
+        self.assertTrue(receipt.settled)
+
+    def test_other_card_updates_are_ignored(self) -> None:
+        """别的 card.update（比如普通卡片刷新）不该被当成指令回执。"""
+        seen: list[dict] = []
+        runner = _bare_runner()
+        runner.set_command_listener(seen.append)
+        runner._on_push("acc", "card.update", {"card": {"body": {"kind": "wechat_reply"}}})
+        self.assertEqual(seen, [])
+
+
+def _bare_runner() -> GatewayRunner:
+    """只为了调 `_on_push`：不连网、不建会话。"""
+    tmp = tempfile.TemporaryDirectory()
+    unittest.addModuleCleanup(tmp.cleanup)
+    return GatewayRunner(
+        settings=GatewaySettings(ai_ws_url="ws://127.0.0.1:1/v1/ws"),
+        ticket_provider=LocalFileTicketProvider(Path(tmp.name) / "t.json"),
+        store=GatewayStore(Path(tmp.name) / "g.db"),
+        source=SilentSource(),
+        sink=RecordingSink(),
+        accounts=["acc"],
+        clock=lambda: T0,
+    )
 
 
 class DebugReplyFormattingTests(unittest.TestCase):

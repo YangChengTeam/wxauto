@@ -184,6 +184,7 @@ class MainWindow:
         self._settings_page: Any = None  # 懒建一次、复用；每次进页 reload() 重读磁盘上的值
         self._config_page: Any = None  # 配置中心的外壳（可滚动）：参数表 + 监听名单一节
         self._debug_page: Any = None   # 调试会话（`debug_page.py`），进那一页才建
+        self._debug_actions: Any = None  # 它在标题栏右边那一组（● AI 已连接 · 新会话）
         self._watch_card: Any = None  # 监听名单那张卡片，跟着配置中心一起建
         self._locked = False  # 转场态：由 _sync_transition_lock() 每拍现场核对，别手动改
         self._last_tick: float | None = None  # 卡顿看门狗的上一拍时刻
@@ -595,19 +596,21 @@ class MainWindow:
             self._subtitle.pack_forget()
 
         # 「实时更新 · N 行」「级别过滤」「清空 / 打开目录」这一排只属于日志页
+        for widget in self._header_actions.winfo_children():
+            widget.pack_forget()  # 每页自己摆自己的那几个，先一律收掉
         if page == "log":
             self._live_row.pack(anchor="w", pady=(2, 0))
             for widget in self._header_actions.winfo_children():
-                widget.pack(side=tk.RIGHT, padx=10)
+                if widget is not self._debug_actions:
+                    widget.pack(side=tk.RIGHT, padx=10)
             self._filter_bar.pack(side=tk.RIGHT, padx=(0, 18))
             self._log_page.pack(fill=tk.BOTH, expand=True)
         else:
             self._live_row.pack_forget()
             self._filter_bar.pack_forget()
-            for widget in self._header_actions.winfo_children():
-                widget.pack_forget()
             if page == "debug":
                 self._ensure_debug_page().pack(fill=tk.BOTH, expand=True)
+                self._debug_actions.pack(side=tk.RIGHT)
             else:
                 self._ensure_settings_page().pack(fill=tk.BOTH, expand=True)
                 self._render_watch_page()
@@ -631,7 +634,11 @@ class MainWindow:
         if self._debug_page is None:
             from .debug_page import DebugPage
 
-            self._debug_page = DebugPage(self._pages, self.service)
+            self._debug_page = DebugPage(self._pages, self.service,
+                                         on_open_log=lambda: self._show_page("log"))
+            # 指令回执要能找回这一页（回调跑在网关线程上，页面那头只入队）
+            self.service.set_command_listener(self._debug_page.on_command_result)
+            self._debug_actions = self._debug_page.build_header_actions(self._header_actions)
         return self._debug_page
 
     def _ensure_settings_page(self) -> Any:
