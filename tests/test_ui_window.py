@@ -1452,6 +1452,29 @@ class DialogTests(unittest.TestCase):
 
         self.assertIsNone(dialog.cancel)
 
+    def test_it_stays_above_the_window_it_blocks(self) -> None:
+        """★ 真机 2026-08-16：「弹框跑到主窗口后面去了」。
+
+        `grab_set` 管输入不管层叠：自画标题栏的窗口不归窗口管理器管，点一下主窗口就把
+        弹框压到后面——而抓取还在，主窗口点什么都没反应，**看起来就是程序卡死了**。
+        抓了输入就得让人看得见是谁抓的。
+        """
+        dialog = self._dialog()
+        self.addCleanup(dialog.top.destroy)
+
+        self.assertEqual(int(dialog.top.attributes("-topmost")), 1)
+
+    def test_it_shows_even_if_the_grab_fails(self) -> None:
+        """★ 抓不到输入也得把框显示出来——宁可少一层模态，也不能弹一个谁都点不着的框。"""
+        dialog = self._dialog()
+        self.addCleanup(dialog.top.destroy)
+        dialog.top.grab_set = mock.Mock(side_effect=tk.TclError("grab failed"))
+        dialog.top.wait_window = mock.Mock()  # 别真等，不然测试挂在这儿
+
+        dialog.show()  # 不该抛
+
+        self.assertTrue(dialog.top.winfo_exists())
+
     def test_it_carries_the_app_logo(self) -> None:
         """★ 用户 2026-08-16「弹框可以加上应用 logo」——一眼看出这是劳小智弹的。"""
         from wxclient.ui import dialog as dialog_mod

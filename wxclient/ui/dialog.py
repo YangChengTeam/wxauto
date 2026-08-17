@@ -9,8 +9,14 @@
 
 三条硬要求，改的时候别丢：
 
-* **模态**：`grab_set()` + `wait_window()`。问「要不要顶掉另一台电脑」这种问题，答案没出来
-  之前不能让人接着点别的。
+* **模态，而且看得见**：`grab_set()` + `wait_window()` + `-topmost`。问「要不要顶掉另一台
+  电脑」这种问题，答案没出来之前不能让人接着点别的。
+  ★ 2026-08-16 真机反馈「弹框跑到主窗口后面去了」：`grab_set` 管的是**输入**，不管**层叠**。
+  自画标题栏（`overrideredirect`）的窗口不归窗口管理器管，`transient()` 对它几乎不起作用，
+  于是点一下主窗口就把弹框压到后面——而这时抓取还在，主窗口点什么都没反应，
+  看起来就是**整个程序卡死了**。所以必须 `-topmost`：抓了输入就得让人看得见是谁抓的。
+  （不用「父窗口获得焦点时再 lift」那套：那要在父窗口上挂绑定，而 Python 3.12 的
+  `unbind(seq, funcid)` 会把这个序列上**所有**绑定一起清掉，收尾比问题本身还险。）
 * **键盘能用**：回车＝确认，Esc＝取消。自画标题栏意味着**没有右上角那个 ×**，Esc 就是
   唯一的「我不想做这件事」的快捷路，丢了它这个框就只能用鼠标关。
   为此 `show()` 必须 `focus_force()`：`overrideredirect` 的窗口不会自动拿到键盘焦点，
@@ -48,6 +54,8 @@ class _Dialog:
         self.top.configure(bg=theme.ROW_LINE)  # 外面这一圈就是 1px 边框
         # 自己画标题栏：系统标题栏是灰的，和这套白底界面接不上。
         self.top.overrideredirect(True)
+        # ★ 必须置顶，理由见模块文档：抓了输入却被压到主窗口后面 = 程序看起来卡死了。
+        self.top.attributes("-topmost", True)
 
         body = tk.Frame(self.top, bg=theme.CONTENT_BG)
         body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
@@ -118,7 +126,12 @@ class _Dialog:
         self.center()
         self.top.deiconify()
         self.top.lift()
-        self.top.grab_set()  # 模态：答案出来之前别让人去点别的
+        try:
+            self.top.grab_set()  # 模态：答案出来之前别让人去点别的
+        except tk.TclError:
+            # 抓不到（极少见：同一时刻别处已经抓着）也得把框显示出来。
+            # 宁可少一层模态，也不能弹出一个谁都点不着的框。
+            pass
         # ★ 必须 force：overrideredirect 的窗口不会自动拿到键盘焦点，
         # 不 force 的话回车和 Esc 那两条绑定一次都不会触发。
         self.top.focus_force()
