@@ -30,7 +30,7 @@ from typing import Any
 
 from wxclient.gateway.debugchat import format_receipt, format_turn
 
-from . import icons, theme, widgets
+from . import icons, theme
 from .service import GatewayService, ServiceNotRunning, ServiceState
 
 #: 心跳：多久取一次流式增量 / 刷一次「已用时」。和日志页一个量级，够跟手。
@@ -94,15 +94,14 @@ class DebugPage(tk.Frame):
     # ── 版式 ──────────────────────────────────────────────────────
 
     def build_header_actions(self, parent: tk.Misc) -> tk.Frame:
-        """标题栏右边那一组（● AI 已连接 · 新会话）。由 window 摆进公共标题行。"""
+        """标题栏右边那一组（● AI 已连接）。由 window 摆进公共标题行。"""
         box = tk.Frame(parent, bg=theme.CONTENT_BG)
         self._conn_dot = tk.Label(box, text="●", font=(theme.UI, 8),
                                   bg=theme.CONTENT_BG, fg=theme.GRAY)
         self._conn_dot.pack(side=tk.LEFT, padx=(0, 5))
         self._conn_text = tk.Label(box, text="未连接", font=theme.FONT_SMALL,
                                    bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
-        self._conn_text.pack(side=tk.LEFT, padx=(0, 14))
-        widgets.ghost_button(box, "新会话", self.reset).pack(side=tk.LEFT)
+        self._conn_text.pack(side=tk.LEFT)
         return box
 
     def _build(self) -> None:
@@ -194,12 +193,6 @@ class DebugPage(tk.Frame):
         self._live = None
         self._show_pending()
         self._send_btn.set_busy(True)
-
-    def reset(self) -> None:
-        """开一轮新的。**不清屏**——上一轮说了什么正是排障时要回看的。"""
-        self.service.reset_debug_session()
-        self._open_cards.clear()
-        self._say_hint("已开始新会话，上下文从这里断开。")
 
     def stop(self) -> None:
         """停止这一轮。只是让 AI 别再往下算，**已经下发的指令不会被撤回**。"""

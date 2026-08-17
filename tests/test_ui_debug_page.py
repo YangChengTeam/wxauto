@@ -83,6 +83,15 @@ class DebugPageTests(unittest.TestCase):
         self.assertNotIn("试试", texts)
         self.assertNotIn("张三", texts)
 
+    def test_the_header_has_no_new_session_button(self) -> None:
+        """★ 没有「新建会话」这回事（用户 2026-08-17）：这一页就骑网关那条已连接的。"""
+        header = self.page.build_header_actions(self.root)
+        texts = " ".join(child.cget("text") for child in _walk(header)
+                         if isinstance(child, tk.Label))
+
+        self.assertNotIn("新会话", texts)
+        self.assertFalse(hasattr(self.page, "reset"), "连入口都不该留着")
+
     # ── 头像 ──────────────────────────────────────────────────────
 
     def test_the_avatar_is_the_brand_logo_at_full_size(self) -> None:

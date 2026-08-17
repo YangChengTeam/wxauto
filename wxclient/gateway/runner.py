@@ -540,12 +540,6 @@ class GatewayRunner:
         """
         self._command_listener = listener
 
-    def reset_debug_session(self) -> None:
-        """把调试会话丢掉，下一句重新开一轮新的（界面上的「新会话」）。"""
-        self._debug_session_id = None
-        for account_id in self._accounts:
-            self._store.drop_session(account_id, DEBUG_PEER_ID)
-
     @staticmethod
     def _turn_meta(peer_id: str, messages: Sequence[InboundMessage]) -> dict[str, Any]:
         """给 AI 端的这一轮元信息（064 design §2）。

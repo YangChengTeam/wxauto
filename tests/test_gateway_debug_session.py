@@ -116,19 +116,21 @@ class DebugSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.ok)
         self.assertEqual(format_turn(result).commands, ("post_moments（content=招 3 个普工）",))
 
-    async def test_it_keeps_the_same_session_until_reset(self) -> None:
-        """上下文要留着（「给他发个消息」的「他」得接得上），点「新会话」才断。"""
+    async def test_it_rides_the_one_session_the_gateway_already_has(self) -> None:
+        """★ 没有「新建会话」这回事（用户 2026-08-17）：调试会话就复用网关那条已连接的。
+
+        上下文必须留着——「给他发个消息」的「他」得接得上。所以第二句、第三句都不该
+        再 `session.start`；界面上也没有任何按钮能把它断开。
+        """
         async with FakeAgentServer(valid_tickets={"tkt-ok"},
                                    turn_script=TurnScript(cards=[])) as server:
             runner = self._runner(server)
             try:
                 await runner.debug_turn("在吗")
                 await runner.debug_turn("给张三发条消息")
-                self.assertEqual(len(self._starts(server)), 1, "同一个调试会话不该重开")
+                await runner.debug_turn("刚才那个他是谁")
 
-                runner.reset_debug_session()
-                await runner.debug_turn("重新开始")
-                self.assertEqual(len(self._starts(server)), 2)
+                self.assertEqual(len(self._starts(server)), 1, "同一个调试会话不该重开")
             finally:
                 await runner.stop()
 

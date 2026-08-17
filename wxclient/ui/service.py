@@ -290,15 +290,6 @@ class GatewayService:
         if gateway is not None:
             gateway.runner.set_command_listener(listener)
 
-    def reset_debug_session(self) -> None:
-        """丢掉调试会话的上下文，下一句从头说起。**碰库，别在 UI 线程上直接调**——
-        这里丢到后台线程去做（界面那边不需要等它的结果）。"""
-        with self._lock:
-            gateway = self._gateway
-        if gateway is None:
-            return
-        self._in_background("wx-svc-debug-reset", gateway.runner.reset_debug_session, None)
-
     def uptime_seconds(self) -> float | None:
         """服务已经跑了多久；没在跑返回 None。
 

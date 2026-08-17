@@ -184,7 +184,7 @@ class MainWindow:
         self._settings_page: Any = None  # 懒建一次、复用；每次进页 reload() 重读磁盘上的值
         self._config_page: Any = None  # 配置中心的外壳（可滚动）：参数表 + 监听名单一节
         self._debug_page: Any = None   # 调试会话（`debug_page.py`），进那一页才建
-        self._debug_actions: Any = None  # 它在标题栏右边那一组（● AI 已连接 · 新会话）
+        self._debug_actions: Any = None  # 它在标题栏右边那一组（● AI 已连接）
         self._watch_card: Any = None  # 监听名单那张卡片，跟着配置中心一起建
         #: 正在请 AI 端移出的会话名 → 那次请求的 Future（tk 线程读，别在别处改）。
         self._watch_removing: dict[str, Any] = {}
