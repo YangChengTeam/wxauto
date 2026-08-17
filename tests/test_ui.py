@@ -665,6 +665,74 @@ class SplashTests(unittest.TestCase):
         with Image.open(png) as image:
             self.assertEqual(image.size, (WIDTH, HEIGHT))
 
+    def test_the_static_frame_is_literally_frame_zero(self) -> None:
+        """★ 静态首屏画的必须**就是动画的第一帧**（用户 2026-08-17）。
+
+        原来静态图只画一段 90° 的弧、动图画整圈渐变，交接那一下人眼一定看得出来——
+        用户说的「第一帧是个实心的 loading，后面还要动一下才开始转」就是这个。
+        这里沿环取样：每一段的中点像素，必须最接近**那一段自己的颜色**。
+        """
+        import math
+
+        from PIL import Image
+
+        from wxclient.ui.splash_style import (
+            RING_RADIUS,
+            WIDTH,
+            comet_arcs,
+            comet_colors,
+        )
+
+        def rgb(value: str) -> tuple[int, int, int]:
+            return tuple(int(value[i:i + 2], 16) for i in (1, 3, 5))
+
+        palette = [rgb(color) for color in comet_colors()]
+        png = Path(__file__).resolve().parent.parent / "wxclient/ui/assets/splash.png"
+        cx, cy = WIDTH // 2, 84
+        with Image.open(png) as image:
+            pixels = image.convert("RGB").load()
+            for start, extent, color in comet_arcs(0):
+                mid = math.radians(start + extent / 2)
+                # Tk/PIL 的角度都是 3 点钟起算，y 轴向下，所以取样点是 (cos, -sin)
+                x = round(cx + RING_RADIUS * math.cos(mid))
+                y = round(cy - RING_RADIUS * math.sin(mid))
+                got = pixels[x, y]
+                closest = min(palette, key=lambda c: sum((a - b) ** 2
+                                                         for a, b in zip(c, got)))
+                self.assertEqual(closest, rgb(color),
+                                 f"环上 {start}° 那一段的颜色对不上：取到 {got}")
+
+    def test_both_frames_sit_in_the_same_place(self) -> None:
+        """★ 两段接力必须落在同一个位置，否则整块会挪一下（用户 2026-08-17）。
+
+        PyInstaller 那张静态首屏的位置写死在它的 Tcl 模板里：
+        ``int(0.5*(display - image))``，也就是屏幕正中。会动的这个照抄同一个算法。
+        """
+        from wxclient.ui.splash_style import HEIGHT, WIDTH, window_position
+
+        for screen in ((1920, 1080), (1366, 768), (2560, 1440)):
+            expected = (int(0.5 * (screen[0] - WIDTH)), int(0.5 * (screen[1] - HEIGHT)))
+            self.assertEqual(window_position(*screen), expected, f"{screen} 上没对齐")
+
+    def test_the_animated_frame_is_as_opaque_as_the_static_one(self) -> None:
+        """★ 静态首屏没有透明度可调。会动的这个只要不是 1.0，接力那一下就会亮一下。"""
+        from wxclient.ui.splash_style import OPACITY
+
+        self.assertEqual(OPACITY, 1.0)
+
+    def test_the_stage_line_is_baked_into_the_image(self) -> None:
+        """★ 不用 PyInstaller 的文字叠加：它只能左对齐、对不准中线，交接时那行字会横着挪。
+
+        我们从不更新它，画死在图里更准。
+        """
+        spec = (Path(__file__).resolve().parent.parent
+                / "packaging/lxz-wechat-gateway.spec").read_text(encoding="utf-8")
+        self.assertNotIn("text_pos", spec)
+        self.assertNotIn("text_default", spec)
+        maker = (Path(__file__).resolve().parent.parent
+                 / "packaging/make_splash.py").read_text(encoding="utf-8")
+        self.assertIn("正在启动…", maker, "那行字得由 make_splash 画进图里")
+
     def test_splash_survives_until_the_gateway_is_assembled(self) -> None:
         """★ 动画得撑到网关装配完——那几秒正是启动里最长的一段。
 
@@ -697,11 +765,13 @@ class SplashTests(unittest.TestCase):
         self.assertIn("pyi_splash", source)
         self.assertIn("_close_frozen_splash()", source)
 
-    def test_splash_is_translucent_and_fades_from_that_same_opacity(self) -> None:
-        """启动窗要透一点；淡出得从这个透明度往下走，不能从 1.0 起（否则先变亮再消失）。"""
-        from wxclient.ui.splash_style import OPACITY
+    def test_the_fade_starts_from_whatever_opacity_the_splash_uses(self) -> None:
+        """淡出必须从 OPACITY 往下走，不能写死从 1.0 起——半透明时会先变亮再消失。
 
-        self.assertTrue(0.5 < OPACITY < 1.0, "太透就看不清，1.0 又等于没透")
+        ★ 2026-08-17 起 OPACITY 就是 1.0（要和静态首屏对得上，见
+        `test_the_animated_frame_is_as_opaque_as_the_static_one`），这条仍然留着：
+        哪天再调回半透明，淡出不该跟着坏。
+        """
         source = (
             Path(__file__).resolve().parent.parent / "wxclient/ui/splash.py"
         ).read_text(encoding="utf-8")

@@ -29,6 +29,7 @@ from wxclient.ui.splash_style import (
     RING_RADIUS,
     RING_WIDTH,
     WIDTH,
+    comet_arcs,
 )
 
 OUT = REPO / "wxclient" / "ui" / "assets" / "splash.png"
@@ -58,8 +59,12 @@ def build() -> Image.Image:
     cx, cy = WIDTH // 2, 84
     box = (cx - RING_RADIUS, cy - RING_RADIUS, cx + RING_RADIUS, cy + RING_RADIUS)
     draw.ellipse(box, outline=theme.SIDEBAR_ACTIVE_BG, width=RING_WIDTH)
-    # 静态的那一段「彗头」：动图里它在转，这里定格在右上角
-    draw.arc(box, start=-70, end=20, fill=theme.BRAND, width=RING_WIDTH)
+    # ★ 画的就是动图的**第一帧**（角度 0），照 `comet_arcs` 那同一份数。
+    # 原来这里只画一段 90° 的弧，而动图是整圈渐变——交接那一下人眼一定看得出来
+    # （用户 2026-08-17：「第一帧是个实心的 loading，后面还要动一下才开始转」）。
+    # 角度要换算：Tk 是 3 点钟起逆时针，PIL 是 3 点钟起顺时针，所以取负再对调首尾。
+    for start, extent, color in comet_arcs(0):
+        draw.arc(box, start=-(start + extent), end=-start, fill=color, width=RING_WIDTH)
 
     if LOGO.exists():
         logo = Image.open(LOGO).convert("RGBA").resize((LOGO_PX, LOGO_PX), Image.LANCZOS)
@@ -67,6 +72,11 @@ def build() -> Image.Image:
 
     draw.text((cx, 152), "劳小智微信助手", font=_font(16),
               fill=theme.SIDEBAR_TITLE, anchor="mm")
+    # 阶段文字也画进图里，位置和 tk 那边的 (cx, 182) 一模一样。
+    # ★ 不再用 PyInstaller 的文字叠加（spec 里那几个 text_* 参数）：它只能左对齐，
+    # 对不准中线，交接时那行字会横着挪一下。反正我们从不更新它，画死更准。
+    draw.text((cx, 182), "正在启动…", font=_font(11),
+              fill=theme.SIDEBAR_MUTED, anchor="mm")
     return image
 
 

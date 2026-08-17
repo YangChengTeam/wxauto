@@ -27,10 +27,13 @@ FRAME_MS = 40
 FADE_STEPS = 6
 FADE_MS = 25
 
-#: 整窗不透明度（1.0 = 实心）。稍微透一点，深色块压在桌面上没那么硬。
-#: 别再往下调：白字压在花桌面上会开始发糊，而它统共只活几秒，看不清就白做了。
-#: 只对会动的这个 tk 启动窗生效——冻结包里 PyInstaller 那张静态首屏没有透明度可调。
-OPACITY = 0.92
+#: 整窗不透明度。**必须是 1.0**：冻结包里 PyInstaller 那张静态首屏没有透明度可调，
+#: 会动的这个只要不是 1.0，接力那一下就会「亮一下」。原来 0.92 是为了让深色块压在桌面上
+#: 没那么硬，代价是每次启动都看得见一次跳变——不值（用户 2026-08-17 反馈体验不好）。
+OPACITY = 1.0
+
+#: 彗尾每一段张开多少度。留 2 度的缝，段与段之间才看得出是一节一节的。
+COMET_EXTENT = 360 // COMET_SEGMENTS - 2
 
 
 def blend(start: str, end: str, ratio: float) -> str:
@@ -51,3 +54,25 @@ def comet_colors(segments: int = COMET_SEGMENTS) -> list[str]:
         blend(theme.SIDEBAR_ACTIVE_BG, theme.BRAND, index / (segments - 1))
         for index in range(segments)
     ]
+
+
+def comet_arcs(angle: int = 0) -> list[tuple[int, int, str]]:
+    """彗尾每一段的 (起始角, 张角, 颜色)。角度按 **Tk 画布**的规矩：3 点钟为 0，逆时针。
+
+    ★ tk 那个会动的启动窗和 PIL 画的静态首屏**照同一份数**画。分成两处各写各的，
+    结果就是两张图长得不一样，接力那一下人眼一定看得出来——用户 2026-08-17 反馈的
+    「第一帧是个实心的 loading，后面还要动一下才开始转」正是这么来的：
+    静态图当时只画了一段 90° 的弧，动图画的是整圈渐变。
+    """
+    step = 360 // COMET_SEGMENTS
+    return [((angle + index * step) % 360, COMET_EXTENT, color)
+            for index, color in enumerate(comet_colors())]
+
+
+def window_position(screen_width: int, screen_height: int) -> tuple[int, int]:
+    """启动窗摆在哪。**屏幕正中**——PyInstaller 那张静态首屏就是这么摆的
+    （它的 Tcl 模板里写死了居中），会动的这个只要摆在别处，接力那一下整块就会挪一下。
+
+    原来这里是 ``0.42 * 屏高``（视觉重心比几何中心高一点更好看）。好看输给不跳。
+    """
+    return (max(0, (screen_width - WIDTH) // 2), max(0, (screen_height - HEIGHT) // 2))

@@ -105,11 +105,9 @@ splash = Splash(
     "../wxclient/ui/assets/splash.png",
     binaries=a.binaries,
     datas=a.datas,
-    # 左对齐（PyInstaller 不给居中），所以 x 要自己往左挪半个文案的宽度才对得上中线
-    text_pos=(155, 176),
-    text_size=9,
-    text_color="#8b8b8b",
-    text_default="正在启动…",
+    # ★ 不用 PyInstaller 的文字叠加：它只能左对齐、对不准中线，交接到会动的那个启动窗时
+    # 那行字会横着挪一下。「正在启动…」已经按同一个坐标画进 splash.png 里了
+    # （`packaging/make_splash.py`），而且我们从来不更新它。
     always_on_top=True,
 )
 

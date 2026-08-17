@@ -20,7 +20,6 @@ from pathlib import Path
 
 from . import theme
 from .splash_style import (
-    COMET_SEGMENTS,
     FADE_MS,
     FADE_STEPS,
     FRAME_MS,
@@ -31,7 +30,8 @@ from .splash_style import (
     RING_WIDTH,
     STEP_DEGREES,
     WIDTH,
-    comet_colors,
+    comet_arcs,
+    window_position,
 )
 
 
@@ -61,7 +61,6 @@ class Splash:
         self._root = root
         self._closed = False
         self._angle = 0
-        self._colors = comet_colors()
         self._photo: tk.PhotoImage | None = None
 
         self._win = tk.Toplevel(root)
@@ -70,8 +69,8 @@ class Splash:
         self._center()
         try:
             self._win.attributes("-topmost", True)
-            # 稍微透一点，别像块硬贴纸糊在桌面上。和淡出用的是同一个 -alpha，
-            # 所以 _fade 得从 OPACITY 往下走，不能从 1.0 起——否则一开始淡出反而先变亮。
+            # OPACITY 现在是 1.0（理由见 splash_style）。留着这一句是因为淡出用的
+            # 是同一个 -alpha：`_fade` 从 OPACITY 往下走，改回半透明时它自己就对了。
             self._win.attributes("-alpha", OPACITY)
         except tk.TclError:  # pragma: no cover - 少数环境不支持
             pass
@@ -91,13 +90,15 @@ class Splash:
             cx - RING_RADIUS, cy - RING_RADIUS, cx + RING_RADIUS, cy + RING_RADIUS,
             outline=theme.SIDEBAR_ACTIVE_BG, width=RING_WIDTH,
         )
+        # ★ 第一帧就是静态首屏的那一帧（角度 0）。两边照 `comet_arcs` 同一份数画，
+        # 接力那一下才看不出来——原来静态图画一段 90° 的弧、动图画整圈渐变，一交接就跳。
         self._arcs = [
             self._canvas.create_arc(
                 cx - RING_RADIUS, cy - RING_RADIUS, cx + RING_RADIUS, cy + RING_RADIUS,
-                start=0, extent=360 // COMET_SEGMENTS - 2, style="arc",
+                start=start, extent=extent, style="arc",
                 outline=color, width=RING_WIDTH,
             )
-            for color in self._colors
+            for start, extent, color in comet_arcs(0)
         ]
         self._place_icon(icon_png, cx, cy)
 
@@ -142,11 +143,8 @@ class Splash:
     # ────────────────────────── 内部 ──────────────────────────
 
     def _center(self) -> None:
-        screen_w = self._win.winfo_screenwidth()
-        screen_h = self._win.winfo_screenheight()
-        x = max(0, (screen_w - WIDTH) // 2)
-        # 略高于正中：人的视觉重心比几何中心高一点，正中会显得偏下
-        y = max(0, int(screen_h * 0.42) - HEIGHT // 2)
+        x, y = window_position(self._win.winfo_screenwidth(),
+                               self._win.winfo_screenheight())
         self._win.geometry(f"{WIDTH}x{HEIGHT}+{x}+{y}")
 
     def _place_icon(self, icon_png: Path | None, cx: int, cy: int) -> None:
@@ -182,10 +180,9 @@ class Splash:
         if self._closed:
             return
         try:
-            for index, arc in enumerate(self._arcs):
-                self._canvas.itemconfig(
-                    arc, start=(self._angle + index * (360 // COMET_SEGMENTS)) % 360
-                )
+            for arc, (start, _extent, _color) in zip(self._arcs,
+                                                      comet_arcs(self._angle)):
+                self._canvas.itemconfig(arc, start=start)
             self._angle = (self._angle + STEP_DEGREES) % 360
             self._root.after(FRAME_MS, self._tick)
         except tk.TclError:
