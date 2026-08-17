@@ -750,12 +750,20 @@ class SplashTests(unittest.TestCase):
         """★ 建完控件必须自己催一次重绘：那会儿 mainloop 还没跑，Tk 一个像素都不画。
 
         真机实测过：少了这句，屏幕上只有 PyInstaller 那张静态图，会动的那个根本不出现。
+
+        ★ 顺序也在这条里：`_reveal()`（露面 + 催重绘）必须排在关掉静态首屏**之前**，
+        否则中间那一瞬间屏幕上一张都没有——那就是用户 2026-08-17 说的「闪一下」。
+        真 Tk 下的行为验证在 `test_ui_window.SplashRevealTests`；这一条是给没有 Tk 的
+        环境留的守卫（Linux/CI 上整个 splash 模块都 import 不了）。
         """
         source = (
             Path(__file__).resolve().parent.parent / "wxclient/ui/splash.py"
         ).read_text(encoding="utf-8")
-        head = source[: source.index("_close_frozen_splash()\n\n")]
-        self.assertIn("self._pump()", head)
+        head = source[: source.index("_close_frozen_splash()\n")]
+        self.assertIn("self._reveal()", head, "露面要排在关静态首屏之前")
+        reveal = source[source.index("def _reveal"):]
+        self.assertIn("self._pump()", reveal, "露面之后必须自己催一次重绘")
+        self.assertIn("self._win.deiconify()", reveal)
 
     def test_animated_splash_closes_the_frozen_one(self) -> None:
         """会动的那个一接手就必须关掉静态首屏，否则两张图叠在一起。"""
@@ -775,8 +783,10 @@ class SplashTests(unittest.TestCase):
         source = (
             Path(__file__).resolve().parent.parent / "wxclient/ui/splash.py"
         ).read_text(encoding="utf-8")
-        self.assertIn('self._win.attributes("-alpha", OPACITY)', source)
         self.assertIn('"-alpha", OPACITY * left / FADE_STEPS', source)
+        # 不透明时不该在创建时就设 -alpha：设了窗口就变成 layered，首次合成走另一条路。
+        # 半透明时又必须设，否则第一帧先实心一下再变透——所以是带条件的那一句。
+        self.assertIn("if OPACITY < 1.0:", source)
 
 
 class ColdStartTests(unittest.TestCase):

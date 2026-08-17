@@ -1337,6 +1337,68 @@ class WatchSectionTests(unittest.TestCase):
         self.assertIn("还没接上", self.window._watch_hint.cget("text"))
 
 
+@unittest.skipUnless(HAS_TK, "没有 Tk")
+class SplashRevealTests(unittest.TestCase):
+    """★ 启动动画得**摆好了再露面**（用户 2026-08-17：位置图标都对了，还是闪一下）。
+
+    `overrideredirect(True)` 是在窗口建出来之后去掉边框的，Windows 那边等于把窗口重建
+    一次。窗口这时候要是已经可见，人就会看见一个带边框的灰框闪一下再变成这张卡片。
+    """
+
+    def setUp(self) -> None:
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.addCleanup(self._teardown)
+
+    def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.root)
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+    def _splash(self):
+        from wxclient.ui.splash import Splash
+
+        splash = Splash(self.root)
+        self.addCleanup(lambda: splash._win.destroy())
+        return splash
+
+    def test_it_stays_hidden_until_everything_is_in_place(self) -> None:
+        """★ 单独验那道「先藏着」：把露面这一步掐掉，窗口就该还是藏着的。
+
+        只验「构造完是可见的」是验不到这条的——那条不管藏没藏过都成立。
+        """
+        from wxclient.ui.splash import Splash
+
+        with mock.patch.object(Splash, "_reveal", lambda _self: None):
+            splash = self._splash()
+
+        self.assertEqual(splash._win.state(), "withdrawn")
+
+    def test_it_is_showing_by_the_time_the_constructor_returns(self) -> None:
+        """藏完得记着露出来——不然就成了「启动时什么都没有」。"""
+        splash = self._splash()
+
+        self.assertEqual(splash._win.state(), "normal")
+
+    def test_the_static_first_frame_is_closed_only_after_ours_is_painted(self) -> None:
+        """★ 顺序是硬的：我们这张画出来了，才关 PyInstaller 那张静态首屏。
+
+        反过来的话中间那一瞬间屏幕上一张都没有——那就是「闪一下」。
+        """
+        from wxclient.ui import splash as splash_mod
+
+        order: list[str] = []
+        with mock.patch.object(splash_mod, "_close_frozen_splash",
+                               lambda: order.append("close_frozen")), \
+                mock.patch.object(splash_mod.Splash, "_reveal",
+                                  lambda _self: order.append("reveal")):
+            self._splash()
+
+        self.assertEqual(order, ["reveal", "close_frozen"])
+
+
 class _StubParent:
     """假的父窗口几何。真窗口在 SSH 会话里全是 1×1，拿它验居中等于什么都没验。"""
 

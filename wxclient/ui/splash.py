@@ -64,14 +64,23 @@ class Splash:
         self._photo: tk.PhotoImage | None = None
 
         self._win = tk.Toplevel(root)
+        # ★ 先藏起来，全部摆好了再 `_reveal()`（用户 2026-08-17：位置图标都对了，还是闪一下）。
+        # `overrideredirect(True)` 是**在窗口建出来之后**去掉边框的，Windows 那边等于把窗口
+        # 重建一次（unmap → 重新 map）。窗口这时候要是已经可见，人就会看见一个带边框的
+        # 灰框闪一下再变成这张卡片。藏着摆、摆完再露面，这一下就没有了。
+        self._win.withdraw()
         self._win.overrideredirect(True)  # 无边框：启动图不该有标题栏和关闭按钮
         self._win.configure(bg=theme.SIDEBAR_BG)
         self._center()
         try:
             self._win.attributes("-topmost", True)
-            # OPACITY 现在是 1.0（理由见 splash_style）。留着这一句是因为淡出用的
-            # 是同一个 -alpha：`_fade` 从 OPACITY 往下走，改回半透明时它自己就对了。
-            self._win.attributes("-alpha", OPACITY)
+            # ★ 这里**不设 -alpha**。设了（哪怕是 1.0）Windows 就把它变成 layered 窗口，
+            # 而 layered 窗口的首次合成和普通窗口不是一条路。OPACITY 现在就是 1.0，
+            # 不透明的窗口没必要走那条路——淡出时 `_fade` 会自己把 -alpha 加上。
+            # （这一条属于「少一个变数」的判断，不是量出来的；哪天 OPACITY 调回半透明，
+            #   得在这儿把它设回来，否则第一帧会先实心一下再变透。）
+            if OPACITY < 1.0:
+                self._win.attributes("-alpha", OPACITY)
         except tk.TclError:  # pragma: no cover - 少数环境不支持
             pass
 
@@ -111,11 +120,21 @@ class Splash:
             fill=theme.SIDEBAR_MUTED, font=theme.FONT_SMALL,
         )
         self._tick()
-        # ★ 必须自己催一次重绘：这时 `root.mainloop()` 还没开始跑，Tk 只建了控件、
-        # 一个像素都没画。少了这句，启动动画在「界面构建完、进 mainloop」之前
-        # 根本不出现——真机实测就是这样，屏幕上只有 PyInstaller 那张静态图（2026-08-14）。
-        self._pump()
+        self._reveal()
+        # ★ 顺序是硬的：**我们这张画出来了，才关掉 PyInstaller 那张静态首屏**。
+        # 反过来的话，中间那一瞬间屏幕上一张都没有——那就是「闪一下」。
         _close_frozen_splash()
+
+    def _reveal(self) -> None:
+        """摆好之后再露面，并且**当场画出来**。
+
+        必须自己催一次重绘：这时 `root.mainloop()` 还没开始跑，Tk 只建了控件、
+        一个像素都没画。少了这句，启动动画在「界面构建完、进 mainloop」之前
+        根本不出现——真机实测就是这样，屏幕上只有 PyInstaller 那张静态图（2026-08-14）。
+        """
+        self._win.deiconify()
+        self._win.lift()
+        self._pump()
 
     # ────────────────────────── 对外 ──────────────────────────
 
