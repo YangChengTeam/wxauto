@@ -192,6 +192,28 @@ def _check_images(lines: list[str]) -> bool:
                 pass
 
 
+def _log_tk_callback_errors(root: tk.Tk) -> None:
+    """把 tk 回调里抛出的异常写进日志。
+
+    ★ 2026-08-17 真机：「移出监听名单」点了**一点反应都没有**。真因是那个回调里抛了
+    AttributeError（弹框的 parent 传了个非控件），而窗口化程序**没有控制台**——tk 默认
+    把回调异常打到 stderr，于是它去了虚空：界面不动、日志不写、什么线索都没有。
+
+    这里换掉那个默认行为：异常照样不中断界面（tk 本来就是这么设计的），但**必须留下痕迹**，
+    而且是留在用户自己就能看到的「实时日志」里。
+    """
+    import traceback
+
+    def report(exc_type, exc_value, exc_tb) -> None:  # noqa: ANN001 - tk 规定的签名
+        _log.error(
+            "界面回调出错",
+            error=f"{exc_type.__name__}: {exc_value}",
+             位置="".join(traceback.format_tb(exc_tb)[-1:]).strip(),
+        )
+
+    root.report_callback_exception = report  # type: ignore[method-assign]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.self_check:
@@ -203,6 +225,7 @@ def main(argv: list[str] | None = None) -> int:
     _claim_taskbar_identity()
     root = tk.Tk()
     root.withdraw()  # 主窗口先藏着，是否露面由后面决定
+    _log_tk_callback_errors(root)
     splash = Splash(root, icon_png=icons.PNG_PATH)
     splash.stage("正在加载…")
 

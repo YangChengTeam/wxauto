@@ -527,11 +527,17 @@ class MainWindow:
         ★ 问的这一句要说清后果和归属：删掉之后**他再来消息不会被自动回复**；名单的权威
         在 AI 端，所以这里是「请 AI 端删」，删完新名单推回来、这一行才会消失——
         不在本机先把行删掉装成功（那样下一次推送又会把它带回来，看起来像「删不掉」）。
+
+        ★ 弹框的 parent 必须是**真控件**（`self.root`）：`MainWindow` 不是 tk 控件，
+        传 `self` 会在 `winfo_toplevel()` 上抛 AttributeError——而 tk 回调里的异常在
+        窗口化程序里是**看不见的**（没有控制台），现场表现就是「点了没反应」
+        （2026-08-17 用户反馈，v0.1.14 真机）。
         """
         if name in self._watch_removing:
             return  # 上一次还没有回话，别排第二条
+        _log.info("请求移出监听名单", 会话=name)
         if not dialog.ask(
-            self, "移出监听名单",
+            self.root, "移出监听名单",
             f"移出「{name}」之后，他再发消息就不会被自动回复了。\n\n"
             "名单由 AI 端保管，这里会请 AI 端删掉；删完新名单会自动同步回这台电脑。",
             confirm="移出", cancel="取消",
@@ -540,7 +546,8 @@ class MainWindow:
         try:
             future = self.service.remove_watched(name)
         except Exception as exc:  # noqa: BLE001 - 服务没起/连不上都要说人话
-            dialog.tell(self, "没能移出", str(exc), tone="error")
+            _log.warning("移出监听名单失败", 会话=name, error=str(exc))
+            dialog.tell(self.root, "没能移出", str(exc), tone="error")
             return
         self._watch_removing[name] = future
         self._watch_shown = None  # 逼下一拍重画，让这一行显示「正在移出…」
@@ -555,13 +562,17 @@ class MainWindow:
             try:
                 result = future.result()
             except Exception as exc:  # noqa: BLE001 - 超时/断线照原样说出来
-                dialog.tell(self, "没能移出", f"{name}：{exc}", tone="error")
+                _log.warning("移出监听名单失败", 会话=name, error=str(exc))
+                dialog.tell(self.root, "没能移出", f"{name}：{exc}", tone="error")
                 continue
             removed = list(result.get("removed") or []) if isinstance(result, dict) else []
             if not removed:
                 # AI 端说它本来就不在名单上。**别当成删成功**——那会让人以为改过了。
-                dialog.tell(self, "没有变化",
+                _log.info("移出监听名单：AI 端说本来就不在名单里", 会话=name)
+                dialog.tell(self.root, "没有变化",
                             f"AI 端说「{name}」本来就不在自动回复名单里。")
+            else:
+                _log.info("已移出监听名单", 会话=name, 删掉=removed)
 
     def _render_watch_page(self) -> None:
         """把名单铺到页面上。停在配置中心时每秒刷一次——名单是 AI 端随时会改的。"""

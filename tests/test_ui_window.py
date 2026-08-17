@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import sys
 import tempfile
 import threading
 import time
@@ -1373,6 +1374,30 @@ class WatchRemovalTests(unittest.TestCase):
         self.calls.append(name)
         return self.future
 
+    def _dialogs(self, answer: bool):
+        """★ **只挡住「弹出来」这一下，弹框本身照真建**。
+
+        2026-08-17 真机上「点了没反应」正是被这层遮住的：那时候用例把 `dialog.ask`
+        整个换成 Mock，于是没人发现真调用会在 `parent.winfo_toplevel()` 上抛
+        AttributeError（`MainWindow` 不是控件）——而 tk 回调里的异常在窗口化程序里
+        看不见，界面就是一动不动。所以这里 patch 的是 `_Dialog.show`，`__init__`
+        照跑，parent 传错立刻炸给用例看。
+        """
+        made: list[tuple[Any, str, str]] = []
+        real_init = window_module.dialog._Dialog.__init__
+
+        def spy_init(inner, parent, title, message, **kw):  # noqa: ANN001, ANN202
+            real_init(inner, parent, title, message, **kw)
+            made.append((parent, title, message))
+            self.addCleanup(_destroy, inner)
+
+        patches = (
+            mock.patch.object(window_module.dialog._Dialog, "__init__", spy_init),
+            mock.patch.object(window_module.dialog._Dialog, "show",
+                              lambda _inner: answer),
+        )
+        return made, patches
+
     def _teardown(self) -> None:
         _KEEP_ALIVE.append(self.window)
         try:
@@ -1380,17 +1405,32 @@ class WatchRemovalTests(unittest.TestCase):
         except tk.TclError:
             pass
 
-    def test_cancelling_the_confirm_changes_nothing(self) -> None:
-        with mock.patch.object(window_module.dialog, "ask", return_value=False) as ask:
+    def test_the_confirm_box_really_opens(self) -> None:
+        """★ 弹框得真弹得出来——2026-08-17 真机上它根本没弹（parent 传了个非控件）。"""
+        made, patches = self._dialogs(False)
+        with patches[0], patches[1]:
             self.window._ask_remove_watched("候选人-王建国")
 
-        ask.assert_called_once()
+        self.assertEqual(len(made), 1, "确认框没弹出来")
+        parent, title, message = made[0]
+        self.assertIsInstance(parent, tk.Misc, "★ 弹框的 parent 必须是真控件")
+        self.assertIn("移出", title)
+        self.assertIn("候选人-王建国", message)
+        self.assertIn("不会被自动回复", message, "得说清后果")
+
+    def test_cancelling_the_confirm_changes_nothing(self) -> None:
+        made, patches = self._dialogs(False)
+        with patches[0], patches[1]:
+            self.window._ask_remove_watched("候选人-王建国")
+
+        self.assertEqual(len(made), 1)
         self.assertEqual(self.calls, [], "点了取消还去删，那这个框就是个摆设")
         self.assertEqual(self.window._watch_removing, {})
 
     def test_confirming_asks_the_ai_side_and_waits_for_it(self) -> None:
         self.future = _PendingFuture()
-        with mock.patch.object(window_module.dialog, "ask", return_value=True):
+        made, patches = self._dialogs(True)
+        with patches[0], patches[1]:
             self.window._ask_remove_watched("候选人-王建国")
 
         self.assertEqual(self.calls, ["候选人-王建国"])
@@ -1399,34 +1439,42 @@ class WatchRemovalTests(unittest.TestCase):
 
     def test_a_no_op_removal_is_not_reported_as_success(self) -> None:
         self.future = _DoneFuture({"removed": [], "watching": 3})
-        with mock.patch.object(window_module.dialog, "ask", return_value=True), \
-             mock.patch.object(window_module.dialog, "tell") as tell:
+        made, patches = self._dialogs(True)
+        with patches[0], patches[1]:
             self.window._ask_remove_watched("查无此人")
             self.window._poll_watch_removals()
 
-        tell.assert_called_once()
-        self.assertIn("本来就不在", tell.call_args.args[2])
+        self.assertEqual(len(made), 2, "确认框 + 「没有变化」各一个")
+        self.assertIn("本来就不在", made[1][2])
 
     def test_a_failure_is_told_as_a_failure(self) -> None:
         self.future = _FailedFuture(RuntimeError("AI 端连不上"))
-        with mock.patch.object(window_module.dialog, "ask", return_value=True), \
-             mock.patch.object(window_module.dialog, "tell") as tell:
+        made, patches = self._dialogs(True)
+        with patches[0], patches[1]:
             self.window._ask_remove_watched("候选人-王建国")
             self.window._poll_watch_removals()
 
         self.assertEqual(self.window._watch_removing, {}, "失败了也要把这一条收掉")
-        self.assertIn("AI 端连不上", tell.call_args.args[2])
+        self.assertIn("AI 端连不上", made[-1][2])
 
     def test_the_service_being_down_says_so_instead_of_throwing(self) -> None:
         def boom(_name: str):
             raise ServiceNotRunning("服务没在运行，名单改不了")
 
         self.service.remove_watched = boom  # type: ignore[method-assign]
-        with mock.patch.object(window_module.dialog, "ask", return_value=True), \
-             mock.patch.object(window_module.dialog, "tell") as tell:
+        made, patches = self._dialogs(True)
+        with patches[0], patches[1]:
             self.window._ask_remove_watched("候选人-王建国")
 
-        self.assertIn("名单改不了", tell.call_args.args[2])
+        self.assertIn("名单改不了", made[-1][2])
+
+
+def _destroy(dialog_obj: Any) -> None:
+    """用例里 `show()` 被挡了，弹框那个 Toplevel 得自己收掉。"""
+    try:
+        dialog_obj.top.destroy()
+    except tk.TclError:
+        pass
 
 
 class _DoneFuture:
@@ -1457,6 +1505,36 @@ class _FailedFuture:
 
     def result(self) -> Any:
         raise self._exc
+
+
+@unittest.skipUnless(HAS_TK, "没有 Tk")
+class TkCallbackErrorTests(unittest.TestCase):
+    """★ tk 回调里抛的异常必须留痕。
+
+    2026-08-17 真机：「移出监听名单」点了一点反应都没有。那个回调里抛了 AttributeError，
+    而窗口化程序没有控制台——tk 默认把回调异常打到 stderr，于是它去了虚空：
+    界面不动、日志不写、没有任何线索。这一条守的是「别再无声无息」。
+    """
+
+    def test_the_hook_writes_the_error_into_the_log(self) -> None:
+        from wxclient.ui.__main__ import _log_tk_callback_errors
+
+        root = tk.Tk()
+        root.withdraw()
+        _KEEP_ALIVE.append(root)
+        self.addCleanup(root.destroy)
+
+        _log_tk_callback_errors(root)
+        logger = mock.MagicMock()
+        with mock.patch("structlog.get_logger", return_value=logger):
+            try:
+                raise ValueError("界面回调炸了")
+            except ValueError:
+                root.report_callback_exception(*sys.exc_info())
+
+        logger.error.assert_called_once()
+        self.assertIn("界面回调出错", logger.error.call_args.args[0])
+        self.assertIn("界面回调炸了", str(logger.error.call_args.kwargs))
 
 
 @unittest.skipUnless(HAS_TK, "没有 Tk")
