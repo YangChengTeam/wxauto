@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import unittest
+from concurrent.futures import Future
 from unittest import mock
 
 try:
@@ -26,7 +27,7 @@ except Exception:  # noqa: BLE001 - 没有 Tk / 没有显示环境都算「跑�
 if HAS_TK:
     from wxclient.ui import debug_page as debug_page_module
     from wxclient.ui import theme
-    from wxclient.ui.debug_page import AI_NAME, PLACEHOLDER, DebugPage, _SlimScroll
+    from wxclient.ui.debug_page import AI_NAME, PLACEHOLDER, DebugPage, _CommandCard, _SlimScroll
     from wxclient.ui.service import GatewayService
 
 #: 建过的窗口留到进程结束——理由和 test_ui_window.py 顶上那段一样（Tcl_AsyncDelete）。
@@ -112,6 +113,54 @@ class DebugPageTests(unittest.TestCase):
         self.assertGreaterEqual(holder.cget("height"), debug_page_module._AVATAR,
                                 "头像那一格没给高度 → 图会被裁成一条线")
 
+    # ── 回执与卡的先后 ────────────────────────────────────────────
+
+    def _receipt(self, op: str = "post_moments", status: str = "done") -> dict:
+        return {"kind": "wechat_command_result", "command_id": "c1", "op": op, "status": status}
+
+    def test_a_receipt_that_beats_its_card_lands_on_that_card(self) -> None:
+        """★ 一条指令一张卡（2026-08-17 用户反馈：「post 成功，下面还写着待下发」）。
+
+        真因是先后：指令一 emit 出来 AI 端就下发了，网关十几秒就报回执，而这一轮的卡
+        **要等整轮收口才画**。回执先到、找不到卡 → 另起一张写「执行成功」，随后真卡
+        又停在「待下发」——同一条指令占了两张卡，还各说各话。
+        """
+        self.page._future = Future()  # 这一轮还在跑
+
+        self.page._render_receipt(self._receipt())
+
+        cards = [c for c in self.page._list.winfo_children() if isinstance(c, _CommandCard)]
+        self.assertEqual(cards, [], "回执跑在前头时不该另起一张卡")
+
+        card = self.page._add_command_card("post_moments（content=招 3 个普工）")
+
+        self.assertIn("执行成功", card._status.cget("text"), "卡一画出来就该认领那条回执")
+        self.assertIs(card._icon._ok, True)
+        self.assertEqual(
+            len([c for c in self.page._list.winfo_children() if isinstance(c, _CommandCard)]), 1,
+            "全程只有一张卡",
+        )
+
+    def test_an_unclaimed_receipt_still_shows_up(self) -> None:
+        """没人认领的回执（排期到点执行、上一轮的指令）照样摆出来——不能吞。"""
+        self.page._future = Future()
+        self.page._render_receipt(self._receipt(op="send_message"))
+
+        self.page._future = None
+        self.page._render_reply(_Turn())
+
+        cards = [c for c in self.page._list.winfo_children() if isinstance(c, _CommandCard)]
+        self.assertEqual(len(cards), 1)
+        self.assertIn("执行成功", cards[0]._status.cget("text"))
+
+    def test_a_receipt_with_no_turn_in_flight_gets_its_own_card(self) -> None:
+        """不在轮次里的回执直接补一张卡（老行为，别回归）。"""
+        self.page._render_receipt(self._receipt(op="send_message"))
+
+        cards = [c for c in self.page._list.winfo_children() if isinstance(c, _CommandCard)]
+        self.assertEqual(len(cards), 1)
+        self.assertIn("执行成功", cards[0]._status.cget("text"))
+
     # ── 「说真话」──────────────────────────────────────────────────
 
     def test_my_bubble_stays_unmarked_until_the_turn_settles(self) -> None:
@@ -183,6 +232,14 @@ class SlimScrollTests(unittest.TestCase):
         self.assertEqual(len(self.moved), 1)
         self.assertGreaterEqual(self.moved[0], 0.0)
         self.assertLessEqual(self.moved[0], 1.0)
+
+
+class _Turn:
+    """`TurnResult` 的形状：一轮什么都没产出（本文件只关心回执那半截）。"""
+
+    error = None
+    text = ""
+    card = None
 
 
 class _Event:

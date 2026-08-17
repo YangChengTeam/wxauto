@@ -86,6 +86,11 @@ class DebugPage(tk.Frame):
         self._pending: tk.Frame | None = None   # 「正在…」那一行
         self._stage_text = ""
         self._open_cards: list[tuple[str, Any]] = []  # (op, 卡片) 等回执认领
+        # ★ 跑在卡前头的回执（2026-08-17 真机）：指令一 emit 出来 AI 端就下发了，网关十几秒就
+        # 报回执，而这一轮的**卡要等整轮收口才画**——回执先到，找不到卡，于是另起一张「执行成功」，
+        # 随后那张真卡又停在「待下发」。用户看到的就是「上面说成功、下面还写着待下发」。
+        # 所以在途的回执先存这儿，卡一画出来就认领。key = op。
+        self._early_receipts: dict[str, list[Any]] = {}
         self._my_mark: tk.Label | None = None    # 这一轮自己那句话右边的下场标记
         self._build()
         self._say_ai(_GREETING)
@@ -293,6 +298,11 @@ class DebugPage(tk.Frame):
             self._say_hint(f"没下发：{line}")
         if reply.raw:
             self._say_hint(f"这一轮没给出能认的产出，原样贴在这儿：\n{reply.raw}")
+        # 存下来却没有卡来认领的回执（排期到点执行、上一轮的指令）——照样摆出来，不吞
+        for leftovers in list(self._early_receipts.values()):
+            for receipt in leftovers:
+                self._standalone_receipt(receipt)
+        self._early_receipts.clear()
         self._live = None
         self._scroll_to_end()
 
@@ -306,11 +316,19 @@ class DebugPage(tk.Frame):
                 if receipt.settled:
                     self._open_cards.pop(index)
                 return
-        # 没有对应的卡（比如上一轮的指令、或排期到点才执行的）——单独补一张
-        card = self._add_command_card(receipt.op)
+        if self._future is not None:
+            # 这一轮还没收口 = 它的指令卡马上就要画出来，回执只是跑到了前头。先存着，
+            # 别另起一张——另起就成了「一条指令两张卡，一张成功一张待下发」。
+            self._early_receipts.setdefault(receipt.op, []).append(receipt)
+            return
+        # 真的没有对应的卡（上一轮的指令、或排期到点才执行的）——单独补一张
+        self._standalone_receipt(receipt)
+
+    def _standalone_receipt(self, receipt: Any) -> None:
+        card = self._add_command_card(receipt.op, claim_early=False)
         card.apply(receipt)
-        if not receipt.settled:
-            self._open_cards.append((receipt.op, card))
+        if receipt.settled:
+            self._open_cards = [(op, c) for op, c in self._open_cards if c is not card]
 
     def _render_connection(self) -> None:
         """标题栏右边那句「AI 已连接」。**据实报**——连不上时说连不上。"""
@@ -442,13 +460,22 @@ class DebugPage(tk.Frame):
         body.pack(side=tk.LEFT, padx=(8, 0))
         self._scroll_to_end()
 
-    def _add_command_card(self, summary: str) -> _CommandCard:
+    def _add_command_card(self, summary: str, *, claim_early: bool = True) -> _CommandCard:
         op = summary.split("（", 1)[0].strip()
         detail = summary[len(op):].strip("（）") if "（" in summary else ""
         card = _CommandCard(self._list, op=op, detail=detail, on_open_log=self._on_open_log,
                             bubble_width=self._bubble_width)
         card.pack(fill=tk.X, padx=(_INDENT, 0), pady=(8, 4))
         self._open_cards.append((op, card))
+        # 回执跑在卡前头时先存在 `_early_receipts` 里，卡一出来就把它认领回来
+        early = self._early_receipts.get(op) if claim_early else None
+        if early:
+            receipt = early.pop(0)
+            if not early:
+                self._early_receipts.pop(op, None)
+            card.apply(receipt)
+            if receipt.settled:
+                self._open_cards.pop()
         self._scroll_to_end()
         return card
 
