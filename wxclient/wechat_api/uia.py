@@ -202,12 +202,7 @@ class UiaWeChatDriver:
         except Exception as exc:
             raise WeChatApiError(f"搜索联系人失败：{exc}") from exc
         finally:
-            if search_edit is not None:
-                try:
-                    search_edit.set_text("")
-                    search_edit.type_keys("{ESC}")
-                except Exception:
-                    pass
+            self._leave_search(chat_button, search_edit)
 
         exact_count = sum(1 for item in matches if item["exact"])
         logger.info(
@@ -223,6 +218,29 @@ class UiaWeChatDriver:
             "match_count": len(matches),
             "exact_count": exact_count,
         }
+
+    @staticmethod
+    def _leave_search(chat_button: Any, search_edit: Any) -> None:
+        """退出搜索态：清空搜索框 + 回会话列表。**绝不按 ESC。**
+
+        ★ 微信 4.x 里，搜索框空着时 ESC = 关窗口 —— 整个微信直接收进右下角托盘
+        （2026-08-17 用户实报：「用搜索去找的话，微信就直接关闭到右下角了」）。
+        我们这一步只是想把界面收拾回原样，结果顺手把人家的微信关了：收进托盘之后
+        UIA 子树会被微信收走（见 `_ensure_ready` 那段注释），下一条指令、下一次读消息
+        都要先把窗口捞回来才做得成，中间那几秒任何操作都可能扑空。
+
+        改成点一下左侧「微信」按钮回到会话列表：搜索面板自然收起，窗口留在原地。
+        两步都是「收拾现场」，失败了也不该把这次搜索判成失败——所以各自吞掉异常。
+        """
+        try:
+            if search_edit is not None:
+                search_edit.set_text("")
+        except Exception:
+            pass
+        try:
+            chat_button.click_input()
+        except Exception:
+            pass
 
     def get_contact_profile(self, friend: str) -> dict[str, Any]:
         normalized_friend = str(friend or "").strip()
