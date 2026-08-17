@@ -232,6 +232,33 @@ class DebugPageTests(unittest.TestCase):
         self.assertEqual(mark.cget("text"), "×")
         self.assertEqual(str(mark.cget("fg")), theme.RED)
 
+    def test_stopping_with_nothing_in_flight_sends_nothing(self) -> None:
+        """没有在跑的轮次时点「停止」= 什么都不发（免得往 AI 端打一条无主的打断）。"""
+        with mock.patch.object(self.page.service, "interrupt_debug") as sent:
+            self.page.stop()
+        sent.assert_not_called()
+
+    def test_a_stopped_turn_says_so_and_is_not_marked_as_done(self) -> None:
+        """★ 点了「停止」要看得见（用户 2026-08-17「停止功能无效」）：不画勾、明说停了。"""
+        future: Future = Future()
+        self.page._future = future
+        mark = self.page._say_me("给张三发条消息")
+        self.page._my_mark = mark
+        self.page._show_pending()
+
+        with mock.patch.object(self.page.service, "interrupt_debug") as sent:
+            self.page.stop()
+        sent.assert_called_once()
+
+        future.set_result(_Turn())   # AI 端认了打断，回一个空轮
+        self.page._drain()
+
+        self.assertEqual(mark.cget("text"), "■", "被打断的一轮不许画成功的勾")
+        hints = [w.cget("text") for w in _walk(self.page._list)
+                 if isinstance(w, tk.Label) and "已停止" in str(w.cget("text"))]
+        self.assertTrue(hints, "界面上要有一句「已停止」")
+        self.assertIn("不会撤回", hints[0], "已经下发的指令撤不回来，这句得说清楚")
+
     def test_a_command_card_starts_pending_and_only_a_receipt_moves_it(self) -> None:
         """★ 卡里有指令只代表 AI 打算做，不代表下发了（2026-08-17 事故）。"""
         card = self.page._add_command_card("send_message（to=张三）")

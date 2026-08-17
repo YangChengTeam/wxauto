@@ -98,6 +98,7 @@ class DebugPage(tk.Frame):
         # 所以在途的回执先存这儿，卡一画出来就认领。key = op。
         self._early_receipts: dict[str, list[Any]] = {}
         self._my_mark: tk.Label | None = None    # 这一轮自己那句话右边的下场标记
+        self._stopping = False                   # 这一轮是被「停止」按停的（收口时要如实说一声）
         self._build()
         self._say_ai(_GREETING)
         self._pump()
@@ -208,7 +209,10 @@ class DebugPage(tk.Frame):
 
     def stop(self) -> None:
         """停止这一轮。只是让 AI 别再往下算，**已经下发的指令不会被撤回**。"""
+        if self._future is None:
+            return  # 没有在跑的轮次，没东西可停
         self.service.interrupt_debug()
+        self._stopping = True
         self._stage_text = "正在停止…"
 
     # 这两个回调**跑在网关线程上**：只准往队列里放，绝不碰控件。
@@ -258,13 +262,20 @@ class DebugPage(tk.Frame):
         self._future = None
         self._hide_pending()
         self._send_btn.set_busy(False)
+        stopped, self._stopping = self._stopping, False
+        if stopped:
+            # 打断的一轮不画勾——它没跑完。先落这个标记，`_render_reply` 里那次
+            # `_mark_turn` 就自然成了空操作（标记只认领一次）。
+            self._mark_turn("■", theme.TEXT_MUTED)
         try:
             result = future.result()
         except Exception as exc:  # noqa: BLE001 - 超时/断线/票据失效都照原样说出来
             self._mark_turn("×", theme.RED)
             self._say_error(f"{type(exc).__name__}：{exc}")
-            return
-        self._render_reply(result)
+        else:
+            self._render_reply(result)
+        if stopped:
+            self._say_hint("已停止。已经下发的指令不会撤回。")
 
     def _mark_turn(self, glyph: str, color: str) -> None:
         """给自己那句话右边落个下场标记。**只在这一轮真收口之后调**。"""
