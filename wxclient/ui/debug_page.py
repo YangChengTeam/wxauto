@@ -85,7 +85,13 @@ class DebugPage(tk.Frame):
         self._live: tk.Label | None = None      # 正在流式写入的那个气泡
         self._pending: tk.Frame | None = None   # 「正在…」那一行
         self._stage_text = ""
-        self._open_cards: list[tuple[str, Any]] = []  # (op, 卡片) 等回执认领
+        # 等回执认领的卡：[op, 卡片, 这张卡属于第几轮, 已绑定的 command_id]
+        # ★ 只按 op 配对会认错人（2026-08-17 真机）：上一轮那张没收口的卡一直挂在这儿，
+        #   下一轮的回执排在它后面就先落到**老卡**上——新卡永远停在「待下发」，
+        #   而用户明明看到消息已经发出去了。所以一旦见过 command_id 就绑死，
+        #   没绑过的候选里取**最近那一轮**的（回执说的必然是刚下发的那条）。
+        self._open_cards: list[list[Any]] = []
+        self._turn_seq = 0  # 每发一句 +1；卡记下自己属于哪一轮
         # ★ 跑在卡前头的回执（2026-08-17 真机）：指令一 emit 出来 AI 端就下发了，网关十几秒就
         # 报回执，而这一轮的**卡要等整轮收口才画**——回执先到，找不到卡，于是另起一张「执行成功」，
         # 随后那张真卡又停在「待下发」。用户看到的就是「上面说成功、下面还写着待下发」。
@@ -190,6 +196,7 @@ class DebugPage(tk.Frame):
             self._say_error(f"发不出去：{exc}")
             return
         self._input.delete("1.0", tk.END)
+        self._turn_seq += 1
         self._my_mark = self._say_me(text)
         self._future = future
         self._stream = ""
@@ -310,12 +317,13 @@ class DebugPage(tk.Frame):
         receipt = format_receipt(body)
         if receipt is None:
             return
-        for index, (op, card) in enumerate(self._open_cards):
-            if op == receipt.op:
-                card.apply(receipt)
-                if receipt.settled:
-                    self._open_cards.pop(index)
-                return
+        entry = self._claim_entry(receipt)
+        if entry is not None:
+            entry[3] = receipt.command_id or entry[3]
+            entry[1].apply(receipt)
+            if receipt.settled:
+                self._open_cards.remove(entry)
+            return
         if self._future is not None:
             # 这一轮还没收口 = 它的指令卡马上就要画出来，回执只是跑到了前头。先存着，
             # 别另起一张——另起就成了「一条指令两张卡，一张成功一张待下发」。
@@ -324,11 +332,29 @@ class DebugPage(tk.Frame):
         # 真的没有对应的卡（上一轮的指令、或排期到点才执行的）——单独补一张
         self._standalone_receipt(receipt)
 
+    def _claim_entry(self, receipt: Any) -> list[Any] | None:
+        """这条回执该落到哪张卡上。绑过 command_id 的认死；没绑过的取**最近一轮**里最早的那张。
+
+        「最近一轮优先」是因为：一条指令的回执总是紧跟着它那一轮来的，而队列里可能还留着
+        更早那轮没等到终态的卡（网关掉线、指令根本没下发）——那些卡的结果永远不会来了，
+        不能拿它们去接别人的回执。同一轮里有多条同 op 指令时按下发顺序（最早的先）配对。
+        """
+        if receipt.command_id:
+            for entry in self._open_cards:
+                if entry[3] == receipt.command_id:
+                    return entry
+        candidates = [e for e in self._open_cards if e[0] == receipt.op and not e[3]]
+        if not candidates:
+            return None
+        newest = max(e[2] for e in candidates)
+        return next(e for e in candidates if e[2] == newest)
+
     def _standalone_receipt(self, receipt: Any) -> None:
         card = self._add_command_card(receipt.op, claim_early=False)
         card.apply(receipt)
-        if receipt.settled:
-            self._open_cards = [(op, c) for op, c in self._open_cards if c is not card]
+        self._open_cards = [e for e in self._open_cards if e[1] is not card]
+        if not receipt.settled:
+            self._open_cards.append([receipt.op, card, self._turn_seq, receipt.command_id])
 
     def _render_connection(self) -> None:
         """标题栏右边那句「AI 已连接」。**据实报**——连不上时说连不上。"""
@@ -466,16 +492,17 @@ class DebugPage(tk.Frame):
         card = _CommandCard(self._list, op=op, detail=detail, on_open_log=self._on_open_log,
                             bubble_width=self._bubble_width)
         card.pack(fill=tk.X, padx=(_INDENT, 0), pady=(8, 4))
-        self._open_cards.append((op, card))
-        # 回执跑在卡前头时先存在 `_early_receipts` 里，卡一出来就把它认领回来
-        early = self._early_receipts.get(op) if claim_early else None
-        if early:
-            receipt = early.pop(0)
-            if not early:
-                self._early_receipts.pop(op, None)
+        entry: list[Any] = [op, card, self._turn_seq, ""]
+        self._open_cards.append(entry)
+        # 回执跑在卡前头时先存在 `_early_receipts` 里，卡一出来就把它认领回来。
+        # ★ 一条指令的回执是**一串**（received → started → done），存下几条就全领回来按序落，
+        #   只领第一条的话卡会停在「已收到，排队中」，后面那几条还会各自另起一张卡。
+        early = self._early_receipts.pop(op, None) if claim_early else None
+        for receipt in early or []:
+            entry[3] = receipt.command_id or entry[3]
             card.apply(receipt)
-            if receipt.settled:
-                self._open_cards.pop()
+            if receipt.settled and entry in self._open_cards:
+                self._open_cards.remove(entry)
         self._scroll_to_end()
         return card
 

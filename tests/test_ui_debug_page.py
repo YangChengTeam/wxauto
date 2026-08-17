@@ -115,8 +115,8 @@ class DebugPageTests(unittest.TestCase):
 
     # ── 回执与卡的先后 ────────────────────────────────────────────
 
-    def _receipt(self, op: str = "post_moments", status: str = "done") -> dict:
-        return {"kind": "wechat_command_result", "command_id": "c1", "op": op, "status": status}
+    def _receipt(self, op: str = "post_moments", status: str = "done", command_id: str = "c1") -> dict:
+        return {"kind": "wechat_command_result", "command_id": command_id, "op": op, "status": status}
 
     def test_a_receipt_that_beats_its_card_lands_on_that_card(self) -> None:
         """★ 一条指令一张卡（2026-08-17 用户反馈：「post 成功，下面还写着待下发」）。
@@ -140,6 +140,56 @@ class DebugPageTests(unittest.TestCase):
             len([c for c in self.page._list.winfo_children() if isinstance(c, _CommandCard)]), 1,
             "全程只有一张卡",
         )
+
+    def test_the_whole_receipt_run_lands_on_the_one_card(self) -> None:
+        """★ 一条指令的回执是**一串**：received → started → done（真机日志逐条可见）。
+
+        只领第一条的话，卡会停在「已收到，排队中」，后面 started/done 还各自另起一张——
+        用户看到的是「待下发/排队中，其实早就发出去了」（2026-08-17）。
+        """
+        self.page._future = Future()
+        for status in ("received", "started", "done"):
+            self.page._render_receipt(self._receipt(op="send_message", status=status))
+
+        card = self.page._add_command_card("send_message（to=张三，text=面试改到明天）")
+
+        self.assertIn("执行成功", card._status.cget("text"), "落到的应该是**最后**那条")
+        self.assertIs(card._icon._ok, True)
+        self.assertEqual(
+            len([c for c in self.page._list.winfo_children() if isinstance(c, _CommandCard)]), 1,
+            "三条回执一张卡，不是三张",
+        )
+
+    def test_a_settled_card_stops_claiming_later_receipts(self) -> None:
+        """收口过的卡要退出认领队列，别把下一条指令的回执抢过去。"""
+        self.page._future = Future()
+        self.page._render_receipt(self._receipt(op="send_message", status="done"))
+        first = self.page._add_command_card("send_message（to=张三）")
+        self.assertEqual(self.page._open_cards, [])
+
+        self.page._future = None
+        self.page._render_receipt(self._receipt(op="send_message", status="failed", command_id="c2"))
+
+        self.assertIn("执行成功", first._status.cget("text"), "第一张卡不该被后来的回执改写")
+
+    def test_a_stale_card_never_steals_the_next_turns_receipt(self) -> None:
+        """★ 上一轮没收口的卡不许接下一轮的回执（2026-08-17 真机：新卡永远停在「待下发」）。
+
+        老卡停在那儿是因为它那条指令的终态**永远不会来了**（网关掉线、根本没下发）。
+        只按 op 配对的话，队列里排在前面的它会把后面每一条回执都截走。
+        """
+        self.page._turn_seq = 1
+        stale = self.page._add_command_card("send_message（to=上一轮的人）")
+        self.page._render_receipt(self._receipt(op="send_message", status="received", command_id="old"))
+        self.assertIn("已收到", stale._status.cget("text"), "前置：老卡确实还开着、且已绑到 old")
+
+        self.page._turn_seq = 2
+        fresh = self.page._add_command_card("send_message（to=这一轮的人）")
+        for status in ("received", "started", "done"):
+            self.page._render_receipt(self._receipt(op="send_message", status=status, command_id="new"))
+
+        self.assertIn("执行成功", fresh._status.cget("text"), "★ 这一轮的回执要落到这一轮的卡上")
+        self.assertIn("已收到", stale._status.cget("text"), "老卡保持原样——它的结果确实没来过")
 
     def test_an_unclaimed_receipt_still_shows_up(self) -> None:
         """没人认领的回执（排期到点执行、上一轮的指令）照样摆出来——不能吞。"""
