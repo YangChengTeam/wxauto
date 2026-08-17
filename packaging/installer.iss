@@ -55,6 +55,11 @@ DisableDirPage=no
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+; ★ 明确挡住装不了的系统。不写的话 Inno 默认放行到 Win7 SP1，而这个包里的
+; Python 是 3.12（3.9 起就不支持 Win7 了），装完的表现是双击没反应——一个连
+; 「为什么打不开」都说不出来的失败。写死 10.0：这也是我们唯一真机验过的档。
+; x64compatible 顺带允许 ARM64 的 Win11 走 x64 模拟。
+MinVersion=10.0
 
 OutputDir={#OutputDir}
 OutputBaseFilename={#AppName}_v{#AppVersion}_安装包

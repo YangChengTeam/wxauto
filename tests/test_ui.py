@@ -8,6 +8,7 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1214,6 +1215,24 @@ class InstallerTests(unittest.TestCase):
         self.assertIn('Filename: "{app}\\{#AppExe}"', icons[0])
         for forbidden in (".bat", ".vbs", ".cmd", "wscript", "python.exe", "cmd.exe"):
             self.assertNotIn(forbidden, icons[0], f"快捷方式不许经过 {forbidden}")
+
+    def test_it_refuses_to_install_on_windows_it_cannot_run_on(self) -> None:
+        """★ 装不了的系统要**当场拒绝**，不能装完了双击没反应。
+
+        包里的 Python 是 3.12（3.9 起不支持 Win7），而 Inno 不写 MinVersion 时默认
+        放行到 Win7 SP1。那种失败最贵：用户既看不到报错，也不知道该换什么。
+        """
+        line = [x for x in self.iss.splitlines() if x.startswith("MinVersion=")]
+        self.assertEqual(len(line), 1, "没写 MinVersion：Inno 会放行到 Win7 SP1")
+        # Inno 的写法允许带 service pack 后缀（`6.1sp1`），取前面的主次版本号就够判。
+        value = line[0].split("=", 1)[1].strip()
+        major = float(re.match(r"\d+(\.\d+)?", value).group(0))
+        self.assertGreaterEqual(major, 10.0,
+                                f"MinVersion={value}：★ Win10 是我们唯一真机验过的档")
+
+    def test_it_only_installs_on_64_bit_windows(self) -> None:
+        """冻结包是 64 位的；32 位系统上装了也起不来。"""
+        self.assertIn("ArchitecturesAllowed=x64compatible", self.iss)
 
     def test_installs_without_elevation(self) -> None:
         """★ 不许要管理员权限。
