@@ -102,7 +102,7 @@ _PAGE_TITLES = {"log": "实时日志", "debug": "调试会话", "settings": "配
 #: 标题底下那句话。空 = 这一页不摆副标题。
 _PAGE_SUBTITLES = {
     "settings": "管理连接、调度与启动设置",
-    "debug": "直接跟 AI 端说话，看它给这台电脑下什么指令",
+    "debug": "直接和小智对话，指令会在本机执行",
 }
 
 #: 左侧导航选中那根绿条的宽度（像素）。
@@ -1034,6 +1034,11 @@ class MainWindow:
         """
         self.show()
         self._show_page("log")
+
+    def open_debug(self) -> None:
+        """托盘「调试会话」：窗口露面，并且停在调试会话页。"""
+        self.show()
+        self._show_page("debug")
 
     def open_settings(self) -> None:
         """托盘「参数设置」：窗口露面，并且停在设置页。"""

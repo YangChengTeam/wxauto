@@ -36,8 +36,15 @@ from .service import GatewayService, ServiceNotRunning, ServiceState
 #: 心跳：多久取一次流式增量 / 刷一次「已用时」。和日志页一个量级，够跟手。
 PUMP_MS = 120
 
-PLACEHOLDER = "给微信助手发送消息"
-AI_NAME = "微信助手"
+#: 对面是谁。**不是「微信助手」**——那是这台电脑上跑的这个程序自己的名字。
+#: 2026-08-17 用户反馈：两边同名，界面上就变成「微信助手在跟微信助手说话」，
+#: 分不清哪句是本机说的、哪句是 AI 端说的。这一页对面坐的是劳小智的 AI 端，叫小智。
+AI_NAME = "小智"
+PLACEHOLDER = f"给{AI_NAME}发送消息"
+
+#: 头像直径（设计稿 docs/chat.png 量出来的）。文字列从 `_INDENT` 起，和头像右边留一口气。
+_AVATAR = 34
+_INDENT = 46
 
 #: 气泡最宽占内容区多少。太宽了长段落一行到底，读起来累；照设计稿取 ~62%。
 _BUBBLE_RATIO = 0.62
@@ -52,7 +59,7 @@ CARD_LINE = "#e6e8eb"
 _DOT_FRAMES = ((1, 0, 0), (0, 1, 0), (0, 0, 1), (0, 1, 0))
 
 #: 空会话时的开场白。**照能力清单写**，别举一个网关做不到的例子。
-_GREETING = "你好，我是微信助手。你可以直接描述要完成的任务。"
+_GREETING = "你好，我是小智。你可以直接描述要完成的任务。"
 _EXAMPLES = (
     "给张三发条消息，问他明天上午十点能不能来面试",
     "发一条朋友圈，招 3 个电子厂普工，日结 180",
@@ -83,6 +90,7 @@ class DebugPage(tk.Frame):
         self._pending: tk.Frame | None = None   # 「正在…」那一行
         self._stage_text = ""
         self._open_cards: list[tuple[str, Any]] = []  # (op, 卡片) 等回执认领
+        self._my_mark: tk.Label | None = None    # 这一轮自己那句话右边的下场标记
         self._build()
         self._say_ai(_GREETING)
         self._say_hint("试试：" + "；".join(_EXAMPLES))
@@ -136,13 +144,13 @@ class DebugPage(tk.Frame):
         # ── 上面：对话流（可滚动）──
         body = tk.Frame(self, bg=theme.CONTENT_BG)
         canvas = tk.Canvas(body, bg=theme.CONTENT_BG, highlightthickness=0, bd=0)
-        scroll = tk.Scrollbar(body, orient=tk.VERTICAL, command=canvas.yview, width=12)
+        scroll = _SlimScroll(body, canvas.yview_moveto)
         self._list = tk.Frame(canvas, bg=theme.CONTENT_BG)
         window_id = canvas.create_window((0, 0), window=self._list, anchor="nw")
         self._list.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: self._on_resize(canvas, window_id, e.width))
         canvas.configure(yscrollcommand=scroll.set)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y, padx=(8, 0))
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._canvas = canvas
         # 滚轮：进出这一页时装卸（和配置中心同一个路数，别把别的页的滚动劫走）
@@ -183,7 +191,7 @@ class DebugPage(tk.Frame):
             self._say_error(f"发不出去：{exc}")
             return
         self._input.delete("1.0", tk.END)
-        self._say_me(text)
+        self._my_mark = self._say_me(text)
         self._future = future
         self._stream = ""
         self._stage_text = "正在发给 AI 端…"
@@ -253,9 +261,18 @@ class DebugPage(tk.Frame):
         try:
             result = future.result()
         except Exception as exc:  # noqa: BLE001 - 超时/断线/票据失效都照原样说出来
+            self._mark_turn("×", theme.RED)
             self._say_error(f"{type(exc).__name__}：{exc}")
             return
         self._render_reply(result)
+
+    def _mark_turn(self, glyph: str, color: str) -> None:
+        """给自己那句话右边落个下场标记。**只在这一轮真收口之后调**。"""
+        mark, self._my_mark = self._my_mark, None
+        if mark is None:
+            return
+        with suppress(tk.TclError):
+            mark.configure(text=glyph, fg=color)
 
     def _render_stream(self) -> None:
         """实时把 AI 正在说的话写进气泡——**边说边显示**，不等这一轮收口。"""
@@ -271,8 +288,10 @@ class DebugPage(tk.Frame):
     def _render_reply(self, result: Any) -> None:
         reply = format_turn(result)
         if reply.error:
+            self._mark_turn("×", theme.RED)
             self._say_error(f"AI 端报错：{reply.error}")
             return
+        self._mark_turn("✓", theme.GREEN)
         if reply.text:
             if self._live is not None:
                 self._live.configure(text=reply.text)  # 用收口后的正文覆盖流式那份
@@ -327,7 +346,7 @@ class DebugPage(tk.Frame):
         row = tk.Frame(self._list, bg=theme.CONTENT_BG)
         row.pack(fill=tk.X, pady=(4, 10))
         left = tk.Frame(row, bg=theme.CONTENT_BG)
-        left.pack(side=tk.LEFT, padx=(46, 0))
+        left.pack(side=tk.LEFT, padx=(_INDENT, 0))
         self._dots = [tk.Label(left, text="●", font=(theme.UI, 8), bg=theme.CONTENT_BG,
                                fg=theme.GRAY) for _ in range(3)]
         for dot in self._dots:
@@ -365,11 +384,12 @@ class DebugPage(tk.Frame):
 
     def _say_ai(self, text: str) -> tk.Label:
         row = tk.Frame(self._list, bg=theme.CONTENT_BG)
-        row.pack(fill=tk.X, pady=(10, 2), anchor="w")
-        avatar = tk.Frame(row, bg=theme.CONTENT_BG, width=34)
+        row.pack(fill=tk.X, pady=(14, 2), anchor="w")
+        avatar = tk.Frame(row, bg=theme.CONTENT_BG, width=_INDENT)
         avatar.pack(side=tk.LEFT, anchor="n")
         avatar.pack_propagate(False)
-        photo = icons.logo_photo(self, 26)
+        # 头像是画出来的机器人脸，**不是品牌图标**——理由见 icons.bot_avatar_photo
+        photo = icons.bot_avatar_photo(self, _AVATAR)
         if photo is not None:
             label = tk.Label(avatar, image=photo, bg=theme.CONTENT_BG)
             label._photo = photo  # 自己留引用，被 GC 掉就成了空白
@@ -392,29 +412,38 @@ class DebugPage(tk.Frame):
         self._scroll_to_end()
         return body
 
-    def _say_me(self, text: str) -> None:
+    def _say_me(self, text: str) -> tk.Label:
+        """自己说的话：右侧绿气泡 + 时间 + 一个「这一轮的下场」标记。
+
+        标记是**空着起手**的：发出去了不代表 AI 端接住了。这一轮真收口才画勾，
+        报错就画叉——和指令卡同一条规矩（见本模块开头那段）。
+        """
         row = tk.Frame(self._list, bg=theme.CONTENT_BG)
-        row.pack(fill=tk.X, pady=(10, 2))
+        row.pack(fill=tk.X, pady=(14, 2))
+        mark = tk.Label(row, text=" ", font=(theme.UI, 10, "bold"), width=2,
+                        bg=theme.CONTENT_BG, fg=theme.GREEN)
+        mark.pack(side=tk.RIGHT)
         tk.Label(row, text=time.strftime("%H:%M:%S"), font=theme.FONT_SMALL,
-                 bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED).pack(side=tk.RIGHT, padx=(8, 0))
+                 bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED).pack(side=tk.RIGHT, padx=(10, 2))
         bubble = tk.Label(row, text=text, font=theme.FONT_BODY, bg=BUBBLE_ME_BG, fg=theme.TEXT,
                           wraplength=self._bubble_width, justify=tk.LEFT,
                           padx=14, pady=10, anchor="w")
         bubble._wraps = True
         bubble.pack(side=tk.RIGHT)
         self._scroll_to_end()
+        return mark
 
     def _say_hint(self, text: str) -> None:
         label = tk.Label(self._list, text=text, font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
                          fg=theme.TEXT_MUTED, wraplength=self._bubble_width * 2,
                          justify=tk.LEFT, anchor="w")
         label._wraps = False
-        label.pack(fill=tk.X, padx=(46, 0), pady=(2, 2))
+        label.pack(fill=tk.X, padx=(_INDENT, 0), pady=(2, 2))
         self._scroll_to_end()
 
     def _say_error(self, text: str) -> None:
         row = tk.Frame(self._list, bg=theme.CONTENT_BG)
-        row.pack(fill=tk.X, padx=(46, 0), pady=(6, 2))
+        row.pack(fill=tk.X, padx=(_INDENT, 0), pady=(6, 2))
         tk.Label(row, text="×", font=(theme.UI, 11, "bold"), bg=theme.CONTENT_BG,
                  fg=theme.RED).pack(side=tk.LEFT, anchor="n")
         body = tk.Label(row, text=text, font=theme.FONT_BODY, bg=theme.CONTENT_BG, fg=theme.RED,
@@ -428,7 +457,7 @@ class DebugPage(tk.Frame):
         detail = summary[len(op):].strip("（）") if "（" in summary else ""
         card = _CommandCard(self._list, op=op, detail=detail, on_open_log=self._on_open_log,
                             bubble_width=self._bubble_width)
-        card.pack(fill=tk.X, padx=(46, 0), pady=(6, 2))
+        card.pack(fill=tk.X, padx=(_INDENT, 0), pady=(8, 4))
         self._open_cards.append((op, card))
         self._scroll_to_end()
         return card
@@ -473,16 +502,16 @@ class _CommandCard(tk.Frame):
         super().__init__(parent, bg=theme.CONTENT_BG, highlightthickness=1,
                          highlightbackground=CARD_LINE, highlightcolor=CARD_LINE, bd=0)
         inner = tk.Frame(self, bg=theme.CONTENT_BG)
-        inner.pack(fill=tk.X, padx=14, pady=10)
-        self._icon = tk.Label(inner, text="◌", font=(theme.UI, 12), bg=theme.CONTENT_BG,
-                              fg=theme.TEXT_MUTED)
-        self._icon.pack(side=tk.LEFT, anchor="n", padx=(0, 10))
+        inner.pack(fill=tk.X, padx=14, pady=11)
+        self._icon = _StatusGlyph(inner)
+        self._icon.pack(side=tk.LEFT, anchor="n", padx=(0, 11))
         col = tk.Frame(inner, bg=theme.CONTENT_BG)
         col.pack(side=tk.LEFT, fill=tk.X, expand=True)
         head = tk.Frame(col, bg=theme.CONTENT_BG)
         head.pack(anchor="w", fill=tk.X)
-        tk.Label(head, text=op, font=(theme.MONO, 9, "bold"), bg=theme.CONTENT_BG,
-                 fg=theme.TEXT).pack(side=tk.LEFT)
+        self._op = tk.Label(head, text=op, font=(theme.MONO, 9, "bold"), bg=theme.CONTENT_BG,
+                            fg=theme.TEXT)
+        self._op.pack(side=tk.LEFT)
         self._status = tk.Label(head, text="· 待下发", font=(theme.UI, 9, "bold"),
                                 bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
         self._status.pack(side=tk.LEFT, padx=(6, 0))
@@ -507,14 +536,94 @@ class _CommandCard(tk.Frame):
         color = theme.TEXT_MUTED if receipt.ok is None else (
             theme.GREEN if receipt.ok else theme.RED
         )
-        glyph = "◌" if receipt.ok is None else ("✓" if receipt.ok else "×")
-        self._icon.configure(text=glyph, fg=color)
+        self._icon.paint(receipt.ok)
         self._status.configure(text=f"· {receipt.label}", fg=color)
+        self._op.configure(fg=theme.TEXT if receipt.ok is None else color)
         if receipt.reason:
             self._reason.configure(text=receipt.reason,
                                    fg=theme.ORANGE if receipt.ok is None else color)
             if not self._reason.winfo_manager():
                 self._reason.pack(anchor="w", pady=(3, 0))
+
+
+class _SlimScroll(tk.Canvas):
+    """右边那根细滚动条（设计稿 docs/chat.png）。
+
+    系统那根 `tk.Scrollbar` 在 Windows 上是带上下箭头的经典灰槽，摆在这一页里像另一个
+    年代的东西（2026-08-17 真机截图）。这根只有一条圆头细线，内容没超出时干脆不画。
+    """
+
+    WIDTH = 8
+    #: 拖块再短也得抓得住。
+    MIN_THUMB = 28
+
+    def __init__(self, parent: tk.Misc, on_move: Callable[[float], None]) -> None:
+        super().__init__(parent, width=self.WIDTH, bg=theme.CONTENT_BG,
+                         highlightthickness=0, bd=0)
+        self._first, self._last = 0.0, 1.0
+        self._on_move = on_move
+        self.bind("<Configure>", lambda _e: self._render())
+        self.bind("<Button-1>", self._jump)
+        self.bind("<B1-Motion>", self._jump)
+
+    def set(self, first: Any, last: Any) -> None:
+        """给 `yscrollcommand` 用，签名要和 `tk.Scrollbar.set` 一样。"""
+        self._first, self._last = float(first), float(last)
+        self._render()
+
+    def _jump(self, event: Any) -> None:
+        height = max(1, self.winfo_height())
+        span = max(0.02, self._last - self._first)
+        self._on_move(min(1.0, max(0.0, event.y / height - span / 2)))
+
+    def _render(self) -> None:
+        try:
+            self.delete("all")
+        except tk.TclError:
+            return
+        if self._last - self._first >= 0.999:
+            return  # 内容没超出，一根条都不画
+        height = max(1, self.winfo_height())
+        top = self._first * height
+        bottom = max(top + self.MIN_THUMB, self._last * height)
+        r = (self.WIDTH - 2) / 2
+        color = "#d3d8de"
+        self.create_oval(1, top, self.WIDTH - 1, top + 2 * r, fill=color, outline="")
+        self.create_oval(1, bottom - 2 * r, self.WIDTH - 1, bottom, fill=color, outline="")
+        self.create_rectangle(1, top + r, self.WIDTH - 1, bottom - r, fill=color, outline="")
+
+
+class _StatusGlyph(tk.Canvas):
+    """指令卡左边那颗圆图标：待下发是一圈空心灰，成了画绿勾，没成画红叉。
+
+    画而不是打字：`✓` 这类字符在不同字体下大小位置都不一样，设计稿要的是一颗**对齐的**
+    圆圈（docs/chat.png）。
+    """
+
+    SIZE = 20
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent, width=self.SIZE, height=self.SIZE, bg=theme.CONTENT_BG,
+                         highlightthickness=0, bd=0)
+        self.paint(None)
+
+    def paint(self, ok: bool | None) -> None:
+        self._ok = ok   # 当前画的是哪种下场（测试拿它断言，别删）
+        try:
+            self.delete("all")
+        except tk.TclError:
+            return
+        color = theme.GRAY if ok is None else (theme.GREEN if ok else theme.RED)
+        s = self.SIZE
+        self.create_oval(2, 2, s - 2, s - 2, outline=color, width=2)
+        if ok is None:
+            return
+        if ok:
+            self.create_line(6, s / 2, s / 2 - 1, s - 7, s - 6, 6,
+                             fill=color, width=2, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        else:
+            self.create_line(7, 7, s - 7, s - 7, fill=color, width=2, capstyle=tk.ROUND)
+            self.create_line(s - 7, 7, 7, s - 7, fill=color, width=2, capstyle=tk.ROUND)
 
 
 class _RoundButton(tk.Canvas):

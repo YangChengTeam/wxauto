@@ -25,6 +25,7 @@ class Tray:
         service: GatewayService,
         *,
         on_show: Callable[[], None],
+        on_debug: Callable[[], None],
         on_settings: Callable[[], None],
         on_quit: Callable[[], None],
         on_logout: Callable[[], None],
@@ -34,6 +35,7 @@ class Tray:
 
         self._service = service
         self._on_show = on_show
+        self._on_debug = on_debug
         self._on_settings = on_settings
         self._on_quit = on_quit
         self._on_logout = on_logout
@@ -64,6 +66,7 @@ class Tray:
             title=self._title(),
             menu=pystray.Menu(
                 pystray.MenuItem("实时日志", self._show, default=True),
+                pystray.MenuItem("调试会话", self._debug),
                 pystray.MenuItem("配置中心", self._settings),
                 pystray.MenuItem("退出登录", self._logout, enabled=self._can_logout),
                 pystray.Menu.SEPARATOR,
@@ -126,6 +129,9 @@ class Tray:
         # 退出登录会停服务，而停机要等网关线程收口（最长 15s）——那件事由窗口丢到后台去做
         # （`MainWindow.logout`），托盘这边只负责把动作传过去，别在托盘线程上等。
         self._on_logout()
+
+    def _debug(self, *_args: Any) -> None:
+        self._on_debug()
 
     def _settings(self, *_args: Any) -> None:
         self._on_settings()

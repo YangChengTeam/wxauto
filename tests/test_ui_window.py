@@ -237,14 +237,16 @@ class WindowAdversarialTests(unittest.TestCase):
         self.window.open_settings()
         self.assertIs(self.window._config_page, page, "真点的时候直接用预热那个")
 
-    def test_the_nav_is_just_log_and_config(self) -> None:
-        """★ 只剩两页（用户 2026-08-15：「计划中心不需要，是发给我们 agent 端的」）。
+    def test_the_nav_is_log_debug_and_config(self) -> None:
+        """★ 三页：实时日志 / 调试会话 / 配置中心。
 
         参数设置→配置中心；监听名单本来就是 AI 端说了算、本机改不了，归进配置中心当
-        只读的一节。计划归 AI 端排、经 WS 推给网关执行，桌面端不摆这一页。
+        只读的一节。计划归 AI 端排、经 WS 推给网关执行，桌面端不摆这一页
+        （用户 2026-08-15：「计划中心不需要，是发给我们 agent 端的」）。
+        调试会话是 2026-08-17 加的：直接跟 AI 端说话，验这台电脑到底动不动得了微信。
         """
         self.assertEqual([item.cget("text") for item in self.window._nav.values()],
-                         ["实时日志", "配置中心"])
+                         ["实时日志", "调试会话", "配置中心"])
         self.assertNotIn("plans", self.window._nav, "计划中心已删")
         self.assertNotIn("watch", self.window._nav, "监听名单不再是单独一项")
         self.assertFalse(hasattr(self.window, "_watch_label"), "侧栏不该再铺名单")
@@ -1216,7 +1218,7 @@ class TrayMenuTests(unittest.TestCase):
 
         return Tray(
             GatewayService(lambda: None),
-            on_show=lambda: None, on_settings=lambda: None,
+            on_show=lambda: None, on_debug=lambda: None, on_settings=lambda: None,
             on_quit=lambda: None, on_logout=lambda: None, can_logout=lambda: logged_in,
         )
 
@@ -1231,7 +1233,7 @@ class TrayMenuTests(unittest.TestCase):
 
         # ★ 窗口里有几页，托盘就得有几项——多一项会指向一个已经不存在的页
         # ★ 菜单名和窗口导航逐字一致（用户 2026-08-15：「显示日志」改叫「实时日志」）
-        self.assertEqual(labels, ["实时日志", "配置中心", "退出登录", "退出"])
+        self.assertEqual(labels, ["实时日志", "调试会话", "配置中心", "退出登录", "退出"])
         self.assertNotIn("计划中心", labels, "★ 那一页删了（计划归 AI 端），托盘得跟着删")
         self.assertNotIn("启动服务", labels, "★ 这一项曾经是登录门的旁路")
         self.assertNotIn("停止服务", labels, "并进「退出登录」了")
@@ -1621,7 +1623,7 @@ class TrayLifecycleTests(unittest.TestCase):
 
         tray = Tray(
             GatewayService(lambda: None),
-            on_show=lambda: None, on_settings=lambda: None,
+            on_show=lambda: None, on_debug=lambda: None, on_settings=lambda: None,
             on_quit=lambda: None, on_logout=lambda: None,
         )
         tray._icon = _StubIcon()  # 换掉真 Icon：测试不许在打包机上真弹图标

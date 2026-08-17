@@ -10,9 +10,34 @@
 #
 # 图标一份管到底：exe、桌面快捷方式、任务栏、右下角托盘都用 wxclient/ui/assets/app.ico。
 
+import os
+
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
-hiddenimports = collect_submodules("pystray") + collect_submodules("comtypes")
+# ★ 微信自动化的真身 `pyweixin` 是 vendored 的（`third_party/pywechat/`），运行时靠
+# `sys.path.insert(...)` 现找（见 `wechat_api/uia.py` 的 `_pyweixin_class`）。
+# **冻结包里那个目录根本不存在**，PyInstaller 也从没在依赖图里见过它 → 打出来的包
+# 一动微信就是 `pyweixin is unavailable: No module named 'pyweixin'`（2026-08-17 真机）。
+# 源码跑、单测跑全绿，只有装完真机点一下「发消息」才看得见。
+#
+# 修法 = 让它变成一个普通依赖：pathex 指到 vendor 目录 + 显式列模块名。这样它连同自己的
+# 依赖（pywinauto / pycaw / psutil / win32clipboard / emoji / pyautogui…）一起进图。
+# **加减 pyweixin 的 .py 要同步这张表**——`tests/test_ui.py::PackagingTests` 会比对。
+VENDOR_PYWEIXIN = os.path.join(SPECPATH, "..", "third_party", "pywechat")
+PYWEIXIN_MODULES = [
+    "pyweixin",
+    "pyweixin.Config",
+    "pyweixin.Errors",
+    "pyweixin.Uielements",
+    "pyweixin.Warnings",
+    "pyweixin.WeChatAuto",
+    "pyweixin.WeChatTools",
+    "pyweixin.WinSettings",
+    "pyweixin.utils",
+]
+
+hiddenimports = (collect_submodules("pystray") + collect_submodules("comtypes")
+                 + PYWEIXIN_MODULES)
 
 # ★ site-packages 里那个叫 `logger` 的顶层包**必须连它的 logging.conf 一起打**。
 #
@@ -81,7 +106,7 @@ DEAD_BINARIES = ("PIL\\_avif", "PIL/_avif")
 # 入口是 launcher.py 不是 wxclient/ui/__main__.py——理由见 launcher.py 顶上的注释。
 a = Analysis(
     ["launcher.py"],
-    pathex=["."],
+    pathex=[".", VENDOR_PYWEIXIN],
     # ★ 整个 assets 目录一起打，**不要逐个文件列**：漏掉一个的表现是「打出来的包少一张图」，
     # 而代码对缺图都是优雅降级（背景变纯色、图标退回圆点），没人会看见报错——正是最难发现的
     # 那类回归。（`tests/test_ui.py::PackagingTests` 会盯着这条。）

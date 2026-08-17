@@ -909,6 +909,44 @@ class PackagingTests(unittest.TestCase):
         for name in ('"win32ui"', '"Pythonwin"', '"win32uiole"'):
             self.assertNotIn(name, excludes, f"{name} 砍不得：pywinauto 要用")
 
+    def test_pyweixin_gets_bundled(self) -> None:
+        """★ vendored 的 `pyweixin` 必须进依赖图——**它才是真正动微信的那个包**。
+
+        2026-08-17 真机：v0.1.12 装完，一点「发消息」就是
+        `pyweixin is unavailable: No module named 'pyweixin'`。它住在
+        `third_party/pywechat/`，运行时靠 `sys.path.insert` 现找，而冻结包里没有那个目录。
+        源码跑、单测跑、连打包后的 `--self-check` 探测都绿——因为探测只用 pywinauto 看窗口，
+        一次都碰不到 pyweixin。**「看得见微信」和「动得了微信」是两件事。**
+        """
+        spec = self.SPEC.read_text(encoding="utf-8")
+        vendor = Path(__file__).resolve().parent.parent / "third_party/pywechat/pyweixin"
+
+        self.assertIn("VENDOR_PYWEIXIN", spec)
+        self.assertIn('pathex=[".", VENDOR_PYWEIXIN]', spec, "vendor 目录要进 pathex")
+        for module in sorted(vendor.glob("*.py")):
+            name = "pyweixin" if module.stem == "__init__" else f"pyweixin.{module.stem}"
+            self.assertIn(f'"{name}"', spec, f"{name} 没列进 hiddenimports，打不进包")
+
+    def test_self_check_really_imports_pyweixin(self) -> None:
+        """★ 自检要真 import 一次 pyweixin，import 不到就必须判失败。
+
+        缺了这条，上一条（spec 里列全了）只是纸面约束：excludes 误砍、依赖装漏一样会让
+        冻结包里 import 不到，而那正是只有装完真机才炸的那类。
+        """
+        from wxclient.ui.__main__ import _check_wechat_driver
+
+        lines: list[str] = []
+        with mock.patch("wxclient.wechat_api.uia.UiaWeChatDriver._pyweixin_class",
+                        side_effect=ImportError("No module named 'pyweixin'")):
+            self.assertFalse(_check_wechat_driver(lines))
+        self.assertTrue(any("pyweixin=FAIL" in line for line in lines), lines)
+
+        lines.clear()
+        with mock.patch("wxclient.wechat_api.uia.UiaWeChatDriver._pyweixin_class"), \
+             mock.patch("wxclient.wechat_api.uia.UiaWeChatDriver._pyweixin_submodule"):
+            self.assertTrue(_check_wechat_driver(lines))
+        self.assertIn("pyweixin=ok", lines)
+
     def test_the_build_verifies_the_package_it_just_made(self) -> None:
         """★ 打完包必须真跑一次 `--self-check`。
 

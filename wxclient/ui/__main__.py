@@ -110,6 +110,7 @@ def self_check(report_path: str) -> int:
     lines: list[str] = []
     ok = True
     ok = _check_images(lines) and ok
+    ok = _check_wechat_driver(lines) and ok
     try:
         from wxclient.uia_probe import probe_wechat_uia
         from wxclient.uia_probe.probe import PROBE_BROKEN_REASON
@@ -131,6 +132,30 @@ def self_check(report_path: str) -> int:
     lines.append("OK" if ok else "NOT OK")
     Path(report_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0 if ok else 1
+
+
+def _check_wechat_driver(lines: list[str]) -> bool:
+    """真 import 一次 `pyweixin`——**真正驱动微信的那个包**，走 uia 驱动自己的那条路。
+
+    ★ 2026-08-17 真机：v0.1.12 装完，一点「发消息」就是
+    `pyweixin is unavailable: No module named 'pyweixin'`。它是 vendored 的
+    （`third_party/pywechat/`），运行时靠 `sys.path.insert` 现找，而**冻结包里没有那个
+    目录**、PyInstaller 也从没在依赖图里见过它。源码跑、单测跑全绿，装完真机才炸。
+
+    下面那次 `probe_wechat_uia()` 挡不住这一类：探测只用 pywinauto 看窗口，一次都碰不到
+    pyweixin。所以这条得单列——**「看得见微信」和「动得了微信」是两件事**。
+    """
+    try:
+        from wxclient.wechat_api.uia import UiaWeChatDriver
+
+        driver = UiaWeChatDriver(dry_run=True)
+        driver._pyweixin_class("Tools")
+        driver._pyweixin_submodule("Uielements")
+    except Exception as exc:  # noqa: BLE001 - 自检本来就是来抓这个的
+        lines.append(f"pyweixin=FAIL {type(exc).__name__}: {exc}")
+        return False
+    lines.append("pyweixin=ok")
+    return True
 
 
 def _check_images(lines: list[str]) -> bool:
@@ -393,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
         # 菜单点哪一项就落到哪一页：open_log/open_settings 自己负责「露面 + 切页」，
         # 别在这儿只 show()——那样点「实时日志」出来的可能还是上次停着的配置中心。
         on_show=lambda: root.after(0, window.open_log),
+        on_debug=lambda: root.after(0, window.open_debug),
         on_settings=lambda: root.after(0, window.open_settings),
         on_quit=lambda: root.after(0, quit_requested),
         on_logout=lambda: root.after(0, logout_requested),
