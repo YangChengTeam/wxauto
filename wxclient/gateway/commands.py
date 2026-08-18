@@ -266,6 +266,15 @@ class CommandExecutor:
             refs = _file_refs(args) if op == "send_files" else []
         except CommandError as exc:
             return CommandResult(command_id, "rejected", str(exc))
+        if op == "add_friend":
+            # ★ 换机/重装之后不给同一个人起第二个备注名（api2 §4.2）。后端记着这个号在用哪个
+            # 会话名，本机启动时已经拉回来了；AI 端产的 remark 只在**本机也不知道**时才作数。
+            # 名字一变，按会话名存的关系记忆（078）就断在这里，而且现场看不出来——
+            # 微信里会多出一个"新人"，聊过的东西全不认了。
+            known = self._store.contact_session_name(self._account, str(payload.get("number") or ""))
+            if known and known != payload.get("remark"):
+                _log.info("按后端已知的会话名设置备注", op=op)   # 名字本身不进日志
+                payload["remark"] = known
         if refs and self._fetcher is None:
             _log.warning("收到发文件指令但没配下载通道", op=op)
             return CommandResult(command_id, "rejected", "本机没有配取文件通道，发不了 AI 端产出的文件")

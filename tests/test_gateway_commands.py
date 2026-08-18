@@ -279,6 +279,35 @@ class FriendStateTests(CommandTestCase):
         self.assertEqual(result.status, "done", result.reason)
         self.assertEqual((result.result or {}).get("friend_state"), "requested")
 
+    async def test_a_known_session_name_wins_over_the_one_the_ai_made_up(self) -> None:
+        """★ 换机后不给同一个人起第二个备注名（api2 §4.2）：后端记着的那个说了算。
+
+        名字一变，按会话名存的关系记忆（078）就断了，而且现场看不出来——
+        微信里会多出一个「新人」，聊过的东西全不认。
+        """
+        self.store.save_contacts(ACCOUNT, [
+            {"number": "wxid_zhang", "session_name": "候选人-张建国", "updated_at": "2026-08-18T09:00:00.000Z"},
+        ])
+        runtime = FakeRuntime()
+        result = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "add_friend",
+            "args": {"number": "wxid_zhang", "greetings": "你好", "remark": "张先生"},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        _, payload, _ = runtime.calls[-1]
+        self.assertEqual(payload["remark"], "候选人-张建国")
+
+    async def test_the_ai_remark_stands_when_this_machine_knows_nothing(self) -> None:
+        """本机没有这个号的记录 —— 那 AI 端给的备注名就是唯一一份，照用。"""
+        runtime = FakeRuntime()
+        result = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "add_friend",
+            "args": {"number": "wxid_new", "greetings": "你好", "remark": "候选人-李四"},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        _, payload, _ = runtime.calls[-1]
+        self.assertEqual(payload["remark"], "候选人-李四")
+
     async def test_accepting_an_application_really_is_accepted(self) -> None:
         runtime = FakeRuntime(result={"items": ["张三"], "verify": True})
         result = await self._executor(runtime).execute({
