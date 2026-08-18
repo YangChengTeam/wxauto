@@ -112,6 +112,9 @@ def _file_refs(args: dict[str, Any]) -> list[FileRef]:
 #:
 #: 刻意不收 watch_chats / scan_messages：它们是有界时长的常驻扫描，属于入站循环，
 #: 被一条指令占住同一个单消费者 worker 会把正常收消息饿死。
+#: 发消息两个 op 另收一个可选参数 `to_group`（bool）：AI 端知道这次发的是群时给 true。
+#: 本机只有收到过群消息才认得出群，主动发第一条时一无所知，会误算进私聊那档配额
+#: （见 `CommandExecutor._to_group`）。**它只能收紧**：给 false 不会把已知的群降回私聊。
 COMMANDS: dict[str, CommandSpec] = {
     # ── 写类 ──
     "send_message": CommandSpec(
@@ -271,13 +274,16 @@ class CommandExecutor:
         #   做不了 = 去修环境（微信没登、只走流程不真发、没配取文件通道）；
         #   不让做 = 规则挡的（频次配额、工作时间窗、黑名单）。
         #   原来所有「做不了」都要执行到一半才发现，用户看到的是一条不知所云的失败。
-        blocked = self._capability_blocker(op, peer)
+        # 「是不是发到群里」算一次，能力检查与频次分档共用同一个判断——
+        # 两处各算各的，迟早会出现「按私聊放行、按群记账」这种自相矛盾。
+        to_group = self._to_group(peer, args)
+        blocked = self._capability_blocker(op, to_group)
         if blocked:
             _log.info("这台电脑现在做不了这个动作", op=op, reason=blocked)
             return CommandResult(command_id, "rejected", blocked)
 
         now = self._clock()
-        action = self._action_for(spec, peer)
+        action = self._action_for(spec, to_group)
         denial = self._gate(spec, peer, now, action)
         if denial:
             _log.info("指令被守门拦下", op=op, reason=denial)
@@ -323,25 +329,64 @@ class CommandExecutor:
                 #   平台看得见的动作，不记就等于朋友圈那一档配额永远用不满、形同虚设。
                 self._store.record_send(self._account, peer, now, action=action)
             _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
-            return CommandResult(command_id, "done", result=(raw or {}).get("result") or {})
+            result = (raw or {}).get("result") or {}
+            state = self._friend_state(op, result)
+            if state:
+                result = {**result, "friend_state": state}
+            return CommandResult(command_id, "done", result=result)
 
-    def _capability_blocker(self, op: str, peer: str) -> str:
+    def _friend_state(self, op: str, result: dict[str, Any]) -> str:
+        """加好友这条链走到哪一步了（docs/18 §3.2）。AI 端据此写候选人的 `wechatAdded`。
+
+        `add_friend` 只能报 `requested`：**申请发出去 ≠ 对方通过**，中间隔着一个真人，
+        要多久没人知道。两个 op 的回执原来长得一模一样，「申请发出」会被当成「已经是好友」，
+        后面所有发消息的动作都建在一个假前提上。
+
+        真正的 `accepted` 只有一处：我们自己通过了对方的申请，而且**确实通过了至少一个**
+        （一个申请都没有时 `items` 是空的，那这一趟什么也没发生，别报状态）。
+        对方通过了我们的申请是**后来**才知道的事，只能靠入站消息，不在这条指令的射程内。
+        """
+        if not self._allow_real:
+            return ""      # 只走流程没真动微信，报了 AI 端就会去写 wechatAdded
+        if op == "add_friend":
+            return "requested"
+        if op == "accept_new_friends" and result.get("items"):
+            return "accepted"
+        return ""
+
+    def _to_group(self, peer: str, args: dict[str, Any]) -> bool:
+        """这条指令是不是发到群里。**提示只准收紧，不准放宽**（072 节拍红线）。
+
+        本机只有**收到过**群消息才认得出群（`wechat_io` 里 `mark_peer_kind`），
+        而计划驱动的主动触达（081）恰恰是往一个从没收过消息的群发第一条——
+        只信本机的话，整批群发会被算进宽松的私聊档（20/时），群那档 6/时 形同虚设。
+        所以也认 AI 端的 `to_group` 提示，并记下来备用。
+
+        只往「是群」这一个方向记：上游说错了也只会让配额更紧、能力检查更严，
+        反方向（说「不是群」）一律不听，否则这就成了绕开群配额的开关。
+        """
+        if not peer:
+            return False
+        if self._store.is_known_group(self._account, peer):
+            return True
+        if args.get("to_group") is not True:
+            return False
+        self._store.mark_peer_kind(self._account, peer, is_group=True)
+        return True
+
+    def _capability_blocker(self, op: str, to_group: bool) -> str:
         """这台机器现在做不做得了这个 op；返回人话理由，空串 = 做得了。"""
         if self._capabilities is None:
             return ""      # 没接能力探测（测试/老装配）→ 不拦，维持原行为
-        key = capability_of(
-            op, to_group=bool(peer) and self._store.is_known_group(self._account, peer)
-        )
+        key = capability_of(op, to_group=to_group)
         cap = self._capabilities().get(key)
         if cap is None or cap.available:
             return ""
         return cap.reason or f"这台电脑现在做不了「{cap.label}」"
 
-    def _action_for(self, spec: CommandSpec, peer: str) -> str:
+    def _action_for(self, spec: CommandSpec, to_group: bool) -> str:
         """这条指令算哪一档配额。发到群里的消息单独算——群的误伤面比单聊大得多。"""
-        if spec.action == ACTION_MESSAGE and peer and self._store.is_known_group(
-            self._account, peer
-        ):
+        if spec.action == ACTION_MESSAGE and to_group:
             return ACTION_GROUP
         return spec.action
 

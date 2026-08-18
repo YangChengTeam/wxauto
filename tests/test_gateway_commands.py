@@ -37,15 +37,16 @@ ACCOUNT = "zk_weixin"
 
 
 class FakeRuntime:
-    def __init__(self, *, boom: bool = False) -> None:
+    def __init__(self, *, boom: bool = False, result: dict[str, Any] | None = None) -> None:
         self.calls: list[tuple[TaskType, dict[str, Any], str]] = []
         self._boom = boom
+        self._result = result if result is not None else {"ok": True}
 
     async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
         if self._boom:
             raise RuntimeError("微信没登录")
         self.calls.append((task_type, dict(payload or {}), confirmation))
-        return {"result": {"ok": True}, "task_id": f"t{len(self.calls)}"}
+        return {"result": dict(self._result), "task_id": f"t{len(self.calls)}"}
 
 
 class CommandTestCase(unittest.IsolatedAsyncioTestCase):
@@ -200,6 +201,116 @@ class CommandGuardTests(CommandTestCase):
         })
         self.assertEqual(blocked.status, "rejected")
         self.assertIn("上限", blocked.reason)
+
+
+class GroupLaneTests(CommandTestCase):
+    """群消息必须走群那一档配额（072 · docs/18 §3.4）。
+
+    本机只在**收到过**群消息时才知道某个名字是群（`wechat_io` 里 `mark_peer_kind`）。
+    计划驱动的主动触达（081）是往 `wechatGroupIds` 里的群发第一条——那时本机一无所知，
+    于是整批群发都被算进宽松的私聊档（20/时），群那档 6/时 形同虚设。
+    """
+
+    GROUP = "劳务派遣交流群"
+
+    async def _send(self, executor, i: int, **args: Any):
+        return await executor.execute({
+            "command_id": f"g{i}", "op": "send_message",
+            "args": {"to": self.GROUP, "text": "招人", **args},
+        })
+
+    async def test_a_never_seen_group_still_uses_the_group_quota(self) -> None:
+        """AI 端说了这是群，就按群算——哪怕本机从没收到过这个群的消息。"""
+        runtime = FakeRuntime()
+        executor = self._executor(runtime)
+        for i in range(6):
+            got = await self._send(executor, i, to_group=True)
+            self.assertEqual(got.status, "done", got.reason)
+        blocked = await self._send(executor, 6, to_group=True)
+        self.assertEqual(blocked.status, "rejected")
+        self.assertIn("群消息", blocked.reason)
+        self.assertEqual(len(runtime.calls), 6)
+
+    async def test_the_hint_is_remembered(self) -> None:
+        """认过一次就记下来：后面不带提示的指令照样按群算。"""
+        runtime = FakeRuntime()
+        executor = self._executor(runtime)
+        await self._send(executor, 0, to_group=True)
+        self.assertTrue(self.store.is_known_group(ACCOUNT, self.GROUP))
+        for i in range(1, 6):
+            self.assertEqual((await self._send(executor, i)).status, "done")
+        self.assertEqual((await self._send(executor, 6)).status, "rejected")
+
+    async def test_the_hint_can_only_tighten(self) -> None:
+        """本机已经知道是群，上游说「不是群」也不放宽——提示只准收紧。"""
+        runtime = FakeRuntime()
+        self.store.mark_peer_kind(ACCOUNT, self.GROUP, is_group=True)
+        executor = self._executor(runtime)
+        for i in range(6):
+            self.assertEqual((await self._send(executor, i, to_group=False)).status, "done")
+        self.assertEqual((await self._send(executor, 6, to_group=False)).status, "rejected")
+
+    async def test_private_chat_is_untouched(self) -> None:
+        """没有提示、也没收过群消息的，仍是私聊那一档（20/时），别误伤。"""
+        runtime = FakeRuntime()
+        executor = self._executor(runtime)
+        for i in range(7):
+            got = await executor.execute({
+                "command_id": f"p{i}", "op": "send_message",
+                "args": {"to": "张三", "text": "在吗"},
+            })
+            self.assertEqual(got.status, "done", got.reason)
+        self.assertFalse(self.store.is_known_group(ACCOUNT, "张三"))
+
+
+class FriendStateTests(CommandTestCase):
+    """加好友回执要说清「只是申请发出去了」还是「真加上了」（docs/18 §3.2）。
+
+    AI 端拿这个字段写候选人的 `wechatAdded`。原来两个 op 的回执长得一模一样，
+    「申请发出」会被当成「已经是好友」——后面所有发消息的动作都建在一个假前提上。
+    """
+
+    async def test_add_friend_only_claims_the_request_was_sent(self) -> None:
+        runtime = FakeRuntime()
+        result = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "add_friend",
+            "args": {"number": "wxid_zhang", "greetings": "你好"},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        self.assertEqual((result.result or {}).get("friend_state"), "requested")
+
+    async def test_accepting_an_application_really_is_accepted(self) -> None:
+        runtime = FakeRuntime(result={"items": ["张三"], "verify": True})
+        result = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "accept_new_friends", "args": {"limit": 1},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        self.assertEqual((result.result or {}).get("friend_state"), "accepted")
+
+    async def test_accepting_nothing_claims_nothing(self) -> None:
+        """一个待处理申请都没有 —— 这一趟什么也没发生，别报 accepted。"""
+        runtime = FakeRuntime(result={"items": [], "verify": True})
+        result = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "accept_new_friends", "args": {"limit": 1},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        self.assertNotIn("friend_state", result.result or {})
+
+    async def test_dry_run_claims_nothing(self) -> None:
+        """只走流程没真动微信，就别报状态——报了 AI 端就会去写 wechatAdded。"""
+        runtime = FakeRuntime()
+        result = await self._executor(runtime, allow_real_actions=False).execute({
+            "command_id": "c1", "op": "add_friend", "args": {"number": "wxid_zhang"},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        self.assertNotIn("friend_state", result.result or {})
+
+    async def test_other_ops_get_no_such_field(self) -> None:
+        runtime = FakeRuntime()
+        result = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "send_message", "args": {"to": "张三", "text": "在吗"},
+        })
+        self.assertNotIn("friend_state", result.result or {})
 
 
 class IdempotencyTests(CommandTestCase):
