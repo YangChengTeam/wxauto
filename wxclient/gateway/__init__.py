@@ -15,6 +15,7 @@ from .commands import (
     CommandResult,
 )
 from .config import GatewaySettings
+from .contacts import ContactDirectory
 from .friends import FriendWatcher
 from .guard import (
     GuardDecision,
@@ -33,7 +34,7 @@ from .inbound import (
     format_transcript,
 )
 from .outbound import DeliveryResult, MessageSink, OutboundSender, extract_reply
-from .pacing import clamp_interval, jittered
+from .pacing import PACING_EVENT, clamp_interval, jittered
 from .runner import ConnectionPool, GatewayRunner
 from .sessions import GatewayStore
 from .ticket import (
@@ -42,7 +43,6 @@ from .ticket import (
     TicketError,
     TicketProvider,
 )
-from .pacing import PACING_EVENT
 from .watchlist import PUSH_EVENT, Watchlist, WatchScope
 from .wechat_io import (
     QueueMessageSink,
@@ -74,6 +74,7 @@ __all__ = [
     "CommandExecutor",
     "CommandResult",
     "ConnectionPool",
+    "ContactDirectory",
     "Debouncer",
     "DeliveryResult",
     "FriendWatcher",

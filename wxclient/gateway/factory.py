@@ -20,6 +20,7 @@ from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRu
 from .capabilities import Capability, probe_capabilities
 from .commands import COMMANDS, CommandExecutor
 from .config import GatewaySettings
+from .contacts import ContactDirectory
 from .download import FileFetcher
 from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from
@@ -142,6 +143,13 @@ def build_gateway(
             supported_ops=set(COMMANDS),
         )
 
+    # 候选人会话名两条路（api2 §4）。和换票共用同一个 Client Token 取值函数——
+    # 它们本来就是同一个员工身份，没登录时两边都自动躺平（不报错、不刷日志）。
+    contacts = ContactDirectory(
+        gateway_settings.business_api_url,
+        client_token or (lambda: ""),
+    )
+
     runner = GatewayRunner(
         settings=gateway_settings,
         ticket_provider=ticket_provider,
@@ -155,6 +163,7 @@ def build_gateway(
         accounts=list(resolved_accounts),
         watchlist=watchlist,
         capabilities=current_capabilities,
+        contacts=contacts,
         command_executor=CommandExecutor(
             runtime=runtime,
             store=store,

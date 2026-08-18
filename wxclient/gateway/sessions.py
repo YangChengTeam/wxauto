@@ -94,6 +94,16 @@ CREATE TABLE IF NOT EXISTS gateway_send_log (
 );
 CREATE INDEX IF NOT EXISTS idx_send_log_account_time
   ON gateway_send_log (account_id, sent_at);
+CREATE TABLE IF NOT EXISTS gateway_contacts (
+  account_id   TEXT NOT NULL,
+  number       TEXT NOT NULL,
+  session_name TEXT NOT NULL DEFAULT '',
+  profile_name TEXT NOT NULL DEFAULT '',
+  status       TEXT NOT NULL DEFAULT '',
+  worker_id    TEXT,
+  updated_at   TEXT NOT NULL,
+  PRIMARY KEY (account_id, number)
+);
 """
 
 
@@ -125,6 +135,62 @@ class GatewayStore:
         conn = sqlite3.connect(self._path)
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
+
+    # ────────────────────────── 候选人会话名（api2 §4） ──────────────────────────
+
+    def save_contacts(self, account_id: str, rows: Iterable[dict]) -> int:
+        """落一批从后端同步回来的会话名映射（按 number 覆盖）。返回落了几条。
+
+        为什么要在本机留一份：换机/重装之后，同一个候选人如果被起了第二个备注名，
+        微信里就成了「两个人」——逐字寻址会找错窗口，聊天上下文也就断了。
+        """
+        saved = 0
+        with closing(self._connect()) as conn:
+            for row in rows:
+                number = str(row.get("number") or "").strip()
+                if not number:
+                    continue  # 没有 number 就归不了位，留着也没用
+                conn.execute(
+                    """INSERT INTO gateway_contacts
+                         (account_id, number, session_name, profile_name, status, worker_id, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(account_id, number) DO UPDATE SET
+                         session_name = excluded.session_name,
+                         profile_name = excluded.profile_name,
+                         status       = excluded.status,
+                         worker_id    = excluded.worker_id,
+                         updated_at   = excluded.updated_at""",
+                    (account_id, number,
+                     str(row.get("session_name") or ""),
+                     str(row.get("profile_name") or ""),
+                     str(row.get("contact_status") or ""),
+                     row.get("worker_id"),
+                     str(row.get("updated_at") or _utcnow().isoformat())),
+                )
+                saved += 1
+            conn.commit()
+        return saved
+
+    def contact_session_name(self, account_id: str, number: str) -> str:
+        """这台机器（或换机前那台）给这个人用的备注名。没有就返回空串。"""
+        number = (number or "").strip()
+        if not number:
+            return ""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT session_name FROM gateway_contacts WHERE account_id = ? AND number = ?",
+                (account_id, number),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+
+    def contacts_synced_until(self, account_id: str) -> str:
+        """本机已同步到的最新 `updated_at`（增量同步的水位）。空 = 没同步过，要全量。"""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT MAX(updated_at) FROM gateway_contacts WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else ""
 
     # ────────────────────────── 会话映射 ──────────────────────────
 

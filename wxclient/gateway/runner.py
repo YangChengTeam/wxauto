@@ -25,9 +25,11 @@ from .commands import (
     RESULT_OP,
     STAGE_RECEIVED,
     CommandExecutor,
+    CommandResult,
     parse_commands,
 )
 from .config import GatewaySettings
+from .contacts import ContactDirectory
 from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from, within_active_hours
 from .inbound import InboundLoop, InboundMessage, MessageSource
@@ -155,6 +157,7 @@ class GatewayRunner:
         watchlist: Watchlist | None = None,
         friend_watcher: FriendWatcher | None = None,
         command_executor: CommandExecutor | None = None,
+        contacts: ContactDirectory | None = None,
         client_factory: Callable[..., AgentWsClient] | None = None,
         clock: Callable[[], datetime] | None = None,
         capabilities: Callable[[], dict[str, Capability]] | None = None,
@@ -167,6 +170,7 @@ class GatewayRunner:
         self._watchlist = watchlist
         self._friends = friend_watcher
         self._commands = command_executor
+        self._contacts = contacts
         self._capabilities = capabilities
         self._reported_capabilities: dict[str, dict[str, Any]] | None = None
         self._command_tasks: set[asyncio.Task[None]] = set()
@@ -348,6 +352,12 @@ class GatewayRunner:
         except Exception as exc:  # noqa: BLE001 —— 执行器炸了也要给上游一个交代
             _log.warning("指令执行器异常", error=str(exc))
             result = None
+        # 先把会话名报给后端，再回执给 AI 端：报失败只记账（ContactDirectory 内部吞掉），
+        # 顺序上放前面只是为了让「加好友成功」和「后端知道这个备注名」尽量同时发生。
+        try:
+            await self._report_contact(command, result)
+        except Exception as exc:  # noqa: BLE001 —— 会话名上报永远不该影响回执
+            _log.warning("会话名上报异常", error=str(exc))
         payload = (
             result.to_frame_data()
             if result is not None
@@ -355,6 +365,41 @@ class GatewayRunner:
         )
         await report(str(payload.pop("status")), **{k: v for k, v in payload.items()
                                                     if k != "command_id"})
+
+    async def _sync_contacts(self) -> None:
+        """把本员工的候选人会话名映射拉回本机（api2 §4.2）。启动时一次，失败不重试。
+
+        **增量优先**：本机已有的最新 `updated_at` 就是水位，只要它之后的。第一次装机没有水位，
+        那次是全量。
+        """
+        if self._contacts is None or not self._contacts.configured:
+            return
+        for account_id in self._accounts:
+            since = self._store.contacts_synced_until(account_id)
+            rows = await self._contacts.pull(updated_since=since)
+            if rows:
+                saved = self._store.save_contacts(account_id, rows)
+                _log.info("候选人会话名已同步", account=account_id, saved=saved, incremental=bool(since))
+
+    async def _report_contact(self, command: dict[str, Any], result: CommandResult | None) -> None:
+        """加好友这条链走到一步就报一次会话名（api2 §4.1）。
+
+        触发的是 `commands.py` 算出来的 `friend_state`——**它只在真动了微信时才有值**
+        （dry-run 不报，否则后端会以为好友已经加上了）。`number`/`remark` 取原指令的参数：
+        备注名就是我们真在微信里设的那个，不是猜的。
+        """
+        if self._contacts is None or result is None:
+            return
+        state = str((result.result or {}).get("friend_state") or "")
+        if not state:
+            return
+        args = (command or {}).get("args") or {}
+        await self._contacts.report(
+            number=str(args.get("number") or ""),
+            remark=str(args.get("remark") or ""),
+            status=state,
+            command_id=str(command.get("command_id") or ""),
+        )
 
     # ────────────────────────── 一轮 ──────────────────────────
 
@@ -622,6 +667,9 @@ class GatewayRunner:
         ]
         if self._friends is not None:
             side_tasks.append(asyncio.create_task(self._friends.run(), name="gw-friends"))
+        # 会话名同步放**后台**跑：它是「换机之后别把同一个人叫成两个名字」的补课，
+        # 不该挡住网关起来（后端慢或没登录时，同步失败只记账，见 ContactDirectory）。
+        side_tasks.append(asyncio.create_task(self._sync_contacts(), name="gw-contacts"))
         try:
             await self.loop.run()
         finally:
