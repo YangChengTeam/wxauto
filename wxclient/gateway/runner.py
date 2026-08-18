@@ -29,6 +29,8 @@ from .commands import (
     parse_commands,
 )
 from .config import GatewaySettings
+from .contacts import STATUS_ACCEPTED as CONTACT_ACCEPTED
+from .contacts import STATUS_REQUESTED as CONTACT_REQUESTED
 from .contacts import ContactDirectory
 from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from, within_active_hours
@@ -46,6 +48,10 @@ _log = structlog.get_logger(__name__)
 #: 建连/保活的节拍。线上 nginx 对 /agent-ws 配的是 600s 空闲上限，30s 一拍既够续命，
 #: 也让「连接已经死了」最多 30s 就被发现（而不是攒到第一条真消息上）。
 KEEPALIVE_INTERVAL_SECONDS = 30.0
+
+#: 候选人会话名多久同步一次（api2 §4.2）。它问的是业务后端、不碰微信，不受节拍红线约束；
+#: 但也没必要勤——名单变化很慢，而且增量同步只取水位之后的。
+CONTACTS_SYNC_INTERVAL_SECONDS = 600.0
 
 #: 调试会话在会话表里占的「对端」。前后各两条下划线，撞不上任何真实 wxid。
 #: 存进同一张表是为了让它和真实会话一样**长命**——关掉窗口再打开，上下文还在。
@@ -368,12 +374,23 @@ class GatewayRunner:
                                                     if k != "command_id"})
 
     async def _sync_contacts(self) -> None:
-        """把本员工的候选人会话名映射拉回本机（api2 §4.2）。启动时一次，失败不重试。
+        """把本员工的候选人会话名映射拉回本机（api2 §4.2）。**启动时一次，之后周期性**。
 
-        **增量优先**：本机已有的最新 `updated_at` 就是水位，只要它之后的。第一次装机没有水位，
-        那次是全量。
+        **增量优先**：本机记的水位之后的才要。第一次装机没有水位，那次是全量。
+
+        为什么不是只在启动时拉一次：这台机器可能一开就是好几天，而名单在企业端随时会变
+        （HR 在网页上改了备注、别的设备报了新映射）。只拉一次的话，这中间加的好友照样会被
+        起第二个备注名——正是这份同步要防的事。
         """
         if self._contacts is None or not self._contacts.configured:
+            return
+        while True:
+            await self._sync_contacts_once()
+            await asyncio.sleep(CONTACTS_SYNC_INTERVAL_SECONDS)
+
+    async def _sync_contacts_once(self) -> None:
+        """同步一轮。失败只记账——同步不上不该把网关带停（ContactDirectory 自己不抛）。"""
+        if self._contacts is None:
             return
         for account_id in self._accounts:
             since = self._store.contacts_synced_until(account_id)
@@ -395,12 +412,62 @@ class GatewayRunner:
         if not state:
             return
         args = (command or {}).get("args") or {}
+        command_id = str(command.get("command_id") or "")
+
+        if state == CONTACT_ACCEPTED and not args.get("number"):
+            # 我方通过了对方的申请（`accept_new_friends`）：手上只有对方显示名，没有号，
+            # 而 `number` 是上报必填。名字若能在本机映射里对上就补出来，对不上就如实不报——
+            # **不编一个号**，后端拿它归位候选人，编的会归到别人头上。
+            await self._report_accepted_by_name(result, command_id)
+            return
+
+        number, remark = str(args.get("number") or ""), str(args.get("remark") or "")
+        if state == CONTACT_REQUESTED and number and remark:
+            # 先落本机再上报：上报可能失败，而「以后要认出对方通过了」这件事不能跟着失败。
+            self._store.note_friend_request(self._account(), number, remark)
         await self._contacts.report(
-            number=str(args.get("number") or ""),
-            remark=str(args.get("remark") or ""),
-            status=state,
-            command_id=str(command.get("command_id") or ""),
+            number=number, remark=remark, status=state, command_id=command_id,
         )
+
+    def _account(self) -> str:
+        """指令归哪个号。现在一条连接一个号（`CommandExecutor` 也是取第一个）。"""
+        return self._accounts[0] if self._accounts else ""
+
+    async def _report_accepted_by_name(self, result: CommandResult, command_id: str) -> None:
+        """我方通过的那几位，凡是本机认得出号的都报一条 `accepted`。"""
+        account_id = self._account()
+        items = (result.result or {}).get("items") or []
+        for item in items if isinstance(items, list) else []:
+            name = str(item or "").strip()
+            if not name:
+                continue
+            number = self._store.contact_number_for(account_id, name)
+            if not number:
+                _log.info("通过了好友申请但本机不认识这个名字，不上报")  # 名字不进日志
+                continue
+            await self._contacts.report(
+                number=number, remark=name, status=CONTACT_ACCEPTED, command_id=command_id,
+            )
+            self._store.mark_contact_status(account_id, number, CONTACT_ACCEPTED)
+
+    async def _note_friend_accepted(self, account_id: str, peer_id: str) -> None:
+        """收到这个人的消息 = 他通过了我们的申请（api2 §4.1「检测到对方通过」）。
+
+        为什么用「来消息」当信号：这是**免费且确定**的一条——微信里能收到私聊消息就说明
+        已经是好友了。另一条路是去查好友列表，那要真动微信、要占节拍配额，为一个能白捡的
+        事实不值得（[[wechat-rate-control]]）。只在还挂着 `requested` 时报，报完落地，
+        所以同一个人只会报一次。
+        """
+        if self._contacts is None:
+            return
+        number = self._store.pending_friend_request(account_id, peer_id)
+        if not number:
+            return
+        await self._contacts.report(
+            number=number, remark=peer_id, status=CONTACT_ACCEPTED,
+        )
+        self._store.mark_contact_status(account_id, number, CONTACT_ACCEPTED)
+        _log.info("对方通过了好友申请，已上报", account=account_id)
 
     # ────────────────────────── 一轮 ──────────────────────────
 
@@ -423,6 +490,9 @@ class GatewayRunner:
           需求文档 §12.4 的原话是「结果未知先查询或转人工，不能盲目重发」，
           所以这一批就此销账，宁可少一条回复，也不赌那一下。
         """
+        # 收到他的消息就说明好友已经加上了——趁这一刻上报（api2 §4.1「检测到对方通过」）。
+        # 放在对话之前：这个事实此刻就成立了，对话失败重投时它已经报过、不会重复报。
+        await self._note_friend_accepted(account_id, peer_id)
         card = await self._run_dialog_turn(account_id, peer_id, transcript, messages)
         try:
             return await self._sender.deliver(account_id, peer_id, card)

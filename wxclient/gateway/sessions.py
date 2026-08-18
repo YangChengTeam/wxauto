@@ -104,6 +104,10 @@ CREATE TABLE IF NOT EXISTS gateway_contacts (
   updated_at   TEXT NOT NULL,
   PRIMARY KEY (account_id, number)
 );
+CREATE TABLE IF NOT EXISTS gateway_contact_sync (
+  account_id   TEXT PRIMARY KEY,
+  synced_until TEXT NOT NULL
+);
 """
 
 
@@ -145,6 +149,7 @@ class GatewayStore:
         微信里就成了「两个人」——逐字寻址会找错窗口，聊天上下文也就断了。
         """
         saved = 0
+        watermark = ""
         with closing(self._connect()) as conn:
             for row in rows:
                 number = str(row.get("number") or "").strip()
@@ -165,9 +170,19 @@ class GatewayStore:
                      str(row.get("profile_name") or ""),
                      str(row.get("contact_status") or ""),
                      row.get("worker_id"),
-                     str(row.get("updated_at") or _utcnow().isoformat())),
+                     str(row.get("updated_at") or "")),
                 )
                 saved += 1
+                # ★ 水位只认**服务端给的**时间。原来缺 updated_at 时拿本机时钟顶替，
+                # 那个值一旦被当成水位，比它早的行以后永远同步不回来（时钟还不一定准）。
+                watermark = max(watermark, str(row.get("updated_at") or ""))
+            if watermark:
+                conn.execute(
+                    """INSERT INTO gateway_contact_sync (account_id, synced_until) VALUES (?, ?)
+                       ON CONFLICT(account_id) DO UPDATE SET
+                         synced_until = MAX(excluded.synced_until, gateway_contact_sync.synced_until)""",
+                    (account_id, watermark),
+                )
             conn.commit()
         return saved
 
@@ -184,13 +199,79 @@ class GatewayStore:
         return str(row[0]) if row and row[0] else ""
 
     def contacts_synced_until(self, account_id: str) -> str:
-        """本机已同步到的最新 `updated_at`（增量同步的水位）。空 = 没同步过，要全量。"""
+        """本机已同步到的最新 `updated_at`（增量同步的水位）。空 = 没同步过，要全量。
+
+        **单独存，不从数据行里推**：这张表里现在也有本机自己记的行（刚发出的好友申请，
+        见 `note_friend_request`），它们没有服务端时间；拿 `MAX(updated_at)` 当水位就会
+        把本机写的东西算进去，从此漏数据。
+        """
         with closing(self._connect()) as conn:
             row = conn.execute(
-                "SELECT MAX(updated_at) FROM gateway_contacts WHERE account_id = ?",
+                "SELECT synced_until FROM gateway_contact_sync WHERE account_id = ?",
                 (account_id,),
             ).fetchone()
         return str(row[0]) if row and row[0] else ""
+
+    def note_friend_request(self, account_id: str, number: str, session_name: str) -> None:
+        """记下「我们刚给这个号发了好友申请，备注名是这个」。
+
+        为的是**以后能认出对方通过了**：通过之后我们收到的第一条消息只带会话名，
+        而上报要的是 `number`（api2 §4.1 必填）——两者的桥就是这一行。
+        重启也要还在，所以落库不放内存。服务端同步回来的行会覆盖它（那边才是权威）。
+        """
+        number, session_name = (number or "").strip(), (session_name or "").strip()
+        if not number or not session_name:
+            return
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT INTO gateway_contacts
+                     (account_id, number, session_name, profile_name, status, worker_id, updated_at)
+                   VALUES (?, ?, ?, '', 'requested', NULL, '')
+                   ON CONFLICT(account_id, number) DO UPDATE SET
+                     session_name = excluded.session_name,
+                     status       = CASE WHEN gateway_contacts.status = 'accepted'
+                                         THEN gateway_contacts.status ELSE 'requested' END""",
+                (account_id, number, session_name),
+            )
+            conn.commit()
+
+    def pending_friend_request(self, account_id: str, session_name: str) -> str:
+        """这个会话名对应的号，如果我们还在等他通过的话。不等了或不认识 → 空串。"""
+        session_name = (session_name or "").strip()
+        if not session_name:
+            return ""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT number FROM gateway_contacts
+                   WHERE account_id = ? AND session_name = ? AND status = 'requested' LIMIT 1""",
+                (account_id, session_name),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+
+    def contact_number_for(self, account_id: str, session_name: str) -> str:
+        """按会话名反查号（不限状态）。我方通过对方申请时只拿得到名字，靠它补 `number`。"""
+        session_name = (session_name or "").strip()
+        if not session_name:
+            return ""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT number FROM gateway_contacts
+                   WHERE account_id = ? AND session_name = ? LIMIT 1""",
+                (account_id, session_name),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+
+    def mark_contact_status(self, account_id: str, number: str, status: str) -> None:
+        """把本机记的好友状态推进一格（只动状态，不碰会话名，也不动同步水位）。"""
+        number, status = (number or "").strip(), (status or "").strip()
+        if not number or not status:
+            return
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE gateway_contacts SET status = ? WHERE account_id = ? AND number = ?",
+                (status, account_id, number),
+            )
+            conn.commit()
 
     # ────────────────────────── 会话映射 ──────────────────────────
 

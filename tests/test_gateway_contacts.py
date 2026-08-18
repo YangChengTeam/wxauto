@@ -246,14 +246,86 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
         await self._runner(d)._report_contact(command, None)
         self.assertEqual(d.reported, [])
 
+    async def test_their_first_message_means_they_accepted(self) -> None:
+        """★ 对方通过了我们的申请 —— 收到他第一条消息的那一刻就报（api2 §4.1）。
+
+        用「来消息」当信号是因为它**免费且确定**：私聊收得到就已经是好友。
+        另一条路是去查好友列表，那要真动微信、占节拍配额，为一个白捡的事实不值当。
+        """
+        d = FakeDirectory()
+        runner = self._runner(d)
+        await runner._report_contact(
+            {"command_id": "cmd-1", "op": "add_friend",
+             "args": {"number": "13800138000", "remark": "张三·普工"}},
+            CommandResult("cmd-1", "done", result={"friend_state": "requested"}),
+        )
+        d.reported.clear()
+
+        await runner._note_friend_accepted("acct-1", "张三·普工")
+
+        self.assertEqual(d.reported, [{"number": "13800138000", "remark": "张三·普工",
+                                       "status": "accepted"}])
+
+    async def test_acceptance_is_reported_only_once(self) -> None:
+        """报完就落地。他后面再说十句话，也不该再报十遍。"""
+        d = FakeDirectory()
+        runner = self._runner(d)
+        self.store.note_friend_request("acct-1", "13800138000", "张三·普工")
+
+        await runner._note_friend_accepted("acct-1", "张三·普工")
+        await runner._note_friend_accepted("acct-1", "张三·普工")
+
+        self.assertEqual(len(d.reported), 1)
+
+    async def test_a_stranger_message_reports_nothing(self) -> None:
+        """没给他发过申请的人来消息 —— 与好友状态无关，一条都不报。"""
+        d = FakeDirectory()
+        await self._runner(d)._note_friend_accepted("acct-1", "查无此人")
+        self.assertEqual(d.reported, [])
+
+    async def test_accepting_their_application_reports_the_ones_we_can_place(self) -> None:
+        """我方通过对方申请：只拿得到显示名，号从本机映射里补；补不出来就不报。
+
+        ★ 不许编号：后端拿 `number` 归位候选人，编的会归到别人头上。
+        """
+        d = FakeDirectory()
+        self.store.save_contacts("acct-1", [
+            {"number": "13800138000", "session_name": "张三·普工",
+             "updated_at": "2026-08-18T09:00:00.000Z"},
+        ])
+        await self._runner(d)._report_contact(
+            {"command_id": "cmd-9", "op": "accept_new_friends", "args": {"limit": 5}},
+            CommandResult("cmd-9", "done",
+                          result={"items": ["张三·普工", "不认识的人"], "friend_state": "accepted"}),
+        )
+        self.assertEqual(d.reported, [{"number": "13800138000", "remark": "张三·普工",
+                                       "status": "accepted", "command_id": "cmd-9"}])
+
+    async def test_local_rows_do_not_move_the_sync_watermark(self) -> None:
+        """★ 水位只认服务端给的时间。
+
+        本机自己记的「刚发出的申请」没有服务端时间；它若被算进水位（老实现取
+        `MAX(updated_at)`、缺了还拿本机时钟顶替），比它早的行以后永远同步不回来。
+        """
+        d = FakeDirectory([{"number": "138", "session_name": "张三",
+                            "updated_at": "2026-08-18T09:12:00.000Z"}])
+        runner = self._runner(d)
+        await runner._sync_contacts_once()
+        self.store.note_friend_request("acct-1", "13900139000", "李四·叉车")
+        self.store.save_contacts("acct-1", [{"number": "137", "session_name": "王五"}])  # 后端没给时间
+
+        await runner._sync_contacts_once()
+
+        self.assertEqual(d.pulled, ["", "2026-08-18T09:12:00.000Z"])
+
     async def test_sync_is_incremental_after_first_run(self) -> None:
         rows = [{"number": "138", "session_name": "张三·普工", "contact_status": "accepted",
                  "updated_at": "2026-08-18T09:12:00.000Z"}]
         d = FakeDirectory(rows)
         runner = self._runner(d)
-        await runner._sync_contacts()
+        await runner._sync_contacts_once()
         self.assertEqual(self.store.contact_session_name("acct-1", "138"), "张三·普工")
-        await runner._sync_contacts()
+        await runner._sync_contacts_once()
         # 第一次没水位（全量），第二次带上本机已知的最新时间
         self.assertEqual(d.pulled, ["", "2026-08-18T09:12:00.000Z"])
 
