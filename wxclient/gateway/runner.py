@@ -172,7 +172,8 @@ class GatewayRunner:
         self._commands = command_executor
         self._contacts = contacts
         self._capabilities = capabilities
-        self._reported_capabilities: dict[str, dict[str, Any]] | None = None
+        # account_id → (报给了哪条连接, 报的是什么)。**连接也要记**，见 _report_capabilities。
+        self._reported_capabilities: dict[str, tuple[Any, dict[str, Any]]] = {}
         self._command_tasks: set[asyncio.Task[None]] = set()
         self._debug_session_id: str | None = None
         self._command_listener: Callable[[dict[str, Any]], None] | None = None
@@ -693,15 +694,23 @@ class GatewayRunner:
         except Exception as exc:  # noqa: BLE001 —— 探测失败不该把保活带停
             _log.warning("能力探测失败", error=str(exc))
             return
-        if frame["capabilities"] == self._reported_capabilities:
-            return
         try:
             client = await self._pool.acquire(account_id)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("能力上报失败", error=str(exc))
+            return
+        # ★ 「变了才报」里的**变**必须同时看连接：AI 端的网关册子是按**连接**记的
+        # （连接一关就注销），而自报能力表正是这台机器入册的唯一途径。断线重连后是一条
+        # 新连接、册子里没有它——此时若因为「内容一样」就不报，这台机器再也不入册，
+        # 之后每条微信指令都死在 no gateway，而两边日志都显示「已连接」。
+        if self._reported_capabilities.get(account_id) == (client, frame["capabilities"]):
+            return
+        try:
             await client.notify(CAPABILITIES_OP, frame)
         except Exception as exc:  # noqa: BLE001
             _log.warning("能力上报失败", error=str(exc))
             return
-        self._reported_capabilities = frame["capabilities"]
+        self._reported_capabilities[account_id] = (client, frame["capabilities"])
         unavailable = [
             cap["label"] for cap in frame["capabilities"].values() if not cap["available"]
         ]
