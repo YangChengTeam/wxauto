@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 
 # 明确的**拒绝联系**表达——命中即永久停止对该联系人的一切自动化动作并拉黑。
@@ -65,7 +65,7 @@ def parse_active_hours(window: str) -> tuple[time, time]:
         start_raw, end_raw = window.split("-", 1)
         start = time.fromisoformat(start_raw.strip())
         end = time.fromisoformat(end_raw.strip())
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise ValueError(f"active_hours 格式应为 HH:MM-HH:MM，收到 {window!r}") from exc
     return start, end
 
@@ -146,6 +146,50 @@ def action_limits_from(settings) -> dict[str, RateLimit]:
     }
 
 
+#: 读类动作的最小间隔（秒）。读不打扰任何人，但一样是「机器在动微信」——
+#: 半夜每秒翻一次联系人，风控看的就是这个。与 `pacing.py` 的轮询下限同源同值：
+#: 那边管的是常驻循环，这里管的是 AI 端随时下发的读指令，绕开哪一边红线都不成立。
+READ_ACTION = "read"                  # 读消息 / 翻聊天记录 / 查联系人 / 看朋友圈
+READ_FRIENDS_ACTION = "read_friends"  # 查新好友申请（加好友相关，节拍必须慢得多）
+
+READ_INTERVALS: dict[str, float] = {
+    READ_ACTION: 30.0,
+    READ_FRIENDS_ACTION: 300.0,
+}
+
+
+@dataclass
+class Reservation:
+    """一次**已经占住的**额度。做完按实际用量结算，没用上的还回去。
+
+    为什么要有它：原来是「先 check 再动微信 再 record_send」，两次数之间隔着一整个
+    微信动作。并发下发时一批指令全读到同一个旧计数后集体放行（实测并发 20 条加好友
+    done=20/rejected=0，串行才是 5/15）；一条 `accept_new_friends` 通过 5 个人也只记
+    1 次，加好友红线实际被放宽 5 倍。占住再做，这两种放宽同时消失。
+    """
+
+    granted: int = 0
+    reason: str = ""
+    _store: object | None = None
+    _rowids: list[int] = field(default_factory=list)
+
+    @property
+    def allowed(self) -> bool:
+        return self.granted > 0
+
+    def settle(self, actually_did: int) -> None:
+        """按真实用量结算：预留 5 实际通过 2 → 还回 3。"""
+        keep = max(min(int(actually_did), self.granted), 0)
+        surplus, self._rowids = self._rowids[keep:], self._rowids[:keep]
+        self.granted = keep
+        if surplus and self._store is not None:
+            self._store.release_sends(surplus)
+
+    def release(self) -> None:
+        """一件都没做成（动作抛错 / 被上层拒了）——全额还回去。"""
+        self.settle(0)
+
+
 @dataclass(frozen=True)
 class GuardDecision:
     """守门结论。``allowed=False`` 时 ``reason`` 说明为什么，供留痕。"""
@@ -212,4 +256,62 @@ class OutboundGuard:
         sent = self._store.sends_in_last_hour(account_id, now)
         if sent >= self._max_per_hour:
             return GuardDecision.deny(f"该账号一小时内已发送 {sent} 条，达到上限")
+        return GuardDecision.allow()
+
+    def reserve(
+        self,
+        account_id: str,
+        peer_id: str,
+        *,
+        now: datetime,
+        action: str = ACTION_MESSAGE,
+        count: int = 1,
+        clamp: bool = False,
+    ) -> Reservation:
+        """**占住 `count` 次额度再返回**。占不到 → `allowed=False` + 理由。
+
+        `clamp=True`：额度不够就减量放行（`accept_new_friends` 的「最多 N 个」）。
+        默认全有或全无——一段回复拆成三条，发出两条比一条不发更糟。
+
+        黑名单与时间窗是纯判断、不涉及计数，先在事务外判掉，理由也更具体。
+        """
+        if self._store.is_blacklisted(account_id, peer_id):
+            return Reservation(reason="该联系人已在黑名单")
+        if not within_active_hours(now, self._active_hours):
+            return Reservation(reason=f"不在允许发送的时间窗 {self._active_hours}")
+
+        limit = self._action_limits.get(action)
+        label = ACTION_LABELS.get(action, action)
+        if limit is not None and limit.max_count <= 0:
+            return Reservation(reason=f"本机没有开放「{label}」这类动作")
+
+        checks: list[tuple[str, str | None, datetime, int]] = []
+        if limit is not None:
+            span = "24 小时" if limit.window_seconds >= DAY else "一小时"
+            checks.append((f"「{label}」在过去{span}内", action, limit.since(now), limit.max_count))
+        checks.append(("该账号一小时内", None, now - timedelta(hours=1), self._max_per_hour))
+
+        rowids, granted, binding = self._store.reserve_sends(
+            account_id, peer_id, now, action, count, checks, clamp=clamp,
+        )
+        if granted <= 0:
+            where, used, cap = binding or (f"「{label}」", 0, 0)
+            return Reservation(reason=f"{where}已做 {used} 次，达到上限 {cap}")
+        return Reservation(granted=granted, _store=self._store, _rowids=rowids)
+
+    def allow_read(self, account_id: str, action: str, *, now: datetime) -> GuardDecision:
+        """读类动作的节拍闸：够慢才放行，放行的同时把这一次记下（原子）。
+
+        读不受配额与黑名单约束（它不打扰任何人），但**受时间窗和最小间隔约束**——
+        原来读类只要理由里没有「时间窗」就一律放行，于是串行 50 条 `check_new_friends`
+        全部通过，≥300s 查好友那条红线在指令路径上等于不存在。
+        """
+        if not within_active_hours(now, self._active_hours):
+            return GuardDecision.deny(f"不在允许动作的时间窗 {self._active_hours}")
+        floor = READ_INTERVALS.get(action)
+        if floor is None:
+            return GuardDecision.allow()
+        wait = self._store.try_touch_read(account_id, action, now, floor)
+        if wait > 0:
+            return GuardDecision.deny(f"这类查询要隔 {int(floor)} 秒才做一次，还要等 {wait:g} 秒")
         return GuardDecision.allow()

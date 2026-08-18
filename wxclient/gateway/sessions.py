@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -104,6 +104,12 @@ CREATE TABLE IF NOT EXISTS gateway_contacts (
   updated_at   TEXT NOT NULL,
   PRIMARY KEY (account_id, number)
 );
+CREATE TABLE IF NOT EXISTS gateway_read_marks (
+  account_id TEXT NOT NULL,
+  action     TEXT NOT NULL,
+  last_at    TEXT NOT NULL,
+  PRIMARY KEY (account_id, action)
+);
 CREATE TABLE IF NOT EXISTS gateway_contact_sync (
   account_id   TEXT PRIMARY KEY,
   synced_until TEXT NOT NULL
@@ -136,7 +142,9 @@ class GatewayStore:
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._path)
+        # isolation_level=None = 关掉 sqlite3 的隐式事务：预留额度那段要自己 `BEGIN IMMEDIATE`
+        # （见 reserve_sends），隐式事务会跟它打架。其余写法照旧显式 commit。
+        conn = sqlite3.connect(self._path, isolation_level=None, timeout=15.0)
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
 
@@ -663,6 +671,117 @@ class GatewayStore:
                 (account_id, peer_id, (at or _utcnow()).isoformat(), action),
             )
             conn.commit()
+
+    def reserve_sends(
+        self,
+        account_id: str,
+        peer_id: str,
+        at: datetime,
+        action: str,
+        count: int,
+        checks: Sequence[tuple[str, str | None, datetime, int]],
+        *,
+        clamp: bool = False,
+    ) -> tuple[list[int], int, tuple[str, int, int] | None]:
+        """**先预留后执行**：在一个事务里把额度数清楚并当场占住，返回占住的行号。
+
+        为什么必须是一个事务：原来是「先 check 再 submit 再 record_send」，两次数之间
+        隔着一整个微信动作。并发下发时一批指令全读到同一个旧计数，然后集体放行——
+        实测并发 20 条加好友 done=20/rejected=0，而串行是 5/15。守门在真实形态下等于没有。
+
+        `checks` = 若干 `(标签, action|None, since, max_count)`；`action=None` 表示总闸（不分档）。
+        `clamp=True` 时额度不够就**减量放行**（`accept_new_friends` 那种「最多 N 个」），
+        否则要么全额占住、要么一个都不占（回复分段：发一半比不发更糟）。
+
+        返回 `(rowids, granted, 卡在哪一档)`。`granted == 0` = 没占到，调用方按拒绝处理；
+        第三项是 `(标签, 已用, 上限)`，用来把拒绝理由说具体。
+        """
+        count = max(int(count), 0)
+        if count == 0:
+            return [], 0, None
+        stamp = at.isoformat()
+        with closing(self._connect()) as conn:
+            # IMMEDIATE：一上来就拿写锁，别的连接只能等这条提交完再数——
+            # 这正是「判一次记一次」缺的那个原子性。
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                granted = count
+                binding: tuple[str, int, int] | None = None
+                for label, scoped, since, max_count in checks:
+                    sql = "SELECT COUNT(*) FROM gateway_send_log WHERE account_id=? AND sent_at>=?"
+                    params: tuple = (account_id, since.isoformat())
+                    if scoped is not None:
+                        sql += " AND action=?"
+                        params = (*params, scoped)
+                    used = int(conn.execute(sql, params).fetchone()[0])
+                    room = max(max_count - used, 0)
+                    if room < granted:
+                        granted, binding = room, (label, used, max_count)
+                if granted <= 0 or (granted < count and not clamp):
+                    conn.rollback()
+                    return [], 0, binding
+                rowids = []
+                for _ in range(granted):
+                    cur = conn.execute(
+                        "INSERT INTO gateway_send_log (account_id, peer_id, sent_at, action) "
+                        "VALUES (?,?,?,?)",
+                        (account_id, peer_id, stamp, action),
+                    )
+                    rowids.append(int(cur.lastrowid or 0))
+                conn.commit()
+                return rowids, granted, binding
+            except Exception:
+                conn.rollback()
+                raise
+
+    def release_sends(self, rowids: Sequence[int]) -> None:
+        """把没用上的预留还回去（动作没做成 / 做得比预留的少）。"""
+        ids = [int(r) for r in rowids if r]
+        if not ids:
+            return
+        with closing(self._connect()) as conn:
+            conn.execute(
+                f"DELETE FROM gateway_send_log WHERE rowid IN ({','.join('?' * len(ids))})",
+                ids,
+            )
+            conn.commit()
+
+    def try_touch_read(
+        self, account_id: str, action: str, at: datetime, min_interval_seconds: float
+    ) -> float:
+        """读类动作的**最小间隔**闸。返回还要等几秒；`0` = 现在可以，并已记下这一次。
+
+        读不打扰任何人，但一样是「机器在动微信」——半夜每秒翻一次联系人，风控看的就是
+        这个。所以读也要有节拍，只是它管的是**间隔**而不是次数（`gateway_send_log` 那边
+        是写动作的额度，读不进那本账，免得把写的总闸挤掉）。
+        """
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT last_at FROM gateway_read_marks WHERE account_id=? AND action=?",
+                    (account_id, action),
+                ).fetchone()
+                if row and row[0]:
+                    try:
+                        last = datetime.fromisoformat(str(row[0]))
+                    except ValueError:
+                        last = None
+                    if last is not None:
+                        waited = (at - last).total_seconds()
+                        if waited < min_interval_seconds:
+                            conn.rollback()
+                            return round(min_interval_seconds - waited, 1)
+                conn.execute(
+                    """INSERT INTO gateway_read_marks (account_id, action, last_at) VALUES (?,?,?)
+                       ON CONFLICT(account_id, action) DO UPDATE SET last_at = excluded.last_at""",
+                    (account_id, action, at.isoformat()),
+                )
+                conn.commit()
+                return 0.0
+            except Exception:
+                conn.rollback()
+                raise
 
     def sends_since(self, account_id: str, since: datetime, action: str | None = None) -> int:
         """``action=None`` = 所有写动作（总闸）；给了就只数那一档。"""

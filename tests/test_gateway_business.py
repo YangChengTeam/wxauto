@@ -1220,11 +1220,16 @@ class PacingTests(unittest.TestCase):
         self.assertEqual(clamp_interval(5.0, 30.0, what="读消息间隔"), 30.0)
         self.assertEqual(clamp_interval(60.0, 30.0, what="读消息间隔"), 60.0)
 
-    def test_jitter_is_bounded_and_not_a_metronome(self) -> None:
+    def test_jitter_never_goes_below_the_floor(self) -> None:
+        """★ 抖动只往慢里抖。
+
+        双向抖动会把实际间隔抖到红线以下（审计实测：读消息 52% 的轮次低于 30s、
+        查好友 50% 低于 300s）——而那两个数正是这一层声称把住的下限。
+        """
         rng = random.Random(7)
-        values = [jittered(60.0, rng=rng) for _ in range(50)]
-        self.assertTrue(all(41.9 <= v <= 78.1 for v in values), values[:3])
-        self.assertGreater(len(set(values)), 40, "间隔还是整齐的，等于没抖")
+        values = [jittered(60.0, rng=rng) for _ in range(200)]
+        self.assertTrue(all(60.0 <= v <= 78.1 for v in values), min(values))
+        self.assertGreater(len(set(values)), 150, "间隔还是整齐的，等于没抖")
 
 
 class QuietHoursTests(StoreTestCase):

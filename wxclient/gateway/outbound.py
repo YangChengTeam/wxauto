@@ -15,7 +15,7 @@ from typing import Any, Protocol
 
 import structlog
 
-from .guard import ACTION_GROUP, ACTION_MESSAGE, GuardDecision, OutboundGuard
+from .guard import ACTION_GROUP, ACTION_MESSAGE, OutboundGuard
 
 _log = structlog.get_logger(__name__)
 
@@ -103,16 +103,23 @@ class OutboundSender:
         now = self._clock()
         # 回到群里和回给一个人是两档配额（072）：群的误伤面大得多。
         action = ACTION_GROUP if self._store.is_known_group(account_id, peer_id) else ACTION_MESSAGE
-        decision: GuardDecision = self._guard.check(account_id, peer_id, now=now, action=action)
-        if not decision.allowed:
-            _log.info("出站被守门拦下", account=account_id, 会话=peer_id, reason=decision.reason)
-            return DeliveryResult(skipped_reason=decision.reason, actions=actions)
+        # ★ 一条回复常常拆成好几段，**每一段都是一次平台看得见的动作**。
+        #   原来判一次就把整张卡发完，等于按 1 条记账、按 N 条打扰；而不同联系人的轮次
+        #   还并发跑，两条一叠加就是「配额写着 20、实际发出去 40」。整批一次占住。
+        reservation = self._guard.reserve(
+            account_id, peer_id, now=now, action=action, count=len(segments),
+        )
+        if not reservation.allowed:
+            _log.info("出站被守门拦下", account=account_id, 会话=peer_id, reason=reservation.reason)
+            return DeliveryResult(skipped_reason=reservation.reason, actions=actions)
 
         task_ids: list[str] = []
-        for segment in segments:
-            task_id = await self._sink.send(account_id, peer_id, segment)
-            self._store.record_send(account_id, peer_id, self._clock(), action=action)
-            task_ids.append(task_id)
+        try:
+            for segment in segments:
+                task_ids.append(await self._sink.send(account_id, peer_id, segment))
+        finally:
+            # 发到一半炸了：没发出去的那几段不该占着额度（发出去的照记）。
+            reservation.settle(len(task_ids))
         _log.info("已投递回复", account=account_id, 会话=peer_id, segments=len(task_ids))
         return DeliveryResult(sent=task_ids, actions=actions)
 

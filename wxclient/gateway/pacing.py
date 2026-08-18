@@ -26,7 +26,12 @@ MIN_READ_INTERVAL_SECONDS = 30.0
 #: 查新好友申请的最小间隔。加好友相关的动作是风控最敏感的一类，节拍必须比读消息慢得多。
 MIN_FRIEND_INTERVAL_SECONDS = 300.0
 
-#: 抖动幅度：实际间隔在 [1-r, 1+r] 之间随机取。0.3 已经足够打散「整点」特征。
+#: 抖动幅度：实际间隔在 [1, 1+r] 之间随机取——**只往慢里抖，不往快里抖**。
+#: 0.3 已经足够打散「整点」特征。
+#:
+#: ★ 原来是 [1-r, 1+r] 双向的（2026-08-18 审计实测：读消息 min=21s、52% 的轮次低于 30s；
+#: 查好友 min=210s、50% 低于 300s）——那两个数字正是本模块声称「下限把住了」的下限。
+#: 下限是防风控红线，抖动不该有权把它抖穿；往慢里抖同样不规律，代价只是平均慢 15%。
 JITTER_RATIO = 0.3
 
 #: AI 端下发节拍用的推送事件。业务比网关更清楚「现在该盯紧还是放松」——正等对方回话
@@ -50,11 +55,11 @@ def clamp_interval(seconds: float, minimum: float, *, what: str) -> float:
 
 
 def jittered(seconds: float, *, ratio: float = JITTER_RATIO, rng: random.Random | None = None) -> float:
-    """给间隔加抖动，返回这一次实际要睡多久。
+    """给间隔加抖动，返回这一次实际要睡多久。**只会比基数慢，绝不会更快。**
 
-    抖动只往「不规律」走，不往「更快」走太多——下限仍由 ``clamp_interval`` 把住基数。
+    传进来的基数已经过 ``clamp_interval``（不低于红线），所以单向抖动 = 红线永远成立。
     """
     if seconds <= 0:
         return 0.0
     source = rng or random
-    return seconds * (1.0 + source.uniform(-ratio, ratio))
+    return seconds * (1.0 + source.uniform(0.0, ratio))

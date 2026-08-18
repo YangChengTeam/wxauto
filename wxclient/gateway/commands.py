@@ -29,7 +29,10 @@ from .guard import (
     ACTION_GROUP,
     ACTION_MESSAGE,
     ACTION_MOMENTS,
+    READ_ACTION,
+    READ_FRIENDS_ACTION,
     OutboundGuard,
+    Reservation,
 )
 
 _log = structlog.get_logger(__name__)
@@ -72,6 +75,21 @@ class CommandSpec:
 
     私聊 / 群消息是同一个 op 的两种形态（发到群里误伤面更大），所以群那一档
     不写在这里，由 `_action_for` 按对方是不是群现算。"""
+
+    read_action: str = READ_ACTION
+    """读类走哪一档**节拍**（最小间隔）。查好友申请比读消息敏感得多，单列一档。"""
+
+    reserve_count: Callable[[dict[str, Any]], int] | None = None
+    """这条指令**最多**做几次这档动作（`None` = 就一次）。
+
+    给了它就意味着「最多 N 个」——额度不够时**减量放行**（做 3 个总比一个不做强）。
+    没给的一律全有或全无：一段回复拆成三条，发出两条比一条不发更糟。"""
+
+    counts: Callable[[dict[str, Any], dict[str, Any]], int] = lambda _args, _result: 1
+    """这条指令**实际**做了几次这档动作。`(args, result) -> n`。
+
+    默认 1。`accept_new_friends` 一条能通过好几个人——按 1 记的话，加好友那档红线
+    实际被放宽到 5 倍（2026-08-18 审计实测）。"""
 
 
 def _req(args: dict[str, Any], key: str, *, alias: str = "") -> str:
@@ -139,6 +157,9 @@ COMMANDS: dict[str, CommandSpec] = {
         TaskType.ACCEPT_NEW_FRIENDS, True,
         lambda a: {"limit": _limit(a, 1, 5)},
         action=ACTION_FRIEND,
+        # 一条指令 = 最多 limit 次「加好友」：按 limit 预留，按真实通过数结算。
+        reserve_count=lambda a: _limit(a, 1, 5),
+        counts=lambda _args, result: len(result.get("items") or []),
     ),
     "post_moments": CommandSpec(
         TaskType.POST_MOMENTS, True,
@@ -166,6 +187,7 @@ COMMANDS: dict[str, CommandSpec] = {
     "check_new_friends": CommandSpec(
         TaskType.CHECK_NEW_FRIENDS, False,
         lambda a: {"limit": _limit(a, 8, 20)},
+        read_action=READ_FRIENDS_ACTION,
     ),
     "read_recent_moments": CommandSpec(
         TaskType.READ_RECENT_MOMENTS, False,
@@ -293,10 +315,26 @@ class CommandExecutor:
 
         now = self._clock()
         action = self._action_for(spec, to_group)
-        denial = self._gate(spec, peer, now, action)
-        if denial:
-            _log.info("指令被守门拦下", op=op, reason=denial)
-            return CommandResult(command_id, "rejected", denial)
+        # ★ 写类：**先占住额度再动微信**（判一次记一次的老写法在并发下等于没有守门）。
+        #    读类：不占额度，但要过节拍闸（最小间隔）。两条路都在动微信之前。
+        reservation = Reservation()
+        if spec.writes:
+            reservation = self._guard.reserve(
+                self._account, peer, now=now, action=action,
+                count=spec.reserve_count(args) if spec.reserve_count else 1,
+                clamp=spec.reserve_count is not None,
+            )
+            if not reservation.allowed:
+                _log.info("指令被守门拦下", op=op, reason=reservation.reason)
+                return CommandResult(command_id, "rejected", reservation.reason)
+            if spec.reserve_count is not None:
+                # 减量放行了就把上限跟着调下来，别让微信那边照原数去做。
+                payload["limit"] = reservation.granted
+        else:
+            decision = self._guard.allow_read(self._account, spec.read_action, now=now)
+            if not decision.allowed:
+                _log.info("读类指令被节拍闸拦下", op=op, reason=decision.reason)
+                return CommandResult(command_id, "rejected", decision.reason)
 
         # 到这里参数齐了、守门也过了，接下来就要真动微信（发文件还要先取字节）。
         # 报一声「开始了」——这段可能跑十几秒，中间没有任何信号的话没法跟「丢了」区分。
@@ -317,9 +355,11 @@ class CommandExecutor:
                         self._fetcher.materialize(self._account, refs)
                     )
                 except DownloadError as exc:
+                    reservation.release()   # 字节都没取到，微信一下没动
                     _log.warning("取 AI 端产出文件失败", op=op, error=str(exc))
                     return CommandResult(command_id, "failed", str(exc))
                 except Exception as exc:  # noqa: BLE001 —— 网络类异常也要回给上游
+                    reservation.release()
                     _log.warning("取 AI 端产出文件失败", op=op, error=str(exc))
                     return CommandResult(command_id, "failed", f"取文件失败：{exc}")
                 payload["files"] = [str(p) for p in paths]
@@ -329,16 +369,16 @@ class CommandExecutor:
                     confirmation=self._confirmation if self._allow_real else "",
                 )
             except Exception as exc:  # noqa: BLE001 —— 失败要能回给上游，不能只写日志
+                reservation.release()   # 一件没做成，额度原样还回去
                 _log.warning("指令执行失败", op=op, error=str(exc))
                 return CommandResult(command_id, "failed", f"{type(exc).__name__}: {exc}")
 
-            if spec.writes:
-                # 主动发出去的也要计入频次——不然「被动回复限 20 条/时」会被主动触达绕开。
-                # ★ 没有具体对象的写动作（发朋友圈）同样要记账（072）：它照样是一次
-                #   平台看得见的动作，不记就等于朋友圈那一档配额永远用不满、形同虚设。
-                self._store.record_send(self._account, peer, now, action=action)
-            _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
             result = (raw or {}).get("result") or {}
+            if spec.writes:
+                # 额度在动微信**之前**就占住了（见上），这里只按真实用量结算：
+                # 预留 5 实际通过 2 → 还回 3。做多少记多少，两个方向都不许含糊。
+                reservation.settle(spec.counts(args, result))
+            _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
             state = self._friend_state(op, result)
             if state:
                 result = {**result, "friend_state": state}
@@ -399,18 +439,6 @@ class CommandExecutor:
             return ACTION_GROUP
         return spec.action
 
-    def _gate(self, spec: CommandSpec, peer: str, now: datetime, action: str) -> str:
-        """返回拒绝理由；空串 = 放行。
-
-        读类只受时间窗约束（半夜翻联系人一样是「机器在跑」）；写类走完整守门。
-        """
-        decision = self._guard.check(self._account, peer, now=now, action=action)
-        if decision.allowed:
-            return ""
-        if not spec.writes and "时间窗" not in decision.reason:
-            # 读操作不受黑名单/发送频次限制——它不打扰任何人。
-            return ""
-        return decision.reason
 
 
 def parse_commands(data: dict[str, Any]) -> Sequence[dict[str, Any]]:
