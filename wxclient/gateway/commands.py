@@ -22,6 +22,7 @@ import structlog
 
 from wxclient.queue import TaskType
 
+from .candidates import CandidateDirectory, CandidateUpdateError
 from .capabilities import capability_of
 from .download import DownloadError, FileRef
 from .guard import (
@@ -152,6 +153,11 @@ def _file_refs(args: dict[str, Any], *, required: bool = True) -> list[FileRef]:
 #: 发消息两个 op 另收一个可选参数 `to_group`（bool）：AI 端知道这次发的是群时给 true。
 #: 本机只有收到过群消息才认得出群，主动发第一条时一无所知，会误算进私聊那档配额
 #: （见 `CommandExecutor._to_group`）。**它只能收紧**：给 false 不会把已知的群降回私聊。
+#: 非微信动作：拿 Client Token 把候选人状态回写到业务后端（api2 §9）。
+#: 不在 `COMMANDS` 里——那张表每一条都要走微信队列，而这条一个微信窗口都不碰，
+#: 也不该占任何微信配额（配额管的是「会不会打扰真人」）。
+UPDATE_CANDIDATE_OP = "update_candidate"
+
 COMMANDS: dict[str, CommandSpec] = {
     # ── 写类 ──
     "send_message": CommandSpec(
@@ -253,6 +259,7 @@ class CommandExecutor:
         fetcher=None,      # FileFetcher | None：发文件时去 AI 端取产出物（067）。没配就发不了文件。
         clock: Callable[[], datetime] | None = None,
         capabilities: Callable[[], dict] | None = None,
+        candidates: CandidateDirectory | None = None,
     ) -> None:
         """``capabilities`` 是个**取当下能力表**的函数（074），不是一份快照——
         微信随时可能被关掉、掉线，执行前这一刻算的才作数。"""
@@ -265,6 +272,7 @@ class CommandExecutor:
         self._fetcher = fetcher
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._capabilities = capabilities
+        self._candidates = candidates
 
     async def execute(
         self,
@@ -298,6 +306,9 @@ class CommandExecutor:
         data: dict[str, Any],
         on_stage: Callable[[str], Awaitable[None]] | None = None,
     ) -> CommandResult:
+        if op == UPDATE_CANDIDATE_OP:
+            return await self._update_candidate(command_id, data)
+
         spec = COMMANDS.get(op)
         if spec is None:
             _log.warning("收到不支持的微信指令", op=op)
@@ -407,6 +418,35 @@ class CommandExecutor:
             if state:
                 result = {**result, "friend_state": state}
             return CommandResult(command_id, "done", result=result)
+
+    async def _update_candidate(self, command_id: str, data: dict[str, Any]) -> CommandResult:
+        """把候选人的资料/AI 状态写回业务后端（api2 §9）。
+
+        不走微信队列、不占配额、不看工作时间窗——它一个微信窗口都不碰。
+        但**只走流程不真发**的时候一律拒：那一轮微信里什么也没发生，把人标成「AI 托管中」
+        就是拿假动作去改真数据，HR 看到的进度会比现实超前一格。
+        """
+        if not self._allow_real:
+            return CommandResult(command_id, "rejected", "本机只走流程不真动微信，不改业务数据")
+        if self._candidates is None or not self._candidates.configured:
+            return CommandResult(command_id, "rejected", "本机没配业务接口地址，写不了候选人状态")
+
+        args = data.get("args")
+        args = args if isinstance(args, dict) else {}
+        profile = args.get("profile")
+        ai_status = args.get("ai_status")
+        try:
+            result = await self._candidates.update(
+                str(args.get("candidate_id") or ""),
+                profile=profile if isinstance(profile, dict) else None,
+                ai_status=ai_status if isinstance(ai_status, dict) else None,
+            )
+        except CandidateUpdateError as exc:
+            _log.warning("候选人回写请求不成立", error=str(exc))
+            return CommandResult(command_id, "rejected", str(exc))
+        if not result.get("updated"):
+            return CommandResult(command_id, "failed", str(result.get("reason") or "候选人状态没写成"))
+        return CommandResult(command_id, "done", result=result)
 
     def _friend_state(self, op: str, result: dict[str, Any]) -> str:
         """加好友这条链走到哪一步了（docs/18 §3.2）。AI 端据此写候选人的 `wechatAdded`。

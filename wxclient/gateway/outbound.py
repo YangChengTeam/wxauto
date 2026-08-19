@@ -15,6 +15,7 @@ from typing import Any, Protocol
 
 import structlog
 
+from .candidates import CandidateDirectory, CandidateUpdateError
 from .guard import ACTION_GROUP, ACTION_MESSAGE, OutboundGuard
 from .inbound import FOLLOW_UP_DEFER
 
@@ -85,11 +86,13 @@ class OutboundSender:
         guard: OutboundGuard,
         store,  # GatewayStore（鸭子类型）
         clock=None,
+        candidates: CandidateDirectory | None = None,
     ) -> None:
         self._sink = sink
         self._guard = guard
         self._store = store
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._candidates = candidates
 
     async def deliver(
         self, account_id: str, peer_id: str, card: dict[str, Any] | None
@@ -98,6 +101,9 @@ class OutboundSender:
 
         # 卡片里的拉黑提案先落地——即使这一轮不发消息，拉黑也要生效。
         self._apply_blacklist_actions(account_id, peer_id, actions)
+        # 同理，状态回写也不等「这一轮发没发消息」：判定转人工的那一轮恰恰**一条都不发**
+        # （v7 §10.4：微信侧不发「已转人工」），而 HR 正是要在那一刻看到状态变了。
+        await self._apply_ai_status_actions(account_id, peer_id, actions)
 
         if not segments:
             _log.info("本轮不回复", account=account_id, 会话=peer_id, reason=no_reply_reason)
@@ -131,6 +137,36 @@ class OutboundSender:
             reservation.settle(len(task_ids))
         _log.info("已投递回复", account=account_id, 会话=peer_id, segments=len(task_ids))
         return DeliveryResult(sent=task_ids, actions=actions)
+
+    async def _apply_ai_status_actions(
+        self, account_id: str, peer_id: str, actions: Sequence[dict[str, Any]]
+    ) -> None:
+        """AI 端判定的候选人 AI 状态 → 写回业务后端（api2 §9.2）。
+
+        **候选人 ID 由本机反查**：AI 端只知道「对面这个微信会话叫什么」，手机号↔候选人的
+        关联全程不经它（081 裁决 2）。反查不到就如实跳过——那是「这个人还没上报过会话名 /
+        后端没归到位」，不是错，更不该拿别人的 ID 顶上。
+        """
+        entries = [a for a in actions if a.get("type") == "set_ai_status"]
+        if not entries or self._candidates is None or not self._candidates.configured:
+            return
+        candidate_id = self._store.contact_worker_id(account_id, peer_id)
+        if not candidate_id:
+            _log.info("状态回写跳过：本机不知道这个会话对应哪个候选人", account=account_id, 会话=peer_id)
+            return
+        # 一轮只写一次：卡上真出现两条就是模型自相矛盾，取第一条，剩下的记一笔。
+        if len(entries) > 1:
+            _log.warning("一张卡上有多条状态提案，只取第一条", count=len(entries))
+        entry = entries[0]
+        payload = entry.get("payload")
+        status = (payload or {}).get("status") if isinstance(payload, dict) else None
+        try:
+            await self._candidates.update(
+                candidate_id,
+                ai_status={"status": status, "reason": entry.get("reason") or ""},
+            )
+        except CandidateUpdateError as exc:
+            _log.warning("状态回写请求不成立", error=str(exc))
 
     def _apply_blacklist_actions(
         self, account_id: str, peer_id: str, actions: Sequence[dict[str, Any]]

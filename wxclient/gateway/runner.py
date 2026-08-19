@@ -19,6 +19,7 @@ from typing import Any
 
 import structlog
 
+from .candidates import CandidateDirectory
 from .capabilities import CAPABILITIES_OP, Capability, capabilities_frame
 from .commands import (
     COMMAND_EVENT,
@@ -165,6 +166,7 @@ class GatewayRunner:
         friend_watcher: FriendWatcher | None = None,
         command_executor: CommandExecutor | None = None,
         contacts: ContactDirectory | None = None,
+        candidates: CandidateDirectory | None = None,
         client_factory: Callable[..., AgentWsClient] | None = None,
         clock: Callable[[], datetime] | None = None,
         capabilities: Callable[[], dict[str, Capability]] | None = None,
@@ -178,6 +180,7 @@ class GatewayRunner:
         self._friends = friend_watcher
         self._commands = command_executor
         self._contacts = contacts
+        self._candidates = candidates
         self._capabilities = capabilities
         # account_id → (报给了哪条连接, 报的是什么)。**连接也要记**，见 _report_capabilities。
         self._reported_capabilities: dict[str, tuple[Any, dict[str, Any]]] = {}
@@ -201,6 +204,7 @@ class GatewayRunner:
             ),
             store=store,
             clock=self._clock,
+            candidates=candidates,
         )
         # 077：定时指令自己一条循环。它压根不动微信（只翻自己的表），所以节拍跟
         # 读消息/查好友无关；到点之后的执行仍走 _run_command，幂等与守门一并复用。
@@ -547,6 +551,7 @@ class GatewayRunner:
                 result = await client.send_message(
                     session_id,
                     transcript,
+                    refs=self._peer_refs(account_id, peer_id),
                     extra={"wechat": self._turn_meta(peer_id, messages)},
                 )
             except Unauthorized:
@@ -694,6 +699,19 @@ class GatewayRunner:
         （「微信端没有在线的网关」）也一起被吞了。
         """
         self._command_listener = listener
+
+    def _peer_refs(self, account_id: str, peer_id: str) -> list[dict[str, Any]]:
+        """这一轮对面是哪个候选人（047 的 `@` 引用协议）。
+
+        `worker_id` 是上报会话名时后端归位后回给我们的，本机一直存着却从没用过——
+        AI 端因此在入站对话里完全不知道对面是谁，一切「按人回写状态 / 按人预约面试」
+        都无从谈起。这里把它按既有的 refs 协议带上去，不另造一套。
+
+        反查不到就不带（`matched: false` 是后端明说允许的常态，不是错），
+        AI 端那边 refs 为空照常跑——**绝不编一个 ID 顶上**。
+        """
+        worker_id = self._store.contact_worker_id(account_id, peer_id)
+        return [{"type": "worker", "id": worker_id}] if worker_id else []
 
     @staticmethod
     def _turn_meta(peer_id: str, messages: Sequence[InboundMessage]) -> dict[str, Any]:

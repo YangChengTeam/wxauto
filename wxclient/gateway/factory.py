@@ -17,6 +17,7 @@ from wxclient.config import load_settings
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
+from .candidates import CandidateDirectory
 from .capabilities import Capability, probe_capabilities
 from .commands import COMMANDS, CommandExecutor
 from .config import GatewaySettings
@@ -149,6 +150,11 @@ def build_gateway(
         gateway_settings.business_api_url,
         client_token or (lambda: ""),
     )
+    # 候选人回写（api2 §9）。同一个 Client Token、同一条「没登录就躺平」的规矩。
+    candidates = CandidateDirectory(
+        gateway_settings.business_api_url,
+        client_token or (lambda: ""),
+    )
 
     runner = GatewayRunner(
         settings=gateway_settings,
@@ -164,6 +170,7 @@ def build_gateway(
         watchlist=watchlist,
         capabilities=current_capabilities,
         contacts=contacts,
+        candidates=candidates,
         command_executor=CommandExecutor(
             runtime=runtime,
             store=store,
@@ -178,6 +185,7 @@ def build_gateway(
             confirmation=REAL_ACTION_CONFIRMATION,
             fetcher=file_fetcher,
             capabilities=current_capabilities,
+            candidates=candidates,
         ),
         friend_watcher=FriendWatcher(
             accounts=resolved_accounts,

@@ -206,6 +206,28 @@ class GatewayStore:
             ).fetchone()
         return str(row[0]) if row and row[0] else ""
 
+    def contact_worker_id(self, account_id: str, session_name: str) -> str:
+        """按**会话名**反查这个人在业务库里的候选人 ID。没有就返回空串。
+
+        入站对话只知道「对面这个微信会话叫什么」——`worker_id` 是上报会话名时后端归位后回给
+        我们的（`contacts.report()` 的 `matched/worker_id`），本机存着就是为了这一刻：
+        AI 端判定「这个人该转人工了」，而它不知道、也不该知道对方是哪个候选人
+        （081 裁决 2：手机号↔会话名的关联全程不经 AI 端）。
+
+        会话名不是主键（一个人可能换过备注），取最近更新的那条。
+        """
+        session_name = (session_name or "").strip()
+        if not session_name:
+            return ""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT worker_id FROM gateway_contacts
+                    WHERE account_id = ? AND session_name = ? AND worker_id IS NOT NULL
+                    ORDER BY updated_at DESC LIMIT 1""",
+                (account_id, session_name),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+
     def contacts_synced_until(self, account_id: str) -> str:
         """本机已同步到的最新 `updated_at`（增量同步的水位）。空 = 没同步过，要全量。
 
@@ -326,7 +348,7 @@ class GatewayStore:
         placeholders = ",".join("?" * len(ids))
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                f"SELECT msg_id FROM gateway_seen_messages "  # noqa: S608 —— 占位符个数由 len(ids) 决定，值仍走参数绑定
+                f"SELECT msg_id FROM gateway_seen_messages "
                 f"WHERE account_id=? AND peer_id=? AND msg_id IN ({placeholders})",
                 (account_id, peer_id, *ids),
             ).fetchall()
