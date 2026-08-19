@@ -40,8 +40,8 @@ wxclient-gateway = "wxclient.gateway.__main__:main"
 wxclient-ui = "wxclient.ui.__main__:main"
 
 [project.optional-dependencies]
-# 打成单体 exe 的依赖。原 MCP onefile 构建脚本已随 MCP 入口一并删除；
-# 网关的 exe 打包尚未做，这个 extra 先留着（见 README「打包」）。
+# 打安装包要的依赖（`packaging/build.py`，见 README「打包」）。
+# 只在打包机上装：`pip install -e ".[build]"`。装 Inno Setup 6 是另一件事，pip 管不着。
 build = [
   "PyInstaller>=6.14",
 ]

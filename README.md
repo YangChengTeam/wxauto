@@ -123,8 +123,10 @@ python packaging\build.py
 ```
 
 它按顺序做四件事：生成两张图（启动首屏 + 安装向导竖幅，都按 `theme.py` 画）→ PyInstaller
-打 onedir → Inno Setup 把 onedir 包成安装程序 → 自检产物在不在、多大。改 `installer.iss`
-时用 `--skip-exe` 跳过最慢的那步。只要 onedir 不要安装包的话：
+打 onedir → **拿打出来的 exe 跑一次 `--self-check`**（真 import 一遍重活、真探一次微信，
+不过就不出包——2026-08-16 一天撞两次「装到别人机器上才炸」，这一步是为此加的）→
+Inno Setup 把 onedir 包成安装程序。改 `installer.iss` 时用 `--skip-exe` 跳过最慢的那步。
+只要 onedir 不要安装包的话：
 
 ```bat
 pyinstaller --noconfirm packaging\lxz-wechat-gateway.spec
