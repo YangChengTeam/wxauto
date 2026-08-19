@@ -3,7 +3,7 @@
 ;   由 packaging/build.py 调用，别手工敲 ISCC——版本号、产物路径都是那边算好传进来的：
 ;   iscc /DAppVersion=0.1.0 /DSourceDir=...\dist\劳小智微信助手 packaging/installer.iss
 ;
-; 三条定下来的事，改之前先读完理由：
+; 四条定下来的事，改之前先读完理由：
 ;
 ; 1. **按用户装，不要管理员**（PrivilegesRequired=lowest，装到 %LOCALAPPDATA%）。
 ;    不是图省事：招聘专员那台电脑多半没有管理员密码，弹一个 UAC 就装不下去了。
@@ -16,6 +16,8 @@
 ;
 ; 3. **卸载不默认删数据**。数据目录里有登录状态、参数和日志（%LOCALAPPDATA%\劳小智微信助手）。
 ;    卸载往往只是为了装新版；默默删掉等于让人重新登录、重新配一遍。要删得人明确点头。
+;
+; 4. **升级先删上一版的 `_internal`**（[InstallDelete]）。理由写在那一节上面。
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -87,6 +89,23 @@ Name: "chs"; MessagesFile: "languages\ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式:"
+
+[InstallDelete]
+; ★ 升级时先把上一版的 `_internal` 整个删掉，再装新的。
+;
+; Inno 只做「覆盖 + 新增」，**不删**新版里已经没有的文件。PyInstaller 的 onedir 每版
+; 收集到的东西都不一样（换个依赖版本就少几十个文件），于是原地升级出来的目录是
+; **两版的并集**。2026-08-19 实测 0.1.20 → 0.1.21：装完 1746 个文件，而包里只有 1067 个，
+; 680 个是上一版的残留。
+;
+; 最难看的一个：pywin32 新版把 `Pythonwin\` 改成了 `pythonwin\`，而 Windows 文件名不分
+; 大小写——两版的 `win32ui.pyd` 落进同一个目录，谁盖谁看装的顺序。`win32ui` 正是
+; 2026-08-16 那次「微信明明开着，界面说找不到微信」的主角，拿一个版本不对的 .pyd 去
+; 顶它，症状会一模一样、而且只在**升级过的机器**上出现——打包机和全新安装都是好的。
+;
+; 只删 `_internal`：exe 本身会被覆盖，而 `{app}` 下别的东西（如果哪天放了什么）不该连坐。
+; 数据目录在 `%LOCALAPPDATA%\劳小智微信助手`，不在这儿，升级不碰。
+Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 ; 整个 onedir 目录一起装。**别逐个列文件**——PyInstaller 每次升级都会换几个 DLL，

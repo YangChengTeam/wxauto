@@ -136,10 +136,17 @@ pyinstaller --noconfirm packaging\lxz-wechat-gateway.spec
 ### 安装包（`packaging/installer.iss`，Inno Setup 6）
 
 打包机上要先装 [Inno Setup 6](https://jrsoftware.org/isdl.php)（中文语言文件随仓库带，
-官方安装包里没有）。安装包本身：中文向导、自带品牌配图、**桌面快捷方式**、开始菜单项、
+官方安装包里没有）。
+安装包本身：中文向导、自带品牌配图、**桌面快捷方式**、开始菜单项、
 控制面板里的卸载入口。
 
-三条定下来的事，改之前先读 `installer.iss` 顶上的理由：
+★ **打包机的 venv 要正好是 `pyproject.toml` 的闭包，别多装东西。** PyInstaller 收的是
+**本机装了什么**，不是仓库声明了什么——环境里多一个包，它就可能顺着 import 链被打进去。
+2026-08-19 换了个干净 venv 重打，安装包从 33.7 MB 掉到 25.0 MB：少掉的 `logger`、`yaml`、
+`simplejson`、`tzdata`、`markupsafe`、`werkzeug` 等等**全仓一处都没 import**，是上一台打包
+环境里的杂物。体积对不上先查这个，别急着怀疑包打漏了（自检那一步会告诉你漏没漏）。
+
+四条定下来的事，改之前先读 `installer.iss` 顶上的理由：
 
 | 决定 | 为什么 |
 |---|---|
@@ -147,6 +154,7 @@ pyinstaller --noconfirm packaging\lxz-wechat-gateway.spec
 | **安装包里不做开机自启** | 程序自己的「启动设置」里有这一项。两处都能改 = 「到底开没开」有两个答案 |
 | **卸载不默认删数据** | 数据目录里是登录状态、参数和日志。卸载多半只是为了装新版，默默删掉等于让人重登重配一遍 |
 | **只装 64 位 Win10/11**（`MinVersion=10.0` + `x64compatible`） | 包里的 Python 是 3.12，3.9 起就不支持 Win7 了。不写 `MinVersion` 的话 Inno 默认放行到 Win7 SP1，装完的表现是**双击没反应**——一个连「为什么打不开」都说不出来的失败。当场拒绝，至少人知道该换什么 |
+| **升级先删上一版的 `_internal`**（`[InstallDelete]`） | Inno 只做「覆盖 + 新增」，不删新版里已经没有的文件，而 PyInstaller 每版收集到的东西都不一样 → 原地升级装出来的是**两版的并集**。2026-08-19 实测 0.1.20 → 0.1.21：装完 1746 个文件，包里只有 1067 个。最难看的是 pywin32 把 `Pythonwin` 改名成 `pythonwin`、而 Windows 不分大小写，两版的 `win32ui.pyd` 落进同一个目录——症状和「微信明明开着却说找不到」一模一样，且**只在升级过的机器上出现** |
 
 #### 系统要求（发给用户前先对一遍）
 

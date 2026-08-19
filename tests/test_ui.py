@@ -947,6 +947,29 @@ class PackagingTests(unittest.TestCase):
             self.assertTrue(_check_wechat_driver(lines))
         self.assertIn("pyweixin=ok", lines)
 
+    def test_upgrading_wipes_the_previous_internal_dir(self) -> None:
+        """★ 升级安装必须先删掉上一版的 `_internal`，否则装出来的是**两版的并集**。
+
+        Inno 只做「覆盖 + 新增」，不删新版里已经没有的文件。PyInstaller 的 onedir 每版收集
+        到的东西都不一样，于是原地升级会留下一堆上一版的残留：2026-08-19 实测 0.1.20 →
+        0.1.21，装完 1746 个文件而包里只有 1067 个，680 个是旧的。
+
+        最难看的一个：pywin32 新版把目录名 `Pythonwin` 改成了 `pythonwin`，而 Windows 文件名不分
+        大小写——两版的 `win32ui.pyd` 落进同一个目录。`win32ui` 正是上面那条测试里
+        「微信明明开着，界面说找不到微信」的主角，拿版本不对的 .pyd 顶它症状一模一样，
+        而且**只在升级过的机器上出现**——打包机和全新安装都是好的，自检也照样绿。
+        """
+        iss = (Path(__file__).resolve().parent.parent
+               / "packaging/installer.iss").read_text(encoding="utf-8")
+        # 认**行首**那个小节头，别认正文里提到的同名字样（顶上的说明就提了一次）。
+        # assertIn 会把整份 iss 打进失败信息，看着累——这里只要一句话说清缺了什么。
+        head = "\n[InstallDelete]\n"
+        self.assertTrue(head in iss,
+                        "installer.iss 里没有 [InstallDelete] 小节，升级装出来就是两版的并集")
+        section = iss.split(head, 1)[1].split("\n[", 1)[0]
+        self.assertIn(r'Name: "{app}\_internal"', section)
+        self.assertIn("filesandordirs", section)
+
     def test_the_build_verifies_the_package_it_just_made(self) -> None:
         """★ 打完包必须真跑一次 `--self-check`。
 
