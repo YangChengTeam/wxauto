@@ -22,6 +22,7 @@ import structlog
 from .capabilities import CAPABILITIES_OP, Capability, capabilities_frame
 from .commands import (
     COMMAND_EVENT,
+    NOTICE_EVENT,
     RESULT_OP,
     STAGE_RECEIVED,
     CommandExecutor,
@@ -250,7 +251,24 @@ class GatewayRunner:
         if ev == "card.update":
             self._on_card_update(data)
             return
+        if ev == NOTICE_EVENT:
+            self._on_notice(data)
+            return
         _log.debug("收到未处理的推送事件", ev=ev)
+
+    def _on_notice(self, data: dict[str, Any]) -> None:
+        """AI 端说「这一轮发生了什么」（``wechat.notice``）——**只写日志，不做任何事**。
+
+        为什么需要它：这台电脑上原本只在「有指令下来」时才有动静。后端按计划触发的一轮，
+        如果 AI 判断这次不用发消息，本机日志里一个字都没有 —— 拿着电脑的人分不出
+        「AI 没收到」「AI 觉得不用做」「投递丢了」哪一种。这条把那段空白填上。
+
+        ★ 它不带用户原话（那可能是简历正文或联系方式），只带调度事实。
+        """
+        text = str(data.get("text") or "").strip()
+        if not text:
+            return
+        _log.info("AI 端消息", 内容=text, 来源=str(data.get("source") or "") or None)
 
     def _on_card_update(self, data: dict[str, Any]) -> None:
         """指令回执（`kind=wechat_command_result`）。转给听众，并留一条日志。

@@ -39,6 +39,10 @@ _log = structlog.get_logger(__name__)
 
 #: AI 端推指令用的事件名（server → 网关）。
 COMMAND_EVENT = "wechat.command"
+#: AI 端 → 网关：这一轮发生了什么。**只打日志、不执行任何动作**。
+#: 在此之前，只有「有指令要执行」时这台电脑上才看得见动静；后端按计划触发的一轮
+#: 如果什么都没做，本机日志里一个字都没有 —— 分不出是没收到、还是收到了觉得不用做。
+NOTICE_EVENT = "wechat.notice"
 
 #: 网关回执用的 op（网关 → server，走客户端帧格式）。
 RESULT_OP = "wechat.result"

@@ -9,6 +9,7 @@ from __future__ import annotations
 from .commands import (
     COMMAND_EVENT,
     COMMANDS,
+    NOTICE_EVENT,
     RESULT_OP,
     CommandError,
     CommandExecutor,
@@ -64,6 +65,7 @@ from .wsclient import (
 __all__ = [
     "COMMANDS",
     "COMMAND_EVENT",
+    "NOTICE_EVENT",
     "PACING_EVENT",
     "PUSH_EVENT",
     "RESULT_OP",
