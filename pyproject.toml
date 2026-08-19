@@ -21,6 +21,12 @@ dependencies = [
   "pywin32>=308; platform_system == 'Windows'",
   "pywin32-ctypes>=0.2.2; platform_system == 'Windows'",
   "pywinauto>=0.6.8; platform_system == 'Windows'",
+  # vendored 的 pyweixin（third_party/pywechat/）要 `packaging.version`，而它不在任何
+  # 依赖图里——不装的话微信 API 直接不可用。★ 报错还会长得莫名其妙：仓库根有个同名的
+  # `packaging/` 目录（构建脚本），真包缺席时它就顶上成了命名空间包，于是错误是
+  # 「cannot import name 'version' from 'packaging' (unknown location)」而不是「没装」。
+  # 2026-08-19 真机实测：装上就好，命名空间包不会盖住真包（后者是常规包，优先）。
+  "packaging>=23.0",
   "structlog>=24.1",
   "sounddevice>=0.5.1",
   "soundfile>=0.13.1",
