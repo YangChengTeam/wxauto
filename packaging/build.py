@@ -169,8 +169,11 @@ def main() -> int:
     # 打包在**最后一行**炸掉（UnicodeEncodeError），而包其实早就打好了——白折腾一轮。
     print(f"\n[完成] {setup}")
     print(f"       {size_mb:.1f} MB / 版本 {version}")
-    if size_mb < 20:
-        print("       [警告] 这个体积不对劲（正常一百多 MB），多半是 onedir 没打全就被包进去了")
+    # 参考值（2026-08-19，干净 venv = pyproject 闭包）：安装包约 25 MB、装开约 75 MB。
+    # 早先在一台装了杂物的环境上打出来是 33.7 MB——**体积对不上先查打包机的 venv**，
+    # PyInstaller 收的是本机装了什么，不是仓库声明了什么。真漏了东西由上面那步自检报。
+    if size_mb < 15:
+        print("       [警告] 这个体积不对劲（正常 25 MB 上下），多半是 onedir 没打全就被包进去了")
     return 0
 
 

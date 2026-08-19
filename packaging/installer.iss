@@ -69,7 +69,7 @@ SetupIconFile=..\wxclient\ui\assets\app.ico
 UninstallDisplayIcon={app}\{#AppExe}
 UninstallDisplayName={#AppName}
 
-; 压缩到底：这包一百多 MB，装的人多半在用公司网络下载。
+; 压缩到底：onedir 装开约 75 MB，装的人多半在用公司网络下载（压出来的安装包约 25 MB）。
 Compression=lzma2/max
 SolidCompression=yes
 LZMANumBlockThreads=4
