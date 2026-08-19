@@ -91,6 +91,17 @@ class CommandSpec:
     默认 1。`accept_new_friends` 一条能通过好几个人——按 1 记的话，加好友那档红线
     实际被放宽到 5 倍（2026-08-18 审计实测）。"""
 
+    files_key: str | None = None
+    """这条指令要带文件时，本机路径落进 payload 的哪个键（`None` = 不带文件）。
+
+    067 的字节通道对 op 是通用的（AI 端随指令送字节、本机落进一次性临时目录），
+    原来却在两处写死了 `op == "send_files"`——于是发朋友圈只能走 `medias`，
+    而那是一串**上游给的本机绝对路径**，公开发到朋友圈上（2026-08-18 审计 P0-5）。
+    把「带不带文件、落进哪个键」写回这张 op 声明表，两处写死随之消失。"""
+
+    files_required: bool = False
+    """没带文件就是这条指令不成立（发文件）。为假 = 可有可无（朋友圈配图）。"""
+
 
 def _req(args: dict[str, Any], key: str, *, alias: str = "") -> str:
     value = args.get(key)
@@ -110,15 +121,19 @@ def _limit(args: dict[str, Any], default: int, cap: int) -> int:
     return max(1, min(value, cap))
 
 
-def _file_refs(args: dict[str, Any]) -> list[FileRef]:
-    """067：`files` 里是**文件描述符**（`{file_id, url}`），不是路径。
+def _file_refs(args: dict[str, Any], *, required: bool = True) -> list[FileRef]:
+    """067：`files` 里是**文件描述符**（`{file_id, file_name, content_b64}`），不是路径。
 
     路径是 AI 端给不了的东西（服务端派生、客户端不可传），所以这里也不接受字符串——
     真收到一串路径，那要么是老版本、要么是有人在试探，两种情况都该当场拒掉而不是照着发。
     本机路径由 `FileFetcher` 下载后产生，见 `_run`。
+
+    ``required=False``：这条指令**可以**不带文件（朋友圈允许纯文字）。
     """
     raw = args.get("files")
     refs = [ref for ref in (FileRef.parse(item) for item in raw) if ref] if isinstance(raw, list) else []
+    if not refs and not required:
+        return []
     if not refs:
         raise CommandError("这条发文件指令没带上任何文件（AI 端应随指令送来文件字节）")
     if len(refs) > 9:
@@ -140,11 +155,12 @@ COMMANDS: dict[str, CommandSpec] = {
         lambda a: {"friend": _req(a, "to", alias="friend"), "text": _req(a, "text")},
         lambda a: _req(a, "to", alias="friend"),
     ),
-    # files 不在这里填：那是下载完才有的本机路径（067，见 CommandExecutor._run）。
+    # 文件不在这里填：那是下载完才有的本机路径（067，见 CommandExecutor._run 与 files_key）。
     "send_files": CommandSpec(
         TaskType.SEND_FILES, True,
         lambda a: {"friend": _req(a, "to", alias="friend"), "text": str(a.get("text") or "")},
         lambda a: _req(a, "to", alias="friend"),
+        files_key="files", files_required=True,
     ),
     "add_friend": CommandSpec(
         TaskType.ADD_FRIEND, True,
@@ -161,10 +177,14 @@ COMMANDS: dict[str, CommandSpec] = {
         reserve_count=lambda a: _limit(a, 1, 5),
         counts=lambda _args, result: len(result.get("items") or []),
     ),
+    # ★ 配图同样只收描述符，`medias` 这个键**不再被 build 看见**（2026-08-18 审计 P0-5）：
+    #   原来它是上游给的一串本机绝对路径，`_normalize_moments_media_paths` 只要文件存在
+    #   就发上朋友圈——而朋友圈是**公开**的，这台电脑上任何一个可读文件都在射程内。
     "post_moments": CommandSpec(
         TaskType.POST_MOMENTS, True,
-        lambda a: {"text": _req(a, "text"), "medias": list(a.get("medias") or [])},
+        lambda a: {"text": _req(a, "text")},
         action=ACTION_MOMENTS,
+        files_key="medias",
     ),
     # ── 读类 ──
     "search_contacts": CommandSpec(
@@ -284,8 +304,8 @@ class CommandExecutor:
         try:
             payload = spec.build(args)
             peer = spec.target(args)
-            # 发文件先把描述符解出来：形状不对要在动微信**之前**拒，别下载完才发现发不了。
-            refs = _file_refs(args) if op == "send_files" else []
+            # 带文件的先把描述符解出来：形状不对要在动微信**之前**拒，别下载完才发现发不了。
+            refs = _file_refs(args, required=spec.files_required) if spec.files_key else []
         except CommandError as exc:
             return CommandResult(command_id, "rejected", str(exc))
         if op == "add_friend":
@@ -362,7 +382,7 @@ class CommandExecutor:
                     reservation.release()
                     _log.warning("取 AI 端产出文件失败", op=op, error=str(exc))
                     return CommandResult(command_id, "failed", f"取文件失败：{exc}")
-                payload["files"] = [str(p) for p in paths]
+                payload[spec.files_key] = [str(p) for p in paths]
             try:
                 raw = await self._runtime.submit(
                     spec.task_type, payload,

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import tempfile
 import unittest
 from contextlib import asynccontextmanager
@@ -27,6 +28,7 @@ from wxclient.gateway.capabilities import (
     probe_capabilities,
 )
 from wxclient.gateway.download import DownloadError, FileFetcher, FileRef
+from wxclient.gateway.guard import ACTION_MOMENTS
 from wxclient.gateway.schedule import MAX_LATE_HOURS, ScheduleLoop, parse_schedule_at
 from wxclient.queue import TaskType
 
@@ -388,36 +390,42 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class SendFilesDownloadTestCase(CommandTestCase):
+def fake_fetcher(root: Path, *, boom: str = "") -> Any:
+    """假的取文件通道：记下被要过哪些 file_id，落盘到 ``root``，退出时标记已清理。"""
+
+    class FakeFetcher:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+            self.cleaned = False
+
+        @asynccontextmanager
+        async def materialize(self, account_id, refs):
+            self.calls.append([r.file_id for r in refs])
+            if boom:
+                raise DownloadError(boom)
+            paths = []
+            for ref in refs:
+                p = root / f"{ref.file_id}.png"
+                p.write_bytes(b"png")
+                paths.append(p)
+            try:
+                yield paths
+            finally:
+                self.cleaned = True
+
+    return FakeFetcher()
+
+
+class FileChannelTestCase(CommandTestCase):
+    def _fetcher(self, *, boom: str = "") -> Any:
+        return fake_fetcher(Path(self._tmp.name), boom=boom)
+
+
+class SendFilesDownloadTestCase(FileChannelTestCase):
     """067：send_files 收的是**文件描述符**，不是路径。
 
     路径由网关自己下载后产生——AI 端给不了、也不许给（那是服务端派生的东西）。
     """
-
-    def _fetcher(self, *, boom: str = "") -> Any:
-        outer = self
-
-        class FakeFetcher:
-            def __init__(self) -> None:
-                self.calls: list[list[str]] = []
-                self.cleaned = False
-
-            @asynccontextmanager
-            async def materialize(self, account_id, refs):
-                self.calls.append([r.file_id for r in refs])
-                if boom:
-                    raise DownloadError(boom)
-                paths = []
-                for ref in refs:
-                    p = Path(outer._tmp.name) / f"{ref.file_id}.png"
-                    p.write_bytes(b"png")
-                    paths.append(p)
-                try:
-                    yield paths
-                finally:
-                    self.cleaned = True
-
-        return FakeFetcher()
 
     async def test_file_ids_下载后交本机路径给底座(self) -> None:
         runtime, fetcher = FakeRuntime(), self._fetcher()
@@ -453,6 +461,68 @@ class SendFilesDownloadTestCase(CommandTestCase):
         })
         self.assertEqual(result.status, "rejected")
         self.assertEqual(runtime.calls, [])
+
+
+class MomentsMediaTestCase(FileChannelTestCase):
+    """P0-5（2026-08-18 审计）：发朋友圈的配图也只收**文件描述符**，不收本机路径。
+
+    原来 `post_moments` 的 build 是 `{"text": …, "medias": list(a.get("medias") or [])}`——
+    AI 端推什么路径就往下传什么，最后 `_normalize_moments_media_paths` 会 expanduser +
+    resolve，只要文件存在就发上朋友圈。**朋友圈是公开的**：HR 那台电脑上任何一个可读文件
+    都在射程内。这个文件开头就写着「地基不信任上游」，`medias` 是它唯一信了上游的地方。
+    """
+
+    async def test_ai端塞本机路径一个字节都进不了payload(self) -> None:
+        runtime = FakeRuntime()
+        ex = self._executor(runtime, fetcher=self._fetcher())
+        result = await ex.execute({
+            "command_id": "m1", "op": "post_moments",
+            "args": {"text": "招 3 个普工", "medias": ["C:/Users/ZK/Pictures/私人照片.jpg"]},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        _task_type, payload, _conf = runtime.calls[0]
+        self.assertNotIn("私人照片", json.dumps(payload, ensure_ascii=False),
+                         "上游给的路径不许出现在 payload 的任何位置")
+        self.assertFalse(payload.get("medias"), "没有描述符就没有图，别把路径当图发")
+
+    async def test_描述符落盘后当配图交给底座(self) -> None:
+        runtime, fetcher = FakeRuntime(), self._fetcher()
+        ex = self._executor(runtime, fetcher=fetcher)
+        result = await ex.execute({
+            "command_id": "m2", "op": "post_moments",
+            "args": {"text": "招 3 个普工",
+                     "files": [{"file_id": "f1", "file_name": "海报.jpg", "content_b64": "YQ=="}]},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        _task_type, payload, _conf = runtime.calls[0]
+        self.assertEqual(fetcher.calls, [["f1"]])
+        self.assertTrue(payload["medias"][0].endswith("f1.png"), payload["medias"])
+        self.assertTrue(fetcher.cleaned, "发完必须清掉临时文件")
+
+    async def test_纯文字朋友圈照发(self) -> None:
+        runtime = FakeRuntime()
+        ex = self._executor(runtime, fetcher=self._fetcher())
+        result = await ex.execute({
+            "command_id": "m3", "op": "post_moments", "args": {"text": "招 3 个普工"},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        _task_type, payload, _conf = runtime.calls[0]
+        self.assertFalse(payload.get("medias"))
+
+    async def test_取图失败要把朋友圈那档额度还回去(self) -> None:
+        """★ 忘了 release，配额被白吃掉——而配额是防风控红线的执行体。"""
+        runtime = FakeRuntime()
+        ex = self._executor(runtime, fetcher=self._fetcher(boom="这个文件在 AI 服务上找不到了"))
+        before = self.store.sends_since(ACCOUNT, self.now - timedelta(hours=24), action=ACTION_MOMENTS)
+        result = await ex.execute({
+            "command_id": "m4", "op": "post_moments",
+            "args": {"text": "招 3 个普工",
+                     "files": [{"file_id": "f1", "file_name": "海报.jpg", "content_b64": "YQ=="}]},
+        })
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(runtime.calls, [], "没取到图就绝不能去发")
+        after = self.store.sends_since(ACCOUNT, self.now - timedelta(hours=24), action=ACTION_MOMENTS)
+        self.assertEqual(after, before, "一件没做成，额度要原样还回去")
 
 
 class InlineFileTestCase(unittest.IsolatedAsyncioTestCase):
