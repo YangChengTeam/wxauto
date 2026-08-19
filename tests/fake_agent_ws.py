@@ -131,6 +131,16 @@ class FakeAgentServer:
                 await self._emit(websocket, ack, "session.resumed", {"session_id": session_id})
                 continue
 
+            if op == "wechat.watchlist.sync":
+                # 和真 AI 端同一份契约（`ws/wechatChannel.ts::handleWatchlistSync`）：
+                # 什么都不改，只把名单**照推送那条路**再发一遍，再回一帧说清有几个。
+                # ★ 名单不进这一帧——网关只有 `apply_push` 一个落地口。
+                await self._emit(websocket, None, "wechat.watchlist",
+                                 {"only": sorted(self.watchlist), "never": []})
+                await self._emit(websocket, ack, "wechat.watchlist.synced",
+                                 {"watching": len(self.watchlist), "blocked": 0})
+                continue
+
             if op == "wechat.watchlist.remove":
                 # 和真 AI 端同一份契约（`ws/wechatChannel.ts::handleWatchlistRemove`）：
                 # 真删 → 立刻把新名单推回来 → 再回一帧说清删掉了哪几个。

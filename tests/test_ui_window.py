@@ -338,17 +338,19 @@ class WindowAdversarialTests(unittest.TestCase):
         self.window._render_watch_page()
         self.assertEqual(self.window._watch_next.cget("text"), "")
 
-    def test_the_sync_button_is_a_placeholder_that_admits_it(self) -> None:
-        """★ 名单以后能从线上同步（用户 2026-08-15 要求先留位）。后端那头还没有，
-        所以按钮是灰的，点了要说清「还没接上」——摆一个点了什么都不发生的按钮比没有更糟。
+    def test_the_sync_button_says_so_when_the_service_is_not_running(self) -> None:
+        """★ 服务没起时点「同步名单」：说清为什么，别静悄悄什么都不发生。
+
+        （服务跑着时的真行为在 `WatchSyncTests` 里验——那儿会把 AI 端那次请求接上。）
         """
         self.window._show_page("settings")
 
         self.window._sync_watchlist()
 
         hint = self.window._watch_hint.cget("text")
-        self.assertIn("还没接", hint)
-        self.assertNotIn("同步成功", hint, "没同步就别说同步过")
+        self.assertIn("同步不了", hint)
+        self.assertIn("没在运行", hint, "得说清是服务没起，不是名单空的")
+        self.assertNotIn("已同步", hint, "没同步就别说同步过")
 
     def test_an_empty_watch_list_says_nothing_will_be_answered(self) -> None:
         """空名单分两种，别混为一谈：没起服务是正常的，**跑着却空**才是要命的。"""
@@ -1300,8 +1302,7 @@ class WindowSizeTests(unittest.TestCase):
 class WatchSectionTests(unittest.TestCase):
     """★「同步名单」按钮的样式要和别处一致（绿框绿字，用户 2026-08-16）。
 
-    ⚠️ 它**功能还没接上**：点了会明说「同步接口还没接上」。样式一致 ≠ 假装能用——
-    真正防它变成假按钮的是那句话，所以这里两条一起验。
+    样式一致 ≠ 假装能用：它得真绑上点击、真把请求发出去。行为在 `WatchSyncTests`。
     """
 
     def setUp(self) -> None:
@@ -1334,16 +1335,19 @@ class WatchSectionTests(unittest.TestCase):
         self.assertEqual(str(button.cget("highlightbackground")), theme.GREEN, "★ 绿框")
         self.assertEqual(str(button.cget("cursor")), "hand2")
 
-    def test_it_still_tells_the_truth_when_clicked(self) -> None:
-        """★ 长得能用，点下去必须说实话——不然就是个假按钮。"""
+    def test_it_is_actually_wired_to_something(self) -> None:
+        """★ 长得能用就得真能用：按钮绑了点击，点的那件事真会去请 AI 端要名单。"""
         button = self._sync_button()  # 顺带把那一节建出来（提示标签在里面）
         # 点击本身在这个窗口站上发不出去（窗口从不真映射），所以分两步验：
-        # ① 按钮确实绑了点击；② 绑的那件事说的是实话。
+        # ① 按钮确实绑了点击；② 绑的那件事真往服务那头发了请求。
         self.assertTrue(button.bind("<Button-1>"), "按钮没绑点击")
 
+        called: list[bool] = []
+        self.window.service.sync_watched = lambda: called.append(True) or _DoneFuture(  # type: ignore[method-assign]
+            {"watching": 2})
         self.window._sync_watchlist()
 
-        self.assertIn("还没接上", self.window._watch_hint.cget("text"))
+        self.assertEqual(called, [True], "★ 点了却不发请求 = 假按钮")
 
 
 @unittest.skipUnless(HAS_TK, "没有 Tk")
@@ -1467,6 +1471,122 @@ class WatchRemovalTests(unittest.TestCase):
             self.window._ask_remove_watched("候选人-王建国")
 
         self.assertIn("名单改不了", made[-1][2])
+
+
+@unittest.skipUnless(HAS_TK, "没有 Tk")
+class WatchSyncTests(unittest.TestCase):
+    """配置中心的「同步名单」（用户 2026-08-19：「接口没有对接，改成真实的接口」）。
+
+    ★ 四条不许破：
+      ① **真发请求**——这按钮以前是个预留位，点了只改一行字，现在必须真去问 AI 端；
+      ② **名单不从这次的返回值里拿**：它照旧走 `wechat.watchlist` 推送落地
+         （`Watchlist.apply_push`）。只留一个落地口，多解析一处就多一份会漂的实现；
+      ③ **回话之前不许说「已同步」**，回话失败要照原样说失败；
+      ④ 「AI 端那份也是空的」和「没同步到」是两句话，不许混。
+
+    还有一条容易被忽略的：那句话得**活得过一拍**。`_render_watch_page` 每秒重写一次
+    提示标签，所以话必须存在 `_watch_note` 里、每拍重新贴——直接 configure 一次，
+    用户根本看不见（旧的预留位实现就是这个毛病）。
+    """
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.service = GatewayService(lambda: None)
+        self.window = MainWindow(self.root, LogBuffer(), self.service,
+                                 data_dir=self.dir, probe_wechat=False)
+        self.window._build_watch_section(self.root)
+        self.calls = 0
+        self.future: Any = _DoneFuture({"watching": 3, "blocked": 0})
+        self.service.sync_watched = self._sync  # type: ignore[method-assign]
+        self.addCleanup(self._teardown)
+
+    def _sync(self):
+        self.calls += 1
+        return self.future
+
+    def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.window)
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+    def test_clicking_really_asks_the_ai_side(self) -> None:
+        self.future = _PendingFuture()
+
+        self.window._sync_watchlist()
+
+        self.assertEqual(self.calls, 1)
+        hint = self.window._watch_hint.cget("text")
+        self.assertIn("正在", hint, "★ 还没回话就说「已同步」= 假装同步过")
+        self.assertNotIn("已同步", hint)
+
+    def test_it_does_not_queue_a_second_request(self) -> None:
+        """连点两下只发一条——排第二条只会让两份回执互相盖。"""
+        self.future = _PendingFuture()
+
+        self.window._sync_watchlist()
+        self.window._sync_watchlist()
+
+        self.assertEqual(self.calls, 1)
+
+    def test_the_result_is_reported_with_the_real_count(self) -> None:
+        self.window._sync_watchlist()
+        self.window._poll_watch_sync()
+
+        hint = self.window._watch_hint.cget("text")
+        self.assertIn("已同步", hint)
+        self.assertIn("3", hint, "报的得是 AI 端说的那个数")
+
+    def test_an_empty_list_from_the_ai_side_is_not_a_failure(self) -> None:
+        """★「AI 端那份也是空的」≠「没同步到」。前者要显眼地说清后果。"""
+        self.future = _DoneFuture({"watching": 0, "blocked": 0})
+
+        self.window._sync_watchlist()
+        self.window._poll_watch_sync()
+
+        hint = self.window._watch_hint.cget("text")
+        self.assertIn("已同步", hint)
+        self.assertIn("一条消息都不会回", hint)
+        self.assertEqual(self.window._watch_hint.cget("fg"), theme.ORANGE, "空名单要显眼")
+
+    def test_a_failure_is_told_as_a_failure(self) -> None:
+        self.future = _FailedFuture(RuntimeError("连不上 AI 端"))
+
+        self.window._sync_watchlist()
+        self.window._poll_watch_sync()
+
+        hint = self.window._watch_hint.cget("text")
+        self.assertIn("同步失败", hint)
+        self.assertIn("连不上 AI 端", hint, "★ 照原样说，别糊成一句「出错了」")
+
+    def test_what_it_said_survives_the_next_repaint(self) -> None:
+        """★ 提示标签每秒被重写一次——话得活过那一拍，不然等于没说。"""
+        self.service._snapshot = (ServiceState.RUNNING, None)
+        self.window._sync_watchlist()
+        self.window._poll_watch_sync()
+
+        self.window._show_page("settings")
+        self.window._render_watch_page()  # 就是每秒会跑的那个
+
+        self.assertIn("已同步", self.window._watch_hint.cget("text"))
+
+    def test_it_gets_out_of_the_way_after_a_while(self) -> None:
+        """说完了就该让位给常规说明，别把一句旧话挂一整天。"""
+        self.service._snapshot = (ServiceState.RUNNING, None)
+        self.window._sync_watchlist()
+        self.window._poll_watch_sync()
+        # 把到期时刻拨到过去，等价于「过了几秒」，不真 sleep
+        text, color, _ = self.window._watch_note
+        self.window._watch_note = (text, color, time.monotonic() - 1)
+
+        self.window._show_page("settings")
+        self.window._render_watch_page()
+
+        self.assertNotIn("已同步", self.window._watch_hint.cget("text"))
+        self.assertIsNone(self.window._watch_note)
 
 
 def _destroy(dialog_obj: Any) -> None:

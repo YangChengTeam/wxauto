@@ -643,6 +643,17 @@ class GatewayRunner:
         client = await self._pool.acquire(self._accounts[0])
         await client.interrupt(session_id)
 
+    async def sync_watched(self) -> dict[str, Any]:
+        """请 AI 端把名单重发一份（配置中心里点的「同步名单」）。
+
+        新名单从 ``wechat.watchlist`` 推回来、走 `_on_push` 落地，和平时那条路一模一样；
+        这个协程的返回值只是回执（``{watching, blocked}``），给界面照实话报数用。
+        """
+        if not self._accounts:
+            raise AgentWsError("这台机器上没有可用的微信账号")
+        client = await self._pool.acquire(self._accounts[0])
+        return await client.sync_watchlist()
+
     async def remove_watched(self, name: str) -> dict[str, Any]:
         """把一个会话移出自动回复名单（配置中心里点的那个删除）。
 

@@ -241,6 +241,20 @@ WXCLIENT_GATEWAY_MAX_MOMENTS_PER_DAY          朋友圈，每**天**，默认 3
 ② **主动联系过谁就自动收录**——分身给谁发过消息、加过谁好友，对方自动进名单，
    不然「加了好友却不会自动回复他」会变成每次都要手工补一遍的苦役。
 
+桌面端两条反向 op（配置中心那一节）：
+
+| op | 谁发 | 做什么 | 应答 |
+|---|---|---|---|
+| `wechat.watchlist.remove` | 网关 → AI | 把某个会话移出名单。**删必须在 AI 端**：名单推一次覆盖一次，本机删只撑到下一次推送 | `ev: wechat.watchlist.removed` `{removed, watching, blocked}` |
+| `wechat.watchlist.sync` | 网关 → AI | 「同步名单」按钮：现在就把权威名单发一份下来。补的是推送**没送到**的时候——推的那一瞬间网关正在重连，或者名单是在别处改的 | `ev: wechat.watchlist.synced` `{watching, blocked}` |
+
+★ 两条都**不把名单塞进应答里**：名单一律走 `ev: "wechat.watchlist"` 那条推送落地
+（`Watchlist.apply_push`）。网关只留一个落地口，多解析一处就多一份会漂的实现。
+应答只是回执，界面拿它照实话报数（「已同步：AI 端现在盯着 N 个会话」）。
+
+`sync` 什么都不改，所以在 AI 端**不进在线授权复核**那张清单（和回执、能力表同类）；
+`remove` 会留下后果，照样复核。
+
 
 启动：
 

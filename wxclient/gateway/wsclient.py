@@ -221,6 +221,18 @@ class AgentWsClient:
     async def interrupt(self, session_id: str) -> None:
         await self._send("message.interrupt", {"session_id": session_id})
 
+    async def sync_watchlist(self) -> dict[str, Any]:
+        """请 AI 端**现在就把名单发一份下来**。返回它说的 ``{watching, blocked}``。
+
+        名单平时是 AI 端主动推的（登记那一刻推一次、名单一变再推一次），够用；这条补的是
+        推送**没送到**的时候——推的那一瞬间这台机器正在重连、或者名单是在别处改的。
+
+        ★ 名单本身不在这条的应答里，它照旧走 ``ev: "wechat.watchlist"`` 那条推送
+        （`_on_push` → `Watchlist.apply_push`）。**只留一个落地口**：多解析一处
+        就多一份会漂的实现。这里等回应，是因为界面要照实话说「同步到几个会话」。
+        """
+        return await self._request("wechat.watchlist.sync", {})
+
     async def remove_watchlist(self, names: list[str]) -> dict[str, Any]:
         """把这几个会话移出自动回复名单。返回 AI 端说的 ``{removed, watching, blocked}``。
 

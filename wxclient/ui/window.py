@@ -186,8 +186,18 @@ class MainWindow:
         self._debug_page: Any = None   # 调试会话（`debug_page.py`），进那一页才建
         self._debug_actions: Any = None  # 它在标题栏右边那一组（● AI 已连接）
         self._watch_card: Any = None  # 监听名单那张卡片，跟着配置中心一起建
+        # 名单那一节的说明标签，同上。**必须在这儿先占个 None**：`_note_watch` 会在
+        # 它还没建出来时被问到，而 tk 回调里的 AttributeError 是**看不见的**（没有控制台），
+        # 现场表现就是「点了没反应」（2026-08-17 那次的形状）。
+        self._watch_hint: Any = None
         #: 正在请 AI 端移出的会话名 → 那次请求的 Future（tk 线程读，别在别处改）。
         self._watch_removing: dict[str, Any] = {}
+        #: 「同步名单」那一次请求的 Future；None = 现在没有在同步的。
+        self._watch_syncing: Any = None
+        #: 名单那一节要临时顶出来的一句话 `(文本, 颜色, 到期时刻)`；到期时刻 None = 不自己消失。
+        #: 不存进 `_watch_hint` 是因为那个标签每秒被 `_render_watch_page` 重写一次——
+        #: 直接写上去的话，说的话活不过一拍（老的 `_sync_watchlist` 就是这个毛病）。
+        self._watch_note: tuple[str, str, float | None] | None = None
         self._locked = False  # 转场态：由 _sync_transition_lock() 每拍现场核对，别手动改
         self._last_tick: float | None = None  # 卡顿看门狗的上一拍时刻
         self._ticks = 0  # 心跳计数：头两拍不报卡顿，理由见 _watch_for_stalls
@@ -479,9 +489,8 @@ class MainWindow:
         """监听名单：谁会被自动回复。**配置中心里的一节**，版式照 `docs/setting2.png`。
 
         名单是「谁会被自动回复」的唯一判据（069 fail-closed），所以必须看得见**具体是谁**。
-        名单从两条路来：这台机器上加的好友，和以后从线上同步下来的那份——所以这里留了一个
-        「同步名单」的位置（用户 2026-08-15）。**后端那头还没有**：按钮和别处长得一样
-        （用户 2026-08-16 要求），但点了会说清为什么，不会假装同步过一次。
+        名单权威在 AI 端，平时由它主动推下来；「同步名单」（用户 2026-08-15）是手动要一份，
+        补的是推送**没送到**的那些时候——推的那一瞬间这台机器正在重连、或者名单是在别处改的。
         """
         page = tk.Frame(parent, bg=theme.CONTENT_BG)
 
@@ -497,9 +506,7 @@ class MainWindow:
         self._watch_next = tk.Label(head, text="", font=theme.FONT_SMALL,
                                     bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
         self._watch_next.pack(side=tk.RIGHT, padx=(0, 14))
-        # ★ 样式和别处的描边按钮一致（绿框绿字，用户 2026-08-16）。**功能仍然没接上**——
-        # 点了会明说「同步接口还没接上」（`_sync_watchlist`），所以它不是一个假装能用的
-        # 按钮：长得一样，但按下去说的是实话。
+        # ★ 样式和别处的描边按钮一致（绿框绿字，用户 2026-08-16）。
         widgets.ghost_button(head, "同步名单", self._sync_watchlist).pack(
             side=tk.RIGHT, padx=(0, 14))
 
@@ -515,11 +522,56 @@ class MainWindow:
         return page
 
     def _sync_watchlist(self) -> None:
-        """「同步名单」的预留位。真接上之前，说清现在名单是怎么来的，别让人干等。"""
-        self._watch_hint.configure(
-            text="同步接口还没接上：名单现在由 AI 端在服务运行时推下来，本机只显示。",
-            fg=theme.ORANGE,
-        )
+        """「同步名单」：请 AI 端**现在就把权威名单发一份下来**。
+
+        平时不用点——AI 端在网关登记那一刻推一次、名单一变再推一次。这个按钮补的是推送
+        没送到的时候：推的那一瞬间这台机器正在重连、或者名单是在别处（对话里）改的，
+        于是屏幕上这份到底新不新，专员自己也说不准。没有它只能重启服务撞运气。
+
+        ★ 新名单**不从这次请求的返回值里拿**，它照旧走 AI 端那条 `wechat.watchlist` 推送
+        落地（`Watchlist.apply_push`）——只留一个落地口，多解析一处就多一份会漂的实现。
+        这里等回执只为一件事：照实话报「同步到几个会话」。
+        """
+        if self._watch_syncing is not None and not self._watch_syncing.done():
+            return  # 上一次还没回话，别排第二条
+        try:
+            self._watch_syncing = self.service.sync_watched()
+        except Exception as exc:  # noqa: BLE001 - 服务没起/连不上都要说人话
+            _log.warning("同步监听名单失败", error=str(exc))
+            self._note_watch(f"同步不了：{exc}", theme.ORANGE)
+            return
+        _log.info("请求同步监听名单")
+        # 不自己消失：等回话那一刻由 `_poll_watch_sync` 换掉，中间别让人以为点空了。
+        self._note_watch("正在向 AI 端要最新名单…", theme.TEXT_MUTED, hold=True)
+
+    def _note_watch(self, text: str, color: str, *, hold: bool = False) -> None:
+        """在名单那一节顶出一句话。`hold` = 一直挂着，否则几秒后自己让位给常规说明。"""
+        expiry = None if hold else time.monotonic() + 6.0
+        self._watch_note = (text, color, expiry)
+        if self._watch_hint is not None:
+            self._watch_hint.configure(text=text, fg=color)
+
+    def _poll_watch_sync(self) -> None:
+        """看看「同步名单」有没有回话。**跑在 tk 线程的心跳里**——后台只放值，这里只读值。"""
+        future = self._watch_syncing
+        if future is None or not future.done():
+            return
+        self._watch_syncing = None
+        try:
+            result = future.result()
+        except Exception as exc:  # noqa: BLE001 - 超时/断线照原样说出来
+            _log.warning("同步监听名单失败", error=str(exc))
+            self._note_watch(f"同步失败：{exc}", theme.ORANGE)
+            return
+        watching = int(result.get("watching") or 0) if isinstance(result, dict) else 0
+        _log.info("监听名单已同步", 会话数=watching)
+        self._watch_shown = None  # 名单可能变了，逼下一拍重画
+        if watching:
+            self._note_watch(f"已同步：AI 端现在盯着 {watching} 个会话。", theme.TEXT_MUTED)
+        else:
+            # 空名单不是「同步没成功」，是「AI 端那边真的谁都不盯」——两句话必须分得开。
+            self._note_watch("已同步：AI 端那边的名单也是空的——一条消息都不会回。",
+                             theme.ORANGE)
 
     def _ask_remove_watched(self, name: str) -> None:
         """「移出」：先问一句，再请 AI 端删。
@@ -584,16 +636,22 @@ class MainWindow:
         self._watch_next.configure(text=_next_read_text(snapshot, running))
         if not running:
             self._watch_count.configure(text="未启动")
-            self._watch_hint.configure(text="服务没在跑，名单由 AI 端在运行时推下来。",
-                                       fg=theme.TEXT_MUTED)
+            hint = ("服务没在跑，名单由 AI 端在运行时推下来。", theme.TEXT_MUTED)
         elif watched:
             self._watch_count.configure(text=f"{len(watched)} 个会话")
-            self._watch_hint.configure(text="名单内会话将自动回复，未列入名单的会话不回复。",
-                                       fg=theme.TEXT_MUTED)
+            hint = ("名单内会话将自动回复，未列入名单的会话不回复。", theme.TEXT_MUTED)
         else:
             self._watch_count.configure(text="0 个会话")
-            self._watch_hint.configure(text="名单是空的——这意味着一条消息都不会回。",
-                                       fg=theme.ORANGE)
+            hint = ("名单是空的——这意味着一条消息都不会回。", theme.ORANGE)
+        # 「同步名单」刚说过的话优先，且这一段每秒都会走一遍——所以那句话必须存在
+        # `_watch_note` 里、每拍重新贴上去，直接 configure 一次是活不过一拍的。
+        if self._watch_note is not None:
+            text, color, expiry = self._watch_note
+            if expiry is not None and time.monotonic() >= expiry:
+                self._watch_note = None
+            else:
+                hint = (text, color)
+        self._watch_hint.configure(text=hint[0], fg=hint[1])
 
         if watched == self._watch_shown:
             return  # 没变就别重画：每秒重建一次控件既费又会把滚动位置抖没
@@ -1181,6 +1239,7 @@ class MainWindow:
         else:
             self._rows["watch"].configure(text=f"{len(watched)} 个会话", fg=theme.GREEN)
         self._poll_watch_removals()
+        self._poll_watch_sync()
         self._render_watch_page()  # 停在配置中心时跟着刷；不在那页是个空操作
 
         self._live_dot.configure(fg=theme.GREEN if state is ServiceState.RUNNING else theme.GRAY)

@@ -259,6 +259,18 @@ class GatewayService:
             gateway.runner.debug_turn(text, on_delta=on_delta, on_stage=on_stage), loop
         )
 
+    def sync_watched(self) -> Future[Any]:
+        """请 AI 端把名单重发一份，返回一个还没完成的 Future（界面在心跳里问它）。
+
+        和 `remove_watched` 一样是「意图发过去、结果推回来」：新名单走 `wechat.watchlist`
+        推送落地，这个 Future 的值只是回执（``{watching, blocked}``）。
+        """
+        with self._lock:
+            loop, gateway = self._loop, self._gateway
+        if loop is None or gateway is None or self.state is not ServiceState.RUNNING:
+            raise ServiceNotRunning("服务没在运行，同步不了名单")
+        return asyncio.run_coroutine_threadsafe(gateway.runner.sync_watched(), loop)
+
     def remove_watched(self, name: str) -> Future[Any]:
         """把一个会话移出自动回复名单，返回一个还没完成的 Future（界面在心跳里问它）。
 
