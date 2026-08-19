@@ -15,7 +15,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Protocol
+from typing import Any, Protocol
 
 import structlog
 
@@ -100,8 +100,19 @@ class MessageSource(Protocol):
     async def fetch(self, account_id: str) -> Sequence[InboundMessage]: ...
 
 
-TurnHandler = Callable[[str, str, str, Sequence[InboundMessage]], Awaitable[None]]
-"""(account_id, peer_id, transcript, messages) -> None"""
+#: 一批入站消息跑完之后的去向。`TurnHandler` 的返回值上带 `follow_up` 就按它办，
+#: 不带（返回 None / 老实现）= 有结论了，销账。
+#:
+#: ★ 为什么要分这两档：原来只要不抛异常就当成功销账，于是「AI 端报错」和「额度用完被
+#: 守门拦下」这两种**一条都没发出去**的情况，候选人的消息被永久丢弃，而唯一的积压指示灯
+#: 同时归零——现场看不出丢过东西（2026-08-18 审计 P0-4，两条路都实跑复现过）。
+FOLLOW_UP_RETRY = "retry"
+"""没跑出结论（AI 端报错、重试后仍连不上）——留着重投，**且计一次失败**（有上限，会放弃）。"""
+FOLLOW_UP_DEFER = "defer"
+"""被规则挡下（额度用完、不在时间窗）——留着重投，**不计失败**：这类拦截一定会自己过期。"""
+
+TurnHandler = Callable[[str, str, str, Sequence[InboundMessage]], Awaitable[Any]]
+"""(account_id, peer_id, transcript, messages) -> 结果对象（可带 `follow_up`）或 None"""
 
 
 def format_transcript(messages: Iterable[InboundMessage]) -> str:
@@ -219,6 +230,10 @@ class InboundLoop:
         self._next_poll_at: datetime | None = None  # 下一趟读消息的时刻，给界面倒计时用
         self._inflight: dict[PeerKey, asyncio.Task[None]] = {}
         self._pending_loaded: set[str] = set()
+        self._inflight_batches: set[str] = set()
+        """正在被某一轮处理的批次。**必须单独记**：它此刻既不在缓冲里、也还没销账，
+        `_reload_pending` 看不见它就会把同一批再装载一次 → 候选人收到两条一样的回复
+        （2026-08-18 审计 P0-8）。"""
         self._quiet_notice: dict[PeerKey, tuple[str, int]] = {}
         self._stopped = asyncio.Event()
 
@@ -343,6 +358,7 @@ class InboundLoop:
             transcript = format_transcript(messages)
             _log.info("派发一轮给 AI 端", 会话=peer_id, 条数=len(messages))
             self._quiet_notice.pop(key, None)
+            self._inflight_batches.update(batch_ids or ())
             self._inflight[key] = asyncio.create_task(
                 self._run_handler(account_id, peer_id, transcript, messages, batch_ids)
             )
@@ -369,25 +385,48 @@ class InboundLoop:
         batch_ids: set[str] | None = None,
     ) -> None:
         try:
-            await self._handler(account_id, peer_id, transcript, messages)
-        except Exception as exc:  # noqa: BLE001 —— 一个联系人处理失败不该拖垮循环
-            # ★ 失败**不销账**：批次留在待处理表里，下一趟 tick 会重投（070）。
-            # 原来这里只记一条 warning 就把消息吞了——AI 端一断线，候选人就永远等不到回复。
-            attempts = 0
+            try:
+                outcome = await self._handler(account_id, peer_id, transcript, messages)
+            except Exception as exc:  # noqa: BLE001 —— 一个联系人处理失败不该拖垮循环
+                # ★ 失败**不销账**：批次留在待处理表里，下一趟 tick 会重投（070）。
+                # 原来这里只记一条 warning 就把消息吞了——AI 端一断线，候选人就永远等不到回复。
+                self._keep_pending(account_id, batch_ids, FOLLOW_UP_RETRY, str(exc))
+                return
+            # 没抛异常 ≠ 把话说出去了。一条都没发出去的两种情况（AI 端报错 / 被守门拦下）
+            # 由 handler 在返回值上标出来——**它们同样不能销账**（审计 P0-4）。
+            follow_up = str(getattr(outcome, "follow_up", "") or "")
+            if follow_up:
+                self._keep_pending(account_id, batch_ids, follow_up,
+                                   str(getattr(outcome, "skipped_reason", "")))
+                return
+            # 有结论了（发出去了，或明确决定不回这一轮）才销账。
+            for batch_id in batch_ids or ():
+                self._store.drop_pending_inbound(batch_id)
+                self._pending_loaded.discard(batch_id)
+        finally:
+            self._inflight_batches.difference_update(batch_ids or ())
+
+    def _keep_pending(
+        self, account_id: str, batch_ids: set[str] | None, follow_up: str, why: str
+    ) -> None:
+        """这批没有结论：留在待处理表里等重投。
+
+        `retry` 计一次失败（有上限，最终会放弃并留一条警告）；`defer` 不计——
+        额度用完、不在时间窗这类拦截一定会自己过期，把它算成失败等于用重试次数
+        去消耗一段本来就该等的时间，等额度回来时批次已经被放弃了。
+        """
+        attempts = 0
+        if follow_up == FOLLOW_UP_RETRY:
             for batch_id in batch_ids or ():
                 attempts = max(attempts, self._store.bump_pending_attempts(batch_id))
-            self._pending_loaded.difference_update(batch_ids or ())
-            _log.warning(
-                "处理入站消息失败，已留在待处理队列等下一趟重投",
-                account=account_id,
-                error=str(exc),
-                已重试=attempts,
-            )
-            return
-        # 成功才销账。
-        for batch_id in batch_ids or ():
-            self._store.drop_pending_inbound(batch_id)
-            self._pending_loaded.discard(batch_id)
+        self._pending_loaded.difference_update(batch_ids or ())
+        _log.warning(
+            "这一轮没把话说出去，本批留在待处理队列等重投",
+            account=account_id,
+            原因=why or follow_up,
+            计入失败=(follow_up == FOLLOW_UP_RETRY),
+            已重试=attempts,
+        )
 
     # ────────────────────────── 欠账重投（070）──────────────────────────
 
@@ -410,7 +449,9 @@ class InboundLoop:
         loaded = 0
         for row in self._store.list_pending_inbound():
             batch_id = row["batch_id"]
-            if batch_id in self._pending_loaded or self._debouncer.has_batch(batch_id):
+            if (batch_id in self._pending_loaded
+                    or batch_id in self._inflight_batches      # 正在跑：再装一次就是回两遍
+                    or self._debouncer.has_batch(batch_id)):
                 continue
             if row["attempts"] >= PENDING_MAX_ATTEMPTS:
                 self._store.drop_pending_inbound(batch_id)

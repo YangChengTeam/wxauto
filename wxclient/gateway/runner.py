@@ -34,7 +34,7 @@ from .contacts import STATUS_REQUESTED as CONTACT_REQUESTED
 from .contacts import ContactDirectory
 from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from, within_active_hours
-from .inbound import InboundLoop, InboundMessage, MessageSource
+from .inbound import FOLLOW_UP_RETRY, InboundLoop, InboundMessage, MessageSource
 from .outbound import DeliveryResult, MessageSink, OutboundSender
 from .pacing import MIN_READ_INTERVAL_SECONDS, PACING_EVENT, clamp_interval
 from .schedule import ScheduleLoop, parse_schedule_at
@@ -489,11 +489,21 @@ class GatewayRunner:
           「已经发出去的那几段再发一遍」——候选人收到重复消息，且撤不回来。
           需求文档 §12.4 的原话是「结果未知先查询或转人工，不能盲目重发」，
           所以这一批就此销账，宁可少一条回复，也不赌那一下。
+
+        - **跑完了但一条都没发出去**（AI 端返回错误、配额用完、不在时间窗）→ 不抛异常，
+          在 `DeliveryResult.follow_up` 上标出来，同样**不销账**。原来这类只要不抛异常
+          就算成功，候选人的消息被永久丢弃、积压指示灯还归零（审计 P0-4）。
         """
         # 收到他的消息就说明好友已经加上了——趁这一刻上报（api2 §4.1「检测到对方通过」）。
         # 放在对话之前：这个事实此刻就成立了，对话失败重投时它已经报过、不会重复报。
         await self._note_friend_accepted(account_id, peer_id)
         card = await self._run_dialog_turn(account_id, peer_id, transcript, messages)
+        if card is None:
+            # AI 端明确报错：fallback 卡里没有 reply_segments，发不出任何东西。
+            # 这一轮**没有结论**，留着下一趟重投（计一次失败，有上限）。
+            return DeliveryResult(
+                skipped_reason="AI 端这一轮没有给出结果", follow_up=FOLLOW_UP_RETRY
+            )
         try:
             return await self._sender.deliver(account_id, peer_id, card)
         except Exception as exc:  # noqa: BLE001 —— 见上：投递阶段不允许触发重投

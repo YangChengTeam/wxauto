@@ -170,6 +170,10 @@ class Reservation:
 
     granted: int = 0
     reason: str = ""
+    temporary: bool = False
+    """这次拒绝会不会自己过去。时间窗、配额用完 = 会（等一等就行）；黑名单、本机没开放
+    这类动作 = 不会。上层据此决定**这批消息是留着重投还是就此销账**——留错了会在额度
+    恢复的那一刻把攒了一天的话一次性喷出去，正是风控要看的东西（审计 P0-4）。"""
     _store: object | None = None
     _rowids: list[int] = field(default_factory=list)
 
@@ -278,7 +282,7 @@ class OutboundGuard:
         if self._store.is_blacklisted(account_id, peer_id):
             return Reservation(reason="该联系人已在黑名单")
         if not within_active_hours(now, self._active_hours):
-            return Reservation(reason=f"不在允许发送的时间窗 {self._active_hours}")
+            return Reservation(reason=f"不在允许发送的时间窗 {self._active_hours}", temporary=True)
 
         limit = self._action_limits.get(action)
         label = ACTION_LABELS.get(action, action)
@@ -296,7 +300,7 @@ class OutboundGuard:
         )
         if granted <= 0:
             where, used, cap = binding or (f"「{label}」", 0, 0)
-            return Reservation(reason=f"{where}已做 {used} 次，达到上限 {cap}")
+            return Reservation(reason=f"{where}已做 {used} 次，达到上限 {cap}", temporary=True)
         return Reservation(granted=granted, _store=self._store, _rowids=rowids)
 
     def allow_read(self, account_id: str, action: str, *, now: datetime) -> GuardDecision:

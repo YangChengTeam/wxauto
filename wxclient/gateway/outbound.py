@@ -16,6 +16,7 @@ from typing import Any, Protocol
 import structlog
 
 from .guard import ACTION_GROUP, ACTION_MESSAGE, OutboundGuard
+from .inbound import FOLLOW_UP_DEFER
 
 _log = structlog.get_logger(__name__)
 
@@ -38,6 +39,8 @@ class DeliveryResult:
     """一条都没发时的原因；发了就是空串。"""
     actions: list[dict[str, Any]] = field(default_factory=list)
     """卡片里给业务后端的执行提案，原样带出，由上层转交。"""
+    follow_up: str = ""
+    """这批入站消息的去向：空 = 有结论了，销账；否则见 `inbound.FOLLOW_UP_*`。"""
 
     @property
     def delivered(self) -> bool:
@@ -111,7 +114,13 @@ class OutboundSender:
         )
         if not reservation.allowed:
             _log.info("出站被守门拦下", account=account_id, 会话=peer_id, reason=reservation.reason)
-            return DeliveryResult(skipped_reason=reservation.reason, actions=actions)
+            # 配额用完 / 不在时间窗 = 等一等就能发，**别把候选人的话丢了**；黑名单、
+            # 本机关掉了这类动作则是明确结论，销账（审计 P0-4）。
+            return DeliveryResult(
+                skipped_reason=reservation.reason,
+                actions=actions,
+                follow_up=FOLLOW_UP_DEFER if reservation.temporary else "",
+            )
 
         task_ids: list[str] = []
         try:
