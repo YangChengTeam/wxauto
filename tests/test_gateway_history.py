@@ -13,7 +13,7 @@ AI 端每一轮只收得到「这一趟去抖攒下的那几条」，而它要�
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import json
 import tempfile
