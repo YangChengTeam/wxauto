@@ -17,12 +17,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
-import httpx
 import structlog
+
+from .backend_client import BackendEndpoint
 
 _log = structlog.get_logger(__name__)
 
@@ -43,25 +43,8 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-class ContactDirectory:
+class ContactDirectory(BackendEndpoint):
     """会话名的上报与同步。**永不往上抛**：这条链断了不该影响已经做完的微信动作。"""
-
-    def __init__(
-        self,
-        base_url: str,
-        token: Callable[[], str],
-        *,
-        timeout_seconds: float = 5.0,
-        client: httpx.AsyncClient | None = None,
-    ) -> None:
-        self._base_url = (base_url or "").rstrip("/")
-        self._token = token
-        self._timeout = timeout_seconds
-        self._client = client
-
-    @property
-    def configured(self) -> bool:
-        return bool(self._base_url)
 
     # ── 上报 ─────────────────────────────────────────────────────
 
@@ -137,25 +120,9 @@ class ContactDirectory:
     # ── 发请求 ───────────────────────────────────────────────────
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any] | None:
-        token = (self._token() or "").strip()
-        if not self._base_url or not token:
-            # 没登录/没配地址不是错，是「这台机器还没准备好」——别刷 warning。
+        response = await self._send(method, f"{self._base_url}{path}", **kwargs)
+        if response is None:
             return None
-        headers = {"authorization": f"Bearer {token}", "content-type": "application/json"}
-        url = f"{self._base_url}{path}"
-        try:
-            if self._client is not None:
-                response = await self._client.request(
-                    method, url, headers=headers, timeout=self._timeout, **kwargs
-                )
-            else:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    response = await client.request(method, url, headers=headers, **kwargs)
-        except Exception as exc:  # noqa: BLE001 —— 网络抖动不该影响微信侧
-            # 只记异常类型与路径：url 之外的细节可能带上凭证片段（同 ticket.py 的口径）。
-            _log.warning("会话名接口请求失败", path=path, error=type(exc).__name__)
-            return None
-
         if response.status_code >= 400:
             _log.warning("会话名接口被拒", path=path, status=response.status_code)
             return None

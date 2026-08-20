@@ -522,15 +522,13 @@ class MainWindow:
         return page
 
     def _sync_watchlist(self) -> None:
-        """「同步名单」：请 AI 端**现在就把权威名单发一份下来**。
+        """「同步名单」：**现在就去取一份最新的**。
 
-        平时不用点——AI 端在网关登记那一刻推一次、名单一变再推一次。这个按钮补的是推送
-        没送到的时候：推的那一瞬间这台机器正在重连、或者名单是在别处（对话里）改的，
-        于是屏幕上这份到底新不新，专员自己也说不准。没有它只能重启服务撞运气。
+        名单权威在业务后端（spec 085），平时由网关按周期自己同步。这个按钮补的是
+        「等不及下一轮」的时候：名单刚在工作台改过，专员想立刻看到。
 
-        ★ 新名单**不从这次请求的返回值里拿**，它照旧走 AI 端那条 `wechat.watchlist` 推送
-        落地（`Watchlist.apply_push`）——只留一个落地口，多解析一处就多一份会漂的实现。
-        这里等回执只为一件事：照实话报「同步到几个会话」。
+        ★ 落地口仍然只有一个（`Watchlist`）——按钮只负责触发和报数，
+        不自己解析名单。多解析一处就多一份会漂的实现。
         """
         if self._watch_syncing is not None and not self._watch_syncing.done():
             return  # 上一次还没回话，别排第二条
@@ -567,11 +565,10 @@ class MainWindow:
         _log.info("监听名单已同步", 会话数=watching)
         self._watch_shown = None  # 名单可能变了，逼下一拍重画
         if watching:
-            self._note_watch(f"已同步：AI 端现在盯着 {watching} 个会话。", theme.TEXT_MUTED)
+            self._note_watch(f"已同步：现在盯着 {watching} 个会话。", theme.TEXT_MUTED)
         else:
-            # 空名单不是「同步没成功」，是「AI 端那边真的谁都不盯」——两句话必须分得开。
-            self._note_watch("已同步：AI 端那边的名单也是空的——一条消息都不会回。",
-                             theme.ORANGE)
+            # 空名单不是「同步没成功」，是「名单里真的一个都没有」——两句话必须分得开。
+            self._note_watch("已同步：名单是空的——一条消息都不会回。", theme.ORANGE)
 
     def _ask_remove_watched(self, name: str) -> None:
         """「移出」：先问一句，再请 AI 端删。

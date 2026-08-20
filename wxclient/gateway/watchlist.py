@@ -80,6 +80,9 @@ class Watchlist:
         self._scope = scope or WatchScope()
         self._persist = persist
         self._warned_empty = False
+        #: 业务后端给过名单没有。给过之后 AI 端的推送不再作数（spec 085 并存期）。
+        self._backend_seen = False
+        self._warned_ai_push_ignored = False
 
     @classmethod
     def from_local(cls, *, only: Sequence[str] = (), never: Sequence[str] = (), **kwargs) -> Watchlist:
@@ -134,9 +137,35 @@ class Watchlist:
         缺字段就沿用现有值——AI 端只想改 ``never`` 时不必把 ``only`` 一起重发。
         坏数据宁可不换：名单被一个坏帧清空 = 网关开始回它本不该回的人，
         或者反过来突然全哑。
+
+        ★ 并存期（spec 085）：业务后端一旦给过名单，AI 端这条推送就**不再作数**。
+        名单权威已经移交，两个来源同时写会让「屏幕上这份到底听谁的」变成一个说不清的问题。
+        在后端第一次给出名单之前，这条路照旧生效——移交途中不能有「谁都不管」的窗口。
         """
+        if self._backend_seen:
+            if not self._warned_ai_push_ignored:
+                self._warned_ai_push_ignored = True
+                _log.info("名单已由业务后端接管，忽略 AI 端推送（spec 085）")
+            return False
+        return self._merge(data, "AI 端推送", "监听列表推送格式不对，忽略")
+
+    def apply_backend(self, data: dict) -> bool:
+        """吃下业务后端同步来的一份名单（spec 085 之后的权威来源）。
+
+        ★ 调用方**只在真拉到时**调这个：`WatchlistDirectory.pull()` 拉不到返回 None，
+        那是「这轮没拿到」，不是「名单空了」。名单是 fail-closed 白名单，
+        把没拿到当成空名单 = 网关一个会话都不回。
+        """
+        changed = self._merge(data, "业务后端同步", "业务后端给的名单格式不对，忽略")
+        # 形状对就算接管了——哪怕内容和现状一样。接管与否看的是「后端说过话没有」，
+        # 不是「说的话有没有让名单变化」。
+        if isinstance(data, dict):
+            self._backend_seen = True
+        return changed
+
+    def _merge(self, data: dict, origin: str, bad_shape_msg: str) -> bool:
         if not isinstance(data, dict):
-            _log.warning("监听列表推送格式不对，忽略")
+            _log.warning(bad_shape_msg)
             return False
 
         updated = self._scope
@@ -145,16 +174,16 @@ class Watchlist:
         if isinstance(data.get("never"), list):
             updated = replace(updated, never=_clean(data["never"]))
         updated = replace(updated, received=True)
-        # 比的是名单本身，不含 origin：AI 端推来一份和现状一模一样的名单不算「变了」。
+        # 比的是名单本身，不含 origin：推来一份和现状一模一样的名单不算「变了」。
         if updated == replace(self._scope, received=True):
             self._scope = updated
             return False
-        self._scope = replace(updated, origin="AI 端推送")
+        self._scope = replace(updated, origin=origin)
         self._warned_empty = False
         if self._persist is not None:
             self._persist(self._scope)
         _log.info(
-            "监听列表已更新（AI 端推送）",
+            f"监听列表已更新（{origin}）",
             只管=len(self._scope.only),
             不管=len(self._scope.never),
         )

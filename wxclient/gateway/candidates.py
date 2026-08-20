@@ -14,11 +14,11 @@ AI 端算出「这个人该往前走一格」→ 把那一格**投回来**（`op
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
-import httpx
 import structlog
+
+from .backend_client import BackendEndpoint
 
 _log = structlog.get_logger(__name__)
 
@@ -38,21 +38,8 @@ class CandidateUpdateError(Exception):
     """请求本身不成立（缺 ID、状态不认识、缺必填原因）。调用方据此回 `rejected`。"""
 
 
-class CandidateDirectory:
+class CandidateDirectory(BackendEndpoint):
     """候选人回写。**永不往上抛网络异常**：这条链断了不该影响已经做完的微信动作。"""
-
-    def __init__(
-        self,
-        base_url: str,
-        token: Callable[[], str],
-        *,
-        timeout_seconds: float = 5.0,
-        client: httpx.AsyncClient | None = None,
-    ) -> None:
-        self._base_url = (base_url or "").rstrip("/")
-        self._token = token
-        self._timeout = timeout_seconds
-        self._client = client
 
     @property
     def configured(self) -> bool:
@@ -113,24 +100,10 @@ class CandidateDirectory:
         return {"updated": True, **({"version": version} if version is not None else {})}
 
     async def _request(self, candidate_id: str, body: dict[str, Any]) -> dict[str, Any] | None:
-        token = (self._token() or "").strip()
-        if not token:
-            _log.info("候选人回写跳过：这台机器还没登录")
-            return None
-        headers = {"authorization": f"Bearer {token}", "content-type": "application/json"}
         # candidate_id 是后端给的 UUID，直接拼进路径前先挡掉分隔符——多一道，别让它跑出这条路径。
         safe_id = candidate_id.replace("/", "").replace("?", "").replace("#", "")
-        url = f"{self._base_url}{CANDIDATES_PATH}/{safe_id}"
-        try:
-            if self._client is not None:
-                response = await self._client.request(
-                    "PATCH", url, headers=headers, json=body, timeout=self._timeout
-                )
-            else:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
-                    response = await client.request("PATCH", url, headers=headers, json=body)
-        except Exception as exc:  # noqa: BLE001 —— 网络抖动不该影响微信侧
-            _log.warning("候选人回写请求失败", error=type(exc).__name__)
+        response = await self._send("PATCH", f"{self._base_url}{CANDIDATES_PATH}/{safe_id}", json=body)
+        if response is None:
             return None
 
         if response.status_code == 409:

@@ -49,6 +49,7 @@ from .schedule import ScheduleLoop, parse_schedule_at
 from .sessions import GatewayStore
 from .ticket import TicketProvider
 from .watchlist import PUSH_EVENT, Watchlist
+from .watchlist_sync import WatchlistDirectory
 from .wsclient import AgentWsClient, AgentWsError, TurnResult, Unauthorized
 
 _log = structlog.get_logger(__name__)
@@ -60,6 +61,9 @@ KEEPALIVE_INTERVAL_SECONDS = 30.0
 #: 候选人会话名多久同步一次（api2 §4.2）。它问的是业务后端、不碰微信，不受节拍红线约束；
 #: 但也没必要勤——名单变化很慢，而且增量同步只取水位之后的。
 CONTACTS_SYNC_INTERVAL_SECONDS = 600.0
+#: 监听名单同步间隔（spec 085）。名单变了要尽快生效——专员在工作台加了人，
+#: 等十分钟才开始自动回复已经算慢；但它只是一次读，不动微信，不受防风控节拍约束。
+WATCHLIST_SYNC_INTERVAL_SECONDS = 120.0
 
 #: 每轮往上带多少条历史。够 AI 端判「这一步走完没有」，又不至于把每轮的输入撑成一倍——
 #: 这段文本每轮都要重新发一遍，是按 token 计费的。
@@ -176,6 +180,7 @@ class GatewayRunner:
         friend_watcher: FriendWatcher | None = None,
         command_executor: CommandExecutor | None = None,
         contacts: ContactDirectory | None = None,
+        watchlist_source: WatchlistDirectory | None = None,
         candidates: CandidateDirectory | None = None,
         client_factory: Callable[..., AgentWsClient] | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -190,6 +195,7 @@ class GatewayRunner:
         self._friends = friend_watcher
         self._commands = command_executor
         self._contacts = contacts
+        self._watchlist_source = watchlist_source
         self._candidates = candidates
         self._capabilities = capabilities
         # account_id → (报给了哪条连接, 报的是什么)。**连接也要记**，见 _report_capabilities。
@@ -430,6 +436,32 @@ class GatewayRunner:
             if rows:
                 saved = self._store.save_contacts(account_id, rows)
                 _log.info("候选人会话名已同步", account=account_id, saved=saved, incremental=bool(since))
+
+    async def _sync_watchlist(self) -> None:
+        """监听名单常驻同步（spec 085）：名单权威在业务后端，这台机器按周期去取。
+
+        和 `_sync_contacts` 同形（后台跑、失败只记账、不挡网关启动），但两者不是一件事：
+        contacts 是「这个人在微信里叫什么」的映射，名单是「哪些会话轮得到自动回复」——
+        名单里有群，而群没有手机号、进不了 contacts 那张表。
+        """
+        if self._watchlist_source is None or not self._watchlist_source.configured:
+            return
+        while True:
+            await self._sync_watchlist_once()
+            await asyncio.sleep(WATCHLIST_SYNC_INTERVAL_SECONDS)
+
+    async def _sync_watchlist_once(self) -> None:
+        """同步一轮。
+
+        ★ 拉不到就**什么都不做**——名单是 fail-closed 白名单，把「这轮没拿到」当成
+        「名单空了」等于让网关一个会话都不回。`pull()` 已经把这两件事分开（None vs 空 only）。
+        """
+        if self._watchlist_source is None or self._watchlist is None:
+            return
+        data = await self._watchlist_source.pull()
+        if data is None:
+            return
+        self._watchlist.apply_backend(data)
 
     async def _report_contact(self, command: dict[str, Any], result: CommandResult | None) -> None:
         """加好友这条链走到一步就报一次会话名（api2 §4.1）。
@@ -680,11 +712,23 @@ class GatewayRunner:
         await client.interrupt(session_id)
 
     async def sync_watched(self) -> dict[str, Any]:
-        """请 AI 端把名单重发一份（配置中心里点的「同步名单」）。
+        """现在就去取一份最新名单（配置中心里点的「同步名单」）。
 
-        新名单从 ``wechat.watchlist`` 推回来、走 `_on_push` 落地，和平时那条路一模一样；
-        这个协程的返回值只是回执（``{watching, blocked}``），给界面照实话报数用。
+        ★ spec 085：名单权威在**业务后端**，所以先问它。问到了就地落进 `Watchlist`，
+        返回 ``{watching, blocked}`` 给界面照实话报数。
+
+        **并存期的回退**（design §6）：后端还没就绪（没配地址 / 没登录 / 这一下没拉到）时，
+        照旧请 AI 端重推那条老路。移交途中不能有「点了同步却什么也不会发生」的窗口——
+        那正是这个按钮存在的理由（专员说不准屏幕上这份新不新）。
         """
+        if self._watchlist_source is not None and self._watchlist_source.configured:
+            data = await self._watchlist_source.pull()
+            if data is not None and self._watchlist is not None:
+                self._watchlist.apply_backend(data)
+                return {
+                    "watching": len(self._watchlist.watched()),
+                    "blocked": len(self._watchlist.scope.never),
+                }
         if not self._accounts:
             raise AgentWsError("这台机器上没有可用的微信账号")
         client = await self._pool.acquire(self._accounts[0])
@@ -743,18 +787,26 @@ class GatewayRunner:
         worker_id = self._store.contact_worker_id(account_id, peer_id)
         return [{"type": "worker", "id": worker_id}] if worker_id else []
 
-    @staticmethod
-    def _turn_meta(peer_id: str, messages: Sequence[InboundMessage]) -> dict[str, Any]:
+    def _turn_meta(self, peer_id: str, messages: Sequence[InboundMessage]) -> dict[str, Any]:
         """给 AI 端的这一轮元信息（064 design §2）。
 
         `peer` 是这个会话在微信里显示的名字。AI 端拿它当关系记忆的键（078）——
         它那边只有 session_id，从 session_id 反推不出「这是在跟谁说话」。
+
+        `watching` 是本机当前在管的会话名（spec 085）。为什么由**网关**带上来而不是让
+        AI 端自己查：名单权威移到业务后端之后，AI 端手上那份就是副本，而模型要用它做的事
+        （专员说「给 aa 发条消息」时对上是哪个 aa）必须和**真正执行的那一方**看到的一致。
+        带上来就只有一份名单，不会出现两处各说各话。
         """
-        return {
+        meta: dict[str, Any] = {
             "peer": peer_id,
             "funnel": "inbound",
             "operator_intervened": any(m.from_self for m in messages),
         }
+        watching = self.watched_peers()
+        if watching:
+            meta["watching"] = watching
+        return meta
 
     # ────────────────────────── 生命周期 ──────────────────────────
 
@@ -828,6 +880,8 @@ class GatewayRunner:
         # 会话名同步放**后台**跑：它是「换机之后别把同一个人叫成两个名字」的补课，
         # 不该挡住网关起来（后端慢或没登录时，同步失败只记账，见 ContactDirectory）。
         side_tasks.append(asyncio.create_task(self._sync_contacts(), name="gw-contacts"))
+        # 监听名单同步（085）：同样放后台——后端没就绪时它一直躺平，不该挡住网关起来。
+        side_tasks.append(asyncio.create_task(self._sync_watchlist(), name="gw-watchlist"))
         try:
             await self.loop.run()
         finally:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
+
 from .pacing import MIN_FRIEND_INTERVAL_SECONDS, MIN_READ_INTERVAL_SECONDS
 
 # 明确的**拒绝联系**表达——命中即永久停止对该联系人的一切自动化动作并拉黑。
