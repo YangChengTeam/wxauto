@@ -1,8 +1,12 @@
 """监听范围：哪些会话才轮到网关管。
 
-**权威在 AI 端**——该盯哪些人是业务侧才知道的事（谁在招聘漏斗里、谁归这个专员），
-不该让专员在桌面端手抄一份名单。名单由 AI 端通过 WS 推下来（``ev: "wechat.watchlist"``），
-推一次覆盖一次，网关只负责照办。
+**权威在业务后端**（spec 085）——该盯哪些人是业务侧才知道的事（谁在招聘漏斗里、谁归这个专员），
+不该让专员在桌面端手抄一份名单。名单**就是会话名映射派生出来的**：`GET /client/contacts`
+回来那些 `accepted` 的会话名（用户 2026-08-20：就用这条既有接口，不新增接口）。
+派生在 `GatewayRunner._apply_derived_watchlist()`，读的是本机 `gateway_contacts` 表。
+
+迁移期 AI 端那条 WS 推送（``ev: "wechat.watchlist"``）仍能落地，直到后端这份真的给出东西为止
+（见 `apply_push` 的 `_backend_seen`）——移交途中不能有「谁都不管」的窗口。
 
 ★ 两条硬规矩（用户裁决 2026-08-14）：
 
@@ -12,7 +16,7 @@
 
 2. **名单是白名单，没在名单上就不管（fail-closed）。** 原来的兜底是「所有单聊都管」，
    意味着装上就会自动回复任何人——包括专员的家人朋友，这违反需求文档 §13.1
-   「对象必须在 HR 数据权限范围内」。现在 AI 端没推名单之前**一个会话都不碰**，
+   「对象必须在 HR 数据权限范围内」。现在拿到名单之前**一个会话都不碰**，
    并把这件事喊出来（否则又变成「装上去什么都不回」的哑谜）。
 
 名单落盘（``GatewayStore``）：进程重启后如果要等 AI 端重推才恢复，中间那段就是全哑的。
@@ -64,7 +68,7 @@ class WatchScope:
         if peer_id in self.only:
             return None
         if not self.received and not self.only:
-            return "还没收到 AI 端的监听名单"
+            return "还没拿到监听名单"
         return "不在监听名单里"
 
 
@@ -124,7 +128,8 @@ class Watchlist:
             return
         self._warned_empty = True
         _log.warning(
-            "监听名单是空的，暂不处理任何会话——等 AI 端把「可以自动回复的人/群」推下来",
+            "监听名单是空的，暂不处理任何会话——等会话名同步把「可以自动回复的人」带回来"
+            "（spec 085：名单 = /client/contacts 里 accepted 的那些会话名）",
         )
 
     def apply_scope(self, scope: WatchScope) -> None:
@@ -152,11 +157,11 @@ class Watchlist:
     def apply_backend(self, data: dict) -> bool:
         """吃下业务后端同步来的一份名单（spec 085 之后的权威来源）。
 
-        ★ 调用方**只在真拉到时**调这个：`WatchlistDirectory.pull()` 拉不到返回 None，
-        那是「这轮没拿到」，不是「名单空了」。名单是 fail-closed 白名单，
-        把没拿到当成空名单 = 网关一个会话都不回。
+        ★ 调用方**只在真派生出东西时**调这个（见 `GatewayRunner._apply_derived_watchlist()`）：
+        派生出来是空的，那是「这轮没拿到」，不是「名单空了」。名单是 fail-closed 白名单，
+        把没拿到当成空名单 = 网关一个会话都不回，而且这一调就再也退不回 AI 端那条推送。
         """
-        changed = self._merge(data, "业务后端同步", "业务后端给的名单格式不对，忽略")
+        changed = self._merge(data, "业务后端会话名同步派生", "派生出来的名单格式不对，忽略")
         # 形状对就算接管了——哪怕内容和现状一样。接管与否看的是「后端说过话没有」，
         # 不是「说的话有没有让名单变化」。
         if isinstance(data, dict):

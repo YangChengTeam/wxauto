@@ -30,7 +30,6 @@ from .runner import GatewayRunner
 from .sessions import GatewayStore
 from .ticket import ClientTokenTicketProvider, LocalFileTicketProvider, TicketProvider
 from .watchlist import Watchlist, WatchScope
-from .watchlist_sync import WatchlistDirectory
 from .wechat_io import QueueMessageSink, QueueMessageSource
 
 _log = structlog.get_logger(__name__)
@@ -147,13 +146,9 @@ def build_gateway(
 
     # 候选人会话名两条路（api2 §4）。和换票共用同一个 Client Token 取值函数——
     # 它们本来就是同一个员工身份，没登录时两边都自动躺平（不报错、不刷日志）。
+    # ★ 它同时是**监听名单**的来源（spec 085，用户 2026-08-20：就用 /client/contacts，
+    # 不新增接口）——名单在 `GatewayRunner._apply_derived_watchlist()` 里从本机那张表派生。
     contacts = ContactDirectory(
-        gateway_settings.business_api_url,
-        client_token or (lambda: ""),
-    )
-    # 监听名单同步（spec 085）。同一个 Client Token；和 contacts 是两条路、两个接口——
-    # 名单里有群，群进不了 contacts 那张表（没有手机号、没有 worker_id）。
-    watchlist_source = WatchlistDirectory(
         gateway_settings.business_api_url,
         client_token or (lambda: ""),
     )
@@ -177,7 +172,6 @@ def build_gateway(
         watchlist=watchlist,
         capabilities=current_capabilities,
         contacts=contacts,
-        watchlist_source=watchlist_source,
         candidates=candidates,
         command_executor=CommandExecutor(
             runtime=runtime,

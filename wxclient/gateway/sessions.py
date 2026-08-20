@@ -240,6 +240,33 @@ class GatewayStore:
             ).fetchone()
         return str(row[0]) if row and row[0] else ""
 
+    def watched_session_names(self, account_id: str) -> list[str]:
+        """监听名单：这台机器该盯哪些会话（spec 085，用户 2026-08-20 改口径）。
+
+        **就从会话名映射里派生，不另开接口**——`GET /client/contacts` 回来的就是
+        「这位专员该管的那些人在他微信里叫什么」，那本身就是名单。
+
+        两条过滤，都不是可有可无的：
+        - **只要 `accepted`**：`requested` 是「申请发出去了、对方还没通过」。好友没通过时
+          微信里根本没有那个会话窗口，放进名单只会让每轮白开一次、白吃一个读名额；
+          而这类行还有第二个来源——业务后端推计划时会自己写一条 `requested`，
+          那是「计划点名要加谁」，更不是「可以自动回复」。
+        - **会话名非空**：名单是按微信里显示的名字**逐字**寻址的，空名字查无此人。
+          `TRIM` 一道是必要的——`save_contacts` 原样存后端给的字符串，只判 `<> ''`
+          放得过去一个全是空格的名字，那种名字每轮都会去开一次窗口、每轮都开不到。
+
+        ★ 派生读的是**本机这张表**，不是每次去打接口。所以「这一趟没拉到」天然等于
+        「沿用上一份」——`_sync_contacts_once` 拉失败时压根不写表。
+        """
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT session_name FROM gateway_contacts
+                   WHERE account_id=? AND status=? AND TRIM(session_name)<>''
+                   ORDER BY session_name""",
+                (account_id, "accepted"),
+            ).fetchall()
+        return [row[0].strip() for row in rows]
+
     def contacts_synced_until(self, account_id: str) -> str:
         """本机已同步到的最新 `updated_at`（增量同步的水位）。空 = 没同步过，要全量。
 

@@ -1,4 +1,8 @@
-"""监听名单换来源（spec 085）：业务后端接管 + 并存期 + fail-closed 不退化。
+"""监听名单换来源（spec 085）：从会话名映射派生 + 并存期 + fail-closed 不退化。
+
+★ 用户 2026-08-20 裁决：**就用 `GET /client/contacts` 派生名单，不新增接口。**
+所以名单 = 本机 `gateway_contacts` 里 `accepted` 且会话名非空的那些行；
+「这一轮没拉到」天然等于「沿用上一份」——拉失败根本不写那张表。
 
 ★ 这组用例守的是整个迁移里最危险的一步。名单是 **fail-closed 白名单**——
 「没拿到名单」和「名单是空的」在行为上天差地别：前者该沿用现有那份，后者是一个会话都不回。
@@ -7,122 +11,128 @@
 
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
-import httpx
-
+from wxclient.gateway import GatewayRunner, GatewaySettings, LocalFileTicketProvider
+from wxclient.gateway.sessions import GatewayStore
 from wxclient.gateway.watchlist import Watchlist, WatchScope
-from wxclient.gateway.watchlist_sync import WatchlistDirectory
+
+ACCOUNT = "acct-1"
 
 
-def _directory(handler, *, base_url: str = "https://b.test", token: str = "T") -> WatchlistDirectory:
-    return WatchlistDirectory(
-        base_url, lambda: token,
-        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
-    )
+def _row(number: str, session_name: str, status: str = "accepted", worker_id: str | None = "w-1") -> dict:
+    """一行 `GET /client/contacts` 的响应（字段名逐字照 api2 §4.2）。"""
+    return {
+        "number": number,
+        "session_name": session_name,
+        "profile_name": "",
+        "contact_status": status,
+        "worker_id": worker_id,
+        "updated_at": "2026-08-20T09:00:00.000Z",
+    }
 
 
-async def _pull(handler, **kwargs):
-    return await _directory(handler, **kwargs).pull()
+class DerivedFromContactsTests(unittest.TestCase):
+    """名单从会话名映射里派生：哪些行算数、哪些不算。"""
 
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.store = GatewayStore(Path(self._tmp.name) / "gateway.db")
 
-class WatchlistPullTests(unittest.IsolatedAsyncioTestCase):
-    async def test_it_pulls_a_list_and_normalises_it(self) -> None:
-        seen: dict[str, str] = {}
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen["url"] = str(request.url)
-            seen["auth"] = request.headers.get("authorization", "")
-            return httpx.Response(200, json={"only": ["张三·普工", " 李四 ", "张三·普工", ""],
-                                             "never": ["王五"]})
+    def test_只取已通过的_去重排序(self) -> None:
+        self.store.save_contacts(ACCOUNT, [
+            _row("138", "张三·普工"),
+            _row("139", "李四·叉车"),
+            _row("140", "张三·普工"),      # 同名不同号：名单里只该有一个
+        ])
+        self.assertEqual(self.store.watched_session_names(ACCOUNT), ["张三·普工", "李四·叉车"])
 
-        got = await _pull(handler)
-        self.assertEqual(got, {"only": ["张三·普工", "李四"], "never": ["王五"]})
-        self.assertTrue(seen["url"].endswith("/recruitment-agent/client/watchlist"))
-        self.assertEqual(seen["auth"], "Bearer T")
+    def test_x_申请还没通过的不进名单(self) -> None:
+        """好友没通过 = 微信里根本没有那个会话窗口，进名单只会每轮白开一次、白吃一个读名额。
 
-    async def test_群名和人名一样收(self) -> None:
-        """群没有手机号、进不了 contacts，只能走这条路——这正是它是独立接口的理由。"""
-        got = await _pull(lambda r: httpx.Response(200, json={"only": ["普工招聘交流群", "张三"]}))
-        self.assertEqual(got, {"only": ["普工招聘交流群", "张三"]})
-
-    async def test_没登录不发请求(self) -> None:
-        called = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            called.append(1)
-            return httpx.Response(200, json={"only": []})
-
-        self.assertIsNone(await _pull(handler, token=""))
-        self.assertIsNone(await _pull(handler, base_url=""))
-        self.assertEqual(called, [])
-
-    async def test_x_拉不到一律返回_None_而不是空名单(self) -> None:
-        """None = 这轮没拿到（沿用现有名单）；空名单 = 一个会话都不回。绝不能混。"""
-        for name, handler in [
-            ("被拒", lambda r: httpx.Response(403, json={})),
-            ("服务器炸", lambda r: httpx.Response(500, text="boom")),
-            ("不是 JSON", lambda r: httpx.Response(200, text="<html>")),
-            ("不是对象", lambda r: httpx.Response(200, json=["张三"])),
-            ("没有 only/never", lambda r: httpx.Response(200, json={"updated_at": "x"})),
-        ]:
-            with self.subTest(name):
-                self.assertIsNone(await _pull(handler))
-
-    async def test_网络异常也是_None_不上抛(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            raise httpx.ConnectError("down")
-
-        self.assertIsNone(await _pull(handler))
-
-    async def test_x_接口还没上线时不刷日志_但好了之后还会再喊(self) -> None:
-        """★ 这条循环 120s 一轮，接口上线前后端一直 404——照直喊就是每天七百多条同样的话。
-
-        真机上 `business_api_url` 是配好的（contacts/candidates 在用），所以这条路
-        **确实会**每 120s 打一次，不是理论问题。
+        这类行还有第二个来源：业务后端推计划时自己写一条 `requested`，
+        那是「计划点名要加谁」，更不是「可以自动回复」。
         """
-        import structlog
+        self.store.save_contacts(ACCOUNT, [_row("138", "张三", status="requested")])
+        self.assertEqual(self.store.watched_session_names(ACCOUNT), [])
 
-        warnings: list[str] = []
+    def test_x_会话名是空的不进名单(self) -> None:
+        """名单按微信里显示的名字**逐字**寻址，空名字查无此人。"""
+        self.store.save_contacts(ACCOUNT, [_row("138", ""), _row("139", "   ")])
+        self.assertEqual(self.store.watched_session_names(ACCOUNT), [])
 
-        def capture(_logger, method_name, event_dict):
-            if method_name == "warning":          # info 那条「已同步」不算，只数抱怨
-                warnings.append(str(event_dict.get("event")))
-            return event_dict
+    def test_归位不了候选人的照样算(self) -> None:
+        """`worker_id` 为 null 只是「后端还没把这条上报归位到候选人」（api2 §4.2 明说映射不丢）。
 
-        structlog.configure(processors=[capture, structlog.processors.KeyValueRenderer()])
-        try:
-            def missing(_request: httpx.Request) -> httpx.Response:
-                return httpx.Response(404, json={})
+        人是真加上了、名字也是真的。拿它过滤就等于「刚通过好友、开口说话，分身不理」。
+        """
+        self.store.save_contacts(ACCOUNT, [_row("138", "张三", worker_id=None)])
+        self.assertEqual(self.store.watched_session_names(ACCOUNT), ["张三"])
 
-            directory = _directory(missing)
-            for _ in range(5):
-                self.assertIsNone(await directory.pull())
-            self.assertEqual(len(warnings), 1, f"同一种失败只该喊一次，实际 {warnings}")
+    def test_别的账号的不算(self) -> None:
+        self.store.save_contacts(ACCOUNT, [_row("138", "我的人")])
+        self.store.save_contacts("acct-2", [_row("139", "别人的人")])
+        self.assertEqual(self.store.watched_session_names(ACCOUNT), ["我的人"])
 
-            # 接口上线 → 成功一次 → 计数清零；再坏还会再喊。
-            directory._client = httpx.AsyncClient(
-                transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"only": ["张三"]}))
-            )
-            self.assertEqual(await directory.pull(), {"only": ["张三"]})
-            directory._client = httpx.AsyncClient(transport=httpx.MockTransport(missing))
-            self.assertIsNone(await directory.pull())
-            self.assertEqual(len(warnings), 2, "好过一次之后再坏，要重新喊一遍")
-        finally:
-            structlog.configure()
 
-    async def test_不同的失败各喊各的(self) -> None:
-        directory = _directory(lambda r: httpx.Response(404, json={}))
-        self.assertIsNone(await directory.pull())
-        directory._client = httpx.AsyncClient(
-            transport=httpx.MockTransport(lambda r: httpx.Response(500, text="boom"))
+class DerivedTakeoverTests(unittest.IsolatedAsyncioTestCase):
+    """派生结果怎么装进 `Watchlist`——**空的一律不接管**是这里的重点。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.store = GatewayStore(root / "gateway.db")
+        self.tickets = root / "tickets.json"
+        self.tickets.write_text(json.dumps({ACCOUNT: "tkt"}), encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _runner(self, watchlist: Watchlist) -> GatewayRunner:
+        return GatewayRunner(
+            settings=GatewaySettings(ai_ws_url="ws://127.0.0.1:1/ws", local_ticket_file=self.tickets),
+            ticket_provider=LocalFileTicketProvider(self.tickets),
+            store=self.store,
+            source=_SilentSource(),
+            sink=_SilentSink(),
+            accounts=[ACCOUNT],
+            watchlist=watchlist,
         )
-        self.assertIsNone(await directory.pull())
-        self.assertEqual(directory._last_complaint, "http:500")
 
-    async def test_后端真的给空名单是收的(self) -> None:
-        """★ 与上一条区分：后端**明确说**「一个都不管」是合法的，那是业务判断。"""
-        self.assertEqual(await _pull(lambda r: httpx.Response(200, json={"only": []})), {"only": []})
+    def test_派生出东西就装上(self) -> None:
+        self.store.save_contacts(ACCOUNT, [_row("138", "张三·普工")])
+        wl = Watchlist()
+        self.assertEqual(self._runner(wl)._apply_derived_watchlist(), 1)
+        self.assertEqual(wl.watched(), ["张三·普工"])
+
+    def test_x_派生出来是空的_绝不接管(self) -> None:
+        """★ 这一条是整次换源的安全阀。
+
+        现网 `gateway_contacts` 眼下还是 0 行。空名单意味着一个会话都不碰，而
+        `apply_backend` 一调就会把 AI 端那条推送永久挡掉——真拿空名单去接管，
+        等来的是整台机器全哑，而且退不回去。
+        """
+        wl = Watchlist()
+        wl.apply_push({"only": ["AI 端推来的张三"]})
+        self.assertEqual(self._runner(wl)._apply_derived_watchlist(), 0)
+        self.assertEqual(wl.watched(), ["AI 端推来的张三"], "沿用现有那份，不清空")
+        self.assertTrue(wl.apply_push({"only": ["李四"]}), "更没接管，AI 推送仍然生效")
+
+
+class _SilentSource:
+    async def fetch(self, account_id: str) -> list:  # pragma: no cover - 这组用例不读微信
+        return []
+
+
+class _SilentSink:
+    async def send(self, account_id: str, peer_id: str, text: str) -> str:  # pragma: no cover
+        raise AssertionError("这条测试不该往微信发东西")
 
 
 class CoexistenceTests(unittest.TestCase):
