@@ -253,10 +253,6 @@ class ClientAuth:
         self._on_revoked = hook
 
 
-def build_auth(data_dir: Path, base_url: str, *, client_version: str = "") -> ClientAuth:
-    return ClientAuth(base_url, data_dir, client_version=client_version)
-
-
 # ── 上次登录的邮箱（登录框里预填）──────────────────────────────────
 
 UI_STATE_FILE = "console-ui.json"

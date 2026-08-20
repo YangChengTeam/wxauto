@@ -6,7 +6,6 @@ from typing import Any
 import structlog
 
 from .errors import WeChatActionUnsupported, WeChatApiUnavailableError
-from .omni import OmniVisualDriver
 from .uia import UiaWeChatDriver
 
 logger = structlog.get_logger(__name__)
@@ -62,7 +61,6 @@ class WeChatApi:
         dry_run: bool = True,
         wechat_path: str | Path | None = None,
         wechat_driver_order: list[str] | None = None,
-        omni_visual_rpa_config: dict[str, Any] | None = None,
     ) -> None:
         self._uia_driver = UiaWeChatDriver(
             project_root=project_root,
@@ -72,7 +70,6 @@ class WeChatApi:
         self.project_root = self._uia_driver.project_root
         self.dry_run = self._uia_driver.dry_run
         self.wechat_driver_order = _normalize_driver_order(wechat_driver_order)
-        self.omni_visual_rpa_config = omni_visual_rpa_config or {}
         self._composite_driver = CompositeWeChatDriver(self._build_drivers())
 
     def __getattr__(self, name: str) -> Any:
@@ -232,14 +229,6 @@ class WeChatApi:
         for driver_name in self.wechat_driver_order:
             if driver_name == "uia":
                 drivers.append(self._uia_driver)
-            elif driver_name == "omni_visual":
-                drivers.append(
-                    OmniVisualDriver(
-                        project_root=self.project_root,
-                        dry_run=self.dry_run,
-                        rpa_config=self.omni_visual_rpa_config,
-                    )
-                )
             else:
                 logger.warning("wechat.driver.unknown", driver=driver_name)
         if not drivers:

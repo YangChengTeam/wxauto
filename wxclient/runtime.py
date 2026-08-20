@@ -68,7 +68,6 @@ class WeChatRuntime:
             dry_run=wechat_settings.dry_run,
             wechat_path=wechat_settings.wechat_path,
             wechat_driver_order=wechat_settings.wechat_driver_order,
-            omni_visual_rpa_config=wechat_settings.omni_visual_rpa_config,
         )
         self.worker = worker or OperationWorker(
             self.store,

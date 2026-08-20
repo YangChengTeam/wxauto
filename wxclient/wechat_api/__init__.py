@@ -1,6 +1,5 @@
 from .service import (
     CompositeWeChatDriver,
-    OmniVisualDriver,
     UiaWeChatDriver,
     WeChatActionUnsupported,
     WeChatApi,
@@ -10,7 +9,6 @@ from .service import (
 
 __all__ = [
     "CompositeWeChatDriver",
-    "OmniVisualDriver",
     "UiaWeChatDriver",
     "WeChatActionUnsupported",
     "WeChatApi",

@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
+from .pacing import MIN_FRIEND_INTERVAL_SECONDS, MIN_READ_INTERVAL_SECONDS
 
 # 明确的**拒绝联系**表达——命中即永久停止对该联系人的一切自动化动作并拉黑。
 # 宁可多拦，不可漏拦：被误拦的后果只是少发一条消息。
@@ -147,14 +148,14 @@ def action_limits_from(settings) -> dict[str, RateLimit]:
 
 
 #: 读类动作的最小间隔（秒）。读不打扰任何人，但一样是「机器在动微信」——
-#: 半夜每秒翻一次联系人，风控看的就是这个。与 `pacing.py` 的轮询下限同源同值：
+#: 半夜每秒翻一次联系人，风控看的就是这个。与 `pacing.py` 的轮询下限同源同值（直接引用那两个常量，不再各抄一份）：
 #: 那边管的是常驻循环，这里管的是 AI 端随时下发的读指令，绕开哪一边红线都不成立。
 READ_ACTION = "read"                  # 读消息 / 翻聊天记录 / 查联系人 / 看朋友圈
 READ_FRIENDS_ACTION = "read_friends"  # 查新好友申请（加好友相关，节拍必须慢得多）
 
 READ_INTERVALS: dict[str, float] = {
-    READ_ACTION: 30.0,
-    READ_FRIENDS_ACTION: 300.0,
+    READ_ACTION: MIN_READ_INTERVAL_SECONDS,
+    READ_FRIENDS_ACTION: MIN_FRIEND_INTERVAL_SECONDS,
 }
 
 

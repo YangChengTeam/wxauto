@@ -2390,29 +2390,6 @@ def _session_preview_is_self_message(preview: Any, message_text: str) -> bool:
     return False
 
 
-def _session_preview_self_reason(preview: Any, outbound_texts: list[str] | None = None) -> str | None:
-    preview_text = str(preview or "").strip()
-    if not preview_text:
-        return None
-    outbound = [str(text or "").strip() for text in outbound_texts or [] if str(text or "").strip()]
-    self_prefixes = (
-        "\u4f60:",
-        "\u4f60\uff1a",
-        "\u6211:",
-        "\u6211\uff1a",
-        "You:",
-        "Me:",
-    )
-    for prefix in self_prefixes:
-        if preview_text.startswith(prefix):
-            tail = preview_text[len(prefix) :].strip()
-            if not outbound or not tail or tail in outbound or preview_text in outbound:
-                return f"preview_prefix:{prefix}"
-    if outbound and preview_text in outbound:
-        return "preview_matches_outbound"
-    return None
-
-
 def _message_needs_sender_annotation(message: dict[str, Any]) -> bool:
     if message.get("is_self") is not None:
         return False

@@ -35,7 +35,6 @@ class Settings(BaseSettings):
     wechat_path: Path | None = None
     dry_run: bool = True
     wechat_driver_order: list[str] = Field(default_factory=lambda: ["uia"])
-    omni_visual_rpa_config: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def resolved_database_path(self) -> Path:

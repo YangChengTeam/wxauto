@@ -79,19 +79,3 @@ def load(data_dir: Path) -> Device:
             pass
     return Device(device_id=device_id, device_name=device_name, os_version=os_version())
 
-
-def rename(data_dir: Path, device_name: str) -> Device:
-    """改设备名（企业端的会话列表里显示的就是它）。"""
-    current = load(data_dir)
-    path = Path(data_dir) / FILE_NAME
-    name = (device_name.strip() or current.device_name)[:120]
-    try:
-        path.write_text(
-            json.dumps({"device_id": current.device_id, "device_name": name},
-                       ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except OSError:
-        pass
-    return Device(device_id=current.device_id, device_name=name,
-                  os_version=current.os_version)

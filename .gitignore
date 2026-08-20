@@ -31,7 +31,6 @@ wxclient/uia_unlock/diagnostics/
 runtime_images/
 
 # Third-party source copies
-third_party/omni-bot-sdk-oss/
 
 # Exported design artifacts
 docs/wxclient-architecture.png
@@ -42,7 +41,6 @@ docs/wxclient-gui-figma-board.svg
 scripts/probe_wechat_native_com.py
 
 # Experimental dependencies
-requirements-omni-visual-rpa.txt
 
 # Local secrets/config
 .env
