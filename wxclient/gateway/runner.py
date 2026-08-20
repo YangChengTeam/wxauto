@@ -36,7 +36,13 @@ from .contacts import STATUS_REQUESTED as CONTACT_REQUESTED
 from .contacts import ContactDirectory
 from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from, within_active_hours
-from .inbound import FOLLOW_UP_RETRY, InboundLoop, InboundMessage, MessageSource
+from .inbound import (
+    FOLLOW_UP_RETRY,
+    InboundLoop,
+    InboundMessage,
+    MessageSource,
+    format_history,
+)
 from .outbound import DeliveryResult, MessageSink, OutboundSender
 from .pacing import MIN_READ_INTERVAL_SECONDS, PACING_EVENT, clamp_interval
 from .schedule import ScheduleLoop, parse_schedule_at
@@ -54,6 +60,10 @@ KEEPALIVE_INTERVAL_SECONDS = 30.0
 #: 候选人会话名多久同步一次（api2 §4.2）。它问的是业务后端、不碰微信，不受节拍红线约束；
 #: 但也没必要勤——名单变化很慢，而且增量同步只取水位之后的。
 CONTACTS_SYNC_INTERVAL_SECONDS = 600.0
+
+#: 每轮往上带多少条历史。够 AI 端判「这一步走完没有」，又不至于把每轮的输入撑成一倍——
+#: 这段文本每轮都要重新发一遍，是按 token 计费的。
+HISTORY_TURNS = 30
 
 #: 调试会话在会话表里占的「对端」。前后各两条下划线，撞不上任何真实 wxid。
 #: 存进同一张表是为了让它和真实会话一样**长命**——关掉窗口再打开，上下文还在。
@@ -552,7 +562,10 @@ class GatewayRunner:
                     session_id,
                     transcript,
                     refs=self._peer_refs(account_id, peer_id),
-                    extra={"wechat": self._turn_meta(peer_id, messages)},
+                    extra={
+                        "wechat": self._turn_meta(peer_id, messages),
+                        "history": self._history_for(account_id, peer_id, messages),
+                    },
                 )
             except Unauthorized:
                 # 票据/归属出问题：会话多半已经不属于我们了，清掉重来。
@@ -699,6 +712,23 @@ class GatewayRunner:
         （「微信端没有在线的网关」）也一起被吞了。
         """
         self._command_listener = listener
+
+    def _history_for(
+        self, account_id: str, peer_id: str, messages: Sequence[InboundMessage]
+    ) -> str:
+        """这一轮**之前**这段对话说过什么（AI 端据此判「这一步走完没有」）。
+
+        ★ 与本轮的 ``transcript`` **分成两条**送上去：AI 端有一堆确定性判定（拒绝识别、
+        来意、是不是只有表情）只该看这一轮。历史并进本轮，三天前那句「我暂时不找了」
+        会每轮重新收口一次。
+
+        本轮那几条要摘掉——它们已经在 ``transcript`` 里，再当历史送一遍，同一句话会出现两次。
+        只有这台机器**亲眼读到过**的才在里面：微信里更早的聊天我们没读过，也不去翻。
+        """
+        rows = self._store.recent_messages(
+            account_id, peer_id, limit=HISTORY_TURNS, exclude=[m.msg_id for m in messages]
+        )
+        return format_history(rows)
 
     def _peer_refs(self, account_id: str, peer_id: str) -> list[dict[str, Any]]:
         """这一轮对面是哪个候选人（047 的 `@` 引用协议）。

@@ -114,6 +114,18 @@ CREATE TABLE IF NOT EXISTS gateway_contact_sync (
   account_id   TEXT PRIMARY KEY,
   synced_until TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS gateway_messages (
+  account_id TEXT NOT NULL,
+  peer_id    TEXT NOT NULL,
+  msg_id     TEXT NOT NULL,
+  at         TEXT NOT NULL,
+  at_text    TEXT NOT NULL DEFAULT '',
+  from_self  INTEGER NOT NULL DEFAULT 0,
+  text       TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (account_id, peer_id, msg_id)
+);
+CREATE INDEX IF NOT EXISTS idx_messages_peer_time
+  ON gateway_messages (account_id, peer_id, at);
 """
 
 
@@ -675,6 +687,89 @@ class GatewayStore:
             )
             conn.commit()
         return stale
+
+    # ────────────────────────── 聊天记录（喂给 AI 端判进度）──────────────────────────
+
+    def record_messages(self, account_id: str, peer_id: str, rows: Iterable[dict]) -> int:
+        """把这个会话里**看到过**的消息记下来（双方都记），返回真正新增了几条。
+
+        为什么要记：AI 端每一轮只收得到「这一趟去抖攒下的那几条」，而它要判的是
+        「这一步走完没有」——对方上周答应过来看看、专员前天已经问过工种，这些都在更早的
+        轮次里。不留一份，换个会话或者隔一天，那些事就等于没发生过。
+
+        只记**这台机器亲眼读到的**：微信里更早的聊天记录我们没读过，也不去翻。
+        重复推同一条不会记两遍（PK 就是 msg_id）。
+        """
+        values = [
+            (
+                account_id,
+                peer_id,
+                str(row.get("msg_id") or ""),
+                str(row.get("at") or ""),
+                str(row.get("at_text") or ""),
+                1 if row.get("from_self") else 0,
+                str(row.get("text") or ""),
+            )
+            for row in rows
+            if row.get("msg_id")
+        ]
+        if not values:
+            return 0
+        with closing(self._connect()) as conn:
+            before = conn.total_changes
+            conn.executemany(
+                """INSERT OR IGNORE INTO gateway_messages
+                       (account_id, peer_id, msg_id, at, at_text, from_self, text)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                values,
+            )
+            conn.commit()
+            return conn.total_changes - before
+
+    def recent_messages(
+        self,
+        account_id: str,
+        peer_id: str,
+        *,
+        limit: int = 40,
+        exclude: Iterable[str] = (),
+    ) -> list[dict]:
+        """这个会话最近的几条，**时间正序**（老→新）。
+
+        ``exclude`` 用来把「这一轮本来就要发过去的那几条」摘掉——它们已经在本轮上下文里，
+        再当历史发一遍，AI 端会看到同一句话出现两次。
+        """
+        skip = {str(x) for x in exclude}
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT msg_id, at, at_text, from_self, text FROM gateway_messages
+                   WHERE account_id=? AND peer_id=?
+                   ORDER BY at DESC, rowid DESC LIMIT ?""",
+                (account_id, peer_id, max(1, limit) + len(skip)),
+            ).fetchall()
+        out = [
+            {
+                "msg_id": row[0],
+                "at": row[1],
+                "at_text": row[2],
+                "from_self": bool(row[3]),
+                "text": row[4],
+            }
+            for row in rows
+            if row[0] not in skip
+        ]
+        return list(reversed(out[:limit]))
+
+    def purge_messages_before(self, cutoff: datetime) -> int:
+        """清掉太老的聊天记录，返回清了几条。
+
+        这份记录是**给 AI 端当短期背景**用的，不是聊天记录归档——留着不清，一台跑几个月的
+        机器会把候选人的对话原文攒成一个越来越大的本地文件（真实 PII）。
+        """
+        with closing(self._connect()) as conn:
+            cur = conn.execute("DELETE FROM gateway_messages WHERE at < ?", (cutoff.isoformat(),))
+            conn.commit()
+            return cur.rowcount or 0
 
     # ────────────────────────── 发送计数（频次守门）──────────────────────────
 

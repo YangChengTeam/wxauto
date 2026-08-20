@@ -111,6 +111,13 @@ FOLLOW_UP_RETRY = "retry"
 FOLLOW_UP_DEFER = "defer"
 """被规则挡下（额度用完、不在时间窗）——留着重投，**不计失败**：这类拦截一定会自己过期。"""
 
+HISTORY_MAX_AGE_DAYS = 14
+"""聊天记录留多久（喂给 AI 端当背景用的，不是聊天归档）。
+
+这份记录里是候选人对话原文——真实 PII 落在专员自己的电脑上。留够判「这一步走完没有」
+就行，一台跑几个月的机器不该把它攒成一个越来越大的本地文件。
+"""
+
 TurnHandler = Callable[[str, str, str, Sequence[InboundMessage]], Awaitable[Any]]
 """(account_id, peer_id, transcript, messages) -> 结果对象（可带 `follow_up`）或 None"""
 
@@ -125,6 +132,26 @@ def format_transcript(messages: Iterable[InboundMessage]) -> str:
         who = "专员本人" if message.from_self else "对方"
         when = message.at_text or f"{message.at:%H:%M}"
         lines.append(f"[{who} · {when}] {message.text}")
+    return "\n".join(lines)
+
+
+def format_history(rows: Iterable[dict]) -> str:
+    """把存下来的聊天记录拼成与 `format_transcript` **一模一样**的行格式。
+
+    两边必须逐字同形：AI 端那头是同一个解析器（`context.mjs` 的 `parseTranscript`），
+    格式一分岔，历史里的话就会被当成「对方刚说的」。
+    """
+    lines = []
+    for row in rows:
+        who = "专员本人" if row.get("from_self") else "对方"
+        when = str(row.get("at_text") or "")
+        if not when:
+            at = str(row.get("at") or "")
+            when = at[11:16] if len(at) >= 16 else at
+        text = str(row.get("text") or "").strip()
+        if not text:
+            continue
+        lines.append(f"[{who} · {when}] {text}")
     return "\n".join(lines)
 
 
@@ -304,6 +331,12 @@ class InboundLoop:
             return
         self._store.mark_seen(account_id, peer_id, [m.msg_id for m in fresh])
 
+        # ★ 看到的都记下来（双方的话都记）。AI 端每一轮只收得到「这一趟攒下的那几条」，
+        # 而它要判的是「这一步走完没有」——对方上周答应过来看看、专员前天已经问过工种，
+        # 都在更早的轮次里。记在这里，下一轮当历史一并送上去（见 `GatewayRunner._history_for`）。
+        # 放在拒绝闸**之前**：那条「别再联系我了」本身也是这段对话的一部分，记下来才对得上。
+        self._store.record_messages(account_id, peer_id, [message_to_row(m) for m in fresh])
+
         # 对方真说话了 = 这个会话正热着 → 接下来几分钟读得勤一点（见 `_interval_for`）。
         if any(not message.from_self for message in fresh):
             self._last_activity = now
@@ -436,6 +469,11 @@ class InboundLoop:
         进程重启、AI 端断线恢复之后靠这一步把欠的账补上。幂等由 ``gateway_seen_messages``
         保证——重投的还是同一批 msg_id，不会二次触发别的规则。
         """
+        # 顺手清掉过保鲜期的聊天记录（真实 PII，不留成越来越大的本地归档）。
+        dropped = self._store.purge_messages_before(now - timedelta(days=HISTORY_MAX_AGE_DAYS))
+        if dropped:
+            _log.info("清掉过期聊天记录", 条数=dropped, 保留天数=HISTORY_MAX_AGE_DAYS)
+
         cutoff = now - timedelta(hours=PENDING_MAX_AGE_HOURS)
         for row in self._store.purge_pending_inbound_before(cutoff):
             self._pending_loaded.discard(row["batch_id"])
