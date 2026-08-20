@@ -64,3 +64,8 @@ Thumbs.db
 .claude/
 .codex/
 CLAUDE.md
+
+# 打包机上还留着这份 vendored GPL-3.0 源（omni_visual 驱动已删，仓里也从未跟踪过它）。
+# 继续忽略：它不该被谁 git add 进来。
+third_party/omni-bot-sdk-oss/
+requirements-omni-visual-rpa.txt
