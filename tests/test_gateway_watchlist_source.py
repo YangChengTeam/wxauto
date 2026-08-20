@@ -11,7 +11,7 @@ import unittest
 
 import httpx
 
-from wxclient.gateway.watchlist import WatchScope, Watchlist
+from wxclient.gateway.watchlist import Watchlist, WatchScope
 from wxclient.gateway.watchlist_sync import WatchlistDirectory
 
 
@@ -74,6 +74,51 @@ class WatchlistPullTests(unittest.IsolatedAsyncioTestCase):
             raise httpx.ConnectError("down")
 
         self.assertIsNone(await _pull(handler))
+
+    async def test_x_接口还没上线时不刷日志_但好了之后还会再喊(self) -> None:
+        """★ 这条循环 120s 一轮，接口上线前后端一直 404——照直喊就是每天七百多条同样的话。
+
+        真机上 `business_api_url` 是配好的（contacts/candidates 在用），所以这条路
+        **确实会**每 120s 打一次，不是理论问题。
+        """
+        import structlog
+
+        warnings: list[str] = []
+
+        def capture(_logger, method_name, event_dict):
+            if method_name == "warning":          # info 那条「已同步」不算，只数抱怨
+                warnings.append(str(event_dict.get("event")))
+            return event_dict
+
+        structlog.configure(processors=[capture, structlog.processors.KeyValueRenderer()])
+        try:
+            def missing(_request: httpx.Request) -> httpx.Response:
+                return httpx.Response(404, json={})
+
+            directory = _directory(missing)
+            for _ in range(5):
+                self.assertIsNone(await directory.pull())
+            self.assertEqual(len(warnings), 1, f"同一种失败只该喊一次，实际 {warnings}")
+
+            # 接口上线 → 成功一次 → 计数清零；再坏还会再喊。
+            directory._client = httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda r: httpx.Response(200, json={"only": ["张三"]}))
+            )
+            self.assertEqual(await directory.pull(), {"only": ["张三"]})
+            directory._client = httpx.AsyncClient(transport=httpx.MockTransport(missing))
+            self.assertIsNone(await directory.pull())
+            self.assertEqual(len(warnings), 2, "好过一次之后再坏，要重新喊一遍")
+        finally:
+            structlog.configure()
+
+    async def test_不同的失败各喊各的(self) -> None:
+        directory = _directory(lambda r: httpx.Response(404, json={}))
+        self.assertIsNone(await directory.pull())
+        directory._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda r: httpx.Response(500, text="boom"))
+        )
+        self.assertIsNone(await directory.pull())
+        self.assertEqual(directory._last_complaint, "http:500")
 
     async def test_后端真的给空名单是收的(self) -> None:
         """★ 与上一条区分：后端**明确说**「一个都不管」是合法的，那是业务判断。"""

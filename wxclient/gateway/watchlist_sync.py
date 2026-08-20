@@ -51,7 +51,20 @@ def _clean_names(raw: Any) -> list[str] | None:
 
 
 class WatchlistDirectory(BackendEndpoint):
-    """从业务后端取监听名单。**永不往上抛**，拉不到就是拉不到。"""
+    """从业务后端取监听名单。**永不往上抛**，拉不到就是拉不到。
+
+    ★ 同一种失败只喊一次（`_last_complaint`）。这条循环 120s 一轮，而接口上线之前
+    后端会一直回 404——照直喊就是专员日志里每天七百多条同样的话，把真正要看的东西冲掉。
+    成功一次就清零，所以接口一上线、或者中途抖了一下又好了，下次再坏还会再喊。
+    """
+
+    _last_complaint: str | None = None
+
+    def _complain(self, message: str, key: str, **fields: Any) -> None:
+        if self._last_complaint == key:
+            return
+        self._last_complaint = key
+        _log.warning(message, **fields)
 
     async def pull(self) -> dict[str, list[str]] | None:
         """取一份名单 → `{"only": [...], "never": [...]}`；拉不到返回 None。
@@ -62,16 +75,22 @@ class WatchlistDirectory(BackendEndpoint):
         response = await self._send("GET", f"{self._base_url}{WATCHLIST_PATH}")
         if response is None:
             return None
+        if response.status_code in (404, 501):
+            # 接口还没上线。这不是故障，是「后端那半还没到」——说一次就够，别每 120s 喊一遍。
+            self._complain("监听名单接口后端还没提供，暂时沿用现有名单（spec 085）",
+                           f"missing:{response.status_code}", status=response.status_code)
+            return None
         if response.status_code >= 400:
-            _log.warning("监听名单接口被拒", status=response.status_code)
+            self._complain("监听名单接口被拒", f"http:{response.status_code}",
+                           status=response.status_code)
             return None
         try:
             body = response.json()
         except Exception:  # noqa: BLE001
-            _log.warning("监听名单接口响应不是合法 JSON")
+            self._complain("监听名单接口响应不是合法 JSON", "badjson")
             return None
         if not isinstance(body, dict):
-            _log.warning("监听名单接口响应形状不对")
+            self._complain("监听名单接口响应形状不对", "badshape")
             return None
 
         out: dict[str, list[str]] = {}
@@ -81,7 +100,8 @@ class WatchlistDirectory(BackendEndpoint):
                 out[key] = names
         if not out:
             # 一个键都没有 = 这个响应什么也没说。当成没拿到，别拿它去覆盖现有名单。
-            _log.warning("监听名单接口没给 only/never，按没拿到处理")
+            self._complain("监听名单接口没给 only/never，按没拿到处理", "nokeys")
             return None
+        self._last_complaint = None  # 成功一次就清零：下次再坏还会再喊一遍
         _log.info("监听名单已同步", only=len(out.get("only", [])), never=len(out.get("never", [])))
         return out
