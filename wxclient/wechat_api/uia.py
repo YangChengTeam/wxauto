@@ -19,6 +19,44 @@ from .errors import WeChatApiError, WeChatApiUnavailableError
 
 logger = structlog.get_logger(__name__)
 
+#: `_disable_esc_close_fallback` 只需要生效一次，模块级记一下别反复包。
+_ESC_CLOSE_FALLBACK_DISABLED = False
+
+
+def _disable_esc_close_fallback() -> None:
+    """让 pywinauto 的 ``close()`` 关不掉时**什么都不做**，而不是回退去按 ESC。
+
+    pywinauto 的 ``UIAWrapper.close()`` 只有支持 Window 模式的控件才真关得掉；
+    关不掉它就 ``type_keys("{ESC}")`` 兜底（它源码里的理由是「menu shadows, tooltips」）。
+    可微信 4.x 里 **ESC = 关窗口** —— 一下就把整个微信收进右下角托盘，UIA 子树跟着被收走，
+    之后每条指令、每次读消息全失败，而且 ``_restore_if_minimized`` 救不回来（那只救最小化），
+    只能人去点托盘图标。同一个坑我们自己在 ``_leave_search`` 踩过一次，那次是自己按的 ESC；
+    这次是 **vendor 里那些 ``close()``** 替我们按 —— 我们改不到每一处调用，就把兜底本身摘掉。
+
+    关不掉的面板顶多留在屏幕上，下一个动作会把它带走；把微信关进托盘是不可逆的。
+    两害相权取其轻：**关不掉就不关。**
+
+    pywinauto 装不上（Linux 上跑单测）时静默跳过——这条只在真机上才有意义。
+    """
+    global _ESC_CLOSE_FALLBACK_DISABLED
+    if _ESC_CLOSE_FALLBACK_DISABLED:
+        return
+    try:
+        from pywinauto import uia_defines
+        from pywinauto.controls.uiawrapper import UIAWrapper
+    except Exception:      # noqa: BLE001 - 没有 pywinauto 就没有这个兜底，无事可做
+        return
+
+    def close_without_esc(self: Any) -> None:
+        try:
+            self.iface_window.Close()
+        except uia_defines.NoPatternInterfaceError:
+            # 原实现在这儿按 ESC。留个日志，别留个「微信没了」。
+            logger.info("uia.close.no_window_pattern")
+
+    UIAWrapper.close = close_without_esc
+    _ESC_CLOSE_FALLBACK_DISABLED = True
+
 
 class UiaWeChatDriver:
     driver_name = "uia"
@@ -1454,6 +1492,8 @@ class UiaWeChatDriver:
             module = __import__("pyweixin", fromlist=[name, "GlobalConfig"])
         except ImportError as exc:
             raise WeChatApiUnavailableError(f"pyweixin is unavailable: {exc}") from exc
+
+        _disable_esc_close_fallback()
 
         config = getattr(module, "GlobalConfig", None)
         if config is not None:

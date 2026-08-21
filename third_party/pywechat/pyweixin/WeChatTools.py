@@ -830,7 +830,7 @@ class Navigator():
             Tools.cancel_pin(main_window)
         offline_button=main_window.child_window(**Buttons.OffLineButton)
         if offline_button.exists(timeout=0.1):
-            main_window.close()
+            # ★劳小智改动：原来这里 main_window.close()——出错就把微信主窗口关掉。微信 4.x 里那等于收进右下角托盘，UIA 子树跟着被收走，之后每条指令、每次读消息全失败，而且只能人去点托盘图标才救得回来。错误本身由下面的 raise 表达就够了，不该顺手关掉人家的微信。
             raise NetWorkError('当前网络不可用,无法进行UI自动化!')
         return main_window
     
@@ -983,7 +983,7 @@ class Navigator():
         chatinfo_button=main_window.child_window(**Buttons.ChatInfoButton)
         #三种情况,非好友,好友.群聊
         if not chatinfo_button.exists(timeout=0.1):
-            main_window.close()
+            # ★劳小智改动：原来这里 main_window.close()——出错就把微信主窗口关掉。微信 4.x 里那等于收进右下角托盘，UIA 子树跟着被收走，之后每条指令、每次读消息全失败，而且只能人去点托盘图标才救得回来。错误本身由下面的 raise 表达就够了，不该顺手关掉人家的微信。
             raise NotFriendError(f'非正常好友或群聊！无法打开该好友或群聊的聊天信息界面')
         else: 
             if not Tools.is_group_chat(main_window):
@@ -1019,7 +1019,7 @@ class Navigator():
         except Exception:
             chatinfo_button=main_window.child_window(**Buttons.ChatInfoButton)
             chatinfo_button.click_input()
-            main_window.close()
+            # ★劳小智改动：原来这里 main_window.close()——出错就把微信主窗口关掉。微信 4.x 里那等于收进右下角托盘，UIA 子树跟着被收走，之后每条指令、每次读消息全失败，而且只能人去点托盘图标才救得回来。错误本身由下面的 raise 表达就够了，不该顺手关掉人家的微信。
             raise NotFriendError(f'此为群聊,非好友,无法打开个人简介界面!')
         
     @staticmethod
@@ -1303,12 +1303,12 @@ class Navigator():
                 else:
                     add_friend_window.close()
                     chat_button.click_input()
-                    main_window.close()
+                    # ★劳小智改动：原来这里 main_window.close()——出错就把微信主窗口关掉。微信 4.x 里那等于收进右下角托盘，UIA 子树跟着被收走，之后每条指令、每次读消息全失败，而且只能人去点托盘图标才救得回来。错误本身由下面的 raise 表达就够了，不该顺手关掉人家的微信。
                     raise NoSuchFriendError
                 return main_window
             if not search_result and not search_mobile:#没有搜索结果也没有绿色网络查找qq/手机号选项
                 chat_button.click_input()
-                main_window.close()
+                # ★劳小智改动：原来这里 main_window.close()——出错就把微信主窗口关掉。微信 4.x 里那等于收进右下角托盘，UIA 子树跟着被收走，之后每条指令、每次读消息全失败，而且只能人去点托盘图标才救得回来。错误本身由下面的 raise 表达就够了，不该顺手关掉人家的微信。
                 raise NoSuchFriendError
 
     @staticmethod                    
@@ -1432,7 +1432,7 @@ class Navigator():
             return dialog_window
         else:#搜索结果栏中没有关于传入参数friend好友昵称或备注的搜索结果，关闭主界面,引发NosuchFriend异常
             chat_button.click_input()
-            main_window.close()
+            # ★劳小智改动：原来这里 main_window.close()——出错就把微信主窗口关掉。微信 4.x 里那等于收进右下角托盘，UIA 子树跟着被收走，之后每条指令、每次读消息全失败，而且只能人去点托盘图标才救得回来。错误本身由下面的 raise 表达就够了，不该顺手关掉人家的微信。
             raise NoSuchFriendError
     @staticmethod
     def open_chat_search_window(keyword:str,window_maximize:bool=None,is_maximize:bool=None,close_weixin:bool=None)->tuple[WindowSpecification,WindowSpecification]:
@@ -1501,7 +1501,7 @@ class Navigator():
         main_window=Navigator.open_dialog_window(friend=friend,is_maximize=is_maximize,search_pages=search_pages)
         chat_history_button=main_window.child_window(**Buttons.ChatHistoryButton)
         if not chat_history_button.exists(timeout=0.3):
-            main_window.close()
+            # ★劳小智改动：原来这里 main_window.close()——出错就把微信主窗口关掉。微信 4.x 里那等于收进右下角托盘，UIA 子树跟着被收走，之后每条指令、每次读消息全失败，而且只能人去点托盘图标才救得回来。错误本身由下面的 raise 表达就够了，不该顺手关掉人家的微信。
             raise NotFriendError(f'非正常好友或群聊！无法打开该好友或群聊的聊天记录界面')
         is_group_chat=Tools.is_group_chat(main_window)
         if not is_group_chat:

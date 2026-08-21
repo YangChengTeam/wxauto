@@ -273,6 +273,10 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "uia.operation_probe":
         status = "可用" if payload.get("uia_exposed") else "不可用"
         return f"微信 UIA 探测完成：{status}，原因：{payload.get('reason') or '-'}"
+    if event == "uia.close.no_window_pattern":
+        # 这一条是「没做什么」的留痕：pywinauto 关不掉这个控件，原本会按 ESC 兜底，
+        # 而 ESC 在微信 4.x 里就是把微信收进托盘。宁可让面板留在屏幕上。
+        return "有个面板关不掉，按原样留着了（没按 ESC——那会把微信收进托盘）"
     if event == "uia.operation_probe.after_restore":
         status = "可用" if payload.get("uia_exposed") else "仍不可用"
         return (
