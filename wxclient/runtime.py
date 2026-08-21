@@ -14,12 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from pathlib import Path
 from typing import Any
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from wxclient.config import Settings, load_settings
+from wxclient.config import Settings
 from wxclient.queue import OperationWorker, Task, TaskStatus, TaskStore, TaskType
 from wxclient.wechat_api import WeChatApi
 
@@ -75,14 +74,6 @@ class WeChatRuntime:
             poll_interval=0.1,
         )
 
-    @classmethod
-    def from_config(
-        cls,
-        config_path: str | Path | None,
-        runtime_settings: RuntimeSettings,
-    ) -> WeChatRuntime:
-        return cls(load_settings(config_path), runtime_settings)
-
     def start(self) -> None:
         self.worker.start()
 
@@ -124,12 +115,6 @@ class WeChatRuntime:
         result = self.task_to_dict(task) if task else {"task_id": task_id}
         result["timed_out"] = True
         return result
-
-    def get_task(self, task_id: str) -> dict[str, Any]:
-        task = self.store.get(task_id)
-        if task is None:
-            raise ValueError(f"Unknown task: {task_id}")
-        return self.task_to_dict(task)
 
     def list_tasks(self, limit: int = 20) -> list[dict[str, Any]]:
         safe_limit = min(max(int(limit), 1), 100)

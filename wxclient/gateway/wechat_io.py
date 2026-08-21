@@ -227,19 +227,6 @@ class QueueMessageSource:
         self._rotation = 0
         self._unreachable: set[str] = set()
 
-    def skip_reason(self, account_id: str, peer_id: str) -> str | None:
-        """这个会话该不该碰；返回不碰的理由，None 表示可以处理。
-
-        判定放在**打开会话之前**：打开一个聊天窗口本身就是打扰（窗口会弹到前台，
-        还会把未读清掉），不该为了判断该不该回而先去动它。名单本身由 AI 端推下来
-        （``watchlist.py``），这里只负责照办。
-
-        ★ 判据**只有名单**，不再看「是不是群」（用户裁决 2026-08-14）：要不要管一个群，
-        是 AI 端那份名单说了算的业务判断。这也顺带解掉了老问题——判断是不是群本来就得
-        先把会话打开才知道，等于为了「决定要不要打扰」先打扰一次。
-        """
-        return self._watchlist.reason(peer_id)
-
     async def fetch(self, account_id: str) -> list[InboundMessage]:
         """读名单里的会话，按游标切出新消息。
 

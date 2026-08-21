@@ -826,10 +826,6 @@ class GatewayRunner:
         """离下一趟读消息还有几秒（None = 现在不会读）。只读，给桌面端状态栏用。"""
         return self.loop.seconds_to_next_poll()
 
-    def scheduled_count(self) -> int:
-        """还排着几条定时指令（077）。只读，给状态栏用。"""
-        return self._store.count_scheduled_commands()
-
     def pending_backlog(self) -> int:
         """入站待处理队列里还欠着几批（070）。只读，给状态栏用。
 

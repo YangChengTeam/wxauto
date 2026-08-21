@@ -264,10 +264,6 @@ class TaskStore:
             ).mappings().fetchone()
         return self._from_row(row) if row else None
 
-    def next_pending(self) -> Task | None:
-        """Compatibility wrapper for callers that have not adopted leases yet."""
-        return self.claim_next("legacy-worker")
-
     def recover_expired(self) -> int:
         now = utcnow()
         recovered = 0
@@ -492,25 +488,6 @@ class TaskStore:
                 query.order_by(self.tasks.c.updated_at.desc()).limit(limit)
             ).mappings().fetchall()
         return [self._from_row(row) for row in rows]
-
-    def delete_tasks(
-        self,
-        task_types: set[TaskType | str] | None = None,
-        statuses: set[TaskStatus | str] | None = None,
-    ) -> int:
-        query = delete(self.tasks)
-        clauses: list[Any] = []
-        type_values = _task_type_values(task_types)
-        if type_values:
-            clauses.append(self.tasks.c.type.in_(type_values))
-        status_values = _task_status_values(statuses)
-        if status_values:
-            clauses.append(self.tasks.c.status.in_(status_values))
-        if clauses:
-            query = query.where(and_(*clauses))
-        with self.engine.begin() as conn:
-            result = conn.execute(query)
-        return int(result.rowcount or 0)
 
     def get(self, task_id: str) -> Task | None:
         with self.engine.connect() as conn:

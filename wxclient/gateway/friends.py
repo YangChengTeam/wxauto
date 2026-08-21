@@ -62,10 +62,6 @@ class FriendWatcher:
     def enabled(self) -> bool:
         return self._interval > 0 and bool(self._accounts)
 
-    def pending_count(self, account_id: str) -> int:
-        """上次查到的待处理申请数。只读，给状态展示用。"""
-        return self._pending.get(account_id, 0)
-
     async def tick(self) -> int:
         """查一趟，返回所有账号加起来的待处理申请数。"""
         if not self.enabled or not self._within_active_hours():

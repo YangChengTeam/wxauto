@@ -215,10 +215,6 @@ class Debouncer:
                 del self._buffers[key]
         return due
 
-    @property
-    def pending_peers(self) -> int:
-        return sum(1 for b in self._buffers.values() if b.messages)
-
 
 class InboundLoop:
     """入站主循环。"""
