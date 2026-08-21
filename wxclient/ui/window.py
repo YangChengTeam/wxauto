@@ -1204,6 +1204,11 @@ class MainWindow:
         # 主线程读它不拿锁、不查库、不进网关（原来这儿每秒要开一次 SQLite 连接）。
         snapshot = self.service.status()
         connected, total = snapshot.connected, snapshot.accounts
+        # ★ 这一格**不再显示积压**（原来是「已连接 · 欠 N 批」）。用户 2026-08-21：
+        #   「欠这个意思也不懂」——「欠」是记账口径不是人话，而且这格只有几个字的地方，
+        #   说不清「读到了没回出去」和「消息丢了」的区别。改成积压一变就往实时日志写
+        #   整整一行（`GatewayService._report_backlog` + `logging_config` 里那段话），
+        #   070 那个「微信显示已读、可是没人回」的知情需求由那一行满足，信息只多不少。
         if state is not ServiceState.RUNNING:
             self._rows["gateway"].configure(text="未启动", fg=theme.GRAY)
         elif connected <= 0:
@@ -1213,10 +1218,6 @@ class MainWindow:
                 text="连不上" if failed else "连接中",
                 fg=theme.RED if failed else theme.ORANGE,
             )
-        elif (backlog := snapshot.backlog) > 0:
-            # 连着但有积压：消息读到了、还没送出去。不显示出来的话，专员看到的就是
-            # 「微信显示已读、可是没人回」——只会以为功能坏了（070）。
-            self._rows["gateway"].configure(text=f"已连接 · 欠 {backlog} 批", fg=theme.ORANGE)
         elif connected >= total:
             self._rows["gateway"].configure(text="已连接", fg=theme.GREEN)
         else:

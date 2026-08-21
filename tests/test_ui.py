@@ -1534,3 +1534,89 @@ class SingleInstanceTests(unittest.TestCase):
         self.assertTrue(SingleInstance(self.data_dir).acquire())
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServiceBacklogLogTests(unittest.TestCase):
+    """「积压」这件事从状态栏搬到实时日志（用户 2026-08-21：「欠这个意思也不懂」）。
+
+    状态栏那一格只放得下几个字，塞进去的「欠 N 批」是记账口径不是人话；实时日志有整行的
+    地方，能一次讲清「发生了什么、要不要管、会不会重复」。搬过来之后有两条新规矩要钉：
+    **只在变了的时候报**（轮询一秒一次，每次都报就是每秒一行刷屏），**没在跑就不报**
+    （那时 backlog 恒为 0，停服务会白报一句「清空了」）。
+    """
+
+    def _service(self):
+        from wxclient.ui.service import GatewayService, ServiceState
+
+        service = GatewayService(lambda: None)  # type: ignore[arg-type,return-value]
+        service._state = ServiceState.RUNNING
+        return service
+
+    def _events(self, service, values: list[int]) -> list[tuple[int, int]]:
+        seen: list[tuple[int, int]] = []
+        with mock.patch("wxclient.ui.service._log") as log:
+            for value in values:
+                service._report_backlog(value)
+            for call in log.info.call_args_list:
+                self.assertEqual(call.args[0], "gateway.backlog.changed")
+                seen.append((call.kwargs["previous"], call.kwargs["backlog"]))
+        return seen
+
+    def test_只在变了的时候报一行(self) -> None:
+        service = self._service()
+        self.assertEqual(
+            self._events(service, [0, 0, 3, 3, 3, 5, 5, 0, 0]),
+            [(0, 3), (3, 5), (5, 0)],
+            "同一个数连着报好几遍就是每秒一行刷屏",
+        )
+
+    def test_刚起来就没积压不报(self) -> None:
+        """「一切正常」不该在日志里占一行——它是常态，不是事件。"""
+        service = self._service()
+        self.assertEqual(self._events(service, [0]), [])
+
+    def test_服务没在跑就不报(self) -> None:
+        """停服务时 backlog 会归 0，照报就会莫名其妙地说一句「积压清空了」。"""
+        from wxclient.ui.service import ServiceState
+
+        service = self._service()
+        self._events(service, [3])
+        service._state = ServiceState.STOPPED
+        self.assertEqual(self._events(service, [0]), [])
+
+    def test_停了再起来会重新报一次(self) -> None:
+        """重启之后那份积压还在（它记在库里），得让人重新知道一次。"""
+        from wxclient.ui.service import ServiceState
+
+        service = self._service()
+        self._events(service, [3])
+        service._state = ServiceState.STOPPED
+        self._events(service, [0])
+        service._state = ServiceState.RUNNING
+        self.assertEqual(self._events(service, [3]), [(0, 3)])
+
+    def test_那句话得说人话(self) -> None:
+        """钉的是「看的人能不能懂」：不许再出现「欠」，得说清不会丢、不会重复回。"""
+        from wxclient.logging_config import ChineseLogRenderer
+
+        def render(**kw: object) -> str:
+            return ChineseLogRenderer()(
+                logging.getLogger("t"), "info",
+                {"timestamp": "2026-08-21 10:00:00", "level": "info",
+                 "event": "gateway.backlog.changed", **kw},
+            )
+
+        rising = render(backlog=5, previous=0)
+        self.assertIn("5 批", rising)
+        self.assertIn("读进来", rising)
+        self.assertIn("还没回出去", rising)
+        self.assertIn("不会丢", rising)
+        self.assertNotIn("欠", rising)
+
+        falling = render(backlog=2, previous=5)
+        self.assertIn("降到 2 批", falling)
+        self.assertIn("补投成功 3 批", falling)
+
+        cleared = render(backlog=0, previous=5)
+        self.assertIn("积压清空了", cleared)
+        self.assertNotIn("欠", cleared)

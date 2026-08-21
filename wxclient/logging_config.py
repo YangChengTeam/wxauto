@@ -273,6 +273,28 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "uia.operation_probe":
         status = "可用" if payload.get("uia_exposed") else "不可用"
         return f"微信 UIA 探测完成：{status}，原因：{payload.get('reason') or '-'}"
+    if event == "gateway.backlog.changed":
+        # 「积压」= 微信里的消息已经读进来了、但这一轮没回出去（多半是 AI 端没给结果）。
+        # 消息不会丢也不会重复回：它们记在待处理队列里，下一轮自动重投。
+        # 写全一点是有意的——状态栏那格原来只放得下「欠 N 批」，没人看得懂（用户 2026-08-21）。
+        now = int(payload.get("backlog") or 0)
+        before = int(payload.get("previous") or 0)
+        if now == 0:
+            return (
+                f"积压清空了：先前那 {before} 批读到但没回出去的微信消息，"
+                f"现在都已经回出去了"
+            )
+        if now > before:
+            return (
+                f"有 {now} 批微信消息已经读进来、但还没回出去"
+                f"（AI 端这几轮没给出结果，已记在待处理队列里，下一轮自动重投）。"
+                f"消息不会丢也不会重复回，读新消息照常进行；"
+                f"要是一直不降，多半是 AI 端出了问题，往上翻找带 [警告] 的那几行"
+            )
+        return (
+            f"待回的积压从 {before} 批降到 {now} 批（补投成功 {before - now} 批），"
+            f"剩下这些还在等 AI 端给结果"
+        )
     if event == "uia.close.no_window_pattern":
         # 这一条是「没做什么」的留痕：pywinauto 关不掉这个控件，原本会按 ESC 兜底，
         # 而 ESC 在微信 4.x 里就是把微信收进托盘。宁可让面板留在屏幕上。

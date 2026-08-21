@@ -882,9 +882,12 @@ class ConfigCenterTests(unittest.TestCase):
         self.window.refresh_state()
         self.assertEqual(self.window._rows["gateway"].cget("text"), "连不上")
 
+        # ★ 有积压时这一格**不再变字**：原来是「已连接 · 欠 N 批」，用户 2026-08-21 说
+        #   「欠这个意思也不懂」，改成往实时日志写整整一行（见 ServiceBacklogLogTests）。
         self.service._status = GatewayStatus(connected=1, accounts=1, backlog=3)
         self.window.refresh_state()
-        self.assertIn("欠 3 批", self.window._rows["gateway"].cget("text"))
+        self.assertEqual(self.window._rows["gateway"].cget("text"), "已连接")
+        self.assertNotIn("欠", self.window._rows["gateway"].cget("text"))
 
 
 @unittest.skipUnless(HAS_TK, "没有 tkinter / 显示环境，窗口层测不了")

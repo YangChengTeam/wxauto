@@ -114,6 +114,9 @@ class GatewayService:
         #   活全在这条线程上。它卡多久都只卡自己，主线程照旧每秒重绘。
         self._command_listener: Callable[[dict], None] | None = None
         self._status = GatewayStatus()
+        #: 上一次报过的积压批数。只在**变了**的时候往实时日志写一行——轮询是一秒一次，
+        #: 每次都写就是每秒一行刷屏。None = 还没报过（服务没跑起来时不报）。
+        self._logged_backlog: int | None = None
         self._poller = threading.Thread(target=self._poll_status, name="wx-svc-status", daemon=True)
         self._poller.start()
 
@@ -350,9 +353,32 @@ class GatewayService:
         while True:
             try:
                 self._status = self._read_status()
+                self._report_backlog(self._status.backlog)
             except Exception:  # noqa: BLE001 - 展示用的东西不该把这条线程弄死
                 self._status = GatewayStatus()
             time.sleep(STATUS_POLL_SECONDS)
+
+    def _report_backlog(self, backlog: int) -> None:
+        """积压批数变了就往实时日志写一行，说清楚它到底是什么意思。
+
+        ★ 这件事原来只在左边状态栏显示成「已连接 · 欠 N 批」（用户 2026-08-21：
+        「欠这个意思也不懂」）。「欠」是记账口径，不是人话，而且状态栏那一格只放得下
+        几个字，说不清「读到了没回出去」和「消息丢了」的区别。所以搬到实时日志：
+        那里有整行的地方，能把**发生了什么、要不要管、会不会重复**一次讲完。
+
+        **只在变化时报**：轮询一秒一次，每次都报就是每秒一行刷屏。
+        服务没在跑时不报——那时候 backlog 恒为 0，停服务会白报一句「清空了」。
+        """
+        if self._state is not ServiceState.RUNNING:
+            self._logged_backlog = None
+            return
+        if backlog == self._logged_backlog:
+            return
+        previous = self._logged_backlog
+        self._logged_backlog = backlog
+        if previous is None and backlog == 0:
+            return          # 刚起来就没有积压，没什么可说的
+        _log.info("gateway.backlog.changed", backlog=backlog, previous=previous or 0)
 
     def _read_status(self) -> GatewayStatus:
         """真去问一遍网关。每一项各自兜底——一项坏了不该把整排状态清空。"""
