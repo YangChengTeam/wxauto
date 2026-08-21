@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wxauto-gateway"
-version = "0.1.0"
+# 版本号唯一来源是 `wxclient/__init__.py` 的 __version__（`packaging/build.py` 也这么读）。
+# 早先这里另写死了一份 0.1.0，25 次发版没人跟着改——到 0.1.26 时装出来的包元数据还写着 0.1.0。
+dynamic = ["version"]
 description = "Windows WeChat automation gateway for 劳小智 recruiting"
 requires-python = ">=3.10"
 # emoji / pillow / pycaw / sounddevice / soundfile 是 vendored third_party/pywechat
@@ -34,6 +36,9 @@ dependencies = [
   "httpx>=0.27",
   "websockets>=13",
 ]
+
+[tool.setuptools.dynamic]
+version = { attr = "wxclient.__version__" }
 
 [project.scripts]
 wxclient-gateway = "wxclient.gateway.__main__:main"
