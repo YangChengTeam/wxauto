@@ -1514,9 +1514,20 @@ class SingleInstanceTests(unittest.TestCase):
         finally:
             child.kill()          # 模拟强杀：没有任何清理机会
             child.wait(timeout=10)
-        self.assertTrue(
-            SingleInstance(self.data_dir).acquire(), "进程没了，锁必须由操作系统自动放掉"
-        )
+        # ★ 强杀之后别当场断言。Windows 的 TerminateProcess 只是让进程结束，句柄由内核
+        #   随后关掉，而 msvcrt 的锁是跟着句柄走的——中间有一小段窗口锁还在。
+        #   2026-08-24 真机上这条稳定失败，查下来就是这几十毫秒，产品侧没有问题
+        #   （现实里没人能在强杀后的同一瞬间重启应用）。这里等的是「不用人工清理就能
+        #   自己好」，不是把断言放宽：等不到就照样红。
+        deadline = time.monotonic() + 5.0
+        while True:
+            guard = SingleInstance(self.data_dir)
+            if guard.acquire():
+                guard.release()   # 别把句柄留着，tearDown 要删这个目录
+                break
+            if time.monotonic() >= deadline:
+                self.fail("进程没了，锁必须由操作系统自动放掉（等满 5 秒还没放）")
+            time.sleep(0.05)
 
     def test_unusable_data_dir_lets_the_app_start_anyway(self) -> None:
         """★ 锁文件建不出来就放行：为了防重复把**唯一**一个实例也拦在门外，比偶尔重复更糟。
