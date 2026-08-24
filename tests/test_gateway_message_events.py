@@ -134,6 +134,35 @@ class BuildEventTests(unittest.TestCase):
             build_event(candidate_id=CANDIDATE, direction=DIRECTION_INBOUND,
                         message_id="m1", occurred_at=T0, message_type="hologram")
 
+    def test_over_long_command_id_is_dropped_not_truncated(self) -> None:
+        """★ 后端 `commandId` 是 varchar(120)，超了整条事件被 400 打回。
+
+        截断只会得到一个对不上任何指令的假 ID；事件本身（「这一刻发出去了一条消息」）
+        才是后端排跟进要的东西，为一个对账字段把它整条丢掉不划算。
+        """
+        event = build_event(
+            candidate_id=CANDIDATE, direction=DIRECTION_OUTBOUND,
+            message_id="m1", occurred_at=T0, command_id="c" * 121,
+        )
+        self.assertNotIn("commandId", event)
+        # 刚好卡在上限上要留着
+        ok = build_event(
+            candidate_id=CANDIDATE, direction=DIRECTION_OUTBOUND,
+            message_id="m1", occurred_at=T0, command_id="c" * 120,
+        )
+        self.assertEqual(ok["commandId"], "c" * 120)
+
+    def test_stays_inside_the_backend_column_widths(self) -> None:
+        """契约字段表 = 后端建表宽度（messageId 180 / contentDigest 128 / commandId 120）。"""
+        event = build_event(
+            candidate_id=CANDIDATE, direction=DIRECTION_OUTBOUND,
+            message_id="m" * 500, occurred_at=T0, content="x" * 10_000,
+            command_id="cmd-1",
+        )
+        self.assertEqual(len(event["messageId"]), 180)
+        self.assertLessEqual(len(event["contentDigest"]), 128)
+        self.assertLessEqual(len(event["commandId"]), 120)
+
     def test_local_message_id_is_stable_and_hides_the_session_name(self) -> None:
         """本机 msg_id 形如「{备注名}#{序号}」——备注名没必要跟着每条事件出门。"""
         made = local_message_id(ACCOUNT, "张三·仓库工#7")

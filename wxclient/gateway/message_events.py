@@ -37,9 +37,12 @@ from .backend_client import BackendEndpoint
 
 _log = structlog.get_logger(__name__)
 
-#: ⚠️ 契约正文写的是 `/api/recruitment-agent/...`，这里**刻意不带 `/api`**：同一个 base URL
-#: 上其余每一条客户端接口（登录、换票、会话名、候选人回写）都没有它，业务后端也是
-#: `app.use('/recruitment-agent', …)`。真 404 了只改这一行，别动别的接口——那几条线上验过。
+#: ⚠️ 契约正文写的是 `/api/recruitment-agent/...`，这里**刻意不带 `/api`**。
+#: 2026-08-24 对线上实测过（后端当天已部署）：
+#:   POST /recruitment-agent/client/message-events      → 401 CLIENT_TOKEN_REQUIRED（就是这条路）
+#:   POST /api/recruitment-agent/client/message-events  → 401 UNAUTHORIZED（另一套网页鉴权，
+#:                                                        客户端 Token 在那儿根本不作数）
+#: 所以带上 `/api` 反而永远进不去。别动别的接口——那几条也都是这个前缀。
 MESSAGE_EVENTS_PATH = "/recruitment-agent/client/message-events"
 
 #: 契约的两个方向。`outbound` = 我方发给候选人，`inbound` = 候选人发来。
@@ -57,6 +60,11 @@ _STATUS_BY_DIRECTION = {DIRECTION_OUTBOUND: "sent", DIRECTION_INBOUND: "received
 
 #: 契约：`messageId` 长度 1–180。
 MAX_MESSAGE_ID_LENGTH = 180
+
+#: 契约：`commandId` 长度 1–120（后端建表就是 varchar(120)，超了整条事件被 400 打回）。
+#: 超长时**丢掉这个字段、保住事件**：截断得到的是一个对不上任何指令的假 ID，而事件本身
+#: （「这一刻发出去了一条消息」）才是后端排跟进要的东西——为一个对账字段把它整条丢掉不划算。
+MAX_COMMAND_ID_LENGTH = 120
 
 #: eventId 的命名空间。写成从 URL 派生而不是拍一个魔法常量，是为了让它自解释：
 #: 换了这个字符串，全世界的 eventId 都会变，后端的幂等去重会认不出重试。**永不改动**。
@@ -155,8 +163,11 @@ def build_event(
         "occurredAt": _iso(occurred_at),
     }
     if command_id and direction == DIRECTION_OUTBOUND:
-        # 契约：候选人入站消息不要带 commandId。
-        event["commandId"] = command_id
+        # 契约：候选人入站消息不要带 commandId（后端会 400，不是忽略）。
+        if len(command_id) <= MAX_COMMAND_ID_LENGTH:
+            event["commandId"] = command_id
+        else:
+            _log.warning("指令 ID 太长，这条事件不带 commandId", length=len(command_id))
     if content:
         event["contentDigest"] = content_digest(content)
     if source:
