@@ -35,6 +35,7 @@ from .guard import (
     OutboundGuard,
     Reservation,
 )
+from .message_events import DIRECTION_OUTBOUND, MessageEventReporter, local_message_id
 
 _log = structlog.get_logger(__name__)
 
@@ -158,6 +159,11 @@ def _file_refs(args: dict[str, Any], *, required: bool = True) -> list[FileRef]:
 #: 也不该占任何微信配额（配额管的是「会不会打扰真人」）。
 UPDATE_CANDIDATE_OP = "update_candidate"
 
+#: 这两个 op 是**真发给候选人一条微信**，做成了要上报给业务后端（未回复跟进的计时起点）。
+#: 值是契约的 `messageType`。其余 op 一律不报：加好友不是消息，朋友圈没有收件人，
+#: 读类什么都没发生。
+MESSAGE_EVENT_OPS: dict[str, str] = {"send_message": "text", "send_files": "file"}
+
 COMMANDS: dict[str, CommandSpec] = {
     # ── 写类 ──
     "send_message": CommandSpec(
@@ -260,6 +266,7 @@ class CommandExecutor:
         clock: Callable[[], datetime] | None = None,
         capabilities: Callable[[], dict] | None = None,
         candidates: CandidateDirectory | None = None,
+        message_events: MessageEventReporter | None = None,
     ) -> None:
         """``capabilities`` 是个**取当下能力表**的函数（074），不是一份快照——
         微信随时可能被关掉、掉线，执行前这一刻算的才作数。"""
@@ -273,6 +280,7 @@ class CommandExecutor:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._capabilities = capabilities
         self._candidates = candidates
+        self._message_events = message_events
 
     async def execute(
         self,
@@ -414,6 +422,7 @@ class CommandExecutor:
                 # 预留 5 实际通过 2 → 还回 3。做多少记多少，两个方向都不许含糊。
                 reservation.settle(spec.counts(args, result))
             _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
+            self._note_message_sent(command_id, op, peer, args, raw)
             state = self._friend_state(op, result)
             if state:
                 result = {**result, "friend_state": state}
@@ -447,6 +456,54 @@ class CommandExecutor:
         if not result.get("updated"):
             return CommandResult(command_id, "failed", str(result.get("reason") or "候选人状态没写成"))
         return CommandResult(command_id, "done", result=result)
+
+    def _note_message_sent(
+        self,
+        command_id: str,
+        op: str,
+        peer: str,
+        args: dict[str, Any],
+        raw: dict[str, Any] | None,
+    ) -> None:
+        """真发出去一条微信 → 登记一条 outbound 事件（计划驱动那条路的计时起点）。
+
+        `commandId` 带上原指令 ID：这条消息来自 AI/后端的一条指令，两端对账时按它对上
+        （契约请求字段表）。**入站事件不带它**，那是候选人发来的，跟指令无关。
+
+        `dry_run` 的一轮微信侧什么都没发生，一律不报（同 `_friend_state` / `update_candidate`
+        的口径）。归不了位的候选人也不报——不编 ID 顶上。
+
+        **只在队列确认 `succeeded` 时才报**：这里刻意只管上报，不改回执语义（那是另一件事，
+        改动面大得多），所以「任务没成功」这一判在本方法内自己做一次。
+        """
+        if self._message_events is None or not self._allow_real:
+            return
+        message_type = MESSAGE_EVENT_OPS.get(op)
+        if message_type is None or not peer:
+            return
+        # ★ 「没抛异常」不等于「话发出去了」：队列的终态里还有 failed / blocked / cancelled，
+        #   等超时更是压根没有结论。只认 succeeded——报一条假的「已发送」，后端就会从一条
+        #   根本没到对方手机上的消息开始算「多久没回」，真正的跟进被推后一整个跟进周期。
+        if str((raw or {}).get("status") or "") != "succeeded":
+            _log.info("微信任务没有确认成功，不上报消息事件", op=op,
+                      status=(raw or {}).get("status") or "unknown")
+            return
+        candidate_id = self._store.contact_worker_id(self._account, peer)
+        if not candidate_id:
+            _log.info("发出的消息没能归位到候选人，不上报消息事件", op=op)
+            return
+        self._message_events.record(
+            self._account,
+            candidate_id=candidate_id,
+            direction=DIRECTION_OUTBOUND,
+            # 一条指令 = 一条消息，拿 command_id 派生本机稳定 ID：重推同一条指令时
+            # 幂等层先挡住（`execute` 的 cached），万一漏过去，后端也按 messageId 去重。
+            message_id=local_message_id(self._account, command_id),
+            message_type=message_type,
+            command_id=command_id,
+            content=str(args.get("text") or ""),
+            source="command",
+        )
 
     def _friend_state(self, op: str, result: dict[str, Any]) -> str:
         """加好友这条链走到哪一步了（docs/18 §3.2）。AI 端据此写候选人的 `wechatAdded`。

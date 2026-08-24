@@ -233,11 +233,17 @@ class InboundLoop:
         is_active: Callable[[datetime], bool] | None = None,
         clock: Callable[[], datetime] | None = None,
         rng: random.Random | None = None,
+        on_peer_messages: Callable[[str, str, Sequence[InboundMessage]], None] | None = None,
     ) -> None:
         self._accounts = list(accounts)
         self._source = source
         self._store = store
         self._handler = handler
+        self._on_peer_messages = on_peer_messages
+        """「刚读到对方几条新消息」的旁听者（业务后端的消息事件上报）。
+
+        **只是旁听**：它不参与去抖、不决定派不派轮，抛异常也只记账。入站循环的职责
+        没变，这里只是把「对方开口了」这个事实原样交出去一次。"""
         self._poll_interval = poll_interval_seconds
         self._active_interval = (
             poll_interval_seconds if active_poll_interval_seconds is None
@@ -337,6 +343,11 @@ class InboundLoop:
         if any(not message.from_self for message in fresh):
             self._last_activity = now
 
+        # ★ 对方真开口了 → 交给旁听者上报（业务后端据此取消待跟进）。
+        #   **必须排在拒绝闸之前**：「别再联系我了」也是一次回复，而那正是最不该再追一条的
+        #   时刻——放在 `return` 后面，这条事件永远发不出去，后端照旧四小时后追过去。
+        self._note_peer_messages(account_id, peer_id, [m for m in fresh if not m.from_self])
+
         # ★ 确定性拒绝闸（第一道，不依赖模型）：对方说了「别联系我」类的话 →
         #   立即拉黑，且**不派发任何一轮**。连告别语都不发——对方要的是别再被联系，
         #   再回一句同样是一次联系（需求文档 §7 的字面要求）。
@@ -364,6 +375,17 @@ class InboundLoop:
             )
         for message in fresh:
             self._debouncer.add(message, now, batch_id)
+
+    def _note_peer_messages(
+        self, account_id: str, peer_id: str, messages: Sequence[InboundMessage]
+    ) -> None:
+        """把「对方发来这几条」交给旁听者。**出了错只记账**——读循环不能被它带停。"""
+        if not messages or self._on_peer_messages is None:
+            return
+        try:
+            self._on_peer_messages(account_id, peer_id, messages)
+        except Exception as exc:  # noqa: BLE001 —— 旁听者出错不该影响收消息
+            _log.warning("入站消息事件登记失败", error=str(exc))
 
     def _dispatch_due(self, now: datetime) -> int:
         dispatched = 0

@@ -25,6 +25,7 @@ from .contacts import ContactDirectory
 from .download import FileFetcher
 from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from
+from .message_events import MessageEventReporter
 from .pacing import MIN_FRIEND_INTERVAL_SECONDS, clamp_interval
 from .runner import GatewayRunner
 from .sessions import GatewayStore
@@ -157,6 +158,22 @@ def build_gateway(
         gateway_settings.business_api_url,
         client_token or (lambda: ""),
     )
+    # 微信消息事件上报（`docs/招聘分身_客户端微信消息事件上报_v1.md`）：我方发出去了、
+    # 候选人回话了，各报一条，业务后端据此排/取消「未回复跟进」。
+    #
+    # ★ **只走流程不真动微信的机器一条都不报**，所以这里在 `allow_real_actions` 为假时
+    #   干脆不建这个上报器（而不是建了再在每个调用点各判一次 dry-run——那种判断迟早
+    #   会漏掉一处）。dry-run 的一轮里微信侧什么都没发生，把它报成「已发送」就是拿假动作
+    #   去改真数据：后端会从一条根本不存在的消息开始算「多久没回」。
+    message_events = (
+        MessageEventReporter(
+            gateway_settings.business_api_url,
+            client_token or (lambda: ""),
+            store=store,
+        )
+        if allow_real_actions
+        else None
+    )
 
     runner = GatewayRunner(
         settings=gateway_settings,
@@ -173,6 +190,7 @@ def build_gateway(
         capabilities=current_capabilities,
         contacts=contacts,
         candidates=candidates,
+        message_events=message_events,
         command_executor=CommandExecutor(
             runtime=runtime,
             store=store,
@@ -188,6 +206,7 @@ def build_gateway(
             fetcher=file_fetcher,
             capabilities=current_capabilities,
             candidates=candidates,
+            message_events=message_events,
         ),
         friend_watcher=FriendWatcher(
             accounts=resolved_accounts,

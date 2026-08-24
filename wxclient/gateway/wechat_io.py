@@ -23,7 +23,7 @@ from typing import Any
 
 import structlog
 
-from wxclient.queue import TaskType
+from wxclient.queue import TaskStatus, TaskType
 
 from .inbound import InboundMessage
 from .sessions import GatewayStore
@@ -335,6 +335,17 @@ class QueueMessageSource:
         ]
 
 
+class SendNotConfirmed(RuntimeError):
+    """发送任务没走到 ``succeeded``（失败、被拦、或等超时了）。
+
+    **「没抛异常」不等于「话发出去了」**：`runtime.submit(wait=True)` 只是等到任务进入终态，
+    终态里既有 succeeded 也有 failed/blocked/cancelled，超时更是压根没有结论。原来这三种
+    一律照常返回 task_id，于是配额按发了记、消息事件也会按发了报——后端从此按一条根本
+    没到对方手机上的消息开始算「多久没回」。结论不明就当没发（需求文档 §12.4：
+    结果未知先查询或转人工，不盲目重发）。
+    """
+
+
 class QueueMessageSink:
     """出站投递：把一段回复投成 ``SEND_MESSAGE`` 任务，由单消费者 worker 串行发出。
 
@@ -355,6 +366,16 @@ class QueueMessageSink:
             confirmation=self._confirmation if self._allow_real else "",
         )
         task_id = str((result or {}).get("task_id") or "")
+        status = str((result or {}).get("status") or "")
+        if status != TaskStatus.SUCCEEDED.value:
+            _log.warning(
+                "发送任务没有确认成功",
+                account=account_id,
+                status=status or "unknown",
+                timed_out=bool((result or {}).get("timed_out")),
+                task_id=task_id,
+            )
+            raise SendNotConfirmed(f"发送任务未确认成功（status={status or 'unknown'}）")
         _log.info(
             "已投递发送任务",
             account=account_id,

@@ -86,6 +86,16 @@ CREATE TABLE IF NOT EXISTS gateway_pending_inbound (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_inbound_account
   ON gateway_pending_inbound (account_id, created_at);
+CREATE TABLE IF NOT EXISTS gateway_message_events (
+  event_id   TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL,
+  payload    TEXT NOT NULL,
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_events_created
+  ON gateway_message_events (created_at);
 CREATE TABLE IF NOT EXISTS gateway_send_log (
   account_id TEXT NOT NULL,
   peer_id    TEXT NOT NULL,
@@ -711,6 +721,98 @@ class GatewayStore:
             conn.executemany(
                 "DELETE FROM gateway_pending_inbound WHERE batch_id=?",
                 [(row["batch_id"],) for row in stale],
+            )
+            conn.commit()
+        return stale
+
+    # ──────────────── 微信消息事件发件箱（未回复跟进的事实来源）────────────────
+
+    def put_message_event(
+        self, account_id: str, event_id: str, payload: dict, at: datetime | None = None
+    ) -> bool:
+        """把一条待上报的消息事件排进发件箱。已经排过（或已发过又重排）返回 ``False``。
+
+        **为什么要落盘**：这条事件是业务后端计算「多久没回」的唯一输入。掉一条的代价不是
+        少一行日志，而是候选人明明回了话、四小时后还被追一条（或者我方发了消息、跟进却
+        永远不排期）。网络抖一下就丢，正是这一整块要根治的毛病。
+
+        ``event_id`` 是**幂等键**（由内容派生，见 ``message_events.event_id_for``）：
+        同一条微信消息重排多少次都只有一行，断网重试时后端也据它去重。
+        """
+        now = (at or _utcnow()).isoformat()
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO gateway_message_events
+                  (event_id, account_id, payload, attempts, created_at, updated_at)
+                VALUES (?,?,?,0,?,?)
+                ON CONFLICT(event_id) DO NOTHING
+                """,
+                (event_id, account_id, json.dumps(payload, ensure_ascii=False), now, now),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def list_message_events(self, limit: int = 50) -> list[dict]:
+        """待上报的事件，最早的排前面（先发生的先报）。"""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT event_id, account_id, payload, attempts, created_at "
+                "FROM gateway_message_events ORDER BY created_at LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [
+            {
+                "event_id": row[0],
+                "account_id": row[1],
+                "payload": json.loads(row[2]),
+                "attempts": int(row[3]),
+                "created_at": row[4],
+            }
+            for row in rows
+        ]
+
+    def count_message_events(self) -> int:
+        """发件箱里还压着几条。只读，给日志/界面报数用。"""
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM gateway_message_events").fetchone()
+        return int(row[0]) if row else 0
+
+    def drop_message_event(self, event_id: str) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("DELETE FROM gateway_message_events WHERE event_id=?", (event_id,))
+            conn.commit()
+
+    def bump_message_event_attempts(self, event_id: str) -> int:
+        """记一次上报失败，返回累计失败次数。"""
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE gateway_message_events SET attempts=attempts+1, updated_at=? "
+                "WHERE event_id=?",
+                (_utcnow().isoformat(), event_id),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT attempts FROM gateway_message_events WHERE event_id=?", (event_id,)
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def purge_message_events_before(self, cutoff: datetime) -> list[dict]:
+        """清掉过期的待上报事件，返回被清掉的那些（调用方必须记进日志）。
+
+        隔了一天还没报出去的事件，后端拿它算出来的跟进时点早就过了。但清掉必须留痕——
+        静悄悄丢事件和静悄悄丢消息是同一种病。
+        """
+        stale = [
+            row for row in self.list_message_events(limit=10_000)
+            if row["created_at"] < cutoff.isoformat()
+        ]
+        if not stale:
+            return []
+        with closing(self._connect()) as conn:
+            conn.executemany(
+                "DELETE FROM gateway_message_events WHERE event_id=?",
+                [(row["event_id"],) for row in stale],
             )
             conn.commit()
         return stale

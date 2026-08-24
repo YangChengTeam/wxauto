@@ -18,6 +18,7 @@ import structlog
 from .candidates import CandidateDirectory, CandidateUpdateError
 from .guard import ACTION_GROUP, ACTION_MESSAGE, OutboundGuard
 from .inbound import FOLLOW_UP_DEFER
+from .message_events import DIRECTION_OUTBOUND, MessageEventReporter, local_message_id
 
 _log = structlog.get_logger(__name__)
 
@@ -87,12 +88,14 @@ class OutboundSender:
         store,  # GatewayStore（鸭子类型）
         clock=None,
         candidates: CandidateDirectory | None = None,
+        message_events: MessageEventReporter | None = None,
     ) -> None:
         self._sink = sink
         self._guard = guard
         self._store = store
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._candidates = candidates
+        self._message_events = message_events
 
     async def deliver(
         self, account_id: str, peer_id: str, card: dict[str, Any] | None
@@ -135,8 +138,43 @@ class OutboundSender:
         finally:
             # 发到一半炸了：没发出去的那几段不该占着额度（发出去的照记）。
             reservation.settle(len(task_ids))
+            # 同理，真发出去的那几段照样要上报——「多久没回」是从**发出的那一刻**起算的。
+            self._note_outbound(account_id, peer_id, task_ids, segments)
         _log.info("已投递回复", account=account_id, 会话=peer_id, segments=len(task_ids))
         return DeliveryResult(sent=task_ids, actions=actions)
+
+    def _note_outbound(
+        self, account_id: str, peer_id: str, task_ids: Sequence[str], segments: Sequence[str]
+    ) -> None:
+        """我方消息发出去了 → 登记一条 outbound 事件（业务后端据此排「未回复跟进」）。
+
+        **一段一条**：一条回复常常拆成好几段，每一段都是对方手机上真真切切的一次响动。
+        后端按最后一条重排跟进时点，正好是我们希望的「从最后说完那句起算」。
+
+        **候选人 ID 由本机反查**，反查不到就如实跳过（契约「对接注意事项」最后一条）——
+        那是「这个人还没上报过会话名 / 后端没归到位」，不是错，更不能拿别人的 ID 顶上。
+
+        ★ 只走流程不真动微信的机器压根不会有这个上报器（见 `factory.py`），
+        所以这里不必再判一次 dry-run。
+        """
+        if self._message_events is None or not task_ids:
+            return
+        candidate_id = self._store.contact_worker_id(account_id, peer_id)
+        if not candidate_id:
+            _log.info("发出的回复没能归位到候选人，不上报消息事件", account=account_id)
+            return
+        now = self._clock()
+        for task_id, segment in zip(task_ids, segments):
+            self._message_events.record(
+                account_id,
+                candidate_id=candidate_id,
+                direction=DIRECTION_OUTBOUND,
+                # 微信读不到稳定的消息 ID，用队列任务 ID 派生一个本机稳定 ID（契约允许）。
+                message_id=local_message_id(account_id, task_id),
+                occurred_at=now,
+                content=segment,
+                source="auto_reply",
+            )
 
     async def _apply_ai_status_actions(
         self, account_id: str, peer_id: str, actions: Sequence[dict[str, Any]]

@@ -43,6 +43,7 @@ from .inbound import (
     MessageSource,
     format_history,
 )
+from .message_events import DIRECTION_INBOUND, MessageEventReporter, local_message_id
 from .outbound import DeliveryResult, MessageSink, OutboundSender
 from .pacing import MIN_READ_INTERVAL_SECONDS, PACING_EVENT, clamp_interval
 from .schedule import ScheduleLoop, parse_schedule_at
@@ -63,6 +64,15 @@ KEEPALIVE_INTERVAL_SECONDS = 30.0
 #: 才认得他，就等于这个数——十分钟太久，那期间他先开口就没人接。增量同步只取水位之后的，
 #: 勤一点也不贵。
 CONTACTS_SYNC_INTERVAL_SECONDS = 120.0
+
+#: 消息事件发件箱多久清一次（业务后端据这些事件排「未回复跟进」）。
+#: 它只问业务后端、不碰微信，不受节拍红线约束。20s 是「候选人回话到后端取消待跟进」
+#: 的最大延迟——跟进本身是小时级的，再勤没有意义；再慢则会在临界点上多追一条。
+MESSAGE_EVENT_FLUSH_INTERVAL_SECONDS = 20.0
+
+#: 退出前最多等发件箱清多久。专员晚上关掉程序时，白天最后那条「候选人回话了」如果还压在
+#: 本机，后端就会照旧追过去——所以宁可多等这两秒。清不完也没丢：发件箱是落盘的。
+MESSAGE_EVENT_DRAIN_SECONDS = 2.0
 
 #: 每轮往上带多少条历史。够 AI 端判「这一步走完没有」，又不至于把每轮的输入撑成一倍——
 #: 这段文本每轮都要重新发一遍，是按 token 计费的。
@@ -180,6 +190,7 @@ class GatewayRunner:
         command_executor: CommandExecutor | None = None,
         contacts: ContactDirectory | None = None,
         candidates: CandidateDirectory | None = None,
+        message_events: MessageEventReporter | None = None,
         client_factory: Callable[..., AgentWsClient] | None = None,
         clock: Callable[[], datetime] | None = None,
         capabilities: Callable[[], dict[str, Capability]] | None = None,
@@ -194,6 +205,7 @@ class GatewayRunner:
         self._commands = command_executor
         self._contacts = contacts
         self._candidates = candidates
+        self._message_events = message_events
         self._capabilities = capabilities
         # account_id → (报给了哪条连接, 报的是什么)。**连接也要记**，见 _report_capabilities。
         self._reported_capabilities: dict[str, tuple[Any, dict[str, Any]]] = {}
@@ -218,6 +230,7 @@ class GatewayRunner:
             store=store,
             clock=self._clock,
             candidates=candidates,
+            message_events=message_events,
         )
         # 077：定时指令自己一条循环。它压根不动微信（只翻自己的表），所以节拍跟
         # 读消息/查好友无关；到点之后的执行仍走 _run_command，幂等与守门一并复用。
@@ -245,6 +258,7 @@ class GatewayRunner:
             hot_window_seconds=settings.hot_window_seconds,
             is_active=self.is_active,
             clock=self._clock,
+            on_peer_messages=self._note_inbound_messages,
         )
 
     def is_active(self, now: datetime) -> bool:
@@ -407,6 +421,49 @@ class GatewayRunner:
         )
         await report(str(payload.pop("status")), **{k: v for k, v in payload.items()
                                                     if k != "command_id"})
+
+    # ──────────────── 微信消息事件（未回复跟进的事实来源）────────────────
+
+    def _note_inbound_messages(
+        self, account_id: str, peer_id: str, messages: Sequence[InboundMessage]
+    ) -> None:
+        """候选人发来消息 → 登记 inbound 事件，业务后端据此**取消**待执行的未回复跟进。
+
+        由 `InboundLoop` 在读到新消息那一刻回调（同步、只写本机发件箱，不发网络请求）——
+        真正的上报在 `_flush_message_events` 那条循环里。
+
+        **候选人 ID 由本机反查**（081 裁决 2：手机号↔会话名的关联全程不经 AI 端）；
+        反查不到就如实跳过（契约：匹配不到 candidateId 的入站消息不要上报）。
+        """
+        if self._message_events is None:
+            return
+        candidate_id = self._store.contact_worker_id(account_id, peer_id)
+        if not candidate_id:
+            _log.info("这个会话还没归位到候选人，入站消息不上报", account=account_id)
+            return
+        for message in messages:
+            self._message_events.record(
+                account_id,
+                candidate_id=candidate_id,
+                direction=DIRECTION_INBOUND,
+                # 微信 UI 读不到稳定的消息 ID（见 `wechat_io` 模块说明），拿本机那个
+                # 单调序号派生一个稳定 ID；哈希掉是因为它里面带着对方的备注名。
+                message_id=local_message_id(account_id, message.msg_id),
+                # `at` 是**读到**这条的时刻。微信自己标的「18:28」没有日期，还原不成可信的
+                # 时间点，所以宁可用读到的时刻，也不去猜一个更好看的（契约要真实发生时间，
+                # 这是本机能给出的最接近的真话）。
+                occurred_at=message.at,
+                content=message.text,
+                source="inbound_poll",
+            )
+
+    async def _flush_message_events(self) -> None:
+        """把消息事件发件箱清空。失败只记账（`MessageEventReporter` 自己不抛）。"""
+        if self._message_events is None:
+            return
+        while True:
+            await self._message_events.flush()
+            await asyncio.sleep(MESSAGE_EVENT_FLUSH_INTERVAL_SECONDS)
 
     async def _sync_contacts(self) -> None:
         """把本员工的候选人会话名映射拉回本机（api2 §4.2）。**启动时一次，之后周期性**。
@@ -872,6 +929,11 @@ class GatewayRunner:
         # ★ 它同时是**监听名单**的来源（085，用户 2026-08-20：就用 /client/contacts，不新增接口），
         # 所以这条循环停了不只是「备注名会重」，而是「HR 新圈的人分身认不出来」。
         side_tasks.append(asyncio.create_task(self._sync_contacts(), name="gw-contacts"))
+        # 消息事件同样后台清：它决定后端排不排「未回复跟进」，但一条都不该挡住微信侧。
+        if self._message_events is not None:
+            side_tasks.append(
+                asyncio.create_task(self._flush_message_events(), name="gw-msg-events")
+            )
         try:
             await self.loop.run()
         finally:
@@ -934,4 +996,24 @@ class GatewayRunner:
         except TimeoutError:
             abandoned = self.loop.cancel_inflight()
             _log.warning("退出时还有未收口的轮次，已放弃", turns=abandoned)
+        await self._drain_message_events()
         await self._pool.close_all()
+
+    async def _drain_message_events(self) -> None:
+        """退出前把发件箱再清一次（有上限）。
+
+        专员晚上关掉程序时，白天最后那条「候选人回话了」如果还压在本机，后端就会照旧
+        四小时后追过去——而它已经排好队了，只差一个 HTTP 往返。清不完也不算丢：
+        发件箱是落盘的，下次开机第一趟就补上。
+        """
+        if self._message_events is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self._message_events.flush(), timeout=MESSAGE_EVENT_DRAIN_SECONDS
+            )
+        except TimeoutError:
+            _log.warning("退出时消息事件没清完，留到下次开机再报",
+                         pending=self._message_events.pending())
+        except Exception as exc:  # noqa: BLE001 —— 退出路径上不许再抛
+            _log.warning("退出时清消息事件出错", error=type(exc).__name__)

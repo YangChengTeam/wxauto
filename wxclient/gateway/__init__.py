@@ -34,6 +34,16 @@ from .inbound import (
     MessageSource,
     format_transcript,
 )
+from .message_events import (
+    DIRECTION_INBOUND,
+    DIRECTION_OUTBOUND,
+    MessageEventError,
+    MessageEventReporter,
+    build_event,
+    content_digest,
+    event_id_for,
+    local_message_id,
+)
 from .outbound import DeliveryResult, MessageSink, OutboundSender, extract_reply
 from .pacing import PACING_EVENT, clamp_interval, jittered
 from .runner import ConnectionPool, GatewayRunner
@@ -48,6 +58,7 @@ from .watchlist import PUSH_EVENT, Watchlist, WatchScope
 from .wechat_io import (
     QueueMessageSink,
     QueueMessageSource,
+    SendNotConfirmed,
     is_self_message,
     is_timestamp_row,
     message_signature,
@@ -65,6 +76,8 @@ from .wsclient import (
 __all__ = [
     "COMMANDS",
     "COMMAND_EVENT",
+    "DIRECTION_INBOUND",
+    "DIRECTION_OUTBOUND",
     "NOTICE_EVENT",
     "PACING_EVENT",
     "PUSH_EVENT",
@@ -87,6 +100,8 @@ __all__ = [
     "InboundLoop",
     "InboundMessage",
     "LocalFileTicketProvider",
+    "MessageEventError",
+    "MessageEventReporter",
     "MessageSink",
     "MessageSource",
     "OutboundGuard",
@@ -94,6 +109,7 @@ __all__ = [
     "QueueMessageSink",
     "QueueMessageSource",
     "RateLimit",
+    "SendNotConfirmed",
     "TicketError",
     "TicketProvider",
     "TurnResult",
@@ -102,12 +118,16 @@ __all__ = [
     "WatchScope",
     "Watchlist",
     "action_limits_from",
+    "build_event",
     "clamp_interval",
+    "content_digest",
+    "event_id_for",
     "extract_reply",
     "format_transcript",
     "is_self_message",
     "is_timestamp_row",
     "jittered",
+    "local_message_id",
     "looks_like_rejection",
     "message_signature",
     "parse_active_hours",
