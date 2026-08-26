@@ -145,6 +145,30 @@ class NeverRollBackTests(unittest.IsolatedAsyncioTestCase):
         outcome = await client.request(CANDIDATE, HUMAN_TAKEOVER, reason="我来跟")
         self.assertTrue(outcome.should_retry, "断网不该把本机的接管撤掉")
 
+    async def test_candidate_not_assigned_stops_syncing_that_event(self) -> None:
+        """★ 404 `CANDIDATE_NOT_ASSIGNED`：v1.5 §6 要求「停止同步该事件」。
+
+        重试一万次也还是不在计划里，所以**不占欠账**；但本机接管照样成立——
+        招聘老师按下去了，不能因为对不上计划就把自动回复的闸放开。
+        """
+        backend = _Backend(httpx.Response(404, json={
+            "error": {"code": "CANDIDATE_NOT_ASSIGNED", "message": "候选人未加入该招聘分身计划或计划已关闭"},
+        }))
+        outcome = await backend.client().request(CANDIDATE, HUMAN_TAKEOVER, reason="我来跟")
+        self.assertFalse(outcome.accepted)
+        self.assertFalse(outcome.should_retry, "不在计划里不是「还没送到」，别一直重试")
+        self.assertTrue(outcome.local_reject)
+        self.assertEqual(outcome.conflict_version, 0, "不是版本冲突，本机档位一个字都不许改")
+        self.assertIn("不在当前招聘计划", outcome.reason)
+
+    async def test_a_404_without_an_envelope_is_handled_the_same_way(self) -> None:
+        """路由不存在（老版本后端）返回的 404 没有错误信封——解析不出来也不能崩。"""
+        outcome = await _Backend(httpx.Response(404, text="Not Found")).client().request(
+            CANDIDATE, HUMAN_TAKEOVER, reason="我来跟",
+        )
+        self.assertFalse(outcome.accepted)
+        self.assertTrue(outcome.local_reject)
+
     async def test_a_version_conflict_carries_the_current_version(self) -> None:
         backend = _Backend(httpx.Response(409, json={
             "error": {

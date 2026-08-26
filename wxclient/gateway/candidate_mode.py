@@ -177,13 +177,34 @@ class CandidateModeClient(BackendEndpoint):
 
         if response.status_code == 409:
             return self._conflict(response, what=what)
+        if response.status_code == 404:
+            # §6 `CANDIDATE_NOT_ASSIGNED`：这个人不在该分身的有效招聘计划里（或计划已关闭）。
+            # 文档要求**停止同步该事件**——重试多少次结果都一样，所以不占欠账。
+            # 但**本机接管照样成立**：招聘老师按了就是按了，不能因为对不上计划就把闸放开。
+            code = self._error_code(response)
+            _log.warning("候选人不在有效招聘计划里", what=what, code=code or None)
+            return ModeOutcome(
+                False,
+                local_reject=True,
+                reason="这个候选人不在当前招聘计划里（或计划已关闭），业务端不收；这台电脑先自己生效了",
+            )
         if response.status_code >= 400:
-            # 400/401/403/404/410/429 全归这一档：同步不上去，但**本机说了算**。
+            # 400/401/403/410/429 全归这一档：同步不上去，但**本机说了算**。
             # 429 尤其不能回滚——那只是连点。
             _log.warning("候选人接管同步被拒", what=what, status=response.status_code)
             return ModeOutcome(False, reason=f"业务接口拒绝（HTTP {response.status_code}）")
 
         return self._accepted(response, what=what)
+
+    @staticmethod
+    def _error_code(response: Any) -> str:
+        """从统一错误信封里取 `error.code`；取不到就空串（形状不对不影响判断）。"""
+        try:
+            payload = response.json() or {}
+        except Exception:  # noqa: BLE001
+            return ""
+        error = payload.get("error")
+        return str(error.get("code") or "") if isinstance(error, dict) else ""
 
     def _accepted(self, response: Any, *, what: str) -> ModeOutcome:
         """成功。响应形状解析不出来也**算成功**——它已经落到业务端账本上了。"""
