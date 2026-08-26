@@ -13,6 +13,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -416,12 +417,18 @@ class ContactsSyncTests(unittest.TestCase):
 
     def _age_local_row(self, session_name: str, written_at: str) -> None:
         """把本机那一行的写入时间改老，绕过接管隔离窗（只在测试里这么干）。"""
-        with sqlite3.connect(self.store._path) as conn:
+        # ★ `with sqlite3.connect(...)` 只管事务**不关连接**。不 close 的话
+        #   Windows 上 tearDown 删不掉临时目录（WinError 32），Linux 却照删不误——
+        #   一个只在真机上炸的测试 bug。
+        with closing(sqlite3.connect(self.store._path)) as conn:
             conn.execute(
                 "UPDATE gateway_candidate_mode SET updated_at=? "
                 "WHERE account_id=? AND session_name=?",
                 (written_at, ACCOUNT, session_name),
             )
+            # ★ `closing` 只关连接**不提交**（`with connect(...)` 才提交）。
+            #   两个都要：不提交这行改不动，不关连接 Windows 上删不掉临时目录。
+            conn.commit()
 
 
 class OutcomeTests(unittest.TestCase):
