@@ -81,11 +81,13 @@ class ConfigLookTests(unittest.TestCase):
             self.assertIn(desc, texts, "★ 段标题旁边那句说明也是设计稿的一部分")
 
     def test_scheduling_rows_sit_two_to_a_line(self) -> None:
-        """★ 调度那四项在设计稿上是两列。四行一列会把这一页拉得老长，还得滚。"""
+        """★ 调度这几项在设计稿上是两列。一行一项会把这一页拉得老长，还得滚。"""
         sched = settings_store.fields_of("sched")
 
         self.assertEqual([field.label for field in sched],
-                         ["读消息间隔", "查新好友间隔", "工作时间窗", "每小时发送上限"])
+                         ["读消息间隔", "查新好友间隔", "工作时间窗", "每小时发送上限",
+                          # 090：陌生人接待也归调度（它决定「碰谁」，不是启动行为）
+                          "接待主动来问的陌生人"])
         self.assertEqual(sched[0].unit, "秒", "单位贴在框里，不写进标签")
         self.assertNotIn("（秒）", sched[0].label)
 
@@ -104,11 +106,15 @@ class ConfigLookTests(unittest.TestCase):
                 walk(child)
 
         walk(self.page)
-        self.assertEqual(len(switches), 2, "开机即启动 + 启动后缩到托盘")
+        # ★ 数目对着**布尔字段**数，别写死一个数字：加一个开关就要来改一次测试，
+        #   而改的人多半只会把 2 改成 3，顺手把下面那条「点的是哪一个」也改错。
+        bool_keys = [f.key for f in settings_store.FIELDS if f.kind == "bool"]
+        self.assertEqual(len(switches), len(bool_keys), "每个布尔参数一枚胶囊开关")
 
+        autostart = switches[bool_keys.index("WXCLIENT_UI_AUTOSTART")]
         var = self.page._vars["WXCLIENT_UI_AUTOSTART"]
         before = bool(var.get())
-        switches[0].toggle()
+        autostart.toggle()
         self.assertNotEqual(bool(var.get()), before, "点一下要真的翻过来")
 
     def test_the_save_buttons_are_pinned_outside_the_scroll_area(self) -> None:

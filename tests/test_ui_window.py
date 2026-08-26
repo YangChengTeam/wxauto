@@ -2073,8 +2073,14 @@ class AgentTakeoverSwitchTests(unittest.TestCase):
             self.window._toggle_context_mode()
 
         self.assertEqual(self.calls, [("take_over", "我本人跟进")])
-        self.assertIn("接管", self._button())
-        self.window._render_context_mode("take_over", synced=True)
+        # ★ 不等回话：这一拍状态行就已经是接管中了（按钮先说「正在切换…」）。
+        self.assertEqual(self._row(), "人工接管中")
+        self.assertEqual(self._button(), "正在切换…")
+
+        # 回话之后按钮落到稳定态：再点一下就是交回。
+        self.window._poll_context_mode()
+        self._running("take_over")
+        self.window.refresh_state()
         self.assertEqual(self._row(), "人工接管中")
         self.assertEqual(self._button(), "交回分身")
 
@@ -2084,6 +2090,7 @@ class AgentTakeoverSwitchTests(unittest.TestCase):
             self.window._toggle_context_mode()
 
         self.assertEqual(self.calls, [])
+        self.window.refresh_state()
         self.assertEqual(self._row(), "AI 托管中")
 
     def test_an_empty_reason_still_carries_one(self) -> None:
@@ -2127,8 +2134,7 @@ class AgentTakeoverSwitchTests(unittest.TestCase):
         self.window._render_context_mode("take_over", synced=False)
 
         self.assertEqual(self._row(), "人工接管中", "报不出去 ≠ 没接管")
-        self.assertIn("未", self._note() or "还没")
-        self.assertIn("业务端", self._note())
+        self.assertIn("业务端", self._note(), "得说清是没报上去，而不是没接管")
 
     def test_an_unsynced_state_says_so_without_lying_about_the_switch(self) -> None:
         """「未同步」是**补充说明**，不是把开关画成关着的。"""
