@@ -159,6 +159,18 @@ def _file_refs(args: dict[str, Any], *, required: bool = True) -> list[FileRef]:
 #: 也不该占任何微信配额（配额管的是「会不会打扰真人」）。
 UPDATE_CANDIDATE_OP = "update_candidate"
 
+#: 089 · 企业端下发的分身级接管/托管。同样**不在 `COMMANDS` 里**，理由和上一条一样，
+#: 但这一条更要紧：它一旦被算进微信配额，就会出现「今天消息发满了 → 主管的接管指令下不去」，
+#: 而接管恰恰是「现在立刻别再发了」的意思。照 `update_candidate` 处置：
+#: 不走微信队列、不 `reserve()`、不看工作时间窗。
+SET_CONTEXT_MODE_OP = "set_context_mode"
+#: 只认这两个词，别的值一律拒（词表的唯一一份在 AI 端 `wechatContextMode.ts`）。
+CONTEXT_MODES = ("take_over", "delegated")
+
+#: 本机 → AI 端的**上行** op（089 任务 13）：招聘老师按了开关、或者重连之后补报一次。
+#: 与上面那条下行是方向相反的两条路，AI 端收到只记账，不会往回投指令。
+CONTEXT_MODE_UPLINK_OP = "wechat.context_mode"
+
 #: 这两个 op 是**真发给候选人一条微信**，做成了要上报给业务后端（未回复跟进的计时起点）。
 #: 值是契约的 `messageType`。其余 op 一律不报：加好友不是消息，朋友圈没有收件人，
 #: 读类什么都没发生。
@@ -267,6 +279,7 @@ class CommandExecutor:
         capabilities: Callable[[], dict] | None = None,
         candidates: CandidateDirectory | None = None,
         message_events: MessageEventReporter | None = None,
+        on_context_mode: Callable[[str], None] | None = None,
     ) -> None:
         """``capabilities`` 是个**取当下能力表**的函数（074），不是一份快照——
         微信随时可能被关掉、掉线，执行前这一刻算的才作数。"""
@@ -281,6 +294,7 @@ class CommandExecutor:
         self._capabilities = capabilities
         self._candidates = candidates
         self._message_events = message_events
+        self._on_context_mode = on_context_mode
 
     async def execute(
         self,
@@ -316,6 +330,8 @@ class CommandExecutor:
     ) -> CommandResult:
         if op == UPDATE_CANDIDATE_OP:
             return await self._update_candidate(command_id, data)
+        if op == SET_CONTEXT_MODE_OP:
+            return self._set_context_mode(command_id, data)
 
         spec = COMMANDS.get(op)
         if spec is None:
@@ -456,6 +472,47 @@ class CommandExecutor:
         if not result.get("updated"):
             return CommandResult(command_id, "failed", str(result.get("reason") or "候选人状态没写成"))
         return CommandResult(command_id, "done", result=result)
+
+    def _set_context_mode(self, command_id: str, data: dict[str, Any]) -> CommandResult:
+        """089 · 企业端下发「接管这台分身 / 交回分身」，落本机 + 刷界面。
+
+        ★ **不走微信队列、不 `reserve()`、不看工作时间窗**——它一个微信窗口都不碰。
+          算进配额就会出现「今天消息发满了 → 主管的接管指令下不去」，而接管的意思恰恰是
+          「现在立刻别再发了」。同 `update_candidate` 的处置。
+
+        ★ **落地之后不回头 PUT 业务端**（docs/19 §5.3 三处防回环里的一处）：
+          这条指令本来就是业务端发起的，报回去只会让它再下发一次。
+
+        ★ **旧 `version` 一律丢弃**：下发和本机开关是两个下达者，定序权威在业务端。
+          同版照收——那是重投，客户端上一次可能没收到。
+
+        ★ 这一条**不看 `allow_real_actions`**：只走流程不真动微信的机器，接管照样要生效
+          （它是「别动微信」，不是「去动微信」）；拒掉反而会让演示机在接管期间照发不误。
+        """
+        args = data.get("args")
+        args = args if isinstance(args, dict) else {}
+        mode = str(args.get("context_mode") or "").strip()
+        if mode not in CONTEXT_MODES:
+            return CommandResult(command_id, "rejected", f"不认识的接管状态：{mode or '(空)'}")
+        raw_version = args.get("version")
+        version = int(raw_version) if isinstance(raw_version, int) and raw_version >= 0 else 0
+        current = self._store.context_mode(self._account)
+        if version and version < current.version:
+            _log.info("接管指令版本比本机的旧，丢弃", version=version, current=current.version)
+            return CommandResult(command_id, "done", "已有更新的状态，本条忽略")
+        reason = str(args.get("reason") or "")[:200]
+        # `reported_at` 给当下：这条是**业务端自己发起**的，它本来就知道，不欠补报。
+        self._store.set_context_mode(
+            self._account, mode, reason=reason, version=version,
+            reported_at=self._clock().isoformat(),
+        )
+        _log.info("分身级接管状态已按企业端下发更新", context_mode=mode, version=version)
+        if self._on_context_mode is not None:
+            try:
+                self._on_context_mode(mode)
+            except Exception:  # noqa: BLE001 —— 刷界面失败不该让指令变成没执行
+                _log.warning("接管状态刷界面失败")
+        return CommandResult(command_id, "done", result={"context_mode": mode, "version": version})
 
     def _note_message_sent(
         self,

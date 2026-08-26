@@ -298,6 +298,11 @@ def main(argv: list[str] | None = None) -> int:
             config_path=args.config,
             gateway_db=args.gateway_db,
             client_token=lambda: auth_client.token,
+            # 089 任务 26：登录响应里那份 `activationStatus` 就是启动对齐的依据（零新接口）。
+            # 每次读**当下**的 identity——重登之后换了人，对齐依据也得跟着换。
+            login_context_mode=lambda: (
+                auth_client.identity.context_mode if auth_client.identity else None
+            ),
         )
 
     service = GatewayService(build)

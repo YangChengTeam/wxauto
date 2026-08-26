@@ -19,10 +19,13 @@ from typing import Any
 
 import structlog
 
+from .agent_status import AgentStatusReporter
 from .candidates import CandidateDirectory
 from .capabilities import CAPABILITIES_OP, Capability, capabilities_frame
 from .commands import (
     COMMAND_EVENT,
+    CONTEXT_MODE_UPLINK_OP,
+    CONTEXT_MODES,
     NOTICE_EVENT,
     RESULT_OP,
     STAGE_RECEIVED,
@@ -196,6 +199,8 @@ class GatewayRunner:
         client_factory: Callable[..., AgentWsClient] | None = None,
         clock: Callable[[], datetime] | None = None,
         capabilities: Callable[[], dict[str, Capability]] | None = None,
+        agent_status: AgentStatusReporter | None = None,
+        login_context_mode: Callable[[], tuple[str, int] | None] | None = None,
     ) -> None:
         self._settings = settings
         self._store = store
@@ -210,8 +215,16 @@ class GatewayRunner:
         self._candidates = candidates
         self._message_events = message_events
         self._capabilities = capabilities
+        # 089：分身级接管状态报给业务后端的那条路。没配（没登录/没接口地址）也照常跑——
+        # 本机那道闸不依赖它，报不上去只是「外面还不知道」。
+        self._agent_status = agent_status
+        #: 登录响应里那份 `activationStatus`（`(context_mode, version)`），启动对齐用。
+        self._login_context_mode = login_context_mode
+        self._context_aligned = False
         # account_id → (报给了哪条连接, 报的是什么)。**连接也要记**，见 _report_capabilities。
         self._reported_capabilities: dict[str, tuple[Any, dict[str, Any]]] = {}
+        # 089 任务 13 同理：接管状态也是按**连接**记的，重连之后要重报一次。
+        self._reported_context_mode: dict[str, tuple[Any, str, int]] = {}
         self._command_tasks: set[asyncio.Task[None]] = set()
         self._debug_session_id: str | None = None
         self._command_listener: Callable[[dict[str, Any]], None] | None = None
@@ -907,6 +920,111 @@ class GatewayRunner:
         """离下一趟读消息还有几秒（None = 现在不会读）。只读，给桌面端状态栏用。"""
         return self.loop.seconds_to_next_poll()
 
+    def context_mode(self) -> tuple[str, bool]:
+        """`(现在归谁用, 报出去了没有)`。只读，给桌面端状态栏用（可跨线程读）。
+
+        ★ 「报出去了没有」**不影响归谁用**：本机才是即时执行的权威（design §1.1）。
+          界面把它显示成一句「未同步」，而不是把开关画成关着的。
+        """
+        if not self._accounts:
+            return ("delegated", True)
+        row = self._store.context_mode(self._accounts[0])
+        # 从没设过（`updated_at` 空）＝ 没有欠账，别把默认状态说成「未同步」。
+        synced = row.reported_at is not None or not row.updated_at
+        return (row.context_mode, synced)
+
+    async def set_context_mode(self, mode: str, *, reason: str = "") -> dict[str, Any]:
+        """招聘老师在界面上按了那个开关（089 Phase 2）。**先落本机，再谈上报**。
+
+        顺序就是权威的划分：接管的意思是「现在立刻别再发了」，它必须在断网、业务端 500、
+        接口还没上线的时候照样成立。所以这里落完库就已经生效了——那道闸在 `guard.py`，纯本地。
+
+        ★ **上报失败不回滚**（`agent_status.py` 那条铁律），唯独 `409` 例外：那是业务端说
+          「你手上那份过期了」，才以它给出的当前真值为准。
+        """
+        if mode not in CONTEXT_MODES:
+            raise ValueError(f"不认识的接管状态：{mode or '(空)'}")
+        account = self._accounts[0] if self._accounts else ""
+        if not account:
+            raise ValueError("这台机器还没绑微信号")
+        current = self._store.context_mode(account)
+        row = self._store.set_context_mode(
+            account, mode, reason=reason, version=current.version,
+        )
+        _log.info("本机按下分身级接管开关", context_mode=mode)
+        # 本机已经生效了，剩下的都是「让外面知道」——失败一律不回滚。
+        self._reported_context_mode.clear()
+        for account_id in self._accounts:
+            await self._report_context_mode(account_id)
+        note = await self._sync_agent_status(account, row.context_mode, reason=reason)
+        synced = note is None
+        return {
+            "context_mode": self._store.context_mode(account).context_mode,
+            "synced": synced,
+            "note": note or "",
+        }
+
+    async def _sync_agent_status(self, account: str, mode: str, *, reason: str) -> str | None:
+        """把状态报给业务后端。返回 None = 报成了；返回一句人话 = 没报成（**本机不动**）。"""
+        if self._agent_status is None:
+            return "业务端还没接这条接口，这台电脑先自己生效了"
+        row = self._store.context_mode(account)
+        outcome = await self._agent_status.report(
+            mode, reason=reason or row.reason, expected_version=row.version,
+        )
+        if outcome.reported:
+            self._store.mark_context_mode_reported(account, self._clock().isoformat())
+            return None
+        if outcome.rollback_to is not None:
+            # ★ 唯一该回滚的一档：企业端刚改过，以它给出的当前真值为准。
+            self._store.set_context_mode(
+                account, outcome.rollback_to,
+                version=outcome.rollback_version or row.version,
+                reported_at=self._clock().isoformat(),
+            )
+            self._reported_context_mode.clear()
+            for account_id in self._accounts:
+                await self._report_context_mode(account_id)
+        return outcome.reason or "没能报给业务端"
+
+    async def align_context_mode(self) -> None:
+        """启动时对齐一次分身级接管状态（089 任务 26 / docs/19 §2.3、§4.3）。**只跑一次**。
+
+        两件事，顺序不能反：
+        ① **欠着的先补报**（`reported_at` 为空）——那是招聘老师按下、外面还不知道的意图。
+           无心跳契约，服务端不会自己来问；不补报，重启就等于把那次接管悄悄取消了。
+        ② 否则按登录响应里的 `activationStatus` 对齐（零新接口）：**只认版本号更大的那份**，
+           定序权威在业务端。同版不动——同版时更晚发生的是本机那次。
+        """
+        if self._context_aligned:
+            return
+        self._context_aligned = True
+        account = self._accounts[0] if self._accounts else ""
+        if not account:
+            return
+        row = self._store.context_mode(account)
+        if row.updated_at and row.reported_at is None:
+            note = await self._sync_agent_status(account, row.context_mode, reason=row.reason)
+            if note:
+                _log.info("启动补报分身级接管状态没成功，先欠着", 原因=note)
+            return
+        if self._login_context_mode is None:
+            return
+        try:
+            landed = self._login_context_mode()
+        except Exception as exc:  # noqa: BLE001 —— 对齐失败不该把启动带停
+            _log.warning("读登录响应里的分身状态失败", error=str(exc))
+            return
+        if landed is None:
+            return
+        mode, version = landed
+        if mode not in CONTEXT_MODES or version <= row.version:
+            return
+        self._store.set_context_mode(
+            account, mode, version=version, reported_at=self._clock().isoformat(),
+        )
+        _log.info("已按登录响应对齐分身级接管状态", context_mode=mode, version=version)
+
     def pending_backlog(self) -> int:
         """入站待处理队列里还欠着几批（070）。只读，给状态栏用。
 
@@ -937,6 +1055,7 @@ class GatewayRunner:
             else:
                 self._connect_error = None
                 await self._report_capabilities(account_id)
+                await self._report_context_mode(account_id)
 
     async def run(self) -> None:
         # 四条常驻循环各走各的节拍：保活 30s、读消息 ~1min、查好友申请 ~15min、
@@ -956,6 +1075,9 @@ class GatewayRunner:
         # ★ 它同时是**监听名单**的来源（085，用户 2026-08-20：就用 /client/contacts，不新增接口），
         # 所以这条循环停了不只是「备注名会重」，而是「HR 新圈的人分身认不出来」。
         side_tasks.append(asyncio.create_task(self._sync_contacts(), name="gw-contacts"))
+        # 089 任务 26：启动对齐分身级接管状态。放后台——它可能要等业务端一个来回，
+        # 不该挡住网关起来；对不齐也只是「外面暂时还不知道」，本机那道闸早生效了。
+        side_tasks.append(asyncio.create_task(self.align_context_mode(), name="gw-context-mode"))
         # 消息事件同样后台清：它决定后端排不排「未回复跟进」，但一条都不该挡住微信侧。
         if self._message_events is not None:
             side_tasks.append(
@@ -1005,6 +1127,50 @@ class GatewayRunner:
             cap["label"] for cap in frame["capabilities"].values() if not cap["available"]
         ]
         _log.info("已上报本机能力", 做不了=unavailable or "无")
+
+    async def _report_context_mode(self, account_id: str) -> None:
+        """重连之后把本机的分身级接管状态补报给 AI 端（089 任务 13 / docs/19 §5.2）。
+
+        不报的后果和 [[wechat-gateway-registration-scope]] 那次事故同形：闸本身是对的，
+        漏的是**重连**那条路——AI 端手里那份停在断线之前，于是「机器上明明接管着，
+        AI 端照常调业务接口」。
+
+        ★ **只补报「本机说了算的那一份」**，两种情形：
+          ① 现在正接管着——丢了它最贵（AI 端会照常动作）；
+          ② 还欠一次上报（`reported_at` 为空）——那是招聘老师按下、但外面还不知道的意图，
+             包括「离线时按了恢复」。
+          其余情况一条都不报：默认是分身在管，平白报一条 `delegated` 可能把企业端在
+          离线那几分钟下的接管顶掉（AI 端还有一道版本闸兜底，但不该指望它）。
+
+        ★ 从来没设过（``updated_at`` 为空）更是什么都不报——机器装好就是默认状态。
+        """
+        row = self._store.context_mode(account_id)
+        if not row.updated_at:
+            return
+        if not row.taken_over and row.reported_at is not None:
+            return
+        try:
+            client = await self._pool.acquire(account_id)
+        except Exception as exc:  # noqa: BLE001 —— 连不上不该把保活带停
+            _log.warning("接管状态补报失败", error=str(exc))
+            return
+        # 「变了才报」同样要连上连接一起看：断线重连是一条**新连接**，内容没变也得重报。
+        fingerprint = (client, row.context_mode, row.version)
+        if self._reported_context_mode.get(account_id) == fingerprint:
+            return
+        frame: dict[str, Any] = {"context_mode": row.context_mode}
+        if row.reason:
+            frame["reason"] = row.reason
+        if row.version:
+            # 带上本机手里那个版本号，好让 AI 端认出「这是离线期间已经过期的一份」。
+            frame["version"] = row.version
+        try:
+            await client.notify(CONTEXT_MODE_UPLINK_OP, frame)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("接管状态补报失败", error=str(exc))
+            return
+        self._reported_context_mode[account_id] = fingerprint
+        _log.info("已把本机接管状态报给 AI 端", context_mode=row.context_mode)
 
     async def _keepalive_loop(self) -> None:
         while True:

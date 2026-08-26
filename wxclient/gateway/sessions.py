@@ -12,6 +12,7 @@ import json
 import sqlite3
 from collections.abc import Iterable, Sequence
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -121,6 +122,18 @@ CREATE TABLE IF NOT EXISTS gateway_strangers (
   last_seen_at  TEXT NOT NULL,
   PRIMARY KEY (account_id, session_name)
 );
+CREATE TABLE IF NOT EXISTS gateway_context_mode (
+  account_id   TEXT PRIMARY KEY,
+  -- take_over = 招聘老师本人在用这台微信；delegated = 交回分身（089 / docs/19）
+  context_mode TEXT NOT NULL,
+  reason       TEXT NOT NULL DEFAULT '',
+  -- 业务后端定序用的版本号；本机自己按下的没有版本号，存 0
+  version      INTEGER NOT NULL DEFAULT 0,
+  updated_at   TEXT NOT NULL,
+  -- 最后一次**成功上报给业务后端**的时间。空 = 还欠一次补报（无心跳契约，
+  -- 服务端不会自己知道；没有这一列，重启之后那次没报上去的接管就永远丢了）
+  reported_at  TEXT
+);
 CREATE TABLE IF NOT EXISTS gateway_read_marks (
   account_id TEXT NOT NULL,
   action     TEXT NOT NULL,
@@ -155,6 +168,22 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str)
     cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in cols:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
+@dataclass(frozen=True)
+class ContextModeRow:
+    """本机那份「这台微信归谁用」（089）。"""
+
+    context_mode: str
+    reason: str
+    version: int
+    updated_at: str
+    """最后一次成功上报给业务后端的时间；None = 还欠一次补报。"""
+    reported_at: str | None
+
+    @property
+    def taken_over(self) -> bool:
+        return self.context_mode == "take_over"
 
 
 class GatewayStore:
@@ -585,6 +614,74 @@ class GatewayStore:
                   updated_at=excluded.updated_at
                 """,
                 (account_id, peer_id, signature, seq, _utcnow().isoformat()),
+            )
+            conn.commit()
+
+    # ────────────── 分身级人工接管（089 / docs/19） ──────────────
+
+    def context_mode(self, account_id: str) -> ContextModeRow:
+        """这台微信现在归谁用。**重启读回**是这张表存在的唯一理由。
+
+        ★ 从来没设过 → `delegated`（分身在管）。默认必须是这一档：接管是**例外状态**，
+          装好就接管等于装上就不干活；而且真正的兜底是——本机这道闸只有招聘老师自己
+          按过才会关上。
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT context_mode, reason, version, updated_at, reported_at "
+                "FROM gateway_context_mode WHERE account_id=?",
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            return ContextModeRow("delegated", "", 0, "", None)
+        mode = str(row[0])
+        return ContextModeRow(
+            mode if mode in ("take_over", "delegated") else "delegated",
+            str(row[1] or ""),
+            int(row[2] or 0),
+            str(row[3] or ""),
+            str(row[4]) if row[4] else None,
+        )
+
+    def set_context_mode(
+        self,
+        account_id: str,
+        mode: str,
+        *,
+        reason: str = "",
+        version: int = 0,
+        reported_at: str | None = None,
+    ) -> ContextModeRow:
+        """落本机。**先落这里再谈上报**——即时执行权在本机（design §1.1）。
+
+        `reported_at=None` = 这一次还没报给业务后端，重启后要补报一次
+        （无心跳契约，服务端不会自己知道）。
+        """
+        now = _utcnow().isoformat()
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO gateway_context_mode
+                  (account_id, context_mode, reason, version, updated_at, reported_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                  context_mode=excluded.context_mode,
+                  reason=excluded.reason,
+                  version=excluded.version,
+                  updated_at=excluded.updated_at,
+                  reported_at=excluded.reported_at
+                """,
+                (account_id, mode, reason, int(version), now, reported_at),
+            )
+            conn.commit()
+        return ContextModeRow(mode, reason, int(version), now, reported_at)
+
+    def mark_context_mode_reported(self, account_id: str, at: str | None = None) -> None:
+        """上报成功了。只动 `reported_at`——状态本身不许在这里被改写。"""
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE gateway_context_mode SET reported_at=? WHERE account_id=?",
+                (at or _utcnow().isoformat(), account_id),
             )
             conn.commit()
 

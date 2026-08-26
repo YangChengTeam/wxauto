@@ -79,6 +79,10 @@ class GatewayStatus:
     next_read_seconds: float | None = None
     #: 在不在工作时间窗之外。窗外一个微信动作都不做，所以也就没有「下一趟」。
     quiet_hours: bool = False
+    #: 089 · 这台分身现在归谁用：`delegated`（分身在管）/ `take_over`（招聘老师本人在跟）。
+    context_mode: str = "delegated"
+    #: 上报给业务端了没有。★ 它**不改变**上面那一格——本机才是权威，界面只多标一句「未同步」。
+    context_synced: bool = True
 
 
 class GatewayService:
@@ -285,6 +289,21 @@ class GatewayService:
             raise ServiceNotRunning("服务没在运行，名单改不了")
         return asyncio.run_coroutine_threadsafe(gateway.runner.remove_watched(name), loop)
 
+    def set_context_mode(self, mode: str, *, reason: str = "") -> Future[Any]:
+        """按下「人工接管 / 交回分身」（089）。返回一个还没完成的 Future（界面在心跳里问它）。
+
+        ★ 落本机这一步在网关线程上同步做完，**不等网络**：接管的意思是「现在立刻别再发了」。
+          Future 的值是 `{context_mode, synced, note}`——`synced=False` 时界面标一句
+          「未同步」，**但开关照旧显示成接管中**（本机才是权威，design §1.1）。
+        """
+        with self._lock:
+            loop, gateway = self._loop, self._gateway
+        if loop is None or gateway is None or self.state is not ServiceState.RUNNING:
+            raise ServiceNotRunning("服务没在运行，接管状态改不了")
+        return asyncio.run_coroutine_threadsafe(
+            gateway.runner.set_context_mode(mode, reason=reason), loop
+        )
+
     def interrupt_debug(self) -> None:
         """停掉调试会话正在跑的那一轮。丢到网关线程上做，界面不等它。"""
         with self._lock:
@@ -394,6 +413,9 @@ class GatewayService:
                 return fallback
 
         accounts = read(lambda: len(gateway.accounts), 0)
+        # 089：读一次就好，下面两格是同一份真相的两半（归谁用 / 报出去了没有）。
+        mode = read(lambda: gateway.runner.context_mode(), ("delegated", True))
+        mode = mode if isinstance(mode, tuple) and len(mode) == 2 else ("delegated", True)
         return GatewayStatus(
             # 一律裹成 lambda：直接写 `gateway.runner.xxx` 会在进 read() 之前就求值，
             # runner 缺席时抛出来的 AttributeError 会绕过这里的兜底、把整排状态清空。
@@ -404,6 +426,8 @@ class GatewayService:
             connect_error=read(lambda: gateway.runner.connect_error, None),  # type: ignore[arg-type]
             next_read_seconds=read(lambda: gateway.runner.seconds_to_next_read(), None),  # type: ignore[arg-type]
             quiet_hours=bool(read(lambda: gateway.runner.in_quiet_hours(), False)),
+            context_mode=str(mode[0]),
+            context_synced=bool(mode[1]),
         )
 
     def wait_ready(self, timeout: float = 10.0) -> bool:

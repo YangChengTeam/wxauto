@@ -17,6 +17,7 @@ from wxclient.config import load_settings
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
+from .agent_status import AgentStatusReporter
 from .candidates import CandidateDirectory
 from .capabilities import Capability, probe_capabilities
 from .commands import COMMANDS, CommandExecutor
@@ -82,6 +83,7 @@ def build_gateway(
     config_path: str | Path | None = None,
     gateway_db: str | Path | None = None,
     client_token: Callable[[], str] | None = None,
+    login_context_mode: Callable[[], tuple[str, int] | None] | None = None,
 ) -> Gateway:
     """装配一套可运行的网关。配置不合法直接抛 ``ValueError``，绝不带着半套配置启动。"""
     resolved_accounts = normalize_accounts(accounts)
@@ -176,6 +178,13 @@ def build_gateway(
         else None
     )
 
+    # 089：分身级接管状态上报。和换票、会话名共用同一个 Client Token——同一个员工身份。
+    # ★ 它**不影响本机那道闸**：报不上去只是「外面还不知道」，接管在这台电脑上早生效了。
+    agent_status = AgentStatusReporter(
+        gateway_settings.business_api_url,
+        client_token or (lambda: ""),
+    )
+
     runner = GatewayRunner(
         settings=gateway_settings,
         ticket_provider=ticket_provider,
@@ -189,6 +198,8 @@ def build_gateway(
         accounts=list(resolved_accounts),
         watchlist=watchlist,
         capabilities=current_capabilities,
+        agent_status=agent_status,
+        login_context_mode=login_context_mode,
         contacts=contacts,
         candidates=candidates,
         message_events=message_events,

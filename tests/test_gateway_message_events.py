@@ -337,6 +337,39 @@ class InboundReportingTests(StoreTestCase):
         self.assertEqual(len(self.store.list_pending_inbound()), 1)
 
 
+class TakeoverLeavesTheReadSideAloneTests(InboundReportingTests):
+    """089 任务 4 · 接管期间**读侧零误伤**（docs/19 §3.2）。
+
+    接管的意思是「分身别自动发」，不是「分身别看了」。读侧一旦跟着停：
+    - 入站事件不报 → 业务后端排不了「未回复跟进」，人交回来之后没人知道谁在等着；
+    - 会话进不了待处理表 → 接管这段时间的话直接消失（连补投的机会都没有）。
+
+    ★ 所以这一组全是「照常」断言。看着乏味，但它盯的正是最容易被顺手一起关掉的一层。
+
+    ★ **故意继承** `InboundReportingTests`：父类那几条（入站事件交出去、拒绝也照报、
+      旁听者出错不带停读循环）在接管状态下**原样再跑一遍**——「照常」这件事，
+      与其重写断言，不如让同一份断言在接管中也成立。
+    """
+
+    def _loop(self, batches, on_peer_messages) -> InboundLoop:
+        loop = super()._loop(batches, on_peer_messages)
+        self.store.set_context_mode(ACCOUNT, "take_over", reason="我自己来跟")
+        return loop
+
+    async def test_the_batch_still_lands_in_the_pending_table(self) -> None:
+        """★ 接管期间的消息照样进队列——恢复托管之后要能原样补投。"""
+        loop = self._loop([[msg("在吗", msg_id="m1")]], lambda *_a: None)
+        await loop.tick()
+        self.assertEqual(len(self.store.list_pending_inbound()), 1)
+
+    async def test_the_watchlist_loses_nobody(self) -> None:
+        """★ 接管 ≠ 把人移出监听名单。名单退不回去，这一步做错就是不可逆的。"""
+        loop = self._loop([[msg("在吗", msg_id="m1")]], lambda *_a: None)
+        before = self.store.get_watchlist()
+        await loop.tick()
+        self.assertEqual(self.store.get_watchlist(), before)
+
+
 # ────────────────────────── 出站：我方发出去了 ──────────────────────────
 
 

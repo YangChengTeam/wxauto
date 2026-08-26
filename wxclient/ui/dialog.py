@@ -43,9 +43,13 @@ class _Dialog:
     """一个模态小窗。别直接用，走下面的 `ask()` / `tell()`。"""
 
     def __init__(self, parent: tk.Misc, title: str, message: str, *,
-                 confirm: str, cancel: str | None, tone: str) -> None:
+                 confirm: str, cancel: str | None, tone: str,
+                 prompt: str | None = None) -> None:
         self.parent = parent.winfo_toplevel()
         self.result = False
+        #: 要人填一行字时那个输入框；`ask_text` 之外一律是 None。
+        self.entry: tk.Entry | None = None
+        self.text = ""
 
         self.top = tk.Toplevel(self.parent)
         self.top.withdraw()  # 先藏着：摆好位置再露面，否则会看见它从左上角跳过来
@@ -80,6 +84,20 @@ class _Dialog:
         tk.Label(body, text=message, font=theme.FONT_BODY, bg=theme.CONTENT_BG,
                  fg=theme.TEXT_MUTED, justify=tk.LEFT, anchor="w",
                  wraplength=WRAP).pack(fill=tk.X, padx=28, pady=(14, 22))
+
+        if prompt is not None:
+            # 要人填一行字（089：接管必须写一句原因，业务端 `human_takeover` 的必填项）。
+            # 就一行——问的是「为什么」，不是让人在这儿写小作文。
+            field = tk.Frame(body, bg=theme.CONTENT_BG)
+            field.pack(fill=tk.X, padx=28, pady=(0, 20))
+            self.entry = tk.Entry(field, font=theme.FONT_BODY, bg=theme.CONTENT_BG,
+                                  fg=theme.TEXT, insertbackground=theme.TEXT,
+                                  relief=tk.FLAT, highlightthickness=1,
+                                  highlightbackground=theme.FIELD_LINE,
+                                  highlightcolor=theme.GREEN)
+            self.entry.pack(fill=tk.X, ipady=6)
+            if prompt:
+                self.entry.insert(0, prompt)
 
         foot = tk.Frame(body, bg=theme.FOOTER_BG)
         foot.pack(fill=tk.X)
@@ -135,12 +153,21 @@ class _Dialog:
         # ★ 必须 force：overrideredirect 的窗口不会自动拿到键盘焦点，
         # 不 force 的话回车和 Esc 那两条绑定一次都不会触发。
         self.top.focus_force()
-        self.confirm.focus_set()
+        # 要填字的时候焦点给输入框：光标不在框里的话，人得先点一下才能打字。
+        (self.entry or self.confirm).focus_set()
+        if self.entry is not None:
+            self.entry.selection_range(0, tk.END)
         self.top.wait_window()
         return self.result
 
     def _close(self, result: bool) -> None:
         self.result = result
+        if self.entry is not None:
+            # 先把字取出来再销毁控件——反过来只会拿到一个 TclError。
+            try:
+                self.text = self.entry.get().strip()
+            except tk.TclError:
+                self.text = ""
         try:
             self.top.grab_release()
         except tk.TclError:
@@ -152,6 +179,18 @@ def ask(parent: tk.Misc, title: str, message: str, *,
         confirm: str = "确定", cancel: str = "取消") -> bool:
     """问一句要不要。关窗口 / Esc / 点取消都回 False。"""
     return _Dialog(parent, title, message, confirm=confirm, cancel=cancel, tone="info").show()
+
+
+def ask_text(parent: tk.Misc, title: str, message: str, *,
+             prompt: str = "", confirm: str = "确定", cancel: str = "取消") -> str | None:
+    """问一句要不要，并要人填一行字。返回那行字；关窗口 / Esc / 点取消都回 None。
+
+    ★ **返回 None 和返回空串是两件事**：None = 「不做这件事」，空串 = 「要做，但一个字没填」。
+      调用方据此决定是拦下来还是给个默认值——压成一个值就分不清了。
+    """
+    box = _Dialog(parent, title, message, confirm=confirm, cancel=cancel,
+                  tone="info", prompt=prompt)
+    return box.text if box.show() else None
 
 
 def tell(parent: tk.Misc, title: str, message: str, *,

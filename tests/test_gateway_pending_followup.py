@@ -165,6 +165,80 @@ class GuardDenialKeepsTheBatchTests(FollowUpLoopTestCase):
         self.assertLessEqual(calls, PENDING_MAX_ATTEMPTS + 1)
 
 
+class TakeoverDefersInsteadOfSettlingTests(GuardDenialKeepsTheBatchTests):
+    """089 任务 3 · 接管两小时 ≠ 丢两小时的人（docs/19 §3.1）。
+
+    接管期间消息**照读**（US3），但一条都不自动回。这一批要跟额度用完时走同一条路：
+    ``defer`` —— 留着、不计失败，恢复托管之后原样重投。
+
+    ★ 如果接管走的是「销账」那一档，现场根本看不出丢过东西：状态栏积压数归零，
+      候选人那几句话就此消失。这正是 [[settle-only-when-said]] 那条教训的直接应用。
+    """
+
+    async def test_a_taken_over_agent_defers_the_batch(self) -> None:
+        self._now = T0
+        sender, sink = self._sender()
+        self.store.set_context_mode(ACCOUNT, "take_over", reason="我自己来跟")
+
+        results: list[DeliveryResult] = []
+
+        async def handler(account_id: str, peer_id: str, _t: str, _m) -> DeliveryResult:
+            result = await sender.deliver(account_id, peer_id, reply_card(["您好"]))
+            results.append(result)
+            return result
+
+        loop = self._loop(FakeSource([[msg("在吗", msg_id="m1")], [], []]), handler, now=T0)
+        await self._dispatch_once(loop)
+
+        self.assertEqual(sink.sent, [], "接管中一条都不许自动发")
+        self.assertEqual(results[-1].follow_up, FOLLOW_UP_DEFER, "接管会结束，属于「等一等」")
+        rows = self._pending()
+        self.assertEqual(len(rows), 1, "被接管拦下 ≠ 处理完")
+        self.assertEqual(rows[0]["attempts"], 0, "★ 等人干完活不该算失败：算了就会在接管期间把重试次数耗光")
+
+    async def test_the_batch_lands_after_the_agent_is_handed_back(self) -> None:
+        """★ 留着不是目的：恢复托管的下一趟要把**同一批**话真的说出去。"""
+        self._now = T0
+        sender, sink = self._sender()
+        self.store.set_context_mode(ACCOUNT, "take_over", reason="我自己来跟")
+
+        async def handler(account_id: str, peer_id: str, _t: str, _m) -> DeliveryResult:
+            return await sender.deliver(account_id, peer_id, reply_card(["您好"]))
+
+        loop = self._loop(FakeSource([[msg("在吗", msg_id="m1")], [], [], []]), handler, now=T0)
+        await self._dispatch_once(loop)
+        self.assertEqual(len(self._pending()), 1)
+
+        self.store.set_context_mode(ACCOUNT, "delegated")
+        self._now += timedelta(minutes=5)
+        await loop.tick()
+        await loop.drain()
+
+        self.assertEqual([text for _a, _p, text in sink.sent], ["您好"])
+        self.assertEqual(self._pending(), [], "发出去了才销账")
+
+    async def test_a_long_takeover_never_burns_the_retry_budget(self) -> None:
+        """接管一上午（远超重试上限的趟数）之后，这批人一个都不能少。"""
+        self._now = T0
+        sender, sink = self._sender()
+        self.store.set_context_mode(ACCOUNT, "take_over", reason="上午都我来")
+
+        async def handler(account_id: str, peer_id: str, _t: str, _m) -> DeliveryResult:
+            return await sender.deliver(account_id, peer_id, reply_card(["您好"]))
+
+        loop = self._loop(
+            FakeSource([[msg("在吗", msg_id="m1")]] + [[]] * 40), handler, now=T0
+        )
+        for _ in range(PENDING_MAX_ATTEMPTS + 2):
+            await self._dispatch_once(loop)
+        self.assertEqual(len(self._pending()), 1, "★ 接管久一点就把人丢了 = 最贵的那种丢")
+
+        self.store.set_context_mode(ACCOUNT, "delegated")
+        await loop.tick()
+        await loop.drain()
+        self.assertEqual([text for _a, _p, text in sink.sent], ["您好"])
+
+
 class InflightBatchIsNotReloadedTests(FollowUpLoopTestCase):
     """★ 正在跑的批次不能被重新装载（审计 P0-8）。
 

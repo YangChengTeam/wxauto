@@ -2015,5 +2015,166 @@ class TrayLifecycleTests(unittest.TestCase):
         self.assertTrue(tray.running)
 
 
+@unittest.skipUnless(HAS_TK, "没有 tkinter / 显示环境，窗口层测不了")
+class AgentTakeoverSwitchTests(unittest.TestCase):
+    """089 Phase 2 · 侧栏那个「人工接管 / 交回分身」开关。
+
+    ★ 一条铁律贯穿全组：**本机才是权威**。点下去就算网络全断、业务端 500、接口还没上线，
+      界面也要立刻变成接管中——因为那台电脑此刻确确实实已经不发消息了（闸在 `guard.py`）。
+      把开关画成「还没生效」等于骗人，而这正是最贵的一种骗：人以为自己接管了，分身还在聊。
+    """
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.service = GatewayService(lambda: None)
+        self.window = MainWindow(self.root, LogBuffer(), self.service,
+                                 data_dir=self.dir, probe_wechat=False)
+        self.calls: list[tuple[str, str]] = []
+        self.future: Any = _DoneFuture({"context_mode": "take_over", "synced": True, "note": ""})
+        self.service.set_context_mode = self._set  # type: ignore[method-assign]
+        self._running()
+        self.addCleanup(self._teardown)
+
+    def _set(self, mode: str, *, reason: str = ""):
+        self.calls.append((mode, reason))
+        if isinstance(self.future, Exception):
+            raise self.future
+        return self.future
+
+    def _running(self, mode: str = "delegated", *, synced: bool = True) -> None:
+        self.service._snapshot = (ServiceState.RUNNING, None)
+        self.service._status = GatewayStatus(
+            connected=1, accounts=1, context_mode=mode, context_synced=synced,
+        )
+
+    def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.window)
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+    def _row(self) -> str:
+        return self.window._rows["context"].cget("text")
+
+    def _button(self) -> str:
+        return self.window._context_button.cget("text")
+
+    def _note(self) -> str:
+        return self.window._context_note.cget("text")
+
+    # ── 点下去 ────────────────────────────────────────────────
+
+    def test_taking_over_asks_for_a_reason_and_changes_the_switch_at_once(self) -> None:
+        """★ 点一下 → 真去改本机状态 + 界面当场变。不等网络。"""
+        with mock.patch.object(window_module.dialog, "ask_text", return_value="我本人跟进"):
+            self.window._toggle_context_mode()
+
+        self.assertEqual(self.calls, [("take_over", "我本人跟进")])
+        self.assertIn("接管", self._button())
+        self.window._render_context_mode("take_over", synced=True)
+        self.assertEqual(self._row(), "人工接管中")
+        self.assertEqual(self._button(), "交回分身")
+
+    def test_cancelling_the_dialog_changes_nothing(self) -> None:
+        """Esc / 取消 = 不做这件事。一个字节都不许落。"""
+        with mock.patch.object(window_module.dialog, "ask_text", return_value=None):
+            self.window._toggle_context_mode()
+
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self._row(), "AI 托管中")
+
+    def test_an_empty_reason_still_carries_one(self) -> None:
+        """`reason` 是业务端 `human_takeover` 的必填项：一个字没填也得替他说一句。"""
+        with mock.patch.object(window_module.dialog, "ask_text", return_value=""):
+            self.window._toggle_context_mode()
+
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(self.calls[0][1], "空原因会被业务端 400 打回")
+
+    def test_handing_the_agent_back_asks_nothing(self) -> None:
+        """★ 交回分身不问：多一道确认只会让「我要它干活」比「让它停下」还费劲。"""
+        self._running("take_over")
+        with mock.patch.object(window_module.dialog, "ask_text") as ask_text, \
+             mock.patch.object(window_module.dialog, "ask") as ask:
+            self.window._toggle_context_mode()
+
+        ask_text.assert_not_called()
+        ask.assert_not_called()
+        self.assertEqual(self.calls, [("delegated", "")])
+
+    def test_a_second_click_while_the_first_is_in_flight_is_ignored(self) -> None:
+        """连点两下不该排两条——第二条会拿着旧状态算出反方向的意图。"""
+        self.future = _PendingFuture()
+        with mock.patch.object(window_module.dialog, "ask_text", return_value="我来"):
+            self.window._toggle_context_mode()
+            self.window._toggle_context_mode()
+
+        self.assertEqual(len(self.calls), 1)
+
+    # ── 报不出去 ──────────────────────────────────────────────
+
+    def test_a_failed_report_never_rolls_the_switch_back(self) -> None:
+        """★★ 这一条错了最贵：「我明明点了接管，分身还在发消息」。"""
+        self.future = _FailedFuture(RuntimeError("业务端 500"))
+        with mock.patch.object(window_module.dialog, "ask_text", return_value="我来"):
+            self.window._toggle_context_mode()
+        self._running("take_over")   # 本机那份早落好了，状态快照跟着变
+
+        self.window._poll_context_mode()
+        self.window._render_context_mode("take_over", synced=False)
+
+        self.assertEqual(self._row(), "人工接管中", "报不出去 ≠ 没接管")
+        self.assertIn("未", self._note() or "还没")
+        self.assertIn("业务端", self._note())
+
+    def test_an_unsynced_state_says_so_without_lying_about_the_switch(self) -> None:
+        """「未同步」是**补充说明**，不是把开关画成关着的。"""
+        self._running("take_over", synced=False)
+        self.window.refresh_state()
+
+        self.assertEqual(self._row(), "人工接管中")
+        self.assertTrue(self._note(), "得说一句还没报上去")
+
+    def test_a_conflict_shows_what_the_backend_says_instead(self) -> None:
+        """★ 409：企业端刚改过 → 以业务端为准，并把这件事说出来（别让人以为自己点漏了）。"""
+        self.future = _DoneFuture({
+            "context_mode": "delegated", "synced": False,
+            "note": "这台分身的状态已被企业端改过，已按企业端的最新状态显示",
+        })
+        with mock.patch.object(window_module.dialog, "ask_text", return_value="我来"):
+            self.window._toggle_context_mode()
+
+        self.window._poll_context_mode()
+        self.window._render_context_mode("delegated", synced=False)
+
+        self.assertEqual(self._row(), "AI 托管中")
+        self.assertIn("企业端", self._note())
+
+    # ── 服务没在跑 ────────────────────────────────────────────
+
+    def test_it_says_why_when_the_service_is_not_running(self) -> None:
+        """★ 说人话，别静悄悄什么都不发生（tk 回调里的异常是看不见的）。"""
+        self.service._snapshot = (ServiceState.STOPPED, None)
+        self.service._status = GatewayStatus()
+        self.future = ServiceNotRunning("服务没在运行，接管状态改不了")
+
+        with mock.patch.object(window_module.dialog, "ask_text", return_value="我来"), \
+             mock.patch.object(window_module.dialog, "tell") as tell:
+            self.window._toggle_context_mode()
+
+        tell.assert_called_once()
+        self.assertIn("没在运行", " ".join(str(a) for a in tell.call_args.args))
+
+    def test_a_stopped_service_shows_the_row_as_not_started(self) -> None:
+        self.service._snapshot = (ServiceState.STOPPED, None)
+        self.service._status = GatewayStatus()
+        self.window.refresh_state()
+
+        self.assertEqual(self._row(), "未启动")
+
+
 if __name__ == "__main__":
     unittest.main()
