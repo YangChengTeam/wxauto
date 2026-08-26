@@ -80,26 +80,35 @@ class UiaWeChatDriver:
     ) -> dict[str, Any]:
         """按手机号/微信号加好友，并把**后续拿什么名字回消息**一并带回来。
 
-        返回里三个名字各有各的用处，别混：
+        返回里几个名字各有各的用处，别混：
           · ``name``         —— 申请时对方名片上的**昵称**。会变、会重名、可能带 emoji，
                                 只适合给人看，**不要拿它当回复的锚**。
           · ``remark``       —— 我们自己设的备注。对方通过后，会话列表里显示的就是它。
           · ``session_name`` —— 后续 ``send_message(to=...)`` 该用的名字 = 备注优先，
                                 没设备注才退回昵称。这是唯一该被记下来的那个。
+          · ``profile_name`` —— 确定是**昵称**的那个值，只在拿得准时才有（见下）。
+          · ``already_friend`` —— 这个号早就是好友了。
 
-        ⚠️ 加好友是**异步**的：这里返回成功只代表申请发出去了，对方没通过就没有会话、
-        也发不了消息。真正"可以回了"的信号是 ``check_new_friends`` / 对方通过。
+        ★ 已经是好友时不再当失败抛（2026-08-26 用户提的场景）：名片这一趟已经搜完了，
+          名字也已经读到手，抛掉等于白搜一次陌生号（节拍红线：查好友 ≥300s 一次）而且
+          这个人在计划里永远停在原地。改成如实回一条「他已经是好友了」，昵称跟着回来，
+          由上层报回业务端。
+
+        ⚠️ 加好友是**异步**的：``already_friend`` 为假时，返回成功只代表申请发出去了，
+        对方没通过就没有会话、也发不了消息。真正"可以回了"的信号是
+        ``check_new_friends`` / 对方通过。
         """
         if self._is_dry_run(dry_run):
             return {
                 "dry_run": True, "action": "add_friend", "number": number,
                 "name": None, "remark": remark, "session_name": remark,
+                "profile_name": None, "already_friend": False,
             }
         self._ensure_ready()
         logger.info("friend.add.start", number=number, greetings=greetings[:20])
-        name: str | None = None
+        read: dict[str, Any] = {}
         try:
-            name = self._add_friend_reading_profile(number, greetings, remark)
+            read = self._add_friend_reading_profile(number, greetings, remark)
         except _AddFriendNotStarted as exc:
             # 只有在**一个按钮都还没点**的时候才会走到这儿，退回原来那条路，
             # 最坏也就是拿不到昵称——绝不会变成"申请发了两遍"。
@@ -110,16 +119,26 @@ class UiaWeChatDriver:
         except Exception as exc:
             logger.info("friend.add.failed", number=number, error=str(exc)[:100])
             raise WeChatApiError(f"添加好友失败：{exc}") from exc
-        session_name = remark or name
-        logger.info("friend.add.done", number=number, name=name, session_name=session_name)
+        name = read.get("name")
+        already_friend = bool(read.get("already_friend"))
+        if already_friend:
+            # 这一轮**没有**点添加、也就没设过备注：微信里他现在叫什么，名片顶上那行才是实情。
+            # 拿我们提议的 remark 当会话名会给出一个微信里根本不存在的名字，
+            # 逐字寻址随即找不到窗口（[[wechat-uia-window-state]] 同一类坑）。
+            session_name = read.get("display_name") or remark
+        else:
+            session_name = remark or name
+        logger.info("friend.add.done", number=number, name=name,
+                    session_name=session_name, already_friend=already_friend)
         return {
             "dry_run": False, "action": "add_friend", "number": number,
             "name": name, "remark": remark, "session_name": session_name,
+            "profile_name": read.get("profile_name"), "already_friend": already_friend,
         }
 
     def _add_friend_reading_profile(
         self, number: str, greetings: str, remark: str | None
-    ) -> str | None:
+    ) -> dict[str, Any]:
         """自己走一遍加好友流程，好在中间把名片上的昵称读下来。
 
         为什么不"先查一次名字再让 vendor 加一次"：那是**两次陌生号网络查找**，
@@ -152,11 +171,25 @@ class UiaWeChatDriver:
                 # AI 端只会以为对方没通过而一直等。说清楚是查不到。
                 raise WeChatApiError(f"没搜到这个号：{number}（号码不对，或对方不允许被搜到）")
 
-            name = _pick_profile_name(_profile_text_lines(profile), str(number))
+            lines = _profile_text_lines(profile)
+            name = _pick_profile_name(lines, str(number))
+            display_name = _pick_profile_display_name(lines, str(number))
+            nickname = _pick_profile_nickname(lines)
 
             add_button = profile.child_window(**Uielements.Buttons.AddToContactsButton)
             if not _truthy_safe_call(lambda: add_button.exists(timeout=2)):
-                raise WeChatApiError(f"这个号加不了：{number}（多半已经是好友了）")
+                # ★ 「没有添加按钮」本身只说明加不了，不说明为什么。要断定「已经是好友」得有
+                #   **正向**证据：名片上有「发消息」。vendor 自己也是这么判的
+                #   （`WeChatTools.py`：有发送消息按钮说明不是新朋友不需要添加）。
+                #   少了这道正向判据，任何一次名片没渲染完/换了版式都会被报成「已经是好友」，
+                #   于是 `wechatAdded` 被写成真——而那个人根本没加上。
+                if not self._profile_says_already_friend(profile, add_friend_pane, Uielements):
+                    raise WeChatApiError(
+                        f"这个号加不了：{number}（名片上既没有「添加到通讯录」也没有「发消息」）"
+                    )
+                logger.info("friend.add.already", number=number)
+                return {"name": name, "display_name": display_name,
+                        "profile_name": nickname, "already_friend": True}
 
             add_button.click_input()          # ← 从这里开始就动真格了，不再退回 vendor
             verify_window = Tools.move_window_to_center(Window=Uielements.Windows.VerifyFriendWindow)
@@ -167,9 +200,27 @@ class UiaWeChatDriver:
             if remark:
                 remark_edit.set_text(remark)
             verify_window.child_window(**Uielements.Buttons.ConfirmButton).click_input()
-            return name
+            # 陌生人名片上没有备注可言，顶上那行就是昵称——这条路上 `profile_name` 拿得准。
+            return {"name": name, "display_name": display_name,
+                    "profile_name": nickname or display_name, "already_friend": False}
         finally:
             _safe_call(getattr(add_friend_pane, "close", None))
+
+    @staticmethod
+    def _profile_says_already_friend(profile: Any, pane: Any, Uielements: Any) -> bool:
+        """名片上有「发消息」＝ 这个人已经在通讯录里了。
+
+        两处都找一遍：不同微信版本里这个按钮有时挂在名片组里、有时挂在整个添加朋友面板上。
+        控件定义缺席（vendor 版本旧）时返回 ``False`` —— 判不出来就不断言，宁可报"加不了"。
+        """
+        criteria = getattr(getattr(Uielements, "Buttons", None), "SendMessageButton", None)
+        if not criteria:
+            return False
+        for root in (profile, pane):
+            button = _safe_call(lambda r=root: r.child_window(**criteria))
+            if button is not None and _truthy_safe_call(lambda b=button: b.exists(timeout=2)):
+                return True
+        return False
 
     def _add_friend_via_vendor(self, number: str, greetings: str, remark: str | None) -> None:
         """原来那条路：vendor 全包，但什么名字都不给。只在退化时用。"""
@@ -2084,6 +2135,45 @@ def _looks_like_number(text: str) -> bool:
     """一串数字/加号/横线 —— 手机号那行，不是名字。"""
     stripped = text.replace("+", "").replace("-", "").replace(" ", "")
     return bool(stripped) and stripped.isdigit()
+
+
+def _pick_profile_nickname(lines: list[str]) -> str | None:
+    """只认**明写的**「昵称：X」。读不到就是读不到。
+
+    为什么不拿卡片顶上那行顶替：已经是好友时那行显示的是**备注**（HR 自己起的名字，
+    比如「张三-仓库工」）。把它当昵称报回业务端，候选人档案里的 `wechatName` 就成了
+    我们自己写的那个名字——一个看起来完全正常、但永远对不上对方微信的值。
+    """
+    for raw in lines:
+        line = str(raw or "").strip()
+        folded = line.casefold()
+        label = next((p for p in ("昵称", "暱稱", "nickname") if folded.startswith(p)), None)
+        if label is None:
+            continue
+        value = line[len(label):].lstrip("：: ").strip()
+        if value:
+            return value
+    return None
+
+
+def _pick_profile_display_name(lines: list[str], number: str) -> str | None:
+    """卡片顶上那行 —— 这台微信里这个人**显示成什么**（有备注就是备注，没有就是昵称）。
+
+    这正是会话列表里的那个名字，也就是 ``send_message(to=...)`` 要逐字用的会话名。
+    """
+    for raw in lines:
+        line = str(raw or "").strip()
+        if not line or line == number or _looks_like_number(line):
+            continue
+        if line.casefold() in _PROFILE_BUTTON_TEXTS:
+            continue
+        folded = line.casefold()
+        if any(folded.startswith(p) for p in _PROFILE_LABEL_PREFIXES):
+            continue
+        if number and number in line:
+            continue
+        return line
+    return None
 
 
 def _pick_profile_name(lines: list[str], number: str) -> str | None:

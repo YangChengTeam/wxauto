@@ -167,6 +167,7 @@ class _FakeControl:
 class _FakeUielements:
     Groups = type("G", (), {"ContactProfileViewGroup": {"_key": "profile"}})()
     Buttons = type("B", (), {"AddToContactsButton": {"_key": "add"},
+                             "SendMessageButton": {"_key": "send"},
                              "ConfirmButton": {"_key": "confirm"}})()
     Windows = type("W", (), {"VerifyFriendWindow": {"_key": "verify"}})()
 
@@ -178,7 +179,8 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
     `session_name` = 备注优先、没有才退回昵称 —— 那才是 send_message(to=...) 该用的。
     """
 
-    def _driver(self, profile_exists: bool = True, add_button_exists: bool = True):
+    def _driver(self, profile_exists: bool = True, add_button_exists: bool = True,
+                send_button_exists: bool = False, profile_text: str | None = None):
         from unittest import mock
 
         from wxclient.wechat_api.uia import UiaWeChatDriver
@@ -190,8 +192,12 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
             "confirm": _FakeControl("确定", log=log),
         }, log=log)
         profile = _FakeControl(
-            "名片", text="张三\n微信号：wxid_abc\n地区：深圳",
-            children={"add": _FakeControl("添加到通讯录", exists_=add_button_exists, log=log)},
+            "名片",
+            text="张三\n微信号：wxid_abc\n地区：深圳" if profile_text is None else profile_text,
+            children={
+                "add": _FakeControl("添加到通讯录", exists_=add_button_exists, log=log),
+                "send": _FakeControl("发消息", exists_=send_button_exists, log=log),
+            },
             exists_=profile_exists, log=log,
         )
         pane = _FakeControl("添加朋友面板", children={
@@ -259,6 +265,49 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
         self.assertIn("没搜到这个号", str(caught.exception))
         self.assertNotIn("click:添加到通讯录", log, "没搜到就绝不该点添加")
         self.assertEqual(vendor_calls, [], "这是明确失败，不是退化——别再让 vendor 加一遍")
+
+    def test_an_existing_friend_comes_back_as_a_fact_not_an_error(self) -> None:
+        """★ 已经是好友：名片这一趟已经搜完了，名字也读到了——别把它连同异常一起丢掉。
+
+        （2026-08-26 用户场景：一个号早就加过了，还是要能把昵称同步回业务端。）
+        """
+        driver, log, vendor_calls, _verify = self._driver(
+            add_button_exists=False, send_button_exists=True,
+            profile_text="张三-仓库工\n昵称：阿三\n微信号：wxid_abc",
+        )
+
+        result = driver.add_friend("13800138000", "你好", remark="张三-叉车工")
+
+        self.assertTrue(result["already_friend"])
+        self.assertEqual(result["profile_name"], "阿三", "明写的「昵称：X」才是昵称")
+        self.assertEqual(result["session_name"], "张三-仓库工",
+                         "★ 这一轮没设过备注：会话名必须是微信里现在显示的那个，不是我们提议的")
+        self.assertNotIn("click:添加到通讯录", log, "按钮都不在，更不该点")
+        self.assertEqual(vendor_calls, [], "这是明确结论，不是退化——别再让 vendor 加一遍")
+
+    def test_no_add_button_and_no_send_button_is_still_a_failure(self) -> None:
+        """★ 「没有添加按钮」只说明加不了。没有正向证据就不许断定「已经是好友」——
+
+        断错的代价是 `wechatAdded` 被写成真，而那个人根本没加上。
+        """
+        driver, _log, vendor_calls, _verify = self._driver(
+            add_button_exists=False, send_button_exists=False,
+        )
+
+        with self.assertRaises(WeChatApiError) as caught:
+            driver.add_friend("13800138000", "你好")
+
+        self.assertIn("加不了", str(caught.exception))
+        self.assertEqual(vendor_calls, [])
+
+    def test_a_stranger_card_has_no_remark_so_the_top_line_is_the_nickname(self) -> None:
+        """陌生人名片上没有备注可言 → 顶上那行就是昵称，`profile_name` 这条路上拿得准。"""
+        driver, _log, _vendor, _verify = self._driver()
+
+        result = driver.add_friend("13800138000", "你好", remark="张三-仓库工")
+
+        self.assertFalse(result["already_friend"])
+        self.assertEqual(result["profile_name"], "张三")
 
     def test_dry_run_says_which_name_would_be_used(self) -> None:
         from wxclient.wechat_api.uia import UiaWeChatDriver

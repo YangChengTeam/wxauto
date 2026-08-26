@@ -236,7 +236,43 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
         result = CommandResult("cmd-1", "done", result={"friend_state": "requested"})
         await self._runner(d)._report_contact(command, result)
         self.assertEqual(d.reported, [{"number": "13800138000", "remark": "张三·普工",
-                                       "status": "requested", "command_id": "cmd-1"}])
+                                       "status": "requested", "profile_name": "",
+                                       "command_id": "cmd-1"}])
+
+    async def test_the_nickname_read_off_the_card_rides_along(self) -> None:
+        """★ 候选人档案里的 `wechatName` 只有这一条来源（api2 §4.1）。
+
+        名片那一趟本来就读到了昵称，回执里也带回来了——原来在这里被整个丢掉，
+        于是那个字段永远是空的。
+        """
+        d = FakeDirectory()
+        await self._runner(d)._report_contact(
+            {"command_id": "cmd-1", "op": "add_friend",
+             "args": {"number": "13800138000", "remark": "张三·普工"}},
+            CommandResult("cmd-1", "done",
+                          result={"friend_state": "requested", "profile_name": "阿三"}),
+        )
+        self.assertEqual(d.reported[0]["profile_name"], "阿三")
+
+    async def test_an_existing_friend_is_reported_accepted_under_his_real_session_name(self) -> None:
+        """★ 这个号早就是好友（2026-08-26 用户场景）：
+
+        ① 状态是 `accepted` 而不是 `requested`——没有人要去"通过"，报成待通过这个人就永远卡着；
+        ② 会话名报**微信里现在显示的那个**，不是我们提议的备注：那一轮压根没设过备注，
+           报 `张三·叉车工` 等于给后端一个微信里不存在的名字，下一条指令就寻不到窗口。
+        """
+        d = FakeDirectory()
+        await self._runner(d)._report_contact(
+            {"command_id": "cmd-2", "op": "add_friend",
+             "args": {"number": "13800138000", "remark": "张三·叉车工"}},
+            CommandResult("cmd-2", "done", result={
+                "friend_state": "accepted", "already_friend": True,
+                "session_name": "张三·仓库工", "profile_name": "阿三",
+            }),
+        )
+        self.assertEqual(d.reported, [{"number": "13800138000", "remark": "张三·仓库工",
+                                       "status": "accepted", "profile_name": "阿三",
+                                       "command_id": "cmd-2"}])
 
     async def test_dry_run_reports_nothing(self) -> None:
         """★ 没真动微信就没有 friend_state → 一条都不该报，否则后端以为好友已经加上了。"""

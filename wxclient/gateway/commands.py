@@ -507,18 +507,22 @@ class CommandExecutor:
     def _friend_state(self, op: str, result: dict[str, Any]) -> str:
         """加好友这条链走到哪一步了（docs/18 §3.2）。AI 端据此写候选人的 `wechatAdded`。
 
-        `add_friend` 只能报 `requested`：**申请发出去 ≠ 对方通过**，中间隔着一个真人，
+        `add_friend` 一般只能报 `requested`：**申请发出去 ≠ 对方通过**，中间隔着一个真人，
         要多久没人知道。两个 op 的回执原来长得一模一样，「申请发出」会被当成「已经是好友」，
         后面所有发消息的动作都建在一个假前提上。
 
-        真正的 `accepted` 只有一处：我们自己通过了对方的申请，而且**确实通过了至少一个**
-        （一个申请都没有时 `items` 是空的，那这一趟什么也没发生，别报状态）。
+        `accepted` 有两处，都要求**好友关系此刻确实存在**：
+        ① 我们自己通过了对方的申请（`accept_new_friends`），而且**确实通过了至少一个**
+           （一个申请都没有时 `items` 是空的，那这一趟什么也没发生，别报状态）；
+        ② 加的这个号**早就是好友**（`already_friend`，驱动层按名片上有「发消息」正向判定）。
+           这不是"申请发出去了"，是既成事实，所以直接是 `accepted`——不这么报的话，这个人
+           在计划里会永远停在"等对方通过"，而根本没有人要通过（2026-08-26 用户提的场景）。
         对方通过了我们的申请是**后来**才知道的事，只能靠入站消息，不在这条指令的射程内。
         """
         if not self._allow_real:
             return ""      # 只走流程没真动微信，报了 AI 端就会去写 wechatAdded
         if op == "add_friend":
-            return "requested"
+            return "accepted" if result.get("already_friend") else "requested"
         if op == "accept_new_friends" and result.get("items"):
             return "accepted"
         return ""

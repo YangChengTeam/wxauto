@@ -310,6 +310,19 @@ class FriendStateTests(CommandTestCase):
         _, payload, _ = runtime.calls[-1]
         self.assertEqual(payload["remark"], "候选人-李四")
 
+    async def test_a_number_that_was_already_a_friend_is_accepted_not_requested(self) -> None:
+        """★ 这个号早就是好友（2026-08-26 用户场景）：好友关系是**既成事实**，不是待通过。
+
+        报成 `requested`，这个人在计划里就永远停在「等对方通过」——而根本没有人要通过。
+        """
+        runtime = FakeRuntime(result={"already_friend": True, "session_name": "张三·仓库工"})
+        result = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "add_friend",
+            "args": {"number": "13800138000", "greetings": "你好"},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        self.assertEqual((result.result or {}).get("friend_state"), "accepted")
+
     async def test_accepting_an_application_really_is_accepted(self) -> None:
         runtime = FakeRuntime(result={"items": ["张三"], "verify": True})
         result = await self._executor(runtime).execute({

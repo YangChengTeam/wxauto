@@ -538,14 +538,20 @@ class GatewayRunner:
         触发的是 `commands.py` 算出来的 `friend_state`——**它只在真动了微信时才有值**
         （dry-run 不报，否则后端会以为好友已经加上了）。`number`/`remark` 取原指令的参数：
         备注名就是我们真在微信里设的那个，不是猜的。
+
+        ★ 顺带把**昵称**（`profile_name`）报上去：名片这一趟本来就读到了，而候选人档案里的
+          `wechatName` 一直是空的——这条上报是它唯一的来源（api2 §4.1）。读不准就不带，
+          后端只更新带上来的字段。
         """
         if self._contacts is None or result is None:
             return
-        state = str((result.result or {}).get("friend_state") or "")
+        payload = result.result or {}
+        state = str(payload.get("friend_state") or "")
         if not state:
             return
         args = (command or {}).get("args") or {}
         command_id = str(command.get("command_id") or "")
+        profile_name = str(payload.get("profile_name") or "")
 
         if state == CONTACT_ACCEPTED and not args.get("number"):
             # 我方通过了对方的申请（`accept_new_friends`）：手上只有对方显示名，没有号，
@@ -555,12 +561,21 @@ class GatewayRunner:
             return
 
         number, remark = str(args.get("number") or ""), str(args.get("remark") or "")
+        if payload.get("already_friend"):
+            # 这一轮**没点添加、也没设过备注**：微信里他现在叫什么，回执里的 session_name
+            # 才是实情。报我们提议的那个 remark = 给后端一个微信里根本不存在的会话名，
+            # 而后端会照着它派下一条指令，逐字寻址随即找不到窗口。
+            remark = str(payload.get("session_name") or "") or remark
         if state == CONTACT_REQUESTED and number and remark:
             # 先落本机再上报：上报可能失败，而「以后要认出对方通过了」这件事不能跟着失败。
             self._store.note_friend_request(self._account(), number, remark)
         await self._contacts.report(
-            number=number, remark=remark, status=state, command_id=command_id,
+            number=number, remark=remark, status=state,
+            profile_name=profile_name, command_id=command_id,
         )
+        if state == CONTACT_ACCEPTED and number:
+            # 本机也记一格，和另外两条 accepted 路径同口径（否则同一个人下次还会被当成待通过）。
+            self._store.mark_contact_status(self._account(), number, CONTACT_ACCEPTED)
 
     def _account(self) -> str:
         """指令归哪个号。现在一条连接一个号（`CommandExecutor` 也是取第一个）。"""
