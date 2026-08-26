@@ -48,6 +48,7 @@ from .outbound import DeliveryResult, MessageSink, OutboundSender
 from .pacing import MIN_READ_INTERVAL_SECONDS, PACING_EVENT, clamp_interval
 from .schedule import ScheduleLoop, parse_schedule_at
 from .sessions import GatewayStore
+from .strangers import StrangerWatcher
 from .ticket import TicketProvider
 from .watchlist import PUSH_EVENT, Watchlist
 from .wsclient import AgentWsClient, AgentWsError, TurnResult, Unauthorized
@@ -187,6 +188,7 @@ class GatewayRunner:
         accounts: Sequence[str],
         watchlist: Watchlist | None = None,
         friend_watcher: FriendWatcher | None = None,
+        stranger_watcher: StrangerWatcher | None = None,
         command_executor: CommandExecutor | None = None,
         contacts: ContactDirectory | None = None,
         candidates: CandidateDirectory | None = None,
@@ -202,6 +204,7 @@ class GatewayRunner:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._watchlist = watchlist
         self._friends = friend_watcher
+        self._strangers = stranger_watcher
         self._commands = command_executor
         self._contacts = contacts
         self._candidates = candidates
@@ -490,6 +493,14 @@ class GatewayRunner:
             if rows:
                 saved = self._store.save_contacts(account_id, rows)
                 _log.info("候选人会话名已同步", account=account_id, saved=saved, incremental=bool(since))
+            # 090：刚才还不认识的人，后端已经给他建好档、会话名也归位了 → 他不再是「陌生人」。
+            # 不摘掉的话，这个人会同时出现在两份来源里，而临时准入到期时会被当成过期清掉，
+            # 名单反而少了一个正经候选人。
+            settled = [name for name in self._store.stranger_names(account_id)
+                       if name in self._store.known_session_names(account_id)]
+            if settled:
+                self._store.drop_strangers(account_id, settled)
+                _log.info("陌生人已归位成候选人，转入正式名单", account=account_id, 数量=len(settled))
         self._apply_derived_watchlist()
 
     def _apply_derived_watchlist(self) -> int:
@@ -505,7 +516,9 @@ class GatewayRunner:
         names: list[str] = []
         seen: set[str] = set()
         for account_id in self._accounts:
-            for name in self._store.watched_session_names(account_id):
+            # 090：临时准入的陌生会话并进来。**并集不是替换**——他们是「还没归位的人」，
+            # 归位之后 `gateway_contacts` 里就有了，这份临时准入过期自然消失。
+            for name in (*self._store.watched_session_names(account_id), *self._store.stranger_names(account_id)):
                 if name not in seen:
                     seen.add(name)
                     names.append(name)
@@ -825,6 +838,10 @@ class GatewayRunner:
         )
         return format_history(rows)
 
+    def _is_stranger(self, peer_id: str) -> bool:
+        """这个会话现在还挂在「临时准入」里吗（090）。"""
+        return any(peer_id in set(self._store.stranger_names(account)) for account in self._accounts)
+
     def _peer_refs(self, account_id: str, peer_id: str) -> list[dict[str, Any]]:
         """这一轮对面是哪个候选人（047 的 `@` 引用协议）。
 
@@ -854,6 +871,13 @@ class GatewayRunner:
             "funnel": "inbound",
             "operator_intervened": any(m.from_self for m in messages),
         }
+        # 090：这个会话是**临时准入的陌生人**（我们不认识他，他主动找上来的）。
+        # AI 端据此收紧第一轮：判不出对方在求职就一条都不发（spec 090 / v1 §9.5）。
+        # ★ 必须由这一层说，不能让 AI 端拿「refs 是空的」去推：入站 refs 为空是常态
+        #   （会话名还没归位到候选人，后端明说允许），拿它当判据会让名单里的正常联系人
+        #   一起哑掉。
+        if self._is_stranger(peer_id):
+            meta["first_contact"] = True
         watching = self.watched_peers()
         if watching:
             meta["watching"] = watching
@@ -924,6 +948,9 @@ class GatewayRunner:
         ]
         if self._friends is not None:
             side_tasks.append(asyncio.create_task(self._friends.run(), name="gw-friends"))
+        # 090：陌生人主动发起。**默认关**，开了才会真起循环（见 `StrangerWatcher.enabled`）。
+        if self._strangers is not None:
+            side_tasks.append(asyncio.create_task(self._strangers.run(), name="gw-strangers"))
         # 会话名同步放**后台**跑：它是「换机之后别把同一个人叫成两个名字」的补课，
         # 不该挡住网关起来（后端慢或没登录时，同步失败只记账，见 ContactDirectory）。
         # ★ 它同时是**监听名单**的来源（085，用户 2026-08-20：就用 /client/contacts，不新增接口），

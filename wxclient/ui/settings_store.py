@@ -93,6 +93,11 @@ FIELDS: tuple[Field, ...] = (
           section="sched", default="09:00-21:00"),
     Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "每小时发送上限", "防止消息风控",
           section="sched", default="30"),
+    # 090：默认关。放开 fail-closed 名单会让「装上就自动回复任何人」重新成为可能
+    # （069 / 需求文档 §13.1），所以必须是专员在这里主动打开的一次知情选择。
+    Field("WXCLIENT_GATEWAY_STRANGER_INTAKE", "接待主动来问的陌生人",
+          "开了之后，主动加你、劳小智里还没有档案的人也会被自动接待；判得出他在找工作才会回话",
+          kind="bool", section="sched", default="0"),
     Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动自动运行服务",
           kind="bool", section="boot", default="1"),
     Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", "启动后最小化到系统托盘",

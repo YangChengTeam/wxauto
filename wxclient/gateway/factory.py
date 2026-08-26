@@ -29,6 +29,7 @@ from .message_events import MessageEventReporter
 from .pacing import MIN_FRIEND_INTERVAL_SECONDS, clamp_interval
 from .runner import GatewayRunner
 from .sessions import GatewayStore
+from .strangers import StrangerWatcher
 from .ticket import ClientTokenTicketProvider, LocalFileTicketProvider, TicketProvider
 from .watchlist import Watchlist, WatchScope
 from .wechat_io import QueueMessageSink, QueueMessageSource
@@ -215,6 +216,17 @@ def build_gateway(
             active_hours=gateway_settings.active_hours,
             allow_real_actions=allow_real_actions,
             confirmation=REAL_ACTION_CONFIRMATION,
+        ),
+        # 090：陌生人主动发起。**默认关**（`stranger_intake`）——放开 fail-closed 名单
+        # 是专员的一次知情选择，不是缺省行为。
+        stranger_watcher=StrangerWatcher(
+            accounts=resolved_accounts,
+            runtime=runtime,
+            store=store,
+            interval_seconds=gateway_settings.stranger_scan_interval_seconds,
+            enabled=gateway_settings.stranger_intake,
+            active_hours=gateway_settings.active_hours,
+            allow_real_actions=allow_real_actions,
         ),
     )
     return Gateway(

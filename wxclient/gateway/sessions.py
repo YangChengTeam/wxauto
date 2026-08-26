@@ -114,6 +114,13 @@ CREATE TABLE IF NOT EXISTS gateway_contacts (
   updated_at   TEXT NOT NULL,
   PRIMARY KEY (account_id, number)
 );
+CREATE TABLE IF NOT EXISTS gateway_strangers (
+  account_id   TEXT NOT NULL,
+  session_name TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at  TEXT NOT NULL,
+  PRIMARY KEY (account_id, session_name)
+);
 CREATE TABLE IF NOT EXISTS gateway_read_marks (
   account_id TEXT NOT NULL,
   action     TEXT NOT NULL,
@@ -276,6 +283,113 @@ class GatewayStore:
                 (account_id, "accepted"),
             ).fetchall()
         return [row[0].strip() for row in rows]
+
+    # ───────────── 陌生人主动发起（spec 090 / v1 §9.5）─────────────
+
+    def note_strangers(
+        self,
+        account_id: str,
+        names: Iterable[str],
+        *,
+        now: datetime | None = None,
+        limit: int = 50,
+    ) -> list[str]:
+        """会话列表里出现了、但本机会话名映射里没有的名字 —— 记下来。返回**新**记下的那些。
+
+        为什么要单独一张表：候选人主动加好友、主动发第一句话时，他既不在任何招聘计划里、
+        也没有候选人档案，因此 `gateway_contacts` 里没有他 —— 而监听名单正是从那张表派生的
+        （spec 085）。没有这一层，**他的消息网关根本读不到**，§9.5 那条「主动推进」无从谈起。
+
+        **有上限**：这是给「刚来的陌生人」用的临时准入，不是第二份名单。满了就不再收新的，
+        老的由 `purge_strangers_before` 按保鲜期清掉。
+        """
+        stamp = (now or _utcnow()).isoformat()
+        added: list[str] = []
+        with closing(self._connect()) as conn:
+            existing = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT session_name FROM gateway_strangers WHERE account_id=?", (account_id,)
+                ).fetchall()
+            }
+            for raw in names:
+                name = str(raw or "").strip()
+                if not name:
+                    continue
+                if name in existing:
+                    conn.execute(
+                        "UPDATE gateway_strangers SET last_seen_at=? WHERE account_id=? AND session_name=?",
+                        (stamp, account_id, name),
+                    )
+                    continue
+                if len(existing) >= limit:
+                    break
+                existing.add(name)
+                added.append(name)
+                conn.execute(
+                    """INSERT INTO gateway_strangers (account_id, session_name, first_seen_at, last_seen_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (account_id, name, stamp, stamp),
+                )
+            conn.commit()
+        return added
+
+    def stranger_names(self, account_id: str) -> list[str]:
+        """当前临时准入的陌生会话名。"""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT session_name FROM gateway_strangers
+                   WHERE account_id=? ORDER BY session_name""",
+                (account_id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
+    def drop_strangers(self, account_id: str, names: Iterable[str]) -> int:
+        """不再当陌生人（已经归位成候选人，或专员说了别理他）。"""
+        wanted = [str(n or "").strip() for n in names]
+        wanted = [n for n in wanted if n]
+        if not wanted:
+            return 0
+        with closing(self._connect()) as conn:
+            cur = conn.execute(
+                f"""DELETE FROM gateway_strangers WHERE account_id=?
+                    AND session_name IN ({",".join("?" * len(wanted))})""",
+                (account_id, *wanted),
+            )
+            conn.commit()
+            return int(cur.rowcount or 0)
+
+    def purge_strangers_before(self, account_id: str, cutoff: datetime) -> list[str]:
+        """过了保鲜期的临时准入清掉。返回清掉的名字。
+
+        没有这一条，一台机器跑上几个月就会攒出一份谁也没审过的长名单 ——
+        而名单的每一项都意味着「这个人会被自动回复」。
+        """
+        stamp = cutoff.isoformat()
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT session_name FROM gateway_strangers WHERE account_id=? AND last_seen_at < ?",
+                (account_id, stamp),
+            ).fetchall()
+            conn.execute(
+                "DELETE FROM gateway_strangers WHERE account_id=? AND last_seen_at < ?",
+                (account_id, stamp),
+            )
+            conn.commit()
+        return [str(row[0]) for row in rows]
+
+    def known_session_names(self, account_id: str) -> set[str]:
+        """本机会话名映射里已有的名字（不分 accepted/requested）。
+
+        判「是不是陌生人」用的是**这一份**，不是监听名单：刚发出好友申请、还没通过的那些
+        （`requested`）也已经在册，他们通过之后发来的消息不该被当成陌生人二次准入。
+        """
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT session_name FROM gateway_contacts WHERE account_id=? AND TRIM(session_name)<>''",
+                (account_id,),
+            ).fetchall()
+        return {str(row[0]).strip() for row in rows}
 
     def contacts_synced_until(self, account_id: str) -> str:
         """本机已同步到的最新 `updated_at`（增量同步的水位）。空 = 没同步过，要全量。
