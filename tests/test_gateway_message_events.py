@@ -338,7 +338,7 @@ class InboundReportingTests(StoreTestCase):
 
 
 class TakeoverLeavesTheReadSideAloneTests(InboundReportingTests):
-    """089 任务 4 · 接管期间**读侧零误伤**（docs/19 §3.2）。
+    """091 · 接管期间**读侧零误伤**（docs/19 v2 §1.1）。
 
     接管的意思是「分身别自动发」，不是「分身别看了」。读侧一旦跟着停：
     - 入站事件不报 → 业务后端排不了「未回复跟进」，人交回来之后没人知道谁在等着；
@@ -353,7 +353,7 @@ class TakeoverLeavesTheReadSideAloneTests(InboundReportingTests):
 
     def _loop(self, batches, on_peer_messages) -> InboundLoop:
         loop = super()._loop(batches, on_peer_messages)
-        self.store.set_context_mode(ACCOUNT, "take_over", reason="我自己来跟")
+        self.store.set_candidate_mode(ACCOUNT, PEER, "human_takeover", reason="我自己来跟")
         return loop
 
     async def test_the_batch_still_lands_in_the_pending_table(self) -> None:

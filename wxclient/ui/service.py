@@ -10,7 +10,7 @@ import asyncio
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
@@ -79,10 +79,10 @@ class GatewayStatus:
     next_read_seconds: float | None = None
     #: 在不在工作时间窗之外。窗外一个微信动作都不做，所以也就没有「下一趟」。
     quiet_hours: bool = False
-    #: 089 · 这台分身现在归谁用：`delegated`（分身在管）/ `take_over`（招聘老师本人在跟）。
-    context_mode: str = "delegated"
-    #: 上报给业务端了没有。★ 它**不改变**上面那一格——本机才是权威，界面只多标一句「未同步」。
-    context_synced: bool = True
+    #: 091 · 每个候选人现在由谁跟：会话名 → `human_takeover` / `ai_managed`。
+    #: ★ **不在这个表里 = 不知道**（本机没记录、同步名单也还没带回来），不是「确定是托管」。
+    #:   界面据此把按钮画成「接管」但不谎报当前档。
+    candidate_modes: Mapping[str, str] = field(default_factory=dict)
 
 
 class GatewayService:
@@ -289,19 +289,19 @@ class GatewayService:
             raise ServiceNotRunning("服务没在运行，名单改不了")
         return asyncio.run_coroutine_threadsafe(gateway.runner.remove_watched(name), loop)
 
-    def set_context_mode(self, mode: str, *, reason: str = "") -> Future[Any]:
-        """按下「人工接管 / 交回分身」（089）。返回一个还没完成的 Future（界面在心跳里问它）。
+    def set_candidate_mode(self, session_name: str, mode: str, *, reason: str = "") -> Future[Any]:
+        """按下某个候选人后面那个小按钮（091）。返回还没完成的 Future（界面在心跳里问它）。
 
-        ★ 落本机这一步在网关线程上同步做完，**不等网络**：接管的意思是「现在立刻别再发了」。
-          Future 的值是 `{context_mode, synced, note}`——`synced=False` 时界面标一句
-          「未同步」，**但开关照旧显示成接管中**（本机才是权威，design §1.1）。
+        ★ 落本机这一步在网关线程上同步做完，**不等网络**：接管的意思是「现在立刻别再发给他了」。
+          Future 的值是 `{mode, synced, note}`——`synced=False` 时界面标一句「未同步」，
+          **但那一行照旧显示成接管中**（本机才是即时执行的权威）。
         """
         with self._lock:
             loop, gateway = self._loop, self._gateway
         if loop is None or gateway is None or self.state is not ServiceState.RUNNING:
             raise ServiceNotRunning("服务没在运行，接管状态改不了")
         return asyncio.run_coroutine_threadsafe(
-            gateway.runner.set_context_mode(mode, reason=reason), loop
+            gateway.runner.set_candidate_mode(session_name, mode, reason=reason), loop
         )
 
     def interrupt_debug(self) -> None:
@@ -413,9 +413,12 @@ class GatewayService:
                 return fallback
 
         accounts = read(lambda: len(gateway.accounts), 0)
-        # 089：读一次就好，下面两格是同一份真相的两半（归谁用 / 报出去了没有）。
-        mode = read(lambda: gateway.runner.context_mode(), ("delegated", True))
-        mode = mode if isinstance(mode, tuple) and len(mode) == 2 else ("delegated", True)
+        # 091：本机记着档位的那几个人。读不到就是空表——「不知道」比猜一个安全。
+        rows = read(lambda: gateway.runner.candidate_modes(), {})
+        modes = {
+            str(name): str(getattr(row, "mode", "") or "")
+            for name, row in (rows.items() if isinstance(rows, dict) else ())
+        } if isinstance(rows, dict) else {}
         return GatewayStatus(
             # 一律裹成 lambda：直接写 `gateway.runner.xxx` 会在进 read() 之前就求值，
             # runner 缺席时抛出来的 AttributeError 会绕过这里的兜底、把整排状态清空。
@@ -426,8 +429,7 @@ class GatewayService:
             connect_error=read(lambda: gateway.runner.connect_error, None),  # type: ignore[arg-type]
             next_read_seconds=read(lambda: gateway.runner.seconds_to_next_read(), None),  # type: ignore[arg-type]
             quiet_hours=bool(read(lambda: gateway.runner.in_quiet_hours(), False)),
-            context_mode=str(mode[0]),
-            context_synced=bool(mode[1]),
+            candidate_modes=modes,
         )
 
     def wait_ready(self, timeout: float = 10.0) -> bool:

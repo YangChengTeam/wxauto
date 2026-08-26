@@ -198,10 +198,10 @@ class MainWindow:
         #: 不存进 `_watch_hint` 是因为那个标签每秒被 `_render_watch_page` 重写一次——
         #: 直接写上去的话，说的话活不过一拍（老的 `_sync_watchlist` 就是这个毛病）。
         self._watch_note: tuple[str, str, float | None] | None = None
-        #: 089 · 那次「接管 / 交回」还没回话的 Future；None = 现在没有在改的。
-        self._context_pending: Any = None
-        #: 上一次操作留下的一句话（未同步 / 被企业端改过），tk 线程读写。
-        self._context_note_text = ""
+        #: 091 · 会话名 → 那次「接管 / 交回」还没回话的 Future。
+        self._mode_pending: dict[str, Any] = {}
+        #: 会话名 → 「还没同步给业务端」那一句。本机已经生效了，这句只是说外面还不知道。
+        self._mode_notes: dict[str, str] = {}
         self._locked = False  # 转场态：由 _sync_transition_lock() 每拍现场核对，别手动改
         self._last_tick: float | None = None  # 卡顿看门狗的上一拍时刻
         self._ticks = 0  # 心跳计数：头两拍不报卡顿，理由见 _watch_for_stalls
@@ -288,26 +288,12 @@ class MainWindow:
         self._divider(bar)
 
         self._rows: dict[str, tk.Label] = {}
+        # ★ 这里曾经还有一行「分身」和一个分身级接管总开关（089）。2026-08-26 裁决
+        #   「接管是针对候选人的，按钮都要去掉」——整套拆了，改成监听名单里**一人一个**
+        #   小按钮（`_watch_row`）。别再往侧栏加回一个能一键停掉全部的开关。
         for key, label in (("service", "服务"), ("gateway", "网关"), ("wechat", "微信"),
-                           ("watch", "监听"), ("context", "分身")):
+                           ("watch", "监听")):
             self._rows[key] = self._status_row(bar, label)
-
-        # 089 · 分身级人工接管的那个开关。**一个按钮两态**，就摆在「分身」那一行下面：
-        # 接管是「这台微信现在归谁用」的总闸，和上面几行状态是同一件事的两半
-        # （上面说现在是什么状态，这里改它）。
-        self._context_button = tk.Label(bar, text="", font=theme.FONT_SMALL,
-                                        bg=theme.SIDEBAR_BG, fg=theme.SIDEBAR_TEXT,
-                                        padx=14, pady=6, cursor="hand2",
-                                        highlightthickness=1,
-                                        highlightbackground=theme.SIDEBAR_MUTED,
-                                        highlightcolor=theme.SIDEBAR_MUTED, bd=0)
-        self._context_button.pack(anchor="w", padx=28, pady=(4, 0))
-        self._context_button.bind("<Button-1>", lambda _e: self._toggle_context_mode())
-        # 「还没报给业务端」只在这里说一句。★ 它**不改上面那一行**——本机才是权威，
-        # 把开关显示成关着的等于骗人：那台电脑此刻确确实实一条都不发。
-        self._context_note = tk.Label(bar, text="", font=theme.FONT_SMALL,
-                                      bg=theme.SIDEBAR_BG, fg=theme.ORANGE,
-                                      anchor="w", justify=tk.LEFT, wraplength=244)
 
         # 侧栏这一行只报「几个会话」。**具体是谁不铺在这儿**——名字一多就把整条侧栏顶下去，
         # 而且多数时候没人在看。要看名字点左边「监听名单」，和「实时日志 / 参数设置」一个路数。
@@ -540,7 +526,7 @@ class MainWindow:
         box.pack(fill=tk.X, pady=(0, 16))
         self._watch_card = tk.Frame(box, bg=theme.CONTENT_BG)
         self._watch_card.pack(fill=tk.BOTH, expand=True)
-        self._watch_shown: tuple[str, ...] | None = None
+        self._watch_shown: tuple | None = None
         return page
 
     def _sync_watchlist(self) -> None:
@@ -592,87 +578,68 @@ class MainWindow:
             # 空名单不是「同步没成功」，是「名单里真的一个都没有」——两句话必须分得开。
             self._note_watch("已同步：名单是空的——一条消息都不会回。", theme.ORANGE)
 
-    # ── 分身级人工接管（089） ────────────────────────────────────
+    # ── 候选人级人工接管（091 / docs/19 v2 §1） ──────────────────
 
-    def _toggle_context_mode(self) -> None:
-        """按一下：接管 ⇄ 交回分身。**先落本机、界面立刻变**，再异步去报（design §1.1）。
+    def _toggle_candidate_mode(self, name: str) -> None:
+        """按名单里某个人后面那个小按钮：接管 ⇄ 交回分身。
 
-        ★ 开接管要先问一句并要一行原因：名下**所有**会话都不会被自动回复了，这是有后果的
-          动作，而且 `reason` 是业务端 `human_takeover` 的必填项。**交回分身不问**——
-          那是把状态交回默认值，多一道确认只会让「我要它干活」变得比「让它停下」还费劲。
+        **先落本机、界面立刻变**，再异步去同步业务端——接管的意思是「现在立刻别再发给他了」，
+        它必须在断网、业务端 500 的时候照样成立。
+
+        ★ 开接管要先问一句并要一行原因：`reason` 是业务端 `human_takeover` 的**必填项**
+          （v1.5 §4.1）。**交回分身不问**——那是把状态交回默认值，多一道确认只会让
+          「我要它干活」比「让它停下」还费劲。
         ★ 弹框的 parent 必须是**真控件**（`self.root`）：`MainWindow` 不是 tk 控件，
           而 tk 回调里的 AttributeError 是**看不见的**，现场表现就是「点了没反应」
           （[[tk-silent-callback-errors]]）。
         """
-        if self._context_pending is not None:
-            return  # 上一次还没回话，别排第二条
-        snapshot = self.service.status()
-        taken_over = snapshot.context_mode == "take_over"
+        if name in self._mode_pending:
+            return  # 这个人上一次还没回话，别排第二条
+        taken_over = self.service.status().candidate_modes.get(name) == "human_takeover"
         reason = ""
         if not taken_over:
             answer = dialog.ask_text(
                 self.root, "人工接管",
-                "接管之后，名下所有会话都不再自动回复，改由你本人跟进。\n\n"
-                "候选人发来的消息照常收着，交回分身时再接着处理。\n"
+                f"接管「{name}」之后，他就不再被自动回复，改由你本人跟进。\n\n"
+                "其他人不受影响；他发来的消息照常收着。\n"
                 "请写一句原因（主管在企业端看得到）：",
-                prompt="我本人跟进这批候选人",
+                prompt="我本人跟进这个候选人",
                 confirm="接管", cancel="取消",
             )
             if answer is None:
                 return
             reason = answer or "招聘老师在客户端上接管"
-        mode = "delegated" if taken_over else "take_over"
-        _log.info("按下分身级接管开关", context_mode=mode)
+        mode = "ai_managed" if taken_over else "human_takeover"
+        _log.info("按下候选人接管按钮", mode=mode)
         try:
-            self._context_pending = self.service.set_context_mode(mode, reason=reason)
+            self._mode_pending[name] = self.service.set_candidate_mode(name, mode, reason=reason)
         except Exception as exc:  # noqa: BLE001 - 服务没起/连不上都要说人话
-            _log.warning("改分身级接管状态失败", error=str(exc))
+            _log.warning("改候选人接管状态失败", error=str(exc))
             dialog.tell(self.root, "没能改", str(exc), tone="error")
             return
-        self._context_note_text = ""
-        self._render_context_mode(mode, synced=True, busy=True)
+        self._mode_notes.pop(name, None)
+        self._watch_shown = None  # 逼下一拍重画，让这一行立刻显示新档位
 
-    def _poll_context_mode(self) -> None:
-        """看看那次「接管 / 交回」有没有回话。**跑在 tk 线程的心跳里**——后台只放值。"""
-        future = self._context_pending
-        if future is None or not future.done():
-            return
-        self._context_pending = None
-        try:
-            result = future.result()
-        except Exception as exc:  # noqa: BLE001 - 超时/断线照原样说出来
-            # ★ **不回滚**：落本机那一步早在网关线程上做完了，这台电脑此刻已经按新状态在跑。
-            #   这里只多标一句「未同步」（[[settle-only-when-said]] 的反面：说了没送到 ≠ 没说）。
-            _log.warning("分身级接管状态没报出去", error=str(exc))
-            self._context_note_text = "还没报给业务端，稍后自动重报"
-            return
-        note = str(result.get("note") or "") if isinstance(result, dict) else ""
-        self._context_note_text = note if note else ""
-
-    def _render_context_mode(self, mode: str, *, synced: bool, busy: bool = False) -> None:
-        """把「归谁用」画到侧栏上。服务没跑时按钮变灰，但**状态照说**。"""
-        running = self.service.state is ServiceState.RUNNING
-        taken_over = mode == "take_over"
-        if not running:
-            self._rows["context"].configure(text="未启动", fg=theme.GRAY)
-        elif taken_over:
-            # 接管中常驻一行橙的：它是**例外状态**，一眼要看得出来「分身现在不干活」。
-            self._rows["context"].configure(text="人工接管中", fg=theme.ORANGE)
-        else:
-            self._rows["context"].configure(text="AI 托管中", fg=theme.GREEN)
-        self._context_button.configure(
-            text="正在切换…" if busy else ("交回分身" if taken_over else "人工接管"),
-            fg=theme.SIDEBAR_MUTED if (busy or not running) else theme.SIDEBAR_TEXT,
-            cursor="" if (busy or not running) else "hand2",
-        )
-        note = self._context_note_text if running else ""
-        if not synced and running and not note:
-            note = "还没报给业务端，稍后自动重报"
-        if note:
-            self._context_note.pack(anchor="w", padx=28, pady=(6, 0))
-            self._context_note.configure(text=note)
-        else:
-            self._context_note.pack_forget()
+    def _poll_candidate_modes(self) -> None:
+        """看看那几次「接管 / 交回」有没有回话。**跑在 tk 线程的心跳里**——后台只放值。"""
+        for name, future in list(self._mode_pending.items()):
+            if not future.done():
+                continue
+            self._mode_pending.pop(name, None)
+            self._watch_shown = None
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001 - 超时/断线照原样说出来
+                # ★ **不回滚**：落本机那一步早在网关线程上做完了，这个人此刻已经按新状态在跑。
+                #   这里只多标一句「未同步」（说了没送到 ≠ 没说）。
+                _log.warning("候选人接管状态没同步出去", error=str(exc))
+                self._mode_notes[name] = "还没同步给业务端，稍后重试"
+                continue
+            note = str(result.get("note") or "") if isinstance(result, dict) else ""
+            if note:
+                self._mode_notes[name] = note
+            else:
+                self._mode_notes.pop(name, None)
 
     def _ask_remove_watched(self, name: str) -> None:
         """「移出」：先问一句，再请 AI 端删。
@@ -754,9 +721,13 @@ class MainWindow:
                 hint = (text, color)
         self._watch_hint.configure(text=hint[0], fg=hint[1])
 
-        if watched == self._watch_shown:
+        # ★ 重画的判据要把**档位**也算进去（091）：只看名字的话，按下接管之后
+        #   那一行会一直画着旧样子，直到名单本身变了为止。
+        shown = (watched, tuple(sorted(snapshot.candidate_modes.items())),
+                 tuple(sorted(self._mode_pending)), tuple(sorted(self._mode_notes.items())))
+        if shown == self._watch_shown:
             return  # 没变就别重画：每秒重建一次控件既费又会把滚动位置抖没
-        self._watch_shown = watched
+        self._watch_shown = shown
         for child in self._watch_card.winfo_children():
             child.destroy()
         if not watched:
@@ -764,10 +735,11 @@ class MainWindow:
                      font=theme.FONT_BODY, bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED,
                      anchor="w").pack(fill=tk.X, padx=18, pady=14)
             return
+        modes = dict(snapshot.candidate_modes)
         for index, name in enumerate(watched):
-            self._watch_row(index, name)
+            self._watch_row(index, name, modes.get(name))
 
-    def _watch_row(self, index: int, name: str) -> None:
+    def _watch_row(self, index: int, name: str, mode: str | None = None) -> None:
         if index:
             tk.Frame(self._watch_card, bg=theme.ROW_LINE, height=1).pack(fill=tk.X)
         row = tk.Frame(self._watch_card, bg=theme.CONTENT_BG)
@@ -801,8 +773,39 @@ class MainWindow:
         remove.bind("<Enter>", lambda _e, w=remove: w.configure(fg=theme.RED))
         remove.bind("<Leave>", lambda _e, w=remove: w.configure(fg=theme.TEXT_MUTED))
 
-        tk.Label(row, text="监听中", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
-                 fg=theme.TEXT_MUTED).pack(side=tk.RIGHT, padx=(0, 16))
+        # ★★ 091 · 一人一个小按钮：接管 ⇄ 交回分身。放在「移出」左边——它是可逆的日常动作，
+        #   而「移出」是从此不再自动回他。两者挨着，但轻重不同，颜色也不同。
+        #
+        # ★ `mode is None` = **不知道**这个人现在哪一档（本机没记录，同步名单也还没带回来：
+        #   业务端还没把 `aiRecruitment` 加进 `GET /client/contacts`）。这时按钮照样能按，
+        #   但**不谎报当前档**——右边那句状态写「监听中」，不写「AI 托管中」。
+        taken_over = mode == "human_takeover"
+        if name in self._mode_pending:
+            tk.Label(row, text="正在切换…", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                     fg=theme.ORANGE).pack(side=tk.RIGHT, padx=(0, 16))
+        else:
+            button = tk.Label(row, text="交回分身" if taken_over else "我来接管",
+                              font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                              fg=theme.TEXT_MUTED, cursor="hand2")
+            button.pack(side=tk.RIGHT, padx=(0, 16))
+            button.bind("<Button-1>", lambda _e, n=name: self._toggle_candidate_mode(n))
+            button.bind("<Enter>", lambda _e, w=button: w.configure(fg=theme.TEXT))
+            button.bind("<Leave>", lambda _e, w=button: w.configure(fg=theme.TEXT_MUTED))
+
+        note = self._mode_notes.get(name, "")
+        if note:
+            tk.Label(row, text=note, font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                     fg=theme.ORANGE).pack(side=tk.RIGHT, padx=(0, 16))
+
+        if taken_over:
+            # 接管中常驻一行橙的：它是**例外状态**，一眼要看得出来「这个人分身不管了」。
+            tk.Label(row, text="人工接管中", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                     fg=theme.ORANGE).pack(side=tk.RIGHT, padx=(0, 16))
+            tk.Label(row, text="●", font=(theme.UI, 8), bg=theme.CONTENT_BG,
+                     fg=theme.ORANGE).pack(side=tk.RIGHT, padx=(0, 5))
+            return
+        tk.Label(row, text="AI 托管中" if mode else "监听中", font=theme.FONT_SMALL,
+                 bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED).pack(side=tk.RIGHT, padx=(0, 16))
         tk.Label(row, text="●", font=(theme.UI, 8), bg=theme.CONTENT_BG,
                  fg=theme.GREEN_BRIGHT).pack(side=tk.RIGHT, padx=(0, 5))
 
@@ -1340,12 +1343,7 @@ class MainWindow:
             self._rows["watch"].configure(text="名单是空的", fg=theme.ORANGE)
         else:
             self._rows["watch"].configure(text=f"{len(watched)} 个会话", fg=theme.GREEN)
-        self._poll_context_mode()
-        self._render_context_mode(
-            snapshot.context_mode if state is ServiceState.RUNNING else "delegated",
-            synced=snapshot.context_synced,
-            busy=self._context_pending is not None,
-        )
+        self._poll_candidate_modes()
         self._poll_watch_removals()
         self._poll_watch_sync()
         self._render_watch_page()  # 停在配置中心时跟着刷；不在那页是个空操作

@@ -122,17 +122,26 @@ CREATE TABLE IF NOT EXISTS gateway_strangers (
   last_seen_at  TEXT NOT NULL,
   PRIMARY KEY (account_id, session_name)
 );
-CREATE TABLE IF NOT EXISTS gateway_context_mode (
-  account_id   TEXT PRIMARY KEY,
-  -- take_over = 招聘老师本人在用这台微信；delegated = 交回分身（089 / docs/19）
-  context_mode TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS gateway_candidate_mode (
+  account_id   TEXT NOT NULL,
+  -- 本机寻址用的**会话名**（微信备注名）。主键用它而不是 candidate_id：
+  -- 闸要在「给这个会话发消息」那一刻判，那一刻手上只有会话名（091 / docs/19 v2 §1）
+  session_name TEXT NOT NULL,
+  -- 业务端的 candidateId（= 同步名单 `GET /client/contacts` 的 worker_id，同一个 UUID 空间）。
+  -- 空 = 还没对上号，本机闸照样成立，但按钮按不了（PUT 的 URL 里就是它）
+  candidate_id TEXT NOT NULL DEFAULT '',
+  -- human_takeover | ai_managed —— **直接用业务端 v1.5 的词**，本机不再翻译一遍
+  mode         TEXT NOT NULL,
   reason       TEXT NOT NULL DEFAULT '',
-  -- 业务后端定序用的版本号；本机自己按下的没有版本号，存 0
+  -- 服务端 aiRecruitment.version（乐观锁用，下次 PUT 当 expectedVersion）
   version      INTEGER NOT NULL DEFAULT 0,
+  -- 服务端 modeVersion + triggerId：`action=report` 要原样回传，客户端不解析
+  mode_version INTEGER NOT NULL DEFAULT 0,
+  trigger_id   TEXT NOT NULL DEFAULT '',
   updated_at   TEXT NOT NULL,
-  -- 最后一次**成功上报给业务后端**的时间。空 = 还欠一次补报（无心跳契约，
-  -- 服务端不会自己知道；没有这一列，重启之后那次没报上去的接管就永远丢了）
-  reported_at  TEXT
+  -- 最后一次成功 `action=report` 的时间。空 = 还欠一次回报
+  reported_at  TEXT,
+  PRIMARY KEY (account_id, session_name)
 );
 CREATE TABLE IF NOT EXISTS gateway_read_marks (
   account_id TEXT NOT NULL,
@@ -170,20 +179,38 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str)
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
-@dataclass(frozen=True)
-class ContextModeRow:
-    """本机那份「这台微信归谁用」（089）。"""
+#: 候选人级接管/托管的两个词（业务端 v1.5 §4，本机原样沿用，不再翻译一遍）。
+HUMAN_TAKEOVER = "human_takeover"
+AI_MANAGED = "ai_managed"
+CANDIDATE_MODES = (HUMAN_TAKEOVER, AI_MANAGED)
 
-    context_mode: str
+
+@dataclass(frozen=True)
+class CandidateModeRow:
+    """本机那份「这个候选人现在由谁跟」（091 / docs/19 v2 §1）。
+
+    ★ 与已拆除的分身级那张表最大的不同：**它是每个人一行**，而且默认那一行
+      **不存在**——「没记录」= 这个人由分身跟（`ai_managed`），和「服务端说他是
+      `ai_managed`」看起来一样但来路不同，所以 `known` 分得开：界面上「不知道当前档」
+      不能画成「确定是托管」。
+    """
+
+    session_name: str
+    candidate_id: str
+    mode: str
     reason: str
     version: int
+    mode_version: int
+    trigger_id: str
     updated_at: str
-    """最后一次成功上报给业务后端的时间；None = 还欠一次补报。"""
+    """最后一次成功 `action=report` 的时间；None = 还欠一次回报。"""
     reported_at: str | None
+    """本机真有这一行吗。False = 从没设过，按默认「分身在跟」处理。"""
+    known: bool = True
 
     @property
     def taken_over(self) -> bool:
-        return self.context_mode == "take_over"
+        return self.mode == HUMAN_TAKEOVER
 
 
 class GatewayStore:
@@ -213,6 +240,11 @@ class GatewayStore:
 
         为什么要在本机留一份：换机/重装之后，同一个候选人如果被起了第二个备注名，
         微信里就成了「两个人」——逐字寻址会找错窗口，聊天上下文也就断了。
+
+        ★ 091：同一条同步里如果带了 `aiRecruitment`（候选人级接管/托管，业务端 v1.5 §3.2），
+          顺手把那个人的档位也对齐——**同步名单就是候选人状态的来源**（用户 2026-08-26 定）。
+          今天 `GET /client/contacts` 还不带这个字段，所以这里写成**带了才更新**：
+          没带就一个字都不动，绝不拿「没带」当成「他是托管」。
         """
         saved = 0
         watermark = ""
@@ -239,6 +271,7 @@ class GatewayStore:
                      str(row.get("updated_at") or "")),
                 )
                 saved += 1
+                self._absorb_ai_recruitment(conn, account_id, row)
                 # ★ 水位只认**服务端给的**时间。原来缺 updated_at 时拿本机时钟顶替，
                 # 那个值一旦被当成水位，比它早的行以后永远同步不回来（时钟还不一定准）。
                 watermark = max(watermark, str(row.get("updated_at") or ""))
@@ -251,6 +284,47 @@ class GatewayStore:
                 )
             conn.commit()
         return saved
+
+    @staticmethod
+    def _absorb_ai_recruitment(conn: sqlite3.Connection, account_id: str, row: dict) -> None:
+        """同步名单里那份候选人档位 → 本机 `gateway_candidate_mode`（091）。
+
+        ★ **服务端那份是权威，直接覆盖本机**，但只覆盖「服务端真说了话」的那几行：
+          字段没来、会话名为空、档位不认识，都当没这回事。
+        ★ `reported_at` 给当下：这一条是**服务端自己告诉我们的**，它本来就知道，不欠回报。
+        """
+        ai = row.get("aiRecruitment")
+        if not isinstance(ai, dict):
+            return
+        session_name = str(row.get("session_name") or "").strip()
+        mode = str(ai.get("status") or "").strip()
+        if not session_name or mode not in CANDIDATE_MODES:
+            return
+        version = ai.get("version")
+        mode_version = ai.get("modeVersion")
+        now = _utcnow().isoformat()
+        conn.execute(
+            """INSERT INTO gateway_candidate_mode
+                 (account_id, session_name, candidate_id, mode, reason,
+                  version, mode_version, trigger_id, updated_at, reported_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(account_id, session_name) DO UPDATE SET
+                 candidate_id=excluded.candidate_id,
+                 mode=excluded.mode,
+                 reason=excluded.reason,
+                 version=excluded.version,
+                 mode_version=excluded.mode_version,
+                 trigger_id=excluded.trigger_id,
+                 updated_at=excluded.updated_at,
+                 reported_at=excluded.reported_at""",
+            (
+                account_id, session_name, str(row.get("worker_id") or ""), mode,
+                str(ai.get("reason") or "")[:500],
+                version if isinstance(version, int) and version > 0 else 0,
+                mode_version if isinstance(mode_version, int) and mode_version > 0 else 0,
+                str(ai.get("triggerId") or ""), now, now,
+            ),
+        )
 
     def contact_session_name(self, account_id: str, number: str) -> str:
         """这台机器（或换机前那台）给这个人用的备注名。没有就返回空串。"""
@@ -617,71 +691,105 @@ class GatewayStore:
             )
             conn.commit()
 
-    # ────────────── 分身级人工接管（089 / docs/19） ──────────────
+    # ────────── 候选人级人工接管（091 / docs/19 v2 §1 / 业务端 v1.5 §4） ──────────
 
-    def context_mode(self, account_id: str) -> ContextModeRow:
-        """这台微信现在归谁用。**重启读回**是这张表存在的唯一理由。
+    @staticmethod
+    def _mode_row(session_name: str, row: tuple) -> CandidateModeRow:
+        mode = str(row[1])
+        return CandidateModeRow(
+            session_name=session_name,
+            candidate_id=str(row[0] or ""),
+            mode=mode if mode in CANDIDATE_MODES else AI_MANAGED,
+            reason=str(row[2] or ""),
+            version=int(row[3] or 0),
+            mode_version=int(row[4] or 0),
+            trigger_id=str(row[5] or ""),
+            updated_at=str(row[6] or ""),
+            reported_at=str(row[7]) if row[7] else None,
+        )
 
-        ★ 从来没设过 → `delegated`（分身在管）。默认必须是这一档：接管是**例外状态**，
-          装好就接管等于装上就不干活；而且真正的兜底是——本机这道闸只有招聘老师自己
-          按过才会关上。
+    _MODE_COLS = "candidate_id, mode, reason, version, mode_version, trigger_id, updated_at, reported_at"
+
+    def candidate_mode(self, account_id: str, session_name: str) -> CandidateModeRow:
+        """这个候选人现在由谁跟。**重启读回**是这张表存在的唯一理由。
+
+        ★ 从来没设过 → `ai_managed` 且 `known=False`。默认必须是「分身在跟」：
+          接管是**例外状态**，默认接管等于装上就不干活。`known=False` 是给界面用的——
+          「本机没记录」不能在界面上画成「服务端确认他是托管」。
         """
         with closing(self._connect()) as conn:
             row = conn.execute(
-                "SELECT context_mode, reason, version, updated_at, reported_at "
-                "FROM gateway_context_mode WHERE account_id=?",
-                (account_id,),
+                f"SELECT {self._MODE_COLS} FROM gateway_candidate_mode "
+                "WHERE account_id=? AND session_name=?",
+                (account_id, session_name),
             ).fetchone()
         if row is None:
-            return ContextModeRow("delegated", "", 0, "", None)
-        mode = str(row[0])
-        return ContextModeRow(
-            mode if mode in ("take_over", "delegated") else "delegated",
-            str(row[1] or ""),
-            int(row[2] or 0),
-            str(row[3] or ""),
-            str(row[4]) if row[4] else None,
-        )
+            return CandidateModeRow(session_name, "", AI_MANAGED, "", 0, 0, "", "", None, known=False)
+        return self._mode_row(session_name, row)
 
-    def set_context_mode(
+    def candidate_modes(self, account_id: str) -> dict[str, CandidateModeRow]:
+        """这台机器上所有有记录的候选人档位，按会话名索引（界面一次画一屏用）。"""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT session_name, {self._MODE_COLS} FROM gateway_candidate_mode WHERE account_id=?",
+                (account_id,),
+            ).fetchall()
+        return {str(r[0]): self._mode_row(str(r[0]), tuple(r[1:])) for r in rows}
+
+    def set_candidate_mode(
         self,
         account_id: str,
+        session_name: str,
         mode: str,
         *,
+        candidate_id: str = "",
         reason: str = "",
         version: int = 0,
+        mode_version: int = 0,
+        trigger_id: str = "",
         reported_at: str | None = None,
-    ) -> ContextModeRow:
-        """落本机。**先落这里再谈上报**——即时执行权在本机（design §1.1）。
+    ) -> CandidateModeRow:
+        """落本机。**先落这里再谈上报**——即时执行权在这台电脑上。
 
-        `reported_at=None` = 这一次还没报给业务后端，重启后要补报一次
-        （无心跳契约，服务端不会自己知道）。
+        `reported_at=None` = 这一次还没 `action=report` 回给业务后端，欠一次回报。
         """
         now = _utcnow().isoformat()
         with closing(self._connect()) as conn:
             conn.execute(
                 """
-                INSERT INTO gateway_context_mode
-                  (account_id, context_mode, reason, version, updated_at, reported_at)
-                VALUES (?,?,?,?,?,?)
-                ON CONFLICT(account_id) DO UPDATE SET
-                  context_mode=excluded.context_mode,
+                INSERT INTO gateway_candidate_mode
+                  (account_id, session_name, candidate_id, mode, reason,
+                   version, mode_version, trigger_id, updated_at, reported_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(account_id, session_name) DO UPDATE SET
+                  candidate_id=excluded.candidate_id,
+                  mode=excluded.mode,
                   reason=excluded.reason,
                   version=excluded.version,
+                  mode_version=excluded.mode_version,
+                  trigger_id=excluded.trigger_id,
                   updated_at=excluded.updated_at,
                   reported_at=excluded.reported_at
                 """,
-                (account_id, mode, reason, int(version), now, reported_at),
+                (
+                    account_id, session_name, candidate_id, mode, reason,
+                    int(version), int(mode_version), trigger_id, now, reported_at,
+                ),
             )
             conn.commit()
-        return ContextModeRow(mode, reason, int(version), now, reported_at)
+        return CandidateModeRow(
+            session_name, candidate_id, mode, reason,
+            int(version), int(mode_version), trigger_id, now, reported_at,
+        )
 
-    def mark_context_mode_reported(self, account_id: str, at: str | None = None) -> None:
-        """上报成功了。只动 `reported_at`——状态本身不许在这里被改写。"""
+    def mark_candidate_mode_reported(
+        self, account_id: str, session_name: str, at: str | None = None,
+    ) -> None:
+        """回报成功了。只动 `reported_at`——状态本身不许在这里被改写。"""
         with closing(self._connect()) as conn:
             conn.execute(
-                "UPDATE gateway_context_mode SET reported_at=? WHERE account_id=?",
-                (at or _utcnow().isoformat(), account_id),
+                "UPDATE gateway_candidate_mode SET reported_at=? WHERE account_id=? AND session_name=?",
+                (at or _utcnow().isoformat(), account_id, session_name),
             )
             conn.commit()
 

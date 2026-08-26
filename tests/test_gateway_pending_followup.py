@@ -166,7 +166,7 @@ class GuardDenialKeepsTheBatchTests(FollowUpLoopTestCase):
 
 
 class TakeoverDefersInsteadOfSettlingTests(GuardDenialKeepsTheBatchTests):
-    """089 任务 3 · 接管两小时 ≠ 丢两小时的人（docs/19 §3.1）。
+    """091 · 接管两小时 ≠ 丢这个人（docs/19 v2 §1）。
 
     接管期间消息**照读**（US3），但一条都不自动回。这一批要跟额度用完时走同一条路：
     ``defer`` —— 留着、不计失败，恢复托管之后原样重投。
@@ -175,10 +175,10 @@ class TakeoverDefersInsteadOfSettlingTests(GuardDenialKeepsTheBatchTests):
       候选人那几句话就此消失。这正是 [[settle-only-when-said]] 那条教训的直接应用。
     """
 
-    async def test_a_taken_over_agent_defers_the_batch(self) -> None:
+    async def test_a_taken_over_candidate_defers_the_batch(self) -> None:
         self._now = T0
         sender, sink = self._sender()
-        self.store.set_context_mode(ACCOUNT, "take_over", reason="我自己来跟")
+        self.store.set_candidate_mode(ACCOUNT, PEER, "human_takeover", reason="我自己来跟")
 
         results: list[DeliveryResult] = []
 
@@ -196,11 +196,11 @@ class TakeoverDefersInsteadOfSettlingTests(GuardDenialKeepsTheBatchTests):
         self.assertEqual(len(rows), 1, "被接管拦下 ≠ 处理完")
         self.assertEqual(rows[0]["attempts"], 0, "★ 等人干完活不该算失败：算了就会在接管期间把重试次数耗光")
 
-    async def test_the_batch_lands_after_the_agent_is_handed_back(self) -> None:
-        """★ 留着不是目的：恢复托管的下一趟要把**同一批**话真的说出去。"""
+    async def test_the_batch_lands_after_the_candidate_is_handed_back(self) -> None:
+        """★ 留着不是目的：交回分身之后的下一趟要把**同一批**话真的说出去。"""
         self._now = T0
         sender, sink = self._sender()
-        self.store.set_context_mode(ACCOUNT, "take_over", reason="我自己来跟")
+        self.store.set_candidate_mode(ACCOUNT, PEER, "human_takeover", reason="我自己来跟")
 
         async def handler(account_id: str, peer_id: str, _t: str, _m) -> DeliveryResult:
             return await sender.deliver(account_id, peer_id, reply_card(["您好"]))
@@ -209,7 +209,7 @@ class TakeoverDefersInsteadOfSettlingTests(GuardDenialKeepsTheBatchTests):
         await self._dispatch_once(loop)
         self.assertEqual(len(self._pending()), 1)
 
-        self.store.set_context_mode(ACCOUNT, "delegated")
+        self.store.set_candidate_mode(ACCOUNT, PEER, "ai_managed")
         self._now += timedelta(minutes=5)
         await loop.tick()
         await loop.drain()
@@ -221,7 +221,7 @@ class TakeoverDefersInsteadOfSettlingTests(GuardDenialKeepsTheBatchTests):
         """接管一上午（远超重试上限的趟数）之后，这批人一个都不能少。"""
         self._now = T0
         sender, sink = self._sender()
-        self.store.set_context_mode(ACCOUNT, "take_over", reason="上午都我来")
+        self.store.set_candidate_mode(ACCOUNT, PEER, "human_takeover", reason="上午都我来")
 
         async def handler(account_id: str, peer_id: str, _t: str, _m) -> DeliveryResult:
             return await sender.deliver(account_id, peer_id, reply_card(["您好"]))
@@ -233,7 +233,7 @@ class TakeoverDefersInsteadOfSettlingTests(GuardDenialKeepsTheBatchTests):
             await self._dispatch_once(loop)
         self.assertEqual(len(self._pending()), 1, "★ 接管久一点就把人丢了 = 最贵的那种丢")
 
-        self.store.set_context_mode(ACCOUNT, "delegated")
+        self.store.set_candidate_mode(ACCOUNT, PEER, "ai_managed")
         await loop.tick()
         await loop.drain()
         self.assertEqual([text for _a, _p, text in sink.sent], ["您好"])

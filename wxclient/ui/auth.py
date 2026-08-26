@@ -46,14 +46,6 @@ class AuthError(RuntimeError):
         return self.code == "ACTIVE_CLIENT_SESSION_EXISTS"
 
 
-def _version_of(activation: object) -> int:
-    """`activationStatus.version`；没有或不是正整数就是 0（= 没有定序信息，不对齐）。"""
-    if not isinstance(activation, dict):
-        return 0
-    raw = activation.get("version")
-    return raw if isinstance(raw, int) and raw > 0 else 0
-
-
 @dataclass(frozen=True)
 class Identity:
     """登录成功之后，我们知道的关于「谁在用这台机器」的事。
@@ -70,21 +62,6 @@ class Identity:
     tenant_name: str = ""
     token: str = ""
     stage: str = ""
-    #: 089 · 登录响应 `activationStatus` 里那份分身状态（契约 §5.1 / docs/19 §2.3）。
-    #: 客户端启动时按它对齐，**零新接口**；业务端还没带这两个字段时是空的，照旧跑。
-    agent_status: str = ""
-    agent_status_version: int = 0
-
-    @property
-    def context_mode(self) -> tuple[str, int] | None:
-        """`(take_over|delegated, version)`；业务端没给就是 None（不对齐，别瞎猜）。
-
-        ★ 只翻译**认识的**那两档。别把 `paused` / `limited` 这些也映成 `delegated`——
-          那是另一套语义（管理侧把分身停了），当成「交回分身」会把接管悄悄解开。
-        """
-        mode = {"human_takeover": "take_over", "ai_managed": "delegated"}.get(self.agent_status)
-        return None if mode is None else (mode, self.agent_status_version)
-
     @property
     def title(self) -> str:
         return self.user_name or self.email
@@ -205,10 +182,6 @@ class ClientAuth:
             session_id=str(body.get("sessionId") or ""),
             token=token,
             stage=str(activation.get("stage") or "") if isinstance(activation, dict) else "",
-            agent_status=(
-                str(activation.get("agentStatus") or "") if isinstance(activation, dict) else ""
-            ),
-            agent_status_version=_version_of(activation),
         )
         if not identity.agent_id:
             # 没有分身就没有「用哪个身份记账」，往下跑只会记出一堆无主数据。

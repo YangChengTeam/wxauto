@@ -240,7 +240,7 @@ class OutboundGuard:
         action: str = ACTION_MESSAGE,
     ) -> GuardDecision:
         """``action`` 决定走哪一档配额（072）。总闸与分档**两道都要过**。"""
-        held = self._takeover_denial(account_id)
+        held = self._takeover_denial(account_id, peer_id)
         if held is not None:
             return GuardDecision.deny(held)
         if self._store.is_blacklisted(account_id, peer_id):
@@ -284,10 +284,11 @@ class OutboundGuard:
 
         黑名单与时间窗是纯判断、不涉及计数，先在事务外判掉，理由也更具体。
         """
-        # ★★ 089 分身级总闸，排在**所有**判断之前。人在用这台微信时一条都不许自动发出去。
-        #   `temporary=True` 是这一档的关键：接管两小时**不等于**丢两小时的人——
+        # ★★ 091 候选人级接管闸，排在**所有**判断之前。人在自己跟这个候选人时，
+        #   一条都不许自动发给他。
+        #   `temporary=True` 是这一档的关键：接管两小时**不等于**丢这个人——
         #   上层据此把这批消息 defer 掉重投，而不是销账（[[settle-only-when-said]]）。
-        held = self._takeover_denial(account_id)
+        held = self._takeover_denial(account_id, peer_id)
         if held is not None:
             return Reservation(reason=held, temporary=True)
         if self._store.is_blacklisted(account_id, peer_id):
@@ -314,24 +315,28 @@ class OutboundGuard:
             return Reservation(reason=f"{where}已做 {used} 次，达到上限 {cap}", temporary=True)
         return Reservation(granted=granted, _store=self._store, _rowids=rowids)
 
-    def _takeover_denial(self, account_id: str) -> str | None:
-        """分身级人工接管中就给一句拒绝理由，否则 None（089 / docs/19 §3.1）。
+    def _takeover_denial(self, account_id: str, peer_id: str) -> str | None:
+        """**这个候选人**正被人工接管就给一句拒绝理由，否则 None（091 / docs/19 v2 §1）。
+
+        ★ **一个人一把闸**：这里判的是 `peer_id`（会话名）那一行，不是整台机器。
+          分身级那把总闸已随 089 拆除——「招聘老师坐下来自己聊」要停哪些人，
+          由他自己在名单上逐个按，不再有一个按钮停掉全部。
 
         ★ **只挂写侧**（``check`` / ``reserve``），``allow_read`` 原样不动：
-          接管期间读消息必须继续——人真回了话，后端那条「未回复跟进」照样要被取消，
-          关系记忆照样要吸收（AI 端跑静默轮）。把读也停了，恢复之后就是一段空白。
+          接管期间读消息必须继续——人真回了话，后端那条「未回复跟进」照样要被取消。
+          把读也停了，恢复之后就是一段空白。
 
         ★ 读不到（老库没这张表、库锁住了）一律当**没接管**。这条闸 fail 的方向要想清楚：
-          读失败就当接管，等于任何一次库抖动都让整台机器停摆，而且界面上那个开关也救不回来
-          （它写的是同一张表）。真正的兜底是招聘老师自己按的那一下——它是显式的、看得见的。
+          读失败就当接管，等于任何一次库抖动都让这个人停摆，而且界面上那个按钮也救不回来
+          （它写的是同一张表）。真正的兜底是招聘老师自己按的那一下——显式、看得见。
         """
         try:
-            row = self._store.context_mode(account_id)
+            row = self._store.candidate_mode(account_id, peer_id)
         except Exception:  # noqa: BLE001 —— 读不到当没接管，理由见 docstring
             return None
         if not row.taken_over:
             return None
-        return f"分身已由人工接管{f'：{row.reason}' if row.reason else ''}"
+        return f"该候选人已由人工接管{f'：{row.reason}' if row.reason else ''}"
 
     def allow_read(self, account_id: str, action: str, *, now: datetime) -> GuardDecision:
         """读类动作的节拍闸：够慢才放行，放行的同时把这一次记下（原子）。
