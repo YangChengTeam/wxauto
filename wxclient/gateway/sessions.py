@@ -16,6 +16,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import structlog
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS gateway_sessions (
   account_id TEXT NOT NULL,
@@ -139,8 +141,14 @@ CREATE TABLE IF NOT EXISTS gateway_candidate_mode (
   mode_version INTEGER NOT NULL DEFAULT 0,
   trigger_id   TEXT NOT NULL DEFAULT '',
   updated_at   TEXT NOT NULL,
-  -- 最后一次成功 `action=report` 的时间。空 = 还欠一次回报
+  -- 历史列：曾经的 `action=report` 时间。业务端 2026-08-26 改成「request 即生效」后
+  -- 不再需要回报那一腿，这一列只留着不删（删列不可逆），新写入一律给当下时间
   reported_at  TEXT,
+  -- 档位是谁定的：`client_candidate_mode` / `enterprise_candidate_mode` / `system`
+  source       TEXT NOT NULL DEFAULT '',
+  -- 服务端 `conversation_mode_updated_at` 原样存着（**服务端时钟**，只用于展示和排查，
+  -- 不参与「谁更新」的判断——本机时钟和它不是一个钟，跨钟比较是错的）
+  server_updated_at TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (account_id, session_name)
 );
 CREATE TABLE IF NOT EXISTS gateway_read_marks (
@@ -166,6 +174,9 @@ CREATE TABLE IF NOT EXISTS gateway_messages (
 CREATE INDEX IF NOT EXISTS idx_messages_peer_time
   ON gateway_messages (account_id, peer_id, at);
 """
+
+
+_log = structlog.get_logger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -203,8 +214,10 @@ class CandidateModeRow:
     mode_version: int
     trigger_id: str
     updated_at: str
-    """最后一次成功 `action=report` 的时间；None = 还欠一次回报。"""
+    """历史字段（回报那一腿已取消）；本机写入时一律给当下时间。"""
     reported_at: str | None
+    """档位是谁定的：`client_candidate_mode` / `enterprise_candidate_mode` / `system` / 空。"""
+    source: str = ""
     """本机真有这一行吗。False = 从没设过，按默认「分身在跟」处理。"""
     known: bool = True
 
@@ -224,6 +237,8 @@ class GatewayStore:
             # 老库补列：CREATE TABLE IF NOT EXISTS 不会动既有表，不补的话
             # 分动作频控（072）在升级过的机器上会直接 "no such column" 崩掉。
             _ensure_column(conn, "gateway_send_log", "action", "TEXT NOT NULL DEFAULT 'message'")
+            _ensure_column(conn, "gateway_candidate_mode", "source", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "gateway_candidate_mode", "server_updated_at", "TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -241,13 +256,18 @@ class GatewayStore:
         为什么要在本机留一份：换机/重装之后，同一个候选人如果被起了第二个备注名，
         微信里就成了「两个人」——逐字寻址会找错窗口，聊天上下文也就断了。
 
-        ★ 091：同一条同步里如果带了 `aiRecruitment`（候选人级接管/托管，业务端 v1.5 §3.2），
-          顺手把那个人的档位也对齐——**同步名单就是候选人状态的来源**（用户 2026-08-26 定）。
-          今天 `GET /client/contacts` 还不带这个字段，所以这里写成**带了才更新**：
-          没带就一个字都不动，绝不拿「没带」当成「他是托管」。
+        ★ 091：同一条同步里带的 `conversation_mode`（候选人级接管/托管）顺手对齐——
+          **同步名单就是候选人状态的来源**（用户 2026-08-26 定）。写成**带了才更新**：
+          没带（老后端）就一个字都不动，绝不拿「没带」当成「他是托管」。
+
+        ★★ 水位与隔离窗的**咬合**：被隔离窗挡下的那一行（见 `_absorb_conversation_mode`），
+          水位**不许越过它**。这是增量同步的陷阱——水位一旦推过去，那一行除非在服务端
+          再变一次，否则**永远不会再发回来**，本机就会一直停在接管上，谁也解不开。
+          挡下就把水位压回它自己那一刻（`updated_since` 是 `>=`，下一轮它会再来一次）。
         """
         saved = 0
         watermark = ""
+        deferred = ""  # 被隔离窗挡下的那些行里**最早**的服务端时间
         with closing(self._connect()) as conn:
             for row in rows:
                 number = str(row.get("number") or "").strip()
@@ -271,7 +291,9 @@ class GatewayStore:
                      str(row.get("updated_at") or "")),
                 )
                 saved += 1
-                self._absorb_ai_recruitment(conn, account_id, row)
+                row_at = str(row.get("updated_at") or "")
+                if not self._absorb_conversation_mode(conn, account_id, row) and row_at:
+                    deferred = min(deferred, row_at) if deferred else row_at
                 # ★ 水位只认**服务端给的**时间。原来缺 updated_at 时拿本机时钟顶替，
                 # 那个值一旦被当成水位，比它早的行以后永远同步不回来（时钟还不一定准）。
                 watermark = max(watermark, str(row.get("updated_at") or ""))
@@ -282,49 +304,96 @@ class GatewayStore:
                          synced_until = MAX(excluded.synced_until, gateway_contact_sync.synced_until)""",
                     (account_id, watermark),
                 )
+            if deferred:
+                # ★ 有行被隔离窗挡下 → **故意把水位往回压**到它自己那一刻。
+                #   上面那句是 MAX（防乱序批次把水位冲低），这句是 MIN（只往回退这一步），
+                #   两句分开写，谁也别顶掉谁。`updated_since` 是 `>=`，下一轮它会再来。
+                #   隔离窗最多 180 秒、同步 120 秒一轮，所以最多多拉两轮就自愈。
+                conn.execute(
+                    """UPDATE gateway_contact_sync SET synced_until = MIN(synced_until, ?)
+                       WHERE account_id = ?""",
+                    (deferred, account_id),
+                )
             conn.commit()
         return saved
 
-    @staticmethod
-    def _absorb_ai_recruitment(conn: sqlite3.Connection, account_id: str, row: dict) -> None:
+    # 本机刚按下的接管，多久之内不许被同步名单里的 `ai_managed` 盖回去（秒）。
+    # 见 `_absorb_conversation_mode` 的说明。
+    _LOCAL_TAKEOVER_QUARANTINE = 180.0
+
+    @classmethod
+    def _absorb_conversation_mode(cls, conn: sqlite3.Connection, account_id: str, row: dict) -> bool:
         """同步名单里那份候选人档位 → 本机 `gateway_candidate_mode`（091）。
 
-        ★ **服务端那份是权威，直接覆盖本机**，但只覆盖「服务端真说了话」的那几行：
-          字段没来、会话名为空、档位不认识，都当没这回事。
-        ★ `reported_at` 给当下：这一条是**服务端自己告诉我们的**，它本来就知道，不欠回报。
+        业务端 2026-08-26 给 `GET /client/contacts` 每一行加了
+        `conversation_mode` / `conversation_mode_source` / `conversation_mode_updated_at`。
+        **这是换机 / 重装 / 别人在企业端改了之后，本机唯一能知道真相的路。**
+
+        ★ **方向不对称**，这是本方法最要紧的一条：
+
+        - 服务端说 `human_takeover` → **无条件收下**。往「别发消息」那一侧倒是安全的。
+        - 服务端说 `ai_managed` → 只有在本机那一行**不是刚按下的接管**时才收下。
+
+          为什么要这道闸：招聘老师在 T 时刻按下接管，客户端先本机生效再 PUT；
+          一条**在 T 之前就发出去**的名单请求可能在 T 之后才回来，里面带的还是
+          `ai_managed`。照单全收就等于「明明点了接管，机器还在发消息」——
+          091 里「只有 409 才回滚」防的就是这件事，而这是它的**第二条路**。
+
+          闸用本机时钟量本机自己的写入时间（180 秒），**不拿服务端时间戳跟本机比**：
+          那是两个钟，跨钟比大小是错的。窗口一过服务端照样说了算，所以它自愈，
+          不会把一条真的「已交回托管」永久挡在外面。
+
+        返回值：`True` = 这一行处理完了（收下了，或本来就没什么可收的）；
+        `False` = **被隔离窗挡下了，还得再来一次**，调用方据此把水位压回去。
         """
-        ai = row.get("aiRecruitment")
-        if not isinstance(ai, dict):
-            return
+        mode = str(row.get("conversation_mode") or "").strip()
         session_name = str(row.get("session_name") or "").strip()
-        mode = str(ai.get("status") or "").strip()
         if not session_name or mode not in CANDIDATE_MODES:
-            return
-        version = ai.get("version")
-        mode_version = ai.get("modeVersion")
+            # 字段没来（老后端）、会话名为空、档位不认识 —— 都当没这回事，本机不动。
+            return True
+        if mode == AI_MANAGED and cls._is_fresh_local_takeover(conn, account_id, session_name):
+            _log.info("同步名单说托管，但本机刚按下接管，这一轮不改", session=session_name)
+            return False
         now = _utcnow().isoformat()
         conn.execute(
             """INSERT INTO gateway_candidate_mode
                  (account_id, session_name, candidate_id, mode, reason,
-                  version, mode_version, trigger_id, updated_at, reported_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)
+                  version, mode_version, trigger_id, updated_at, reported_at,
+                  source, server_updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(account_id, session_name) DO UPDATE SET
                  candidate_id=excluded.candidate_id,
                  mode=excluded.mode,
-                 reason=excluded.reason,
-                 version=excluded.version,
-                 mode_version=excluded.mode_version,
-                 trigger_id=excluded.trigger_id,
                  updated_at=excluded.updated_at,
-                 reported_at=excluded.reported_at""",
+                 reported_at=excluded.reported_at,
+                 source=excluded.source,
+                 server_updated_at=excluded.server_updated_at""",
             (
-                account_id, session_name, str(row.get("worker_id") or ""), mode,
-                str(ai.get("reason") or "")[:500],
-                version if isinstance(version, int) and version > 0 else 0,
-                mode_version if isinstance(mode_version, int) and mode_version > 0 else 0,
-                str(ai.get("triggerId") or ""), now, now,
+                account_id, session_name, str(row.get("worker_id") or ""), mode, "",
+                0, 0, "", now, now,
+                str(row.get("conversation_mode_source") or "")[:40],
+                str(row.get("conversation_mode_updated_at") or "")[:64],
             ),
         )
+        return True
+
+    @classmethod
+    def _is_fresh_local_takeover(cls, conn: sqlite3.Connection, account_id: str, session_name: str) -> bool:
+        """本机这一行是不是「刚刚按下的接管」（见 `_absorb_conversation_mode`）。"""
+        found = conn.execute(
+            "SELECT mode, updated_at FROM gateway_candidate_mode "
+            "WHERE account_id=? AND session_name=?",
+            (account_id, session_name),
+        ).fetchone()
+        if not found or str(found[0]) != HUMAN_TAKEOVER:
+            return False
+        try:
+            written = datetime.fromisoformat(str(found[1]))
+        except ValueError:
+            return False
+        if written.tzinfo is None:
+            written = written.replace(tzinfo=timezone.utc)
+        return (_utcnow() - written).total_seconds() < cls._LOCAL_TAKEOVER_QUARANTINE
 
     def contact_session_name(self, account_id: str, number: str) -> str:
         """这台机器（或换机前那台）给这个人用的备注名。没有就返回空串。"""
@@ -706,9 +775,13 @@ class GatewayStore:
             trigger_id=str(row[5] or ""),
             updated_at=str(row[6] or ""),
             reported_at=str(row[7]) if row[7] else None,
+            source=str(row[8] or ""),
         )
 
-    _MODE_COLS = "candidate_id, mode, reason, version, mode_version, trigger_id, updated_at, reported_at"
+    _MODE_COLS = (
+        "candidate_id, mode, reason, version, mode_version, trigger_id, "
+        "updated_at, reported_at, source"
+    )
 
     def candidate_mode(self, account_id: str, session_name: str) -> CandidateModeRow:
         """这个候选人现在由谁跟。**重启读回**是这张表存在的唯一理由。
@@ -724,7 +797,7 @@ class GatewayStore:
                 (account_id, session_name),
             ).fetchone()
         if row is None:
-            return CandidateModeRow(session_name, "", AI_MANAGED, "", 0, 0, "", "", None, known=False)
+            return CandidateModeRow(session_name, "", AI_MANAGED, "", 0, 0, "", "", None, "", known=False)
         return self._mode_row(session_name, row)
 
     def candidate_modes(self, account_id: str) -> dict[str, CandidateModeRow]:

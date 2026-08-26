@@ -140,6 +140,11 @@ class CandidateModeClient(BackendEndpoint):
     ) -> ModeOutcome:
         """回报**本机真的应用了没有**（v1.5 §4.3）。
 
+        ★ **当前不调用。** 业务端 2026-08-26 把 `action=request` 改成收到就直接
+          `appliedMode = requestedMode` / `syncStatus = 'synced'`，并明确「不用处理 report」。
+          接口那一侧还在，契约也还在，所以这个方法留着；真要再打开这一腿，
+          调用点在 `runner._sync_candidate_mode`。
+
         ★ `triggerId` / `modeVersion` 原样回传，不解析、不重算——服务端据此找到本次请求
           影响的那几个计划分配。三样对不上会被 409 `..._REPORT_CONFLICT` 打回。
         """

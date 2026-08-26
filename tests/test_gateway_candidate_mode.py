@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -292,23 +293,112 @@ class ContactsSyncTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_ai_recruitment_lands_when_the_backend_sends_it(self) -> None:
+    def test_conversation_mode_lands_when_the_backend_sends_it(self) -> None:
+        """业务端 2026-08-26 给 contacts 每行加了 `conversation_mode` 三件套。"""
         self.store.save_contacts(ACCOUNT, [{
             "number": "13800138000", "session_name": "张三", "worker_id": CANDIDATE,
             "updated_at": "2026-08-26T09:00:00.000Z",
-            "aiRecruitment": {
-                "status": HUMAN_TAKEOVER, "version": 4, "modeVersion": 1,
-                "triggerId": "handoff:p1:c1:1:x", "reason": "HR 手动接管",
-            },
+            "conversation_mode": HUMAN_TAKEOVER,
+            "conversation_mode_source": "enterprise_candidate_mode",
+            "conversation_mode_updated_at": "2026-08-26T08:59:00.000Z",
         }])
         row = self.store.candidate_mode(ACCOUNT, "张三")
         self.assertTrue(row.taken_over)
         self.assertEqual(row.candidate_id, CANDIDATE)
-        self.assertEqual((row.version, row.mode_version), (4, 1))
-        self.assertIsNotNone(row.reported_at, "服务端自己说的，不欠回报")
+        self.assertEqual(row.source, "enterprise_candidate_mode")
+
+    def test_the_backend_can_hand_a_candidate_back_to_the_agent(self) -> None:
+        """别人在企业端交回托管 → 这台机器下一次同步名单就该跟上。"""
+        self.store.set_candidate_mode(
+            ACCOUNT, "张三", HUMAN_TAKEOVER, candidate_id=CANDIDATE, reason="我先跟",
+        )
+        # 把本机那一行的写入时间推到隔离窗之外（模拟「上周按的」）。
+        self._age_local_row("张三", "2026-08-20T09:00:00+00:00")
+        self.store.save_contacts(ACCOUNT, [{
+            "number": "13800138000", "session_name": "张三", "worker_id": CANDIDATE,
+            "updated_at": "2026-08-26T09:00:00.000Z",
+            "conversation_mode": AI_MANAGED,
+            "conversation_mode_source": "enterprise_candidate_mode",
+        }])
+        self.assertFalse(self.store.candidate_mode(ACCOUNT, "张三").taken_over)
+
+    def test_a_stale_ai_managed_cannot_undo_a_fresh_local_takeover(self) -> None:
+        """★★ 本类最要紧的一条：**「只有 409 才回滚」的第二条路**。
+
+        招聘老师刚按下接管，一条**在那之前就发出去**的名单请求晚到了，里面还写着
+        `ai_managed`。照单全收＝「明明点了接管，机器还在发消息」。
+        """
+        self.store.set_candidate_mode(
+            ACCOUNT, "张三", HUMAN_TAKEOVER, candidate_id=CANDIDATE, reason="我来跟",
+        )
+        self.store.save_contacts(ACCOUNT, [{
+            "number": "13800138000", "session_name": "张三", "worker_id": CANDIDATE,
+            "updated_at": "2026-08-26T09:00:00.000Z",
+            "conversation_mode": AI_MANAGED,
+        }])
+        self.assertTrue(
+            self.store.candidate_mode(ACCOUNT, "张三").taken_over,
+            "刚按下的接管不许被一条晚到的托管盖掉",
+        )
+
+    def test_a_takeover_from_the_backend_is_always_taken(self) -> None:
+        """反方向**不设闸**：往「别发消息」那一侧倒永远是安全的，不用等隔离窗。"""
+        self.store.set_candidate_mode(
+            ACCOUNT, "张三", AI_MANAGED, candidate_id=CANDIDATE, reason="交回",
+        )
+        self.store.save_contacts(ACCOUNT, [{
+            "number": "13800138000", "session_name": "张三", "worker_id": CANDIDATE,
+            "updated_at": "2026-08-26T09:00:00.000Z",
+            "conversation_mode": HUMAN_TAKEOVER,
+        }])
+        self.assertTrue(self.store.candidate_mode(ACCOUNT, "张三").taken_over)
+
+    def test_a_quarantined_row_is_not_skipped_forever(self) -> None:
+        """★★ 隔离窗与**增量水位**的咬合：挡下的那一行必须还回得来。
+
+        同步名单是增量的（`updated_since` 水位）。水位一旦推过被挡下的那一行，
+        它除非在服务端再变一次否则**永远不会再发回来**——本机就一直停在接管上，
+        谁也解不开。所以挡下的时候要把水位**压回它自己那一刻**。
+        """
+        self.store.set_candidate_mode(
+            ACCOUNT, "张三", HUMAN_TAKEOVER, candidate_id=CANDIDATE, reason="我来跟",
+        )
+        self.store.save_contacts(ACCOUNT, [
+            {
+                "number": "13800138000", "session_name": "张三", "worker_id": CANDIDATE,
+                "updated_at": "2026-08-26T09:00:00.000Z",
+                "conversation_mode": AI_MANAGED,
+            },
+            {
+                "number": "13900139000", "session_name": "李四",
+                "updated_at": "2026-08-26T10:00:00.000Z",
+                "conversation_mode": AI_MANAGED,
+            },
+        ])
+        self.assertLessEqual(
+            self.store.contacts_synced_until(ACCOUNT), "2026-08-26T09:00:00.000Z",
+            "水位不许越过被挡下的那一行，否则它再也回不来了",
+        )
+        # 隔离窗过了（模拟「上周按的」）→ 同一行再来一次就该收下。
+        self._age_local_row("张三", "2026-08-20T09:00:00+00:00")
+        self.store.save_contacts(ACCOUNT, [{
+            "number": "13800138000", "session_name": "张三", "worker_id": CANDIDATE,
+            "updated_at": "2026-08-26T09:00:00.000Z",
+            "conversation_mode": AI_MANAGED,
+        }])
+        self.assertFalse(self.store.candidate_mode(ACCOUNT, "张三").taken_over)
+
+    def test_a_clean_batch_still_moves_the_watermark_forward(self) -> None:
+        """没有被挡下的行时，水位照旧只进不退。"""
+        self.store.save_contacts(ACCOUNT, [{
+            "number": "13900139000", "session_name": "李四",
+            "updated_at": "2026-08-26T10:00:00.000Z",
+            "conversation_mode": AI_MANAGED,
+        }])
+        self.assertEqual(self.store.contacts_synced_until(ACCOUNT), "2026-08-26T10:00:00.000Z")
 
     def test_a_contacts_row_without_the_field_touches_nothing(self) -> None:
-        """★ 业务端今天还没加这个字段。**没带 ≠ 他是托管**——一个字都不能动。"""
+        """老后端不带这个字段。**没带 ≠ 他是托管**——一个字都不能动。"""
         self.store.set_candidate_mode(ACCOUNT, "张三", HUMAN_TAKEOVER, reason="我自己跟")
         self.store.save_contacts(ACCOUNT, [{
             "number": "13800138000", "session_name": "张三", "worker_id": CANDIDATE,
@@ -320,9 +410,18 @@ class ContactsSyncTests(unittest.TestCase):
         self.store.save_contacts(ACCOUNT, [{
             "number": "13800138000", "session_name": "张三",
             "updated_at": "2026-08-26T09:00:00.000Z",
-            "aiRecruitment": {"status": "paused", "version": 4},
+            "conversation_mode": "paused",
         }])
         self.assertFalse(self.store.candidate_mode(ACCOUNT, "张三").known)
+
+    def _age_local_row(self, session_name: str, written_at: str) -> None:
+        """把本机那一行的写入时间改老，绕过接管隔离窗（只在测试里这么干）。"""
+        with sqlite3.connect(self.store._path) as conn:
+            conn.execute(
+                "UPDATE gateway_candidate_mode SET updated_at=? "
+                "WHERE account_id=? AND session_name=?",
+                (written_at, ACCOUNT, session_name),
+            )
 
 
 class OutcomeTests(unittest.TestCase):

@@ -998,20 +998,16 @@ class GatewayRunner:
                     reason=row.reason, version=asked.conflict_version,
                 )
             return asked.reason or "没能同步给业务端"
-        # 本机此刻已经是这个档位了 → 第二段：如实回报「真的应用了」。
-        reported = await self._candidate_mode.report(
-            row.candidate_id, mode,
-            trigger_id=asked.trigger_id, mode_version=asked.mode_version,
-        )
+        # ★ 到这里就结束了，**没有第二腿**。业务端 2026-08-26 改成「收到 request 就直接
+        #   把 requestedMode 和 appliedMode 一起置成 synced」，明确说了「不用处理 report」，
+        #   所以再调 `action=report` 只会撞出一个 409 REPORT_CONFLICT 和一句吓人的提示。
+        #   `reported_at` 照旧写当下时间：那一列是历史遗留，不删也不留空。
         self._store.set_candidate_mode(
             account, session_name, mode, candidate_id=row.candidate_id, reason=reason or row.reason,
             version=asked.version or row.version, mode_version=asked.mode_version,
             trigger_id=asked.trigger_id,
-            reported_at=self._clock().isoformat() if reported.accepted else None,
+            reported_at=self._clock().isoformat(),
         )
-        if not reported.accepted:
-            # 请求已经落到业务端了，只是「真应用了」这一句没送到。欠着，别回滚。
-            return reported.reason or "已同步请求，但回报没送到"
         return None
 
     def pending_backlog(self) -> int:
