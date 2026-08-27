@@ -17,6 +17,7 @@ from wxclient.config import load_settings
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
+from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
 from .candidates import CandidateDirectory
 from .capabilities import Capability, probe_capabilities
@@ -184,6 +185,24 @@ def build_gateway(
         client_token or (lambda: ""),
     )
 
+    command_executor = CommandExecutor(
+        runtime=runtime,
+        store=store,
+        guard=OutboundGuard(
+            store,
+            max_sends_per_hour=gateway_settings.max_sends_per_hour,
+            active_hours=gateway_settings.active_hours,
+            action_limits=action_limits_from(gateway_settings),
+        ),
+        account_id=resolved_accounts[0],
+        allow_real_actions=allow_real_actions,
+        confirmation=REAL_ACTION_CONFIRMATION,
+        fetcher=file_fetcher,
+        capabilities=current_capabilities,
+        candidates=candidates,
+        message_events=message_events,
+    )
+
     runner = GatewayRunner(
         settings=gateway_settings,
         ticket_provider=ticket_provider,
@@ -201,22 +220,14 @@ def build_gateway(
         contacts=contacts,
         candidates=candidates,
         message_events=message_events,
-        command_executor=CommandExecutor(
-            runtime=runtime,
+        command_executor=command_executor,
+        # 092：名单里还不是好友的人自动补加。加好友本身仍走 `command_executor`——
+        # 能力闸、频控闸、时间窗、幂等一道不绕。
+        auto_friend=AutoFriendWatcher(
             store=store,
-            guard=OutboundGuard(
-                store,
-                max_sends_per_hour=gateway_settings.max_sends_per_hour,
-                active_hours=gateway_settings.active_hours,
-                action_limits=action_limits_from(gateway_settings),
-            ),
-            account_id=resolved_accounts[0],
-            allow_real_actions=allow_real_actions,
-            confirmation=REAL_ACTION_CONFIRMATION,
-            fetcher=file_fetcher,
-            capabilities=current_capabilities,
-            candidates=candidates,
-            message_events=message_events,
+            runtime=runtime,
+            commands=command_executor,
+            enabled=gateway_settings.auto_add_friend,
         ),
         friend_watcher=FriendWatcher(
             accounts=resolved_accounts,

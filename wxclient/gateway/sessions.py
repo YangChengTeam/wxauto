@@ -162,6 +162,18 @@ CREATE TABLE IF NOT EXISTS gateway_candidate_mode (
   server_updated_at TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (account_id, session_name)
 );
+CREATE TABLE IF NOT EXISTS gateway_auto_friend (
+  -- 「这台机器**自作主张**给这个号发过好友申请」的台账（092）。
+  -- ★ 为什么不复用 gateway_contacts.status='requested'：那张表**同步名单会覆盖**
+  --   （服务端才是权威，见 note_friend_request 的说明）。拿它当去重键，
+  --   同步一次就会把同一个人再加一遍——加好友重复执行就是风控事故。
+  -- ★ 这张表**只由本机写**，同步名单一个字都不碰它。
+  account_id   TEXT NOT NULL,
+  number       TEXT NOT NULL,
+  session_name TEXT NOT NULL DEFAULT '',
+  at           TEXT NOT NULL,
+  PRIMARY KEY (account_id, number)
+);
 CREATE TABLE IF NOT EXISTS gateway_read_marks (
   account_id TEXT NOT NULL,
   action     TEXT NOT NULL,
@@ -584,6 +596,55 @@ class GatewayStore:
         with closing(self._connect()) as conn:
             row = conn.execute(
                 "SELECT synced_until FROM gateway_contact_sync WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+
+    # ────────────────────── 自动补加好友台账（092） ──────────────────────
+
+    def auto_friend_tried(self, account_id: str, number: str) -> str:
+        """这台机器自作主张给这个号发过好友申请吗。发过返回那一刻，没发过返回空串。
+
+        ★ **同一个号只自动加一次**，之后永不自动重加。对方一直不通过也不再补——
+          自动重加是风控最敏感的一件事，而「没通过」本来就该由人去看。
+          人工或 AI 明确下发的 `add_friend` 指令**不看这张表**：那是别人要求的，
+          不是本机自作主张。
+        """
+        number = (number or "").strip()
+        if not number:
+            return ""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT at FROM gateway_auto_friend WHERE account_id=? AND number=?",
+                (account_id, number),
+            ).fetchone()
+        return str(row[0]) if row else ""
+
+    def note_auto_friend(self, account_id: str, number: str, session_name: str, at: str) -> bool:
+        """记下「本机要给这个号自动发好友申请了」。**先记账再动手。**
+
+        返回 `True` = 这一笔是新记上的，可以动手；`False` = 已经有了，**别加**。
+        顺序不能反：先动手后记账的话，动手成功而记账失败（磁盘满、进程被杀）
+        下一轮就会再加一次。宁可漏一次，不可重一次。
+        """
+        number, session_name = (number or "").strip(), (session_name or "").strip()
+        if not number:
+            return False
+        with closing(self._connect()) as conn:
+            changed = conn.execute(
+                """INSERT INTO gateway_auto_friend (account_id, number, session_name, at)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(account_id, number) DO NOTHING""",
+                (account_id, number, session_name, at),
+            ).rowcount
+            conn.commit()
+        return changed > 0
+
+    def last_auto_friend_at(self, account_id: str) -> str:
+        """本机上一次自动加好友是什么时候（节拍用）。没加过返回空串。"""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT MAX(at) FROM gateway_auto_friend WHERE account_id=?",
                 (account_id,),
             ).fetchone()
         return str(row[0]) if row and row[0] else ""

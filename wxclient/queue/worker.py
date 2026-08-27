@@ -200,7 +200,10 @@ class OperationWorker:
         if task.type == TaskType.ADD_FRIEND:
             return self.api.add_friend(
                 number=str(payload["number"]),
-                greetings=str(payload.get("greetings") or "你好"),
+                # 「没给」兜底「你好」，「明确给了空串」就保持空——空的时候
+                # 驱动层不碰验证语输入框，微信用它自己预填的那句（092）。
+                greetings=(payload["greetings"]
+                           if isinstance(payload.get("greetings"), str) else "你好"),
                 remark=payload.get("remark"),
                 dry_run=payload.get("dry_run"),
             )

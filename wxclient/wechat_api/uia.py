@@ -228,7 +228,9 @@ class UiaWeChatDriver:
         try:
             FriendSettings.add_new_friend(
                 number=number,
-                greetings=greetings,
+                # 空串按 None 传：vendor 的签名就是 `greetings:str=None`，
+                # None 才是「你别管这句话」，空串未必被它当成同一回事（092）。
+                greetings=greetings or None,
                 remark=remark,
                 chat_only=False,
                 is_maximize=False,

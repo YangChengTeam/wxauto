@@ -19,6 +19,7 @@ from typing import Any
 
 import structlog
 
+from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
 from .candidates import CandidateDirectory
 from .capabilities import CAPABILITIES_OP, Capability, capabilities_frame
@@ -210,6 +211,7 @@ class GatewayRunner:
         clock: Callable[[], datetime] | None = None,
         capabilities: Callable[[], dict[str, Capability]] | None = None,
         candidate_mode: CandidateModeClient | None = None,
+        auto_friend: AutoFriendWatcher | None = None,
     ) -> None:
         self._settings = settings
         self._store = store
@@ -220,6 +222,7 @@ class GatewayRunner:
         self._friends = friend_watcher
         self._strangers = stranger_watcher
         self._commands = command_executor
+        self._auto_friend = auto_friend
         self._contacts = contacts
         self._candidates = candidates
         self._message_events = message_events
@@ -280,6 +283,11 @@ class GatewayRunner:
             clock=self._clock,
             on_peer_messages=self._note_inbound_messages,
         )
+        # 092：名单里连续几轮读不到的那个会话，交给 AutoFriendWatcher 去判「是不是压根还不是好友」。
+        # 到这一步才装：它要用 `CommandExecutor` 和 `_report_contact`，两个都比 source 晚。
+        if auto_friend is not None and hasattr(source, "set_unreachable_handler"):
+            auto_friend.on_added = self._report_contact
+            source.set_unreachable_handler(auto_friend.on_unreachable)
 
     def is_active(self, now: datetime) -> bool:
         """现在允不允许动微信。读消息、查好友、发送共用同一个「工作时间窗」。"""

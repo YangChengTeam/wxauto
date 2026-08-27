@@ -109,6 +109,20 @@ class CommandSpec:
     """没带文件就是这条指令不成立（发文件）。为假 = 可有可无（朋友圈配图）。"""
 
 
+def _greetings(args: dict[str, Any]) -> str:
+    """加好友的验证语。**「没给」和「明确给了空」是两回事**（092）。
+
+    - 没给（键不在、给的是 null）→ 兜底一句「你好」，保持原行为不变；
+    - 明确给了空串 → **就是要空**，让微信用它自己预填的「我是XXX」
+      （`uia.py` 里是 `if greetings:` 才动那个输入框）。用户 2026-08-27 裁决。
+
+    ★ 红线不变：内部 `reason` 绝不兜底进验证语——那是「内部指令变成一条候选人
+      真能读到的微信」那个事故形状。这里连碰都不碰 `reason`。
+    """
+    value = args.get("greetings")
+    return value if isinstance(value, str) else "你好"
+
+
 def _req(args: dict[str, Any], key: str, *, alias: str = "") -> str:
     value = args.get(key)
     if not value and alias:
@@ -180,7 +194,7 @@ COMMANDS: dict[str, CommandSpec] = {
     ),
     "add_friend": CommandSpec(
         TaskType.ADD_FRIEND, True,
-        lambda a: {"number": _req(a, "number"), "greetings": str(a.get("greetings") or "你好"),
+        lambda a: {"number": _req(a, "number"), "greetings": _greetings(a),
                    "remark": a.get("remark")},
         lambda a: _req(a, "number"),
         action=ACTION_FRIEND,

@@ -36,6 +36,10 @@ SELF_SENDER = "我"
 #: 一轮最多读几个会话。见 ``QueueMessageSource._due_peers``——每读一个就要开一次聊天窗口。
 MAX_PEERS_PER_POLL = 8
 
+#: 连续几轮读不到才算「这个会话真有问题」（092）。
+#: 一轮读不到太常见了——微信卡一下、窗口没起来都会。拿一次失败就去加好友是误加。
+UNREACHABLE_STRIKES = 3
+
 
 def is_self_message(raw: dict[str, Any]) -> bool:
     """这条是不是专员本人发的。
@@ -218,6 +222,7 @@ class QueueMessageSource:
         watchlist: Watchlist | None = None,
         history_limit: int = 20,
         clock=None,
+        on_unreachable=None,
     ) -> None:
         self._runtime = runtime
         self._store = store
@@ -225,7 +230,11 @@ class QueueMessageSource:
         self._history_limit = history_limit
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._rotation = 0
-        self._unreachable: set[str] = set()
+        # 092：连续 UNREACHABLE_STRIKES 轮读不到时喊一声。**只是「读不到」，不是「不是好友」**
+        # ——判定留给回调那边（`autofriend.py`），这里一行都不管策略。
+        self._on_unreachable = on_unreachable
+        # 会话名 → 连续读不到了几轮（092：从 set 改成计数）
+        self._unreachable: dict[str, int] = {}
 
     async def fetch(self, account_id: str) -> list[InboundMessage]:
         """读名单里的会话，按游标切出新消息。
@@ -263,6 +272,14 @@ class QueueMessageSource:
         _log.info("名单较长，本轮只读其中一段", 名单=len(watched), 本轮=len(due))
         return due
 
+    def set_unreachable_handler(self, handler) -> None:
+        """装上「连续几轮读不到就喊一声」的回调（092）。
+
+        构造时装不上：喊话的对象（`AutoFriendWatcher`）要用到 `CommandExecutor`，
+        而那个是 runner 拼起来的，比本对象晚。所以留一个装配口，别让 runner 戳私有属性。
+        """
+        self._on_unreachable = handler
+
     async def _fetch_peer(self, account_id: str, peer_id: str) -> list[InboundMessage]:
         history = await self._runtime.submit(
             TaskType.READ_CHAT_HISTORY, {"friend": peer_id, "limit": self._history_limit}
@@ -272,14 +289,19 @@ class QueueMessageSource:
         # 现场表现就成了「名单加了、可他就是不回」，谁也想不到是名字对不上（2026-08-14 实测）。
         if str((history or {}).get("status") or "") not in {"", "succeeded"}:
             reason = str((history or {}).get("last_error") or "").strip()
+            strikes = self._unreachable.get(peer_id, 0) + 1
+            self._unreachable[peer_id] = strikes
             # 只在「刚开始读不到」时喊一次：轮询是分钟级的，每轮一条会把日志刷满，
             # 真正有用的信息（第一次是什么时候、为什么）反而被埋掉。
-            if peer_id not in self._unreachable:
-                self._unreachable.add(peer_id)
+            if strikes == 1:
                 _log.warning("名单里的这个会话读不到，先跳过", 会话=peer_id, 原因=reason[:120])
+            # 092：连续几轮都读不到才喊。**喊的是「读不到」，不是「不是好友」**——
+            # 这条分支任何读失败都会走（名字差一个字、微信卡了、窗口打不开），
+            # 拿它直接去加好友就是误加。到底是不是好友由回调那边再确定性判一次。
+            if strikes == UNREACHABLE_STRIKES and self._on_unreachable is not None:
+                await self._on_unreachable(account_id, peer_id, reason)
             return []
-        if peer_id in self._unreachable:
-            self._unreachable.discard(peer_id)
+        if self._unreachable.pop(peer_id, 0):
             _log.info("名单里的这个会话又能读了", 会话=peer_id)
         raw_messages = ((history or {}).get("result") or {}).get("messages") or []
         # 时间分隔行必须在切游标**之前**滤掉：它会被当成一条消息发给 AI，还会把游标钉在
