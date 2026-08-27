@@ -179,8 +179,18 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
     `session_name` = 备注优先、没有才退回昵称 —— 那才是 send_message(to=...) 该用的。
     """
 
+    def setUp(self) -> None:
+        # 等名片默认 12 秒（真机上搜陌生号是一次网络查找）。用例里把它压到近乎 0：
+        # 这里测的是**判据**，不是耐心。
+        from unittest import mock
+
+        patcher = mock.patch("wxclient.wechat_api.uia._PROFILE_WAIT_SECONDS", 0.05)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _driver(self, profile_exists: bool = True, add_button_exists: bool = True,
-                send_button_exists: bool = False, profile_text: str | None = None):
+                send_button_exists: bool = False, profile_text: str | None = None,
+                group_matches: bool = True):
         from unittest import mock
 
         from wxclient.wechat_api.uia import UiaWeChatDriver
@@ -200,9 +210,17 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
             },
             exists_=profile_exists, log=log,
         )
-        pane = _FakeControl("添加朋友面板", children={
-            "Edit": _FakeControl("搜索框", log=log), "profile": profile,
-        }, log=log)
+        pane_children = {"Edit": _FakeControl("搜索框", log=log)}
+        if group_matches:
+            pane_children["profile"] = profile
+        else:
+            # 「那层 Group 的 class_name 换了」：名片组认不出来，但名片本身就在面板里。
+            pane_children.update(profile._children)
+        pane = _FakeControl(
+            "添加朋友面板",
+            text="" if group_matches else (profile.window_text() or ""),
+            children=pane_children, log=log,
+        )
         vendor_calls: list[dict] = []
 
         class _Navigator:
@@ -284,6 +302,45 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
                          "★ 这一轮没设过备注：会话名必须是微信里现在显示的那个，不是我们提议的")
         self.assertNotIn("click:添加到通讯录", log, "按钮都不在，更不该点")
         self.assertEqual(vendor_calls, [], "这是明确结论，不是退化——别再让 vendor 加一遍")
+
+    def test_a_renamed_profile_group_no_longer_reads_as_not_found(self) -> None:
+        """★ 2026-08-27 陈卓那次：弹框出来了、人也找到了，一下又关了，日志报「没搜到这个号」。
+
+        真因是名片那层 Group 的 ``class_name`` **跟微信版本走**（vendor 表里只覆盖两个版本），
+        表里没有的版本 → 名片「查无此控件」→ 报没搜到 → ``finally`` 把面板关掉。
+        现在判据换成**按钮在不在**，那层 Group 叫什么已经不重要。
+        """
+        driver, log, vendor_calls, _verify = self._driver(group_matches=False)
+
+        result = driver.add_friend("13800138000", "你好", remark="张三-仓库工")
+
+        self.assertIn("click:添加到通讯录", log, "★ 名片就在面板里，必须加得成")
+        self.assertEqual(result["session_name"], "张三-仓库工")
+        self.assertEqual(result["name"], "张三", "退化到整个面板当名片根，昵称照样挑得出来")
+        self.assertEqual(vendor_calls, [])
+
+    def test_a_slow_profile_is_waited_for_instead_of_called_missing(self) -> None:
+        """★ 慢 ≠ 没有。搜陌生号是一次网络查找，名片晚几秒才渲染出来是常事。"""
+        from unittest import mock
+
+        driver, log, _vendor, _verify = self._driver(add_button_exists=False)
+        add_button = _FakeControl("添加到通讯录", exists_=False, log=log)
+
+        polls = {"n": 0}
+
+        def renders_on_the_third_poll(*_a: object, **_k: object) -> bool:
+            polls["n"] += 1
+            return polls["n"] >= 3            # 前两轮还没渲染好，第三轮才出来
+
+        add_button.exists = renders_on_the_third_poll   # type: ignore[method-assign]
+        profile = _FakeControl("名片", text="张三", children={"add": add_button}, log=log)
+
+        with mock.patch("wxclient.wechat_api.uia._PROFILE_WAIT_SECONDS", 3.0):
+            driver._contact_profile_roots = lambda pane, ui: [profile, pane]  # type: ignore[assignment]
+            driver.add_friend("13800138000", "你好")
+
+        self.assertGreaterEqual(polls["n"], 3, "★ 得真的多轮询了几次，不是一次就撞上")
+        self.assertIn("click:添加到通讯录", log, "多等一轮就等到了，不该报没搜到")
 
     def test_no_add_button_and_no_send_button_is_still_a_failure(self) -> None:
         """★ 「没有添加按钮」只说明加不了。没有正向证据就不许断定「已经是好友」——

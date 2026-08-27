@@ -165,28 +165,19 @@ class UiaWeChatDriver:
                 raise _AddFriendNotStarted(f"搜索框用不了：{exc}") from exc
             time.sleep(1)
 
-            profile = add_friend_pane.child_window(**Uielements.Groups.ContactProfileViewGroup)
-            if not _truthy_safe_call(lambda: profile.exists(timeout=2)):
-                # 原来这种情况是**静默返回成功**的：查无此号也报"加好友完成"，
-                # AI 端只会以为对方没通过而一直等。说清楚是查不到。
-                raise WeChatApiError(f"没搜到这个号：{number}（号码不对，或对方不允许被搜到）")
+            profile, add_button = self._await_contact_profile(add_friend_pane, Uielements, number)
 
             lines = _profile_text_lines(profile)
             name = _pick_profile_name(lines, str(number))
             display_name = _pick_profile_display_name(lines, str(number))
             nickname = _pick_profile_nickname(lines)
 
-            add_button = profile.child_window(**Uielements.Buttons.AddToContactsButton)
-            if not _truthy_safe_call(lambda: add_button.exists(timeout=2)):
-                # ★ 「没有添加按钮」本身只说明加不了，不说明为什么。要断定「已经是好友」得有
-                #   **正向**证据：名片上有「发消息」。vendor 自己也是这么判的
-                #   （`WeChatTools.py`：有发送消息按钮说明不是新朋友不需要添加）。
-                #   少了这道正向判据，任何一次名片没渲染完/换了版式都会被报成「已经是好友」，
-                #   于是 `wechatAdded` 被写成真——而那个人根本没加上。
-                if not self._profile_says_already_friend(profile, add_friend_pane, Uielements):
-                    raise WeChatApiError(
-                        f"这个号加不了：{number}（名片上既没有「添加到通讯录」也没有「发消息」）"
-                    )
+            if add_button is None:
+                # 名片上没有「添加到通讯录」、但有「发消息」＝ 这个人已经在通讯录里了。
+                # 判据是**正向**的（vendor 自己也这么判：`WeChatTools.py` 里
+                # 「有发送消息按钮说明不是新朋友不需要添加」）。少了这道正向判据，
+                # 任何一次名片没渲染完都会被报成「已经是好友」，于是 `wechatAdded`
+                # 被写成真——而那个人根本没加上。
                 logger.info("friend.add.already", number=number)
                 return {"name": name, "display_name": display_name,
                         "profile_name": nickname, "already_friend": True}
@@ -206,21 +197,77 @@ class UiaWeChatDriver:
         finally:
             _safe_call(getattr(add_friend_pane, "close", None))
 
-    @staticmethod
-    def _profile_says_already_friend(profile: Any, pane: Any, Uielements: Any) -> bool:
-        """名片上有「发消息」＝ 这个人已经在通讯录里了。
+    def _await_contact_profile(
+        self, pane: Any, Uielements: Any, number: str
+    ) -> tuple[Any, Any | None]:
+        """等名片渲染出来，返回 ``(名片根控件, 添加按钮)``；``添加按钮`` 为 ``None`` = 已经是好友。
 
-        两处都找一遍：不同微信版本里这个按钮有时挂在名片组里、有时挂在整个添加朋友面板上。
-        控件定义缺席（vendor 版本旧）时返回 ``False`` —— 判不出来就不断言，宁可报"加不了"。
+        ★ **判「搜到了」用正向证据：名片上出现「添加到通讯录」或「发消息」**，
+          不拿那个 Group 的 ``class_name`` 当判据。它是**跟微信版本走的**——vendor 的表里
+          写死 ``mmui::ContactProfileView``，只有版本号里带 `4.1.9` 才换成 ``mmui::ProfileView``
+          （`third_party/pywechat/pyweixin/Uielements.py`）。表里没覆盖到的版本会让整张名片
+          「查无此控件」，现场表现就是**人明明就在屏幕上，我们却报「没搜到这个号」，
+          然后 finally 把面板关掉**（2026-08-27 陈卓那次：弹框出来了、人也找到了，一下又关了）。
+
+        ★ **等得起**：搜一个陌生号是一次网络查找，慢的时候名片好几秒才渲染出来。
+          原来只等 1+2 秒，等不到就当查无此号——把「慢」误判成「没有」。
+          等久一点的代价只是这条指令多花几秒；判错的代价是这条计划项被记成失败。
         """
-        criteria = getattr(getattr(Uielements, "Buttons", None), "SendMessageButton", None)
-        if not criteria:
-            return False
-        for root in (profile, pane):
-            button = _safe_call(lambda r=root: r.child_window(**criteria))
-            if button is not None and _truthy_safe_call(lambda b=button: b.exists(timeout=2)):
-                return True
-        return False
+        add_criteria = getattr(getattr(Uielements, "Buttons", None), "AddToContactsButton", None)
+        send_criteria = getattr(getattr(Uielements, "Buttons", None), "SendMessageButton", None)
+        deadline = time.monotonic() + _PROFILE_WAIT_SECONDS
+        rendered = False
+        while True:
+            roots = self._contact_profile_roots(pane, Uielements)
+            rendered = rendered or len(roots) > 1     # 兜底根永远在，多出来的才是真认出了名片
+            for root in roots:
+                if add_criteria:
+                    button = _safe_call(lambda r=root: r.child_window(**add_criteria))
+                    if button is not None and _truthy_safe_call(lambda b=button: b.exists(timeout=0.2)):
+                        return root, button
+                if send_criteria:
+                    button = _safe_call(lambda r=root: r.child_window(**send_criteria))
+                    if button is not None and _truthy_safe_call(lambda b=button: b.exists(timeout=0.2)):
+                        return root, None
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.5)
+        # 放弃之前把面板上到底有什么留一行：控件树各版本不一样，下次再遇到，
+        # 这一行日志自己说得清是「版式又变了」还是「真的没搜到」。
+        logger.info("friend.add.profile_missing", number=number,
+                    rendered=rendered, seen=_pane_inventory(pane))
+        if rendered:
+            # 名片在，但两个按钮一个都没有 —— 「加不了」和「没搜到」是两回事，别混着报。
+            raise WeChatApiError(
+                f"这个号加不了：{number}（名片上既没有「添加到通讯录」也没有「发消息」）"
+            )
+        # 原来这种情况是**静默返回成功**的：查无此号也报"加好友完成"，
+        # AI 端只会以为对方没通过而一直等。说清楚是查不到。
+        raise WeChatApiError(f"没搜到这个号：{number}（号码不对，或对方不允许被搜到）")
+
+    @staticmethod
+    def _contact_profile_roots(pane: Any, Uielements: Any) -> list[Any]:
+        """名片可能挂在哪几个控件下面，从最确切到最兜底。**最后一个永远是整个面板。**
+
+        兜底为什么安全：名片一定在这个面板里，我们只是不认得包着它的那层 Group 叫什么；
+        而挑名字的那几个函数（`_pick_profile_*`）已经把按钮文案、字段行、号码行和
+        面板自身的标题都排掉了。
+        """
+        roots: list[Any] = []
+        criteria_list: list[dict] = []
+        declared = getattr(getattr(Uielements, "Groups", None), "ContactProfileViewGroup", None)
+        if declared:
+            criteria_list.append(dict(declared))
+        for class_name in _PROFILE_GROUP_CLASSES:
+            entry = {"title": "", "control_type": "Group", "class_name": class_name}
+            if entry not in criteria_list:
+                criteria_list.append(entry)
+        for criteria in criteria_list:
+            group = _safe_call(lambda c=criteria: pane.child_window(**c))
+            if group is not None and _truthy_safe_call(lambda g=group: g.exists(timeout=0.2)):
+                roots.append(group)
+        roots.append(pane)
+        return roots
 
     def _add_friend_via_vendor(self, number: str, greetings: str, remark: str | None) -> None:
         """原来那条路：vendor 全包，但什么名字都不给。只在退化时用。"""
@@ -2111,6 +2158,22 @@ class _AddFriendNotStarted(Exception):
     """加好友流程还没点到任何按钮就走不下去了——可以安全退回 vendor 实现重来一次。"""
 
 
+#: 搜一个陌生号是**一次网络查找**，慢的时候名片好几秒才渲染出来。等不到就当查无此号，
+#: 是把「慢」误判成「没有」——等久一点只是这条指令多花几秒，判错却让整条计划项记成失败。
+_PROFILE_WAIT_SECONDS = 12.0
+
+#: 名片那层 Group 在 vendor 的表里是**跟微信版本走的**（见 `_await_contact_profile` 的注释）。
+#: 已知的两个都试一遍，别赌当前这台跑的是表里覆盖到的那个版本。
+_PROFILE_GROUP_CLASSES = ("mmui::ContactProfileView", "mmui::ProfileView")
+
+#: 添加朋友面板**自己**的标题/提示文案。退化到拿整个面板当名片根时，别把它们当成名字。
+_ADD_FRIEND_PANE_CHROME = (
+    "添加朋友", "新增朋友", "add friends", "add contacts",
+    "搜索微信号/手机号", "搜尋微信id 或者手機號碼", "search by id/mobile",
+    "我的微信号", "我的微信號", "my wechat id",
+    "添加朋友面板",
+)
+
 #: 名片上这些是**字段行**不是昵称。前缀匹配，冒号写法（中英文冒号）都算。
 _PROFILE_LABEL_PREFIXES = (
     "微信号", "微信號", "wechat id", "weixin id",
@@ -2130,6 +2193,8 @@ _PROFILE_BUTTON_TEXTS = frozenset({
     "发消息", "發消息", "send message", "message",
     "搜索", "搜尋", "search", "取消", "cancel", "确定", "確定", "ok",
     "更多", "more", "朋友圈", "moments",
+    # 退化到拿整个添加朋友面板当名片根时会多读到这些行（见 `_contact_profile_roots`）。
+    *(text.casefold() for text in _ADD_FRIEND_PANE_CHROME),
 })
 
 
@@ -2212,6 +2277,21 @@ def _pick_profile_name(lines: list[str], number: str) -> str | None:
         if fallback is None:
             fallback = line
     return fallback
+
+
+def _pane_inventory(pane: Any, limit: int = 25) -> str:
+    """放弃时把面板上到底有什么留成一行。
+
+    控件树各版本长得不一样，真机上又没法复现——出问题时这一行就是全部线索。
+    只截前 ``limit`` 个、每个标题只留 20 字：这是本机日志，不是取证转储。
+    """
+    parts: list[str] = []
+    for control in (_safe_call(lambda: pane.descendants()) or [])[:limit]:
+        class_name = str(_safe_call(getattr(control, "class_name", None)) or "")
+        title = str(_safe_call(getattr(control, "window_text", None)) or "").strip()[:20]
+        if class_name or title:
+            parts.append(f"{class_name}|{title}")
+    return "; ".join(parts) or "(什么都没读到)"
 
 
 def _profile_text_lines(pane: Any) -> list[str]:

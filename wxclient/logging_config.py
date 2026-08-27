@@ -214,6 +214,10 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             return f"这个号早就是好友了：{payload.get('number')}{suffix}"
         # 只是「申请发出去了」，不是「已经是好友了」——对方点同意才算数。
         return f"好友申请已提交：{payload.get('number')}{suffix}"
+    if event == "friend.add.profile_missing":
+        if payload.get("rendered"):
+            return f"名片读到了但加不了：{payload.get('number')}（既没有「添加到通讯录」也没有「发消息」）"
+        return f"等不到这个号的名片：{payload.get('number')}（可能号码不对，也可能微信版式变了）"
     if event == "friend.add.fallback":
         return f"添加好友改走备用流程：{payload.get('number')}（这次读不到对方昵称）"
     if event == "friend.add.failed":
