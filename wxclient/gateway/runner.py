@@ -459,7 +459,12 @@ class GatewayRunner:
         terminal = status in TERMINAL_STATUSES and bool(command_id)
         if terminal:
             # 先写盘再发：发到一半进程被杀，重启后这条还在。
-            self._store.queue_receipt(account_id, command_id, payload)
+            # ★ 落盘时间用 runner 自己的钟（`_clock`），别让 store 去取真实时间：
+            #   过期判定（24h）用的就是这个钟，两边各取各的，时间线就对不上了。
+            #   生产上两者本来是同一个值，所以这不改行为——但测试注入时钟时，
+            #   「入库用真实 now、过期用注入 now」会让同一条用例今天绿明天红
+            #   （2026-08-28 撞到：入库时刻反而晚于「25 小时后」，于是过期的那条清不掉）。
+            self._store.queue_receipt(account_id, command_id, payload, at=self._clock())
         try:
             client = await self._pool.acquire(account_id)
             await client.notify(RESULT_OP, payload)
@@ -657,12 +662,18 @@ class GatewayRunner:
             await self._report_accepted_by_name(result, command_id)
             return
 
-        number, remark = str(args.get("number") or ""), str(args.get("remark") or "")
-        if payload.get("already_friend"):
-            # 这一轮**没点添加、也没设过备注**：微信里他现在叫什么，回执里的 session_name
-            # 才是实情。报我们提议的那个 remark = 给后端一个微信里根本不存在的会话名，
-            # 而后端会照着它派下一条指令，逐字寻址随即找不到窗口。
-            remark = str(payload.get("session_name") or "") or remark
+        number = str(args.get("number") or "")
+        # ★ 备注名一律以**回执里的** `session_name` 为准，原指令的 `args` 只当兜底。
+        #   有两条路会让两者不一样，而它们都只写在回执里：
+        #   ① `already_friend`：这一轮没点添加、也没设过备注，微信里他现在叫什么才是实情。
+        #      报我们提议的那个 remark = 给后端一个微信里根本不存在的会话名，
+        #      后端照着它派下一条指令，逐字寻址随即找不到窗口。
+        #   ② `commands.py` 按**后端已知的会话名**补过备注（api2 §4.2：换机不给同一个人
+        #      起第二个名字）。那次补写进的是给微信的 `payload`，**原指令的 args 仍是空的**。
+        #   2026-08-27 真机就栽在②上：AI 端下发的指令没带 remark，本机补上了、微信里
+        #   备注也设对了，可上报读的是 args → 判成「缺 remark」整条跳过，
+        #   于是后端始终不知道这个人在微信里叫什么，名单里也就永远没有他。
+        remark = str(payload.get("session_name") or "") or str(args.get("remark") or "")
         if state == CONTACT_REQUESTED and number and remark:
             # 先落本机再上报：上报可能失败，而「以后要认出对方通过了」这件事不能跟着失败。
             self._store.note_friend_request(self._account(), number, remark)

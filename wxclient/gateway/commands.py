@@ -436,7 +436,7 @@ class CommandExecutor:
                 reservation.settle(spec.counts(args, result))
             _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
             self._note_message_sent(command_id, op, peer, args, raw)
-            state = self._friend_state(op, result)
+            state = self._friend_state(op, result, raw)
             if state:
                 result = {**result, "friend_state": state}
             return CommandResult(command_id, "done", result=result)
@@ -518,7 +518,9 @@ class CommandExecutor:
             source="command",
         )
 
-    def _friend_state(self, op: str, result: dict[str, Any]) -> str:
+    def _friend_state(
+        self, op: str, result: dict[str, Any], raw: dict[str, Any] | None = None
+    ) -> str:
         """加好友这条链走到哪一步了（docs/18 §3.2）。AI 端据此写候选人的 `wechatAdded`。
 
         `add_friend` 一般只能报 `requested`：**申请发出去 ≠ 对方通过**，中间隔着一个真人，
@@ -535,6 +537,16 @@ class CommandExecutor:
         """
         if not self._allow_real:
             return ""      # 只走流程没真动微信，报了 AI 端就会去写 wechatAdded
+        # ★ **「没抛异常」不等于「申请真发出去了」**（`_note_message_sent` 上那条同款教训，
+        #   2026-08-27 真机发现这条路上漏了）：队列的终态里还有 failed / blocked，
+        #   `submit` 一个字都不抛，只在 `raw["status"]` 里写着。不判这一下，
+        #   一次「没搜到这个号」照样算出 `requested` —— 后端把人记成「申请已发出、等对方通过」，
+        #   AI 端跟着写 `ai_managed`，而微信里**什么都没发生**，这个人从此卡在那儿等一个
+        #   永远不会来的通过。判不出状态时（老装配没传 raw）维持原样，别把现有链路判死。
+        if raw is not None and str(raw.get("status") or "") != "succeeded":
+            _log.info("加好友任务没有确认成功，不给好友状态", op=op,
+                      status=raw.get("status") or "unknown")
+            return ""
         if op == "add_friend":
             return "accepted" if result.get("already_friend") else "requested"
         if op == "accept_new_friends" and result.get("items"):

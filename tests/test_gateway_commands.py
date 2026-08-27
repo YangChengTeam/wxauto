@@ -39,16 +39,31 @@ ACCOUNT = "zk_weixin"
 
 
 class FakeRuntime:
-    def __init__(self, *, boom: bool = False, result: dict[str, Any] | None = None) -> None:
+    """★ 回执里**必须带 `status`**：真的 `WeChatRuntime.submit` 返回的是任务终态
+    （`succeeded` / `failed` / `blocked`，见 `runtime.task_to_dict`），失败时**一个字都不抛**。
+    Fake 里漏掉这个字段，「任务失败」这条路在测试里就根本走不到——
+    2026-08-27 真机上「没搜到这个号」照样被算成 `friend_state=requested`，
+    正是因为这里少了一个字段，没有任何一条用例能红。
+    """
+
+    def __init__(
+        self,
+        *,
+        boom: bool = False,
+        result: dict[str, Any] | None = None,
+        status: str = "succeeded",
+    ) -> None:
         self.calls: list[tuple[TaskType, dict[str, Any], str]] = []
         self._boom = boom
         self._result = result if result is not None else {"ok": True}
+        self._status = status
 
     async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
         if self._boom:
             raise RuntimeError("微信没登录")
         self.calls.append((task_type, dict(payload or {}), confirmation))
-        return {"result": dict(self._result), "task_id": f"t{len(self.calls)}"}
+        return {"status": self._status, "result": dict(self._result),
+                "task_id": f"t{len(self.calls)}"}
 
 
 class CommandTestCase(unittest.IsolatedAsyncioTestCase):
@@ -280,6 +295,20 @@ class FriendStateTests(CommandTestCase):
         })
         self.assertEqual(result.status, "done", result.reason)
         self.assertEqual((result.result or {}).get("friend_state"), "requested")
+
+    async def test_a_failed_add_friend_claims_nothing(self) -> None:
+        """★ 「没搜到这个号」= 微信里什么都没发生，**不许**报成「申请已发出」。
+
+        2026-08-27 真机实况：`submit` 对失败的任务一个字都不抛，只在 `status` 里写着 failed，
+        而这里从前不看 status —— 于是后端把人记成「等对方通过」、AI 端跟着写 `ai_managed`，
+        这个人从此卡在那儿等一个永远不会来的通过。
+        """
+        runtime = FakeRuntime(status="failed", result={"number": "wxid_zhang"})
+        result = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "add_friend",
+            "args": {"number": "wxid_zhang", "greetings": "你好", "remark": "张三"},
+        })
+        self.assertIsNone((result.result or {}).get("friend_state"))
 
     async def test_a_known_session_name_wins_over_the_one_the_ai_made_up(self) -> None:
         """★ 换机后不给同一个人起第二个备注名（api2 §4.2）：后端记着的那个说了算。

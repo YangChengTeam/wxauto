@@ -274,6 +274,27 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
                                        "status": "accepted", "profile_name": "阿三",
                                        "command_id": "cmd-2"}])
 
+    async def test_the_remark_the_client_filled_in_is_the_one_reported(self) -> None:
+        """★ 2026-08-27 真机：AI 端下发的指令**没带 remark**，本机按后端已知的会话名补上了，
+        微信里备注也设对了 —— 可上报读的是原指令的 `args`，于是判成「缺 remark」整条跳过
+        （日志：`会话名上报被跳过：缺 number 或 remark，has_number=true，has_remark=false`）。
+
+        后果不是少一条日志：后端从此不知道这个人在微信里叫什么，
+        名单是按会话名派生的，他也就永远进不了名单、说话没人读。
+        补出来的名字只写在**回执**里（`session_name`），所以上报必须以回执为准。
+        """
+        d = FakeDirectory()
+        await self._runner(d)._report_contact(
+            {"command_id": "cmd-9", "op": "add_friend",
+             "args": {"number": "13800138000"}},          # ← 指令里一个 remark 都没有
+            CommandResult("cmd-9", "done", result={
+                "friend_state": "requested", "session_name": "候选人-张建国",
+            }),
+        )
+        self.assertEqual(d.reported, [{"number": "13800138000", "remark": "候选人-张建国",
+                                       "status": "requested", "profile_name": "",
+                                       "command_id": "cmd-9"}])
+
     async def test_dry_run_reports_nothing(self) -> None:
         """★ 没真动微信就没有 friend_state → 一条都不该报，否则后端以为好友已经加上了。"""
         d = FakeDirectory()
