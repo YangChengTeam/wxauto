@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Sequence
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
@@ -27,6 +27,7 @@ from .commands import (
     NOTICE_EVENT,
     RESULT_OP,
     STAGE_RECEIVED,
+    TERMINAL_STATUSES,
     CommandExecutor,
     CommandResult,
     parse_commands,
@@ -71,6 +72,17 @@ CONTACTS_SYNC_INTERVAL_SECONDS = 120.0
 #: 它只问业务后端、不碰微信，不受节拍红线约束。20s 是「候选人回话到后端取消待跟进」
 #: 的最大延迟——跟进本身是小时级的，再勤没有意义；再慢则会在临界点上多追一条。
 MESSAGE_EVENT_FLUSH_INTERVAL_SECONDS = 20.0
+
+#: 回执发件箱多久补发一次。它只发一帧 WS、不碰微信，不受节拍红线约束。
+#: 20s = 连接恢复到那条计划项被销账的最大延迟；业务后端的等待窗是 180s，够补回去。
+RECEIPT_FLUSH_INTERVAL_SECONDS = 20.0
+
+#: 一轮最多补几条。压着几百条时不要在一轮里全打出去，把读循环挤住。
+RECEIPT_FLUSH_BATCH = 20
+
+#: 回执压多久就不再补。★ 必须跟 AI 端在途表的存活期对齐（`wechatChannel.ts` 的
+#: `PENDING_TTL_MS` = 24h）：那边已经忘了这条指令，再补只会落在「unknown command」上。
+RECEIPT_MAX_AGE_HOURS = 24
 
 #: 退出前最多等发件箱清多久。专员晚上关掉程序时，白天最后那条「候选人回话了」如果还压在
 #: 本机，后端就会照旧追过去——所以宁可多等这两秒。清不完也没丢：发件箱是落盘的。
@@ -356,13 +368,40 @@ class GatewayRunner:
         """指令**不在读循环里执行**：一条指令要动微信、可能跑十几秒，卡在读循环里
         期间连 ping 都收不到，整条连接会被判死。所以只登记任务，交给事件循环去跑。
         """
-        if self._commands is None:
-            _log.warning("收到微信指令但没有执行器，已忽略")
+        commands = parse_commands(data)
+        # 先判帧读不读得懂，再判做不做得了：读不懂时 `commands` 是空的，那一列表拿去回拒
+        # 等于一条都不回——而帧本身可能带着 `command_id`，回得了话。
+        if not commands:
+            # 帧里既没有 commands 数组、op 又是空的。带了 command_id 就还回得了话；
+            # 连 command_id 都没有才是真的无从回起（那条 AI 端也挂不上在途表）。
+            _log.warning("收到读不懂的微信指令帧")
+            self._reject_commands(account_id, [data], "这条指令读不懂：缺少 op")
             return
-        for command in parse_commands(data):
+        if self._commands is None:
+            # ★ 不能只写日志就完事：AI 端那条指令会一直挂在在途表里等回执，业务后端
+            #   超时重投又被幂等挡掉，这条计划项**永远发不出去且被记成已处理**。
+            #   做不了就明说做不了（074：「做不了」和「不让做」给用户的话完全两样）。
+            _log.warning("收到微信指令但没有执行器，已回拒", 条数=len(commands))
+            self._reject_commands(account_id, commands, "这台电脑上的网关没有配指令执行器")
+            return
+        for command in commands:
             if self._defer_if_scheduled(account_id, command):
                 continue
             task = asyncio.create_task(self._run_command(account_id, command))
+            self._command_tasks.add(task)
+            task.add_done_callback(self._command_tasks.discard)
+
+    def _reject_commands(
+        self, account_id: str, commands: Sequence[dict[str, Any]], reason: str
+    ) -> None:
+        """这几条一条都做不了 → 逐条回一个 `rejected`，别让 AI 端干等到超时。"""
+        for command in commands:
+            command_id = str((command or {}).get("command_id") or "").strip()
+            if not command_id:
+                continue
+            task = asyncio.create_task(
+                self._report(account_id, command_id, "rejected", reason=reason)
+            )
             self._command_tasks.add(task)
             task.add_done_callback(self._command_tasks.discard)
 
@@ -394,12 +433,55 @@ class GatewayRunner:
         return True
 
     async def _report(self, account_id: str, command_id: str, status: str, **extra: Any) -> None:
-        """把一个阶段报回 AI 端。报不出去只记账——回执发不掉不该影响已做完的动作。"""
+        """把一个阶段报回 AI 端。报不出去不影响已做完的动作，但**终态会落盘等补发**。
+
+        ★ 终态（done/failed/rejected）和中间态（received/started/scheduled）待遇不同：
+          终态是 AI 端「这条到底发出去没有」的唯一凭据（`docs/17 §5`），丢一条 = 那条计划项
+          在 AI 端永远挂在在途表里，业务后端超时重投又被幂等挡掉，**永远发不出去且被记成
+          已处理**。中间态只是刷卡片，隔了几分钟才补上去反而是噪音——发不掉就算了。
+        """
+        payload = {"command_id": command_id, "status": status, **extra}
+        terminal = status in TERMINAL_STATUSES and bool(command_id)
+        if terminal:
+            # 先写盘再发：发到一半进程被杀，重启后这条还在。
+            self._store.queue_receipt(account_id, command_id, payload)
         try:
             client = await self._pool.acquire(account_id)
-            await client.notify(RESULT_OP, {"command_id": command_id, "status": status, **extra})
+            await client.notify(RESULT_OP, payload)
         except Exception as exc:  # noqa: BLE001
-            _log.warning("指令回执发送失败", error=str(exc), status=status)
+            _log.warning("指令回执发送失败", error=str(exc), status=status, 待补发=terminal)
+            return
+        if terminal:
+            self._store.drop_receipt(account_id, command_id)
+
+    async def _flush_receipts(self) -> None:
+        """把没送到的终态回执补发出去。**启动时先跑一轮**（上次进程是被杀掉的那种情况）。"""
+        while True:
+            await self._flush_receipts_once()
+            await asyncio.sleep(RECEIPT_FLUSH_INTERVAL_SECONDS)
+
+    async def _flush_receipts_once(self) -> None:
+        """补发一轮。发不掉就留着下一轮再来——这条链断了不该把网关带停。"""
+        stale = self._store.purge_receipts_before(
+            self._clock() - timedelta(hours=RECEIPT_MAX_AGE_HOURS)
+        )
+        for row in stale:
+            # 丢必须留痕：AI 端那边已经忘了这条指令（在途表 24h TTL），补也补不上了。
+            _log.warning("回执过期未送达，已丢弃", command_id=row["command_id"],
+                         attempts=row["attempts"], created_at=row["created_at"])
+        for row in self._store.list_receipts(limit=RECEIPT_FLUSH_BATCH):
+            account_id, command_id = row["account_id"], row["command_id"]
+            try:
+                client = await self._pool.acquire(account_id)
+                await client.notify(RESULT_OP, row["payload"])
+            except Exception as exc:  # noqa: BLE001
+                attempts = self._store.bump_receipt_attempts(account_id, command_id)
+                _log.info("回执补发没成功，留着下一轮", command_id=command_id,
+                          attempts=attempts, error=str(exc)[:100])
+                # 连接这会儿不通，同一轮里后面几条也是白试。
+                return
+            self._store.drop_receipt(account_id, command_id)
+            _log.info("回执已补发", command_id=command_id, attempts=row["attempts"])
 
     async def _run_command(self, account_id: str, command: dict[str, Any]) -> None:
         assert self._commands is not None
@@ -1064,6 +1146,9 @@ class GatewayRunner:
             side_tasks.append(
                 asyncio.create_task(self._flush_message_events(), name="gw-msg-events")
             )
+        # 回执补发：终态回执是 AI 端唯一的销账凭据，发不出去的那些要一直补到送达
+        # （`docs/17 §5`）。**无条件起**——它不依赖任何可选组件。
+        side_tasks.append(asyncio.create_task(self._flush_receipts(), name="gw-receipts"))
         try:
             await self.loop.run()
         finally:

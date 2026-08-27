@@ -65,6 +65,17 @@ CREATE TABLE IF NOT EXISTS gateway_commands (
   done_at    TEXT NOT NULL,
   PRIMARY KEY (account_id, command_id)
 );
+CREATE TABLE IF NOT EXISTS gateway_receipt_outbox (
+  account_id TEXT NOT NULL,
+  command_id TEXT NOT NULL,
+  payload    TEXT NOT NULL,
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (account_id, command_id)
+);
+CREATE INDEX IF NOT EXISTS idx_receipt_outbox_created
+  ON gateway_receipt_outbox (created_at);
 CREATE TABLE IF NOT EXISTS gateway_scheduled_commands (
   command_id TEXT PRIMARY KEY,
   account_id TEXT NOT NULL,
@@ -1205,6 +1216,103 @@ class GatewayStore:
             conn.executemany(
                 "DELETE FROM gateway_message_events WHERE event_id=?",
                 [(row["event_id"],) for row in stale],
+            )
+            conn.commit()
+        return stale
+
+    # ────────────────────────── 指令回执发件箱 ──────────────────────────
+
+    def queue_receipt(
+        self, account_id: str, command_id: str, payload: dict, at: datetime | None = None
+    ) -> None:
+        """把一条**终态**回执排进发件箱（同一条指令覆盖，终态只有一个）。
+
+        **为什么要落盘**：这条回执是 AI 端「这条计划项到底发出去没有」的唯一凭据
+        （`docs/17 §5`：不要拿 `done` 当凭据，等 `wechat_command_result`）。原来发不出去
+        就只写一行日志、没人再补——那一条计划项在 AI 端会一直挂在在途表里，业务后端
+        等到超时重投又被幂等挡掉，于是**永远发不出去且被记成已处理**。
+
+        排进来时先写盘再发：发到一半进程被杀，重启后这条还在。
+        """
+        now = (at or _utcnow()).isoformat()
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO gateway_receipt_outbox
+                  (account_id, command_id, payload, attempts, created_at, updated_at)
+                VALUES (?,?,?,0,?,?)
+                ON CONFLICT(account_id, command_id) DO UPDATE SET
+                  payload = excluded.payload,
+                  updated_at = excluded.updated_at
+                """,
+                (account_id, command_id, json.dumps(payload, ensure_ascii=False), now, now),
+            )
+            conn.commit()
+
+    def list_receipts(self, limit: int = 50) -> list[dict]:
+        """待补发的回执，最早的排前面。"""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT account_id, command_id, payload, attempts, created_at "
+                "FROM gateway_receipt_outbox ORDER BY created_at LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [
+            {
+                "account_id": row[0],
+                "command_id": row[1],
+                "payload": json.loads(row[2]),
+                "attempts": int(row[3]),
+                "created_at": row[4],
+            }
+            for row in rows
+        ]
+
+    def count_receipts(self) -> int:
+        with closing(self._connect()) as conn:
+            row = conn.execute("SELECT COUNT(*) FROM gateway_receipt_outbox").fetchone()
+        return int(row[0]) if row else 0
+
+    def drop_receipt(self, account_id: str, command_id: str) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "DELETE FROM gateway_receipt_outbox WHERE account_id=? AND command_id=?",
+                (account_id, command_id),
+            )
+            conn.commit()
+
+    def bump_receipt_attempts(self, account_id: str, command_id: str) -> int:
+        """记一次补发失败，返回累计失败次数。"""
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE gateway_receipt_outbox SET attempts=attempts+1, updated_at=? "
+                "WHERE account_id=? AND command_id=?",
+                (_utcnow().isoformat(), account_id, command_id),
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT attempts FROM gateway_receipt_outbox WHERE account_id=? AND command_id=?",
+                (account_id, command_id),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def purge_receipts_before(self, cutoff: datetime) -> list[dict]:
+        """清掉过期的回执，返回被清掉的那些（调用方必须记进日志）。
+
+        ★ 截止时间要跟 AI 端在途表的存活期对齐（`wechatChannel.ts` 的 `PENDING_TTL_MS`，24h）：
+        那边已经忘了这条指令，再补发只会落在「wechat result for unknown command」上。
+        但清掉必须留痕——静悄悄丢回执和静悄悄丢消息是同一种病。
+        """
+        stale = [
+            row for row in self.list_receipts(limit=10_000)
+            if row["created_at"] < cutoff.isoformat()
+        ]
+        if not stale:
+            return []
+        with closing(self._connect()) as conn:
+            conn.executemany(
+                "DELETE FROM gateway_receipt_outbox WHERE account_id=? AND command_id=?",
+                [(row["account_id"], row["command_id"]) for row in stale],
             )
             conn.commit()
         return stale
