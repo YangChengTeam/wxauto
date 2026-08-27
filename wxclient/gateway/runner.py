@@ -37,6 +37,7 @@ from .config import GatewaySettings
 from .contacts import STATUS_ACCEPTED as CONTACT_ACCEPTED
 from .contacts import STATUS_REQUESTED as CONTACT_REQUESTED
 from .contacts import ContactDirectory
+from .friendcheck import PendingFriendWatcher
 from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from, within_active_hours
 from .inbound import (
@@ -212,6 +213,7 @@ class GatewayRunner:
         capabilities: Callable[[], dict[str, Capability]] | None = None,
         candidate_mode: CandidateModeClient | None = None,
         auto_friend: AutoFriendWatcher | None = None,
+        friend_checker: PendingFriendWatcher | None = None,
     ) -> None:
         self._settings = settings
         self._store = store
@@ -223,6 +225,7 @@ class GatewayRunner:
         self._strangers = stranger_watcher
         self._commands = command_executor
         self._auto_friend = auto_friend
+        self._friend_checker = friend_checker
         self._contacts = contacts
         self._candidates = candidates
         self._message_events = message_events
@@ -288,6 +291,10 @@ class GatewayRunner:
         if auto_friend is not None and hasattr(source, "set_unreachable_handler"):
             auto_friend.on_added = self._report_contact
             source.set_unreachable_handler(auto_friend.on_unreachable)
+        # 093：反过来的那半边——已申请、还没通过的人，隔一阵复查一次是不是通过了。
+        # 092 管「在名单里却不是好友」，093 管「是好友了却不在名单里」。
+        if friend_checker is not None:
+            friend_checker.on_accepted = self._on_friend_accepted
 
     def is_active(self, now: datetime) -> bool:
         """现在允不允许动微信。读消息、查好友、发送共用同一个「工作时间窗」。"""
@@ -706,6 +713,25 @@ class GatewayRunner:
         )
         self._store.mark_contact_status(account_id, number, CONTACT_ACCEPTED)
         _log.info("对方通过了好友申请，已上报", account=account_id)
+
+    async def _on_friend_accepted(self, account_id: str, session_name: str) -> None:
+        """复查确认对方通过了（093）→ 走**既有**那条上报路，并让他立刻进监听名单。
+
+        这里一个字的上报逻辑都不重写：`_note_friend_accepted` 本来就是干这个的
+        （查号 → 报 `accepted` → 本机记一格），只是原来唯一的触发点是「收到他的消息」，
+        而没进名单的人根本不会被读到消息——那段代码等的调用永远不来。复查补的就是这个调用。
+
+        报完立刻重算名单：不重算的话，他要等下一次 `_sync_contacts`（默认几分钟一轮）
+        才进得来，中间他说的话仍然没人读。
+        """
+        await self._note_friend_accepted(account_id, session_name)
+        # 上报口没配（没登录/没接业务端）时上面那段是整段跳过的，本机那一格也就没记。
+        # 不兜这一下，复查每轮都会重新确认同一个人、白动一次微信搜索，而且后面排队的谁也轮不上。
+        # 服务端恢复之后同步名单会用它那份覆盖回 `requested`，再复查一次就正常报出去——能自愈。
+        number = self._store.pending_friend_request(account_id, session_name)
+        if number:
+            self._store.mark_contact_status(account_id, number, CONTACT_ACCEPTED)
+        self._apply_derived_watchlist()
 
     # ────────────────────────── 一轮 ──────────────────────────
 
@@ -1144,6 +1170,11 @@ class GatewayRunner:
         # 090：陌生人主动发起。**默认关**，开了才会真起循环（见 `StrangerWatcher.enabled`）。
         if self._strangers is not None:
             side_tasks.append(asyncio.create_task(self._strangers.run(), name="gw-strangers"))
+        # 093：已申请、还没通过的人隔一阵复查一次（`interval<=0` 时 run() 自己就返回了）。
+        if self._friend_checker is not None:
+            side_tasks.append(
+                asyncio.create_task(self._friend_checker.run(), name="gw-friend-check")
+            )
         # 会话名同步放**后台**跑：它是「换机之后别把同一个人叫成两个名字」的补课，
         # 不该挡住网关起来（后端慢或没登录时，同步失败只记账，见 ContactDirectory）。
         # ★ 它同时是**监听名单**的来源（085，用户 2026-08-20：就用 /client/contacts，不新增接口），

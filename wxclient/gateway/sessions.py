@@ -174,6 +174,18 @@ CREATE TABLE IF NOT EXISTS gateway_auto_friend (
   at           TEXT NOT NULL,
   PRIMARY KEY (account_id, number)
 );
+CREATE TABLE IF NOT EXISTS gateway_friend_checks (
+  -- 「已申请、还没通过」的人复查到哪一步了（093）。
+  -- ★ 和 gateway_auto_friend 同样的理由**不复用 gateway_contacts**：那张表同步名单会覆盖，
+  --   而这里记的是本机自己的复查进度，被覆盖就等于从头再查一遍。只由本机写。
+  account_id TEXT NOT NULL,
+  number     TEXT NOT NULL,
+  -- 上一次**真去微信里查过**他的时间（查失败也算，否则下一轮还挑中同一个人）
+  last_at    TEXT NOT NULL DEFAULT '',
+  -- **确认过「还没通过」**的次数（查失败不计）。到上限就不再查
+  checks     INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, number)
+);
 CREATE TABLE IF NOT EXISTS gateway_read_marks (
   account_id TEXT NOT NULL,
   action     TEXT NOT NULL,
@@ -646,6 +658,65 @@ class GatewayStore:
             row = conn.execute(
                 "SELECT MAX(at) FROM gateway_auto_friend WHERE account_id=?",
                 (account_id,),
+            ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+
+    # ─────────── 已申请、还没通过的好友：复查台账（093）───────────
+
+    def next_friend_check(self, account_id: str, *, max_checks: int) -> tuple[str, str]:
+        """下一个该复查的「已申请、还没通过」的人：``(number, session_name)``；没有就 ``("", "")``。
+
+        取的是 `gateway_contacts` 里 `requested` 那些行——**他们不在监听名单里**
+        （`watched_session_names` 只要 `accepted`），所以除了复查这条循环，
+        没有任何一段代码会再提起他们。
+
+        排序「最久没查过的优先」：没查过的 `last_at` 是空串，天然排最前。
+        已经确认过 `max_checks` 次还没通过的不再取——对方大概率不会通过了，
+        再查下去只是每轮白动一次微信。
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT c.number, c.session_name
+                     FROM gateway_contacts AS c
+                     LEFT JOIN gateway_friend_checks AS k
+                       ON k.account_id = c.account_id AND k.number = c.number
+                    WHERE c.account_id = ? AND c.status = 'requested'
+                      AND TRIM(c.session_name) <> ''
+                      AND COALESCE(k.checks, 0) < ?
+                 ORDER BY COALESCE(k.last_at, ''), c.number
+                    LIMIT 1""",
+                (account_id, int(max_checks)),
+            ).fetchone()
+        return (str(row[0]), str(row[1]).strip()) if row else ("", "")
+
+    def note_friend_check(self, account_id: str, number: str, at: str, *, counted: bool) -> None:
+        """记下「这一趟真去微信里查过他了」。
+
+        ``counted=False`` 是**没判出来**的那一趟（搜索本身失败）：时间照记——不记的话
+        下一轮还挑中同一个人，一直卡在他身上；次数不记——那一趟并没有证明「他还没通过」，
+        拿它去凑放弃阈值，等于把「查不动」算成了「他不来」。
+        """
+        number = (number or "").strip()
+        if not number:
+            return
+        step = 1 if counted else 0
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT INTO gateway_friend_checks (account_id, number, last_at, checks)
+                   VALUES (?,?,?,?)
+                   ON CONFLICT(account_id, number) DO UPDATE SET
+                     last_at = excluded.last_at,
+                     checks  = gateway_friend_checks.checks + ?""",
+                (account_id, number, at, step, step),
+            )
+            conn.commit()
+
+    def friend_check_mark(self, account_id: str, number: str) -> str:
+        """上一次**真去微信里查过他**的时间；没查过是空串。排查和测试用。"""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT last_at FROM gateway_friend_checks WHERE account_id=? AND number=?",
+                (account_id, (number or "").strip()),
             ).fetchone()
         return str(row[0]) if row and row[0] else ""
 

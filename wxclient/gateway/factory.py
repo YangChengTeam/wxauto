@@ -25,6 +25,7 @@ from .commands import COMMANDS, CommandExecutor
 from .config import GatewaySettings
 from .contacts import ContactDirectory
 from .download import FileFetcher
+from .friendcheck import PendingFriendWatcher
 from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from
 from .message_events import MessageEventReporter
@@ -236,6 +237,14 @@ def build_gateway(
             active_hours=gateway_settings.active_hours,
             allow_real_actions=allow_real_actions,
             confirmation=REAL_ACTION_CONFIRMATION,
+        ),
+        # 093：已申请、还没通过的人，隔一阵复查一次是不是通过了。和 092 一正一反。
+        friend_checker=PendingFriendWatcher(
+            accounts=resolved_accounts,
+            runtime=runtime,
+            store=store,
+            interval_seconds=gateway_settings.friend_recheck_interval_seconds,
+            active_hours=gateway_settings.active_hours,
         ),
         # 090：陌生人主动发起。**默认关**（`stranger_intake`）——放开 fail-closed 名单
         # 是专员的一次知情选择，不是缺省行为。
