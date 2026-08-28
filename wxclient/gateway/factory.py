@@ -27,7 +27,7 @@ from .contacts import ContactDirectory
 from .download import FileFetcher
 from .friendcheck import PendingFriendWatcher
 from .friends import FriendWatcher
-from .guard import OutboundGuard, action_limits_from
+from .guard import OutboundGuard, action_limits_from, write_intervals_from
 from .message_events import MessageEventReporter
 from .pacing import MIN_FRIEND_INTERVAL_SECONDS, clamp_interval
 from .runner import GatewayRunner
@@ -194,6 +194,7 @@ def build_gateway(
             max_sends_per_hour=gateway_settings.max_sends_per_hour,
             active_hours=gateway_settings.active_hours,
             action_limits=action_limits_from(gateway_settings),
+            write_intervals=write_intervals_from(gateway_settings),
         ),
         account_id=resolved_accounts[0],
         allow_real_actions=allow_real_actions,

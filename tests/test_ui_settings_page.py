@@ -86,6 +86,7 @@ class ConfigLookTests(unittest.TestCase):
 
         self.assertEqual([field.label for field in sched],
                          ["读消息间隔", "查新好友间隔", "工作时间窗", "每小时发送上限",
+                          "每小时加好友上限", "加好友最小间隔",
                           # 090：陌生人接待也归调度（它决定「碰谁」，不是启动行为）
                           "接待主动来问的陌生人"])
         self.assertEqual(sched[0].unit, "秒", "单位贴在框里，不写进标签")

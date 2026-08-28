@@ -437,13 +437,7 @@ class CommandExecutor:
                 return CommandResult(command_id, "failed", f"{type(exc).__name__}: {exc}")
 
             result = (raw or {}).get("result") or {}
-            # ★ 连着「没搜到这个号」要退避：那更像在试号，不像正常加好友（见 guard.pace_write）。
-            #   判据和 `_friend_state` 同一条——终态写在 `raw["status"]` 里，`submit` 不抛。
             if spec.writes:
-                self._guard.note_write_outcome(
-                    self._account, op,
-                    ok=str((raw or {}).get("status") or "") == "succeeded",
-                )
                 # 额度在动微信**之前**就占住了（见上），这里只按真实用量结算：
                 # 预留 5 实际通过 2 → 还回 3。做多少记多少，两个方向都不许含糊。
                 reservation.settle(spec.counts(args, result))

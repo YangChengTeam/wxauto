@@ -26,7 +26,7 @@ import structlog
 from wxclient.queue import TaskStatus, TaskType
 
 from .inbound import InboundMessage
-from .sessions import GatewayStore
+from .sessions import HUMAN_TAKEOVER, GatewayStore
 from .watchlist import Watchlist
 
 _log = structlog.get_logger(__name__)
@@ -235,6 +235,8 @@ class QueueMessageSource:
         self._on_unreachable = on_unreachable
         # 会话名 → 连续读不到了几轮（092：从 set 改成计数）
         self._unreachable: dict[str, int] = {}
+        # 上一轮因人工接管被跳过的会话，只为「变了才喊一声」（见 `_drop_handed_off`）
+        self._paused_peers: set[str] = set()
 
     async def fetch(self, account_id: str) -> list[InboundMessage]:
         """读名单里的会话，按游标切出新消息。
@@ -250,11 +252,46 @@ class QueueMessageSource:
         watched = self._watchlist.watched()
         if not watched:
             return []
+        watched = self._drop_handed_off(account_id, watched)
+        if not watched:
+            return []
 
         collected: list[InboundMessage] = []
         for peer_id in self._due_peers(watched):
             collected.extend(await self._fetch_peer(account_id, peer_id))
         return collected
+
+    def _drop_handed_off(self, account_id: str, watched: Sequence[str]) -> list[str]:
+        """人工接管中的候选人，这一轮连读都不读（用户裁决 2026-08-28）。
+
+        ★ 这是**改过一次口径**的地方，别照着旧注释改回去。原来接管只挂写侧
+          （`guard.OutboundGuard._takeover_denial`），读照旧——理由是「人真回了话，
+          后端那条『未回复跟进』照样要被取消」。现在按用户的口径改成读也停：
+          招聘老师自己坐下来聊的时候，助手不该再去开他那个聊天窗口
+          （开窗会抢焦点、清未读，还白吃一个读名额）。
+
+        ★ **代价说清楚**：接管期间不再有 `候选人回话` 那条消息事件上报
+          （`runner._note_inbound_messages` 是轮询喂的），后端的「未回复跟进」
+          在这段时间里不会被对方的回话取消。这是这次口径变更的已知后果，不是 bug。
+
+        交回分身时游标会被抹掉（`GatewayStore._forget_cursor`），所以恢复之后
+        不会把接管期间那一堆当新消息倒给模型。
+        """
+        kept: list[str] = []
+        paused: list[str] = []
+        for peer_id in watched:
+            if self._store.candidate_mode(account_id, peer_id).mode == HUMAN_TAKEOVER:
+                paused.append(peer_id)
+            else:
+                kept.append(peer_id)
+        # 只在名单变化时喊一次：轮询是分钟级的，每轮一条会把实时日志刷满，
+        # 而这条信息（谁被接管了、什么时候开始的）只有在变的那一刻才有用。
+        if paused and set(paused) != self._paused_peers:
+            _log.info("这些会话正在人工接管，这轮不读", 数量=len(paused))
+        elif self._paused_peers and not paused:
+            _log.info("人工接管都交回来了，恢复读取")
+        self._paused_peers = set(paused)
+        return kept
 
     def _due_peers(self, watched: Sequence[str]) -> list[str]:
         """这一轮读哪几个。名单长了就轮着来，一轮最多 ``MAX_PEERS_PER_POLL`` 个。

@@ -10,6 +10,7 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ..endpoints import DEFAULT_AI_WS_URL, DEFAULT_BUSINESS_API_URL
+from .pacing import MIN_FRIEND_INTERVAL_SECONDS
 
 
 class GatewaySettings(BaseSettings):
@@ -148,6 +149,17 @@ class GatewaySettings(BaseSettings):
 
     max_friend_actions_per_hour: int = 5
     """加好友 + 通过好友申请，每小时上限。最招风控的一类，5 个已经不算保守。"""
+
+    friend_interval_seconds: float = MIN_FRIEND_INTERVAL_SECONDS
+    """两次**主动加好友**之间至少隔多久（秒）。配额之外的第二道闸：配额管总量、它管节奏。
+
+    ★ 为什么要有它：2026-08-27 真机弹了微信安全验证，那天加好友一共才两次——
+    15:22:36 和 15:23:57，隔 81 秒，两次都是「没搜到这个号」。只有配额的话，
+    「5 次/小时」允许 5 次全挤进一分钟，而连着搜不到的陌生号正是枚举的形状。
+
+    ★ 默认 300 秒就是那条线。**调小是往风险那侧走**，调小到 81 秒就是复现事故的节奏；
+    真要调，自己清楚在做什么。`0` = 这道闸关掉，只剩配额。
+    只管主动加（`add_friend`），不管通过别人发来的申请——那不用搜号。"""
 
     max_moments_per_day: int = 3
     """发朋友圈，每 **天** 上限——一小时发 3 条和一天发 3 条完全是两回事。"""

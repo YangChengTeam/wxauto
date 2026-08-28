@@ -93,6 +93,14 @@ FIELDS: tuple[Field, ...] = (
           section="sched", default="09:00-21:00"),
     Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "每小时发送上限", "防止消息风控",
           section="sched", default="30"),
+    # 用户 2026-08-28：加好友的上限和间隔都要能在界面上改（不同账号的承受力不一样）。
+    # 两个数管两件事：上限管**一小时总共几个**，间隔管**两次之间隔多久**。
+    # 只有上限的话，5 个全挤进一分钟也照样放行——2026-08-27 弹安全验证就是这么来的。
+    Field("WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR", "每小时加好友上限",
+          "加好友最招风控，一小时总共加几个", section="sched", default="5"),
+    Field("WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS", "加好友最小间隔",
+          "两次加好友至少隔多久；调小是往风险那侧走，0=不限", section="sched", unit="秒",
+          default="300"),
     # 090：默认关。放开 fail-closed 名单会让「装上就自动回复任何人」重新成为可能
     # （069 / 需求文档 §13.1），所以必须是专员在这里主动打开的一次知情选择。
     Field("WXCLIENT_GATEWAY_STRANGER_INTAKE", "接待主动来问的陌生人",

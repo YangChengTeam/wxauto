@@ -1019,6 +1019,8 @@ class SettingsDefaultsTests(unittest.TestCase):
                 int(gateway.friend_check_interval_seconds),
             "WXCLIENT_GATEWAY_ACTIVE_HOURS": gateway.active_hours,
             "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": gateway.max_sends_per_hour,
+            "WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR": gateway.max_friend_actions_per_hour,
+            "WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS": int(gateway.friend_interval_seconds),
             "WXCLIENT_GATEWAY_STRANGER_INTAKE": gateway.stranger_intake,
             "WXCLIENT_UI_AUTOSTART": ui.autostart,
             "WXCLIENT_UI_START_HIDDEN": ui.start_hidden,

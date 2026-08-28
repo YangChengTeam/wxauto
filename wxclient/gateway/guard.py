@@ -16,7 +16,6 @@ from datetime import datetime, time, timedelta
 from .pacing import (
     MIN_FRIEND_INTERVAL_SECONDS,
     MIN_READ_INTERVAL_SECONDS,
-    backoff_seconds,
 )
 
 # 明确的**拒绝联系**表达——命中即永久停止对该联系人的一切自动化动作并拉黑。
@@ -178,11 +177,24 @@ FRIEND_WRITE_ACTION = "friend_write"  # 主动加好友（搜陌生号，风控�
 #:   不查下轮再查；加好友只有这一次机会。所以是复查躲加好友（见 `friendcheck.py`），
 #:   不是加好友等复查。
 #:
+#: 间隔秒数**不写死在这张表里**：默认 `MIN_FRIEND_INTERVAL_SECONDS`，实际取
+#: `OutboundGuard(write_intervals=...)`，由 `GatewaySettings.friend_interval_seconds` 灌进来。
+#:
 #: 配额（5 次/小时）**保留**：那是总量，这是节奏，两道各管一头。
 #: 原来只有配额，于是 5 次全挤进一分钟也照样放行——真机上就挤成了 81 秒两次。
-WRITE_PACING: dict[str, tuple[str, float, str]] = {
-    "add_friend": (FRIEND_WRITE_ACTION, MIN_FRIEND_INTERVAL_SECONDS, "加好友"),
+WRITE_PACING: dict[str, tuple[str, str]] = {
+    "add_friend": (FRIEND_WRITE_ACTION, "加好友"),
 }
+
+#: 各本写侧节拍账的默认间隔（秒）。可被 `OutboundGuard(write_intervals=...)` 覆盖。
+WRITE_INTERVALS: dict[str, float] = {
+    FRIEND_WRITE_ACTION: MIN_FRIEND_INTERVAL_SECONDS,
+}
+
+
+def write_intervals_from(settings) -> dict[str, float]:
+    """把 ``GatewaySettings`` 里的节拍配置翻成间隔表（对应 `action_limits_from`）。"""
+    return {FRIEND_WRITE_ACTION: float(settings.friend_interval_seconds)}
 
 
 @dataclass
@@ -247,6 +259,7 @@ class OutboundGuard:
         max_sends_per_hour: int = 30,
         active_hours: str = "09:00-21:00",
         action_limits: dict[str, RateLimit] | None = None,
+        write_intervals: dict[str, float] | None = None,
     ) -> None:
         self._store = store
         self._max_per_hour = max_sends_per_hour
@@ -254,6 +267,10 @@ class OutboundGuard:
         self._action_limits = dict(DEFAULT_ACTION_LIMITS)
         if action_limits:
             self._action_limits.update(action_limits)
+        # 写侧节拍（`pace_write`）。没给就用默认，别让「没配」等于「没有闸」。
+        self._write_intervals = dict(WRITE_INTERVALS)
+        if write_intervals:
+            self._write_intervals.update(write_intervals)
         parse_active_hours(active_hours)  # 提前校验，别等到要发消息才炸
 
     def check(
@@ -349,29 +366,23 @@ class OutboundGuard:
         ★ 和 `reserve` 的先后：**先占额度、再过这道闸**。反过来的话，一次被节拍挡下的
           尝试会白占一次配额，而那一趟微信一下都没动。挡下时调用方负责 `release()`。
 
-        ★ 连续失败要退避（`backoff_seconds`）：一次「没搜到这个号」在微信那边不像正常
-          加好友，更像在试号；紧接着再来一个搜不到的，就是枚举的形状。所以间隔翻倍，
-          成功一次归零。退避只往慢里走。
+        ★ 间隔是**一个固定值**，不随失败翻倍。曾经有过一档连续失败退避
+          （300→600→1200→2400），2026-08-28 按用户要求删了：等太久。想更慢就把
+          `friend_interval_seconds` 调大——一个看得见、改得动的数，好过一个自己会长的数。
         """
         entry = WRITE_PACING.get(op)
         if entry is None:
             return GuardDecision.allow()
-        bucket, base, label = entry
-        streak = self._store.action_fail_streak(account_id, bucket)
-        floor = backoff_seconds(base, streak)
+        bucket, label = entry
+        floor = self._write_intervals.get(bucket, MIN_FRIEND_INTERVAL_SECONDS)
+        if floor <= 0:
+            return GuardDecision.allow()
         wait = self._store.try_touch_read(account_id, bucket, now, floor)
         if wait <= 0:
             return GuardDecision.allow()
-        tail = f"（前面连着 {streak} 次没成，间隔已放慢）" if streak > 0 else ""
         return GuardDecision.deny(
-            f"「{label}」要隔 {int(floor)} 秒才做一次，还要等 {wait:g} 秒{tail}"
+            f"「{label}」要隔 {int(floor)} 秒才做一次，还要等 {wait:g} 秒"
         )
-
-    def note_write_outcome(self, account_id: str, op: str, *, ok: bool) -> None:
-        """一次写指令做完了，把结果记进它那本节拍账（失败会让下次间隔翻倍）。"""
-        entry = WRITE_PACING.get(op)
-        if entry is not None:
-            self._store.note_action_outcome(account_id, entry[0], ok=ok)
 
     def _takeover_denial(self, account_id: str, peer_id: str) -> str | None:
         """**这个候选人**正被人工接管就给一句拒绝理由，否则 None（091 / docs/19 v2 §1）。
@@ -380,9 +391,13 @@ class OutboundGuard:
           分身级那把总闸已随 089 拆除——「招聘老师坐下来自己聊」要停哪些人，
           由他自己在名单上逐个按，不再有一个按钮停掉全部。
 
-        ★ **只挂写侧**（``check`` / ``reserve``），``allow_read`` 原样不动：
-          接管期间读消息必须继续——人真回了话，后端那条「未回复跟进」照样要被取消。
-          把读也停了，恢复之后就是一段空白。
+        ★ **这里只挂写侧**（``check`` / ``reserve``），``allow_read`` 原样不动——
+          但**读也已经停了**，停在更上游：`wechat_io.QueueMessageSource._drop_handed_off`
+          直接把接管中的会话从这一轮名单里摘掉（用户裁决 2026-08-28，改了原来的口径）。
+          原口径是「接管期间读消息必须继续，否则后端那条『未回复跟进』取消不掉」——
+          那条代价现在是**明知故犯**地接受了，理由是招聘老师自己在聊的时候，
+          助手不该再去开他那个聊天窗口。这道写侧的闸留着：它是第二条路，
+          名单摘漏了（陌生人临时准入、名字对不上）也照样发不出去。
 
         ★ 读不到（老库没这张表、库锁住了）一律当**没接管**。这条闸 fail 的方向要想清楚：
           读失败就当接管，等于任何一次库抖动都让这个人停摆，而且界面上那个按钮也救不回来

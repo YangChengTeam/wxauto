@@ -190,8 +190,6 @@ CREATE TABLE IF NOT EXISTS gateway_read_marks (
   account_id  TEXT NOT NULL,
   action      TEXT NOT NULL,
   last_at     TEXT NOT NULL,
-  -- 这一档**连续**失败了几次。只有加好友在用：连着搜不到号要退避（见 pacing.backoff_seconds）。
-  fail_streak INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (account_id, action)
 );
 CREATE TABLE IF NOT EXISTS gateway_contact_sync (
@@ -277,7 +275,6 @@ class GatewayStore:
             _ensure_column(conn, "gateway_candidate_mode", "source", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(conn, "gateway_candidate_mode", "server_updated_at", "TEXT NOT NULL DEFAULT ''")
             # 连续失败次数（加好友退避用）。老库没有这一列，不补就 "no such column"。
-            _ensure_column(conn, "gateway_read_marks", "fail_streak", "INTEGER NOT NULL DEFAULT 0")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -393,6 +390,9 @@ class GatewayStore:
         if mode == AI_MANAGED and cls._is_fresh_local_takeover(conn, account_id, session_name):
             _log.info("同步名单说托管，但本机刚按下接管，这一轮不改", session=session_name)
             return False
+        # 交回分身的那一刻要把游标抹掉——接管期间没轮询，续上就是把老师自己打的话
+        # 当新消息接过来（见 `_forget_cursor`）。判要在写之前，写完就看不出来了。
+        resumed = mode == AI_MANAGED and cls._mode_of(conn, account_id, session_name) == HUMAN_TAKEOVER
         now = _utcnow().isoformat()
         conn.execute(
             """INSERT INTO gateway_candidate_mode
@@ -414,7 +414,20 @@ class GatewayStore:
                 str(row.get("conversation_mode_updated_at") or "")[:64],
             ),
         )
+        if resumed:
+            cls._forget_cursor(conn, account_id, session_name)
+            _log.info("交回分身，这个会话按「第一次读」重新接上", session=session_name)
         return True
+
+    @staticmethod
+    def _mode_of(conn: sqlite3.Connection, account_id: str, session_name: str) -> str:
+        """本机这一行现在记着的档位。没这一行 → 空串（不是 `ai_managed`：
+        「没记录」和「确认托管」是两件事，见 `candidate_mode` 的 `known`）。"""
+        row = conn.execute(
+            "SELECT mode FROM gateway_candidate_mode WHERE account_id=? AND session_name=?",
+            (account_id, session_name),
+        ).fetchone()
+        return str(row[0]) if row else ""
 
     @classmethod
     def _is_fresh_local_takeover(cls, conn: sqlite3.Connection, account_id: str, session_name: str) -> bool:
@@ -892,6 +905,26 @@ class GatewayStore:
             ).fetchone()
         return (row[0], int(row[1])) if row else (None, 0)
 
+    @staticmethod
+    def _forget_cursor(conn: sqlite3.Connection, account_id: str, peer_id: str) -> None:
+        """把这个会话的游标抹掉，下次读它按「第一次读」算（`first_seen_fresh`）。
+
+        ★ 用在**人工接管交回分身**的那一刻。接管期间不轮询（用户 2026-08-28），
+        游标停在接管前那条；直接续上的话，分身一睁眼就会拿到招聘老师自己打的那一串
+        当「新消息」，还可能去回一句人家已经回过的话。抹掉之后走 `first_seen_fresh`：
+        只认尾部今天、对方发的那几条——老师最后说话就什么都不接，候选人最后说话才接上。
+        """
+        conn.execute(
+            "DELETE FROM gateway_cursors WHERE account_id=? AND peer_id=?",
+            (account_id, peer_id),
+        )
+
+    def clear_cursor(self, account_id: str, peer_id: str) -> None:
+        """公开版的 `_forget_cursor`（自己开连接）。"""
+        with closing(self._connect()) as conn:
+            self._forget_cursor(conn, account_id, peer_id)
+            conn.commit()
+
     def set_cursor(self, account_id: str, peer_id: str, signature: str, seq: int) -> None:
         with closing(self._connect()) as conn:
             conn.execute(
@@ -975,6 +1008,8 @@ class GatewayStore:
         """
         now = _utcnow().isoformat()
         with closing(self._connect()) as conn:
+            # 和同步那条路同一个理由：交回分身时抹游标（见 `_forget_cursor`）。
+            resumed = mode == AI_MANAGED and self._mode_of(conn, account_id, session_name) == HUMAN_TAKEOVER
             conn.execute(
                 """
                 INSERT INTO gateway_candidate_mode
@@ -996,6 +1031,9 @@ class GatewayStore:
                     int(version), int(mode_version), trigger_id, now, reported_at,
                 ),
             )
+            if resumed:
+                self._forget_cursor(conn, account_id, session_name)
+                _log.info("交回分身，这个会话按「第一次读」重新接上", session=session_name)
             conn.commit()
         return CandidateModeRow(
             session_name, candidate_id, mode, reason,
@@ -1683,32 +1721,6 @@ class GatewayStore:
         except ValueError:
             return None
         return (at - last).total_seconds()
-
-    def action_fail_streak(self, account_id: str, action: str) -> int:
-        """这一档**连续**失败了几次。没有记录 → 0。"""
-        with closing(self._connect()) as conn:
-            row = conn.execute(
-                "SELECT fail_streak FROM gateway_read_marks WHERE account_id=? AND action=?",
-                (account_id, action),
-            ).fetchone()
-        return int(row[0]) if row and row[0] else 0
-
-    def note_action_outcome(self, account_id: str, action: str, *, ok: bool) -> None:
-        """记一次结果：成功归零，失败 +1。**只动计数，不动 `last_at`**。
-
-        `last_at` 归 `try_touch_read` 管（做之前记），这里是做完之后才知道的事。
-        两者分开写，免得一次失败把节拍也顺手往前推。
-
-        行不存在时不新建：能走到这儿说明 `try_touch_read` 刚放行过、行一定在。
-        真不在（库被清过）就当没这回事，下一次做的时候自然会建出来。
-        """
-        with closing(self._connect()) as conn:
-            conn.execute(
-                "UPDATE gateway_read_marks SET fail_streak = CASE WHEN ? THEN 0 "
-                "ELSE fail_streak + 1 END WHERE account_id=? AND action=?",
-                (1 if ok else 0, account_id, action),
-            )
-            conn.commit()
 
     def sends_since(self, account_id: str, since: datetime, action: str | None = None) -> int:
         """``action=None`` = 所有写动作（总闸）；给了就只数那一档。"""

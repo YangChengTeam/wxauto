@@ -85,6 +85,7 @@ class CommandTestCase(unittest.IsolatedAsyncioTestCase):
                 self.store,
                 max_sends_per_hour=kwargs.pop("max_sends_per_hour", 20),
                 active_hours=kwargs.pop("active_hours", "09:00-21:00"),
+                write_intervals=kwargs.pop("write_intervals", None),
             ),
             account_id=ACCOUNT,
             clock=lambda: self.now,
@@ -896,36 +897,40 @@ class AddFriendPacingTests(CommandTestCase):
         used = self.store.sends_since(ACCOUNT, self.now - timedelta(hours=1), action="friend")
         self.assertEqual(used, 1, "只有真做成的那次该记账")
 
-    async def test_consecutive_failures_back_off(self) -> None:
-        """★ 连着「没搜到这个号」→ 间隔翻倍。那更像在试号，不像正常加好友。"""
-        runtime = FakeRuntime(status="failed", result={})
-        await self._add(runtime, "c1")
-        self.assertEqual(self.store.action_fail_streak(ACCOUNT, "friend_write"), 1)
+    async def test_the_interval_is_configurable(self) -> None:
+        """★ 间隔是**一个可配的数**，不是写死的 300。
 
-        self.now += timedelta(seconds=301)         # 按原来的 300s 本该放行
-        blocked = await self._add(runtime, "c2", "13800000002")
-        self.assertEqual(blocked.status, "rejected")
-        self.assertIn("600", blocked.reason)
-        self.assertIn("连着", blocked.reason)
-
-        self.now += timedelta(seconds=601)
-        self.assertEqual((await self._add(runtime, "c3", "13800000003")).status, "done")
-
-    async def test_a_success_resets_the_backoff(self) -> None:
-        fail, ok = FakeRuntime(status="failed", result={}), FakeRuntime()
-        await self._executor(fail).execute({
+        曾经有过一档「连续失败翻倍」（300→600→1200→2400），2026-08-28 按用户要求删了：
+        等太久。想更慢就把这个数调大——一个看得见、改得动的数，好过一个自己会长的数。
+        """
+        runtime = FakeRuntime()
+        executor = self._executor(runtime, write_intervals={"friend_write": 60.0})
+        self.assertEqual((await executor.execute({
             "command_id": "c1", "op": "add_friend", "args": {"number": "13800000001"},
-        })
-        self.now += timedelta(seconds=601)
-        await self._executor(ok).execute({
+        })).status, "done")
+        self.now += timedelta(seconds=61)
+        second = await executor.execute({
             "command_id": "c2", "op": "add_friend", "args": {"number": "13800000002"},
         })
-        self.assertEqual(self.store.action_fail_streak(ACCOUNT, "friend_write"), 0)
-        self.now += timedelta(seconds=301)         # 归零之后 300s 就够了
-        third = await self._executor(ok).execute({
-            "command_id": "c3", "op": "add_friend", "args": {"number": "13800000003"},
-        })
+        self.assertEqual(second.status, "done", second.reason)
+
+    async def test_failures_do_not_stretch_the_interval(self) -> None:
+        """★ 连着加不上也**不**放慢。这条是上面那条的另一面，专门守「别把退避加回来」。"""
+        runtime = FakeRuntime(status="failed", result={})
+        await self._add(runtime, "c1")
+        self.now += timedelta(seconds=301)
+        third = await self._add(runtime, "c2", "13800000002")
         self.assertEqual(third.status, "done", third.reason)
+
+    async def test_zero_turns_the_gate_off(self) -> None:
+        """`0` = 这道闸关掉，只剩配额。配置得能真的关掉，否则就是假配置。"""
+        runtime = FakeRuntime()
+        executor = self._executor(runtime, write_intervals={"friend_write": 0.0})
+        for i in range(3):
+            r = await executor.execute({
+                "command_id": f"c{i}", "op": "add_friend", "args": {"number": f"1380000000{i}"},
+            })
+            self.assertEqual(r.status, "done", r.reason)
 
     async def test_sending_a_message_is_not_slowed_down_by_this(self) -> None:
         """闸只挂在登记过的写动作上。发消息有它自己的节奏——对方在等回话。"""

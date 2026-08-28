@@ -259,8 +259,14 @@ class GuardTests(unittest.TestCase):
         self.assertIn("人工接管", blocked.reason)
         self.assertTrue(self.guard.check(ACCOUNT, "李四", now=T0).allowed)
 
-    def test_reads_keep_running_during_a_takeover(self) -> None:
-        """接管期间照常读消息——把读也停了，交回分身之后就是一段空白。"""
+    def test_this_gate_still_only_touches_the_write_side(self) -> None:
+        """★ 这道闸**只挂写侧**，`allow_read` 原样放行——但读其实已经停了，停在更上游。
+
+        用户 2026-08-28 改了口径：接管中的会话连读都不读，摘在
+        `wechat_io.QueueMessageSource._drop_handed_off`（见 `test_gateway_handoff_no_poll.py`）。
+        这里仍然断言放行，不是「读还在跑」的意思，是**分工没变**：
+        名单摘漏了（陌生人临时准入、名字对不上）时，写侧这道闸还得挡得住。
+        """
         self._take_over("张三")
         self.assertTrue(self.guard.allow_read(ACCOUNT, "check_new_messages", now=T0).allowed)
 
