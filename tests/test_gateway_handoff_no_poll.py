@@ -16,6 +16,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -124,7 +125,9 @@ class ForgetsTheCursorTests(_Base):
         同步应答用 `ai_managed` 盖回去。这组用例要验的是窗口之外的正常交回，
         所以得先让这一行「不新鲜」——真机上等 3 分钟自然就过了。
         """
-        with sqlite3.connect(Path(self._tmp.name) / "gateway.db") as conn:
+        # ★ `with sqlite3.connect(...)` 只提交、**不关连接**——Windows 上那个没关的句柄会让
+        #   tearDown 删不掉临时目录（仓库里 `c09d29f` 就是这条，Linux 上一次也不会红）。
+        with closing(sqlite3.connect(Path(self._tmp.name) / "gateway.db")) as conn:
             conn.execute(
                 "UPDATE gateway_candidate_mode SET updated_at='2020-01-01T00:00:00+00:00' "
                 "WHERE account_id=? AND session_name=?",
