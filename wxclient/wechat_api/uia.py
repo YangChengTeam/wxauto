@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import re
 import sys
 import time
@@ -159,11 +160,12 @@ class UiaWeChatDriver:
             try:
                 search_edit = add_friend_pane.child_window(control_type="Edit")
                 search_edit.set_text("")
-                search_edit.type_keys(str(number), with_spaces=True)
+                _type_like_human(search_edit, str(number))
+                _human_pause("before_enter")
                 search_edit.type_keys("{ENTER}")
             except Exception as exc:
                 raise _AddFriendNotStarted(f"搜索框用不了：{exc}") from exc
-            time.sleep(1)
+            _human_pause("after_enter")
 
             profile, add_button = self._await_contact_profile(add_friend_pane, Uielements, number)
 
@@ -182,14 +184,18 @@ class UiaWeChatDriver:
                 return {"name": name, "display_name": display_name,
                         "profile_name": nickname, "already_friend": True}
 
+            _human_pause("read_profile")       # 名片出来了，先看一眼——真人不会零延迟点下去
             add_button.click_input()          # ← 从这里开始就动真格了，不再退回 vendor
             verify_window = Tools.move_window_to_center(Window=Uielements.Windows.VerifyFriendWindow)
+            _human_pause("verify_open")
             request_edit = verify_window.child_window(control_type="Edit", found_index=0)
             remark_edit = verify_window.child_window(control_type="Edit", found_index=1)
             if greetings:
                 request_edit.set_text(greetings)
+                _human_pause("between_fields")
             if remark:
                 remark_edit.set_text(remark)
+            _human_pause("before_confirm")
             verify_window.child_window(**Uielements.Buttons.ConfirmButton).click_input()
             # 陌生人名片上没有备注可言，顶上那行就是昵称——这条路上 `profile_name` 拿得准。
             return {"name": name, "display_name": display_name,
@@ -2154,6 +2160,54 @@ _SEARCH_RESULT_SECTIONS = {
     "官方賬號": ("official_accounts", "official_account"),
     "聊天記錄": ("chat_history", "chat_history"),
 }
+#: 加好友这趟交互里，每一步之间停多久（秒，闭区间，实际在区间内均匀取）。
+#:
+#: ★ 2026-08-27 真机弹了安全验证。节拍那层已经补了（`guard.WRITE_PACING_BUCKETS`：
+#: 每 300 秒才碰一次好友），这里补的是**单趟交互的形状**：原来整趟 6~7 秒、方差为零——
+#: 号码整串糊进搜索框、名片一出来立刻点添加、验证语和备注也是整串粘贴、点击之间零停顿。
+#: 真人会打字、会看一眼名片、会想一下写什么，而且每次都不一样。
+#:
+#: **只加停顿，不改任何判据**：多等一会儿对名片渲染只有好处（`_await_contact_profile`
+#: 本来就在轮询等它出来）。加完整趟大约 13~21 秒。
+#:
+#: 停顿一律取随机区间，不写死。固定 2.0 秒和固定 0.0 秒一样是机器特征，只是慢一点。
+_PAUSES: dict[str, tuple[float, float]] = {
+    "before_enter": (0.6, 1.6),    # 号码打完，按回车之前
+    "after_enter": (1.5, 3.5),     # 回车之后等搜索结果（原来是写死的 sleep(1)）
+    "read_profile": (1.2, 3.0),    # 名片出来了，看一眼再点「添加到通讯录」
+    "verify_open": (0.8, 2.0),     # 验证窗弹出来，看清楚再动手
+    "between_fields": (0.5, 1.5),  # 验证语写完到写备注
+    "before_confirm": (0.8, 2.0),  # 都填好了，点确定之前
+}
+
+#: 逐字输入时每个键之间停多久（秒）。人打字大约每分钟 60~200 个字符。
+_KEYSTROKE_PAUSE = (0.05, 0.18)
+
+
+def _human_pause(what: str) -> None:
+    """按 `_PAUSES` 里那一档随机停一会儿。表里没有的名字不停（不静默乱猜一个值）。"""
+    span = _PAUSES.get(what)
+    if span is None:
+        return
+    time.sleep(random.uniform(*span))
+
+
+def _type_like_human(edit: Any, text: str) -> None:
+    """把 `text` 逐字敲进去，键与键之间随机停顿。
+
+    只用于**号码/微信号**这类纯 ASCII 的短串：`type_keys` 会把 ``{}()+^%~`` 当按键语法，
+    拿它敲用户写的验证语会把内容改掉。验证语和备注仍走 `set_text`（人也会粘贴），
+    靠前后的停顿拉开节奏。
+
+    老 pywinauto 的 `type_keys` 不一定认 `pause=`，认不出就退回整串输入——
+    输不进去比慢一点严重得多，这一层不该有能让加好友失败的新失败点。
+    """
+    try:
+        edit.type_keys(text, with_spaces=True, pause=random.uniform(*_KEYSTROKE_PAUSE))
+    except TypeError:
+        edit.type_keys(text, with_spaces=True)
+
+
 class _AddFriendNotStarted(Exception):
     """加好友流程还没点到任何按钮就走不下去了——可以安全退回 vendor 实现重来一次。"""
 

@@ -386,6 +386,13 @@ class CommandExecutor:
             if spec.reserve_count is not None:
                 # 减量放行了就把上限跟着调下来，别让微信那边照原数去做。
                 payload["limit"] = reservation.granted
+            # ★ 额度之外还有**节奏**：加好友自己有一本 300s 的账（2026-08-27 安全验证）。
+            #   排在 reserve 之后，是因为被节拍挡下的这一趟微信一下都没动，不该白占一次配额。
+            paced = self._guard.pace_write(self._account, op, now=now)
+            if not paced.allowed:
+                reservation.release()
+                _log.info("写类指令被节拍闸拦下", op=op, reason=paced.reason)
+                return CommandResult(command_id, "rejected", paced.reason)
         else:
             decision = self._guard.allow_read(self._account, spec.read_action, now=now)
             if not decision.allowed:
@@ -430,7 +437,13 @@ class CommandExecutor:
                 return CommandResult(command_id, "failed", f"{type(exc).__name__}: {exc}")
 
             result = (raw or {}).get("result") or {}
+            # ★ 连着「没搜到这个号」要退避：那更像在试号，不像正常加好友（见 guard.pace_write）。
+            #   判据和 `_friend_state` 同一条——终态写在 `raw["status"]` 里，`submit` 不抛。
             if spec.writes:
+                self._guard.note_write_outcome(
+                    self._account, op,
+                    ok=str((raw or {}).get("status") or "") == "succeeded",
+                )
                 # 额度在动微信**之前**就占住了（见上），这里只按真实用量结算：
                 # 预留 5 实际通过 2 → 还回 3。做多少记多少，两个方向都不许含糊。
                 reservation.settle(spec.counts(args, result))

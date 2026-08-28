@@ -81,6 +81,30 @@ class ConcurrencyTests(ReservationTestCase):
         """★ 这条是整个改动的理由：并发不再能把配额冲开。
 
         `delay` 撑开的正是老实现里「已经放行、还没记账」那段窗口。
+
+        用发消息来量**配额**这一道：加好友后来又多了一道 300 秒的节拍闸
+        （`guard.WRITE_PACING`），并发下它先拦到只剩 1 条，配额那道就量不出来了。
+        两道闸各测各的，见下面一条。
+        """
+        runtime = SlowRuntime(delay=0.02)
+        executor = self._executor(runtime, max_sends_per_hour=5)
+        results = await asyncio.gather(*(
+            executor.execute({"command_id": f"c{i}", "op": "send_message",
+                              "args": {"to": f"人{i}", "text": "在吗"}})
+            for i in range(20)
+        ))
+        done = [r for r in results if r.status == "done"]
+        self.assertEqual(len(done), 5, "一小时 5 条，并发也必须是 5 条")
+        self.assertEqual(len(runtime.calls), 5, "被拒的那 15 条一次微信都不许动")
+        self.assertEqual(
+            self.store.sends_since(ACCOUNT, self.now - timedelta(hours=1), action=ACTION_MESSAGE), 5
+        )
+
+    async def test_twenty_add_friends_at_once_get_exactly_one(self) -> None:
+        """★ 加好友并发下只过 1 个：配额说「一小时 5 个」，节拍说「300 秒 1 个」。
+
+        两道闸取更严的那一道。2026-08-27 真机上只有配额，于是 81 秒里加了两次、
+        两次都「没搜到这个号」，微信随即弹出安全验证。
         """
         runtime = SlowRuntime(delay=0.02)
         executor = self._executor(runtime)
@@ -89,10 +113,9 @@ class ConcurrencyTests(ReservationTestCase):
                               "args": {"number": f"wxid_{i}"}})
             for i in range(20)
         ))
-        done = [r for r in results if r.status == "done"]
-        self.assertEqual(len(done), 5, "加好友一小时 5 个，并发也必须是 5 个")
-        self.assertEqual(len(runtime.calls), 5, "被拒的那 15 条一次微信都不许动")
-        self.assertEqual(self._friend_sends(), 5)
+        self.assertEqual(len([r for r in results if r.status == "done"]), 1)
+        self.assertEqual(len(runtime.calls), 1, "被拒的那 19 条一次微信都不许动")
+        self.assertEqual(self._friend_sends(), 1, "被节拍挡下的不许白占配额")
 
 
 class BatchAccountingTests(ReservationTestCase):

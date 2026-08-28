@@ -24,6 +24,8 @@
 ② **节拍走共享的 `read_friends` 闸**（`GatewayStore.try_touch_read`），和 AI 端下发的
    `check_new_friends` 共用同一档。这是「查好友」这类动作在**整台机器上**的总节拍（≥300s），
    不是本循环自己的间隔——否则几条循环各自守着自己的 300s，合起来就是每 100 秒动一次微信。
+   另外本循环还要**给主动加好友让路**：加好友那本账（`friend_write`）只看不占，
+   刚加过就跳过这轮。让路的是能重来的一方，被拒的加好友指令是直接丢掉的。
 
 ③ **同名会误判。** 搜的是我们自己设的备注名（`张三-仓库工` 这种），微信通讯录里另有一个
    一模一样的名字就会命中。备注名带岗位后缀时概率很低，但这是这条判据的已知边界。
@@ -42,7 +44,7 @@ import structlog
 
 from wxclient.queue import TaskType
 
-from .guard import READ_FRIENDS_ACTION, within_active_hours
+from .guard import FRIEND_WRITE_ACTION, READ_FRIENDS_ACTION, within_active_hours
 from .pacing import MIN_FRIEND_INTERVAL_SECONDS, jittered
 from .sessions import GatewayStore
 
@@ -111,6 +113,14 @@ class PendingFriendWatcher:
             return ""
 
         now = self._clock()
+        # ★ 先给「主动加好友」让路（2026-08-27 安全验证）。刚搜过一个陌生号，紧接着再搜
+        #   一个人，在微信那边就是连着两次搜索——正是弹安全验证的形状。
+        #   让路的必须是本循环：复查是死循环，这轮不查下轮再查；AI 端下发的加好友被拒
+        #   就直接丢了。所以这里只**看**加好友那本账（`seconds_since_read`，不占住它）。
+        since_add = self._store.seconds_since_read(account_id, FRIEND_WRITE_ACTION, now)
+        if since_add is not None and since_add < MIN_FRIEND_INTERVAL_SECONDS:
+            _log.info("刚加过好友，这轮先不复查", 距上次加好友=round(since_add, 1))
+            return ""
         # ★ 共享节拍闸，不是本循环自己的间隔。092 的自动补加、AI 端下发的查好友申请
         #   都走这一档，谁先动了微信，后面的就得等——这才是「整台机器每 300 秒才查一次」。
         wait = self._store.try_touch_read(

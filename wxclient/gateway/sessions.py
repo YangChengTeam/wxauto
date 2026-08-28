@@ -187,9 +187,11 @@ CREATE TABLE IF NOT EXISTS gateway_friend_checks (
   PRIMARY KEY (account_id, number)
 );
 CREATE TABLE IF NOT EXISTS gateway_read_marks (
-  account_id TEXT NOT NULL,
-  action     TEXT NOT NULL,
-  last_at    TEXT NOT NULL,
+  account_id  TEXT NOT NULL,
+  action      TEXT NOT NULL,
+  last_at     TEXT NOT NULL,
+  -- 这一档**连续**失败了几次。只有加好友在用：连着搜不到号要退避（见 pacing.backoff_seconds）。
+  fail_streak INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (account_id, action)
 );
 CREATE TABLE IF NOT EXISTS gateway_contact_sync (
@@ -274,6 +276,8 @@ class GatewayStore:
             _ensure_column(conn, "gateway_send_log", "action", "TEXT NOT NULL DEFAULT 'message'")
             _ensure_column(conn, "gateway_candidate_mode", "source", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(conn, "gateway_candidate_mode", "server_updated_at", "TEXT NOT NULL DEFAULT ''")
+            # 连续失败次数（加好友退避用）。老库没有这一列，不补就 "no such column"。
+            _ensure_column(conn, "gateway_read_marks", "fail_streak", "INTEGER NOT NULL DEFAULT 0")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
@@ -1660,6 +1664,51 @@ class GatewayStore:
             except Exception:
                 conn.rollback()
                 raise
+
+    def seconds_since_read(self, account_id: str, action: str, at: datetime) -> float | None:
+        """这一档上次动微信是多久以前（秒）。没记录过 → None。**只看不记**。
+
+        `try_touch_read` 是「问一句顺手就占住」，谁问谁就把节拍推后了。想让 A 给 B 让路，
+        A 只能用这个：占住的事得留给真要动微信的那一方。
+        """
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT last_at FROM gateway_read_marks WHERE account_id=? AND action=?",
+                (account_id, action),
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            last = datetime.fromisoformat(str(row[0]))
+        except ValueError:
+            return None
+        return (at - last).total_seconds()
+
+    def action_fail_streak(self, account_id: str, action: str) -> int:
+        """这一档**连续**失败了几次。没有记录 → 0。"""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT fail_streak FROM gateway_read_marks WHERE account_id=? AND action=?",
+                (account_id, action),
+            ).fetchone()
+        return int(row[0]) if row and row[0] else 0
+
+    def note_action_outcome(self, account_id: str, action: str, *, ok: bool) -> None:
+        """记一次结果：成功归零，失败 +1。**只动计数，不动 `last_at`**。
+
+        `last_at` 归 `try_touch_read` 管（做之前记），这里是做完之后才知道的事。
+        两者分开写，免得一次失败把节拍也顺手往前推。
+
+        行不存在时不新建：能走到这儿说明 `try_touch_read` 刚放行过、行一定在。
+        真不在（库被清过）就当没这回事，下一次做的时候自然会建出来。
+        """
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE gateway_read_marks SET fail_streak = CASE WHEN ? THEN 0 "
+                "ELSE fail_streak + 1 END WHERE account_id=? AND action=?",
+                (1 if ok else 0, account_id, action),
+            )
+            conn.commit()
 
     def sends_since(self, account_id: str, since: datetime, action: str | None = None) -> int:
         """``action=None`` = 所有写动作（总闸）；给了就只数那一档。"""

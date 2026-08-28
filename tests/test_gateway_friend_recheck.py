@@ -182,6 +182,38 @@ class TestPacing(_Base):
         self.assertEqual(await watcher.tick(), [])
         self.assertEqual(runtime.calls, [])
 
+    async def test_刚加过好友这轮就让路(self) -> None:
+        """★ 复查给主动加好友让路（2026-08-27 安全验证）。
+
+        搜完一个陌生号紧接着再搜一个人，在微信那边就是连着两次搜索。
+        让路的是本循环：复查是死循环，这轮不查下轮再查；加好友被拒就直接丢了。
+        """
+        self.requested()
+        from wxclient.gateway.guard import FRIEND_WRITE_ACTION
+
+        self.store.try_touch_read(ACCOUNT, FRIEND_WRITE_ACTION, self.now, 300.0)
+        runtime = _Runtime({"exact_count": 1})
+        self.assertEqual(await self.watcher(runtime).tick(), [])
+        self.assertEqual(runtime.calls, [])
+
+        self.now += timedelta(seconds=301)
+        self.assertEqual(await self.watcher(runtime).tick(), [NAME])
+
+    async def test_让路只看不占_加好友那本账不动(self) -> None:
+        """★ 让路用的是 `seconds_since_read`（只看不记）。
+
+        用 `try_touch_read` 去问的话，问一句就把加好友的节拍推后 300 秒——
+        本来是给它让路，结果成了替它把闸关上。
+        """
+        self.requested()
+        from wxclient.gateway.guard import FRIEND_WRITE_ACTION
+
+        await self.watcher(_Runtime()).tick()
+        self.assertIsNone(
+            self.store.seconds_since_read(ACCOUNT, FRIEND_WRITE_ACTION, self.now),
+            "复查跑过一轮，加好友那本账必须还是空的",
+        )
+
     async def test_间隔为零就完全不查(self) -> None:
         self.requested()
         runtime = _Runtime({"exact_count": 1})

@@ -13,7 +13,11 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 
-from .pacing import MIN_FRIEND_INTERVAL_SECONDS, MIN_READ_INTERVAL_SECONDS
+from .pacing import (
+    MIN_FRIEND_INTERVAL_SECONDS,
+    MIN_READ_INTERVAL_SECONDS,
+    backoff_seconds,
+)
 
 # 明确的**拒绝联系**表达——命中即永久停止对该联系人的一切自动化动作并拉黑。
 # 宁可多拦，不可漏拦：被误拦的后果只是少发一条消息。
@@ -157,6 +161,27 @@ READ_FRIENDS_ACTION = "read_friends"  # 查新好友申请（加好友相关，�
 READ_INTERVALS: dict[str, float] = {
     READ_ACTION: MIN_READ_INTERVAL_SECONDS,
     READ_FRIENDS_ACTION: MIN_FRIEND_INTERVAL_SECONDS,
+}
+
+FRIEND_WRITE_ACTION = "friend_write"  # 主动加好友（搜陌生号，风控最敏感的那一下）
+
+#: 写类动作也要过最小间隔的，登记在这儿：**指令名** → （节拍账, 最小间隔秒, 人话名字）。
+#:
+#: ★ 按**指令名**登记，不是按 `action`：`accept_new_friends` 和 `add_friend` 共用
+#:   `ACTION_FRIEND` 那本**配额**，但风险形状完全不同——通过别人发来的申请不用搜号，
+#:   给它套 300 秒的闸只会让攒着的申请通不完。这道闸只管「主动去搜一个陌生号」。
+#:
+#: ★ 自己一本账，**不与 `READ_FRIENDS_ACTION` 合账**。合过一次，是错的：复查循环
+#:   （`friendcheck.py`）只要还有人待复查就每 300 秒摸一次那本账，合账等于 AI 端下发的
+#:   加好友**永远**排在它后面被拒——而被拒的指令是直接丢掉、不排队的。
+#:   两条搜索确实不该挨着做，但让路的必须是**能重来的那一方**：复查是死循环，这轮
+#:   不查下轮再查；加好友只有这一次机会。所以是复查躲加好友（见 `friendcheck.py`），
+#:   不是加好友等复查。
+#:
+#: 配额（5 次/小时）**保留**：那是总量，这是节奏，两道各管一头。
+#: 原来只有配额，于是 5 次全挤进一分钟也照样放行——真机上就挤成了 81 秒两次。
+WRITE_PACING: dict[str, tuple[str, float, str]] = {
+    "add_friend": (FRIEND_WRITE_ACTION, MIN_FRIEND_INTERVAL_SECONDS, "加好友"),
 }
 
 
@@ -314,6 +339,39 @@ class OutboundGuard:
             where, used, cap = binding or (f"「{label}」", 0, 0)
             return Reservation(reason=f"{where}已做 {used} 次，达到上限 {cap}", temporary=True)
         return Reservation(granted=granted, _store=self._store, _rowids=rowids)
+
+    def pace_write(self, account_id: str, op: str, *, now: datetime) -> GuardDecision:
+        """写类指令的**最小间隔**闸。放行的同时把这一次记下（原子）。
+
+        只有登记在 `WRITE_PACING` 里的指令才受管；别的原样放行——
+        发消息有它自己的节奏（对方在等回话），不该被这条 300 秒的闸卡住。
+
+        ★ 和 `reserve` 的先后：**先占额度、再过这道闸**。反过来的话，一次被节拍挡下的
+          尝试会白占一次配额，而那一趟微信一下都没动。挡下时调用方负责 `release()`。
+
+        ★ 连续失败要退避（`backoff_seconds`）：一次「没搜到这个号」在微信那边不像正常
+          加好友，更像在试号；紧接着再来一个搜不到的，就是枚举的形状。所以间隔翻倍，
+          成功一次归零。退避只往慢里走。
+        """
+        entry = WRITE_PACING.get(op)
+        if entry is None:
+            return GuardDecision.allow()
+        bucket, base, label = entry
+        streak = self._store.action_fail_streak(account_id, bucket)
+        floor = backoff_seconds(base, streak)
+        wait = self._store.try_touch_read(account_id, bucket, now, floor)
+        if wait <= 0:
+            return GuardDecision.allow()
+        tail = f"（前面连着 {streak} 次没成，间隔已放慢）" if streak > 0 else ""
+        return GuardDecision.deny(
+            f"「{label}」要隔 {int(floor)} 秒才做一次，还要等 {wait:g} 秒{tail}"
+        )
+
+    def note_write_outcome(self, account_id: str, op: str, *, ok: bool) -> None:
+        """一次写指令做完了，把结果记进它那本节拍账（失败会让下次间隔翻倍）。"""
+        entry = WRITE_PACING.get(op)
+        if entry is not None:
+            self._store.note_action_outcome(account_id, entry[0], ok=ok)
 
     def _takeover_denial(self, account_id: str, peer_id: str) -> str | None:
         """**这个候选人**正被人工接管就给一句拒绝理由，否则 None（091 / docs/19 v2 §1）。

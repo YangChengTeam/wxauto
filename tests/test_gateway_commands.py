@@ -820,3 +820,119 @@ class CapabilityGateTests(unittest.IsolatedAsyncioTestCase):
         })
         self.assertEqual(result.status, "done")
         self.assertEqual(len(runtime.calls), 1)
+
+
+class AddFriendPacingTests(CommandTestCase):
+    """加好友的**节奏**（2026-08-27 真机弹了安全验证）。
+
+    那天整个日志里加好友只有两次——不是量大，是这两次的性质和间距：
+    15:22:36 和 15:23:57，隔 81 秒，而且**两次都是「没搜到这个号」**。
+    连续搜不到的陌生手机号是枚举的形状，比成功加一个好友敏感得多。
+
+    81 秒能过闸，是因为写侧只有「5 次/小时」的配额、**没有最小间隔**——
+    `pacing.py` 上写着「加好友相关的动作节拍必须慢得多」，可那道 300 秒的闸
+    只挂在读侧（查好友申请），真正去搜陌生号的 `add_friend` 一直在闸外面。
+    """
+
+    def _add(self, runtime: FakeRuntime, cid: str = "c1", number: str = "13800000001"):
+        return self._executor(runtime).execute({
+            "command_id": cid, "op": "add_friend",
+            "args": {"number": number, "greetings": "你好", "remark": "张三"},
+        })
+
+    async def test_two_add_friends_in_a_row_are_paced_not_just_quota_checked(self) -> None:
+        """★ 第二次紧接着来 → 被节拍闸拦下（配额还剩 4 次，闸管的是间隔不是总量）。"""
+        runtime = FakeRuntime()
+        self.assertEqual((await self._add(runtime, "c1")).status, "done")
+        self.now += timedelta(seconds=81)          # 真机上就是这个间距
+        second = await self._add(runtime, "c2", "13800000002")
+        self.assertEqual(second.status, "rejected")
+        self.assertIn("300", second.reason)
+        self.assertEqual(len(runtime.calls), 1, "被拦下的那次一下微信都不该动")
+
+    async def test_after_the_floor_has_passed_it_goes_through(self) -> None:
+        runtime = FakeRuntime()
+        await self._add(runtime, "c1")
+        self.now += timedelta(seconds=301)
+        self.assertEqual((await self._add(runtime, "c2", "13800000002")).status, "done")
+        self.assertEqual(len(runtime.calls), 2)
+
+    async def test_accepting_requests_is_not_slowed_down_by_this(self) -> None:
+        """★ 闸只管「主动去搜一个陌生号」，不管「通过别人发来的申请」。
+
+        两者共用 `ACTION_FRIEND` 那本**配额**，但通过申请不用搜号——给它套 300 秒，
+        攒着的申请就永远通不完。所以 `WRITE_PACING` 按**指令名**登记，不按 action。
+        """
+        runtime = FakeRuntime(result={"items": ["甲"]})
+        await self._add(FakeRuntime(), "c1")
+        self.now += timedelta(seconds=10)
+        accepted = await self._executor(runtime).execute({
+            "command_id": "c2", "op": "accept_new_friends", "args": {"limit": 1},
+        })
+        self.assertEqual(accepted.status, "done", accepted.reason)
+
+    async def test_checking_does_not_block_adding(self) -> None:
+        """★ 加好友**不与查好友合账**——合过一次，是错的。
+
+        复查循环（`friendcheck.py`）只要还有人待复查就每 300 秒摸一次 `read_friends`，
+        合账等于 AI 端下发的加好友永远排在它后面被拒；而被拒的指令是直接丢掉、不排队的。
+        让路的必须是能重来的那一方，所以是复查躲加好友（见 friendcheck 的对应测试）。
+        """
+        runtime = FakeRuntime()
+        checked = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "check_new_friends", "args": {},
+        })
+        self.assertEqual(checked.status, "done", checked.reason)
+        self.now += timedelta(seconds=10)
+        added = await self._add(runtime, "c2")
+        self.assertEqual(added.status, "done", added.reason)
+
+    async def test_a_rejected_attempt_does_not_burn_quota(self) -> None:
+        """被节拍挡下的那一趟微信一下都没动，不该白占一次「5 次/小时」。"""
+        runtime = FakeRuntime()
+        await self._add(runtime, "c1")
+        self.now += timedelta(seconds=10)
+        await self._add(runtime, "c2", "13800000002")
+        used = self.store.sends_since(ACCOUNT, self.now - timedelta(hours=1), action="friend")
+        self.assertEqual(used, 1, "只有真做成的那次该记账")
+
+    async def test_consecutive_failures_back_off(self) -> None:
+        """★ 连着「没搜到这个号」→ 间隔翻倍。那更像在试号，不像正常加好友。"""
+        runtime = FakeRuntime(status="failed", result={})
+        await self._add(runtime, "c1")
+        self.assertEqual(self.store.action_fail_streak(ACCOUNT, "friend_write"), 1)
+
+        self.now += timedelta(seconds=301)         # 按原来的 300s 本该放行
+        blocked = await self._add(runtime, "c2", "13800000002")
+        self.assertEqual(blocked.status, "rejected")
+        self.assertIn("600", blocked.reason)
+        self.assertIn("连着", blocked.reason)
+
+        self.now += timedelta(seconds=601)
+        self.assertEqual((await self._add(runtime, "c3", "13800000003")).status, "done")
+
+    async def test_a_success_resets_the_backoff(self) -> None:
+        fail, ok = FakeRuntime(status="failed", result={}), FakeRuntime()
+        await self._executor(fail).execute({
+            "command_id": "c1", "op": "add_friend", "args": {"number": "13800000001"},
+        })
+        self.now += timedelta(seconds=601)
+        await self._executor(ok).execute({
+            "command_id": "c2", "op": "add_friend", "args": {"number": "13800000002"},
+        })
+        self.assertEqual(self.store.action_fail_streak(ACCOUNT, "friend_write"), 0)
+        self.now += timedelta(seconds=301)         # 归零之后 300s 就够了
+        third = await self._executor(ok).execute({
+            "command_id": "c3", "op": "add_friend", "args": {"number": "13800000003"},
+        })
+        self.assertEqual(third.status, "done", third.reason)
+
+    async def test_sending_a_message_is_not_slowed_down_by_this(self) -> None:
+        """闸只挂在登记过的写动作上。发消息有它自己的节奏——对方在等回话。"""
+        runtime = FakeRuntime()
+        for i in range(3):
+            r = await self._executor(runtime).execute({
+                "command_id": f"m{i}", "op": "send_message",
+                "args": {"to": "张三", "text": "在吗"},
+            })
+            self.assertEqual(r.status, "done", r.reason)
