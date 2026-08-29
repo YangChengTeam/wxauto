@@ -23,6 +23,7 @@ from wxclient.gateway import (
     LocalFileTicketProvider,
 )
 from wxclient.gateway.friendcheck import MAX_CHECKS, PendingFriendWatcher
+from wxclient.gateway.runner import ACCEPTED_REPORT_DELAY_SECONDS
 from wxclient.gateway.watchlist import Watchlist
 from wxclient.queue import TaskType
 
@@ -269,6 +270,7 @@ class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
         self.tickets.write_text(json.dumps({ACCOUNT: "tkt"}), encoding="utf-8")
         self.contacts = _Contacts()
         self.watchlist = Watchlist()
+        self.now = T0
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
@@ -284,6 +286,7 @@ class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
             watchlist=self.watchlist,
             contacts=self.contacts,
             friend_checker=checker,
+            clock=lambda: self.now,      # 好友通过的上报要等半小时，测试得能拨表
         )
 
     async def test_确认通过_报给后端并立刻进名单(self) -> None:
@@ -297,19 +300,28 @@ class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
             interval_seconds=900.0,
             clock=lambda: T0,
         )
-        self._runner(checker)          # 装配那一下会把 on_accepted 挂上
+        runner = self._runner(checker)          # 装配那一下会把 on_accepted 挂上
         self.assertEqual(await checker.tick(), [NAME])
 
-        # ① 报给后端的是 accepted，号是本机映射查出来的那个，remark 就是会话名
+        # ★ 「进名单」和「报给后端」现在是两个节奏，这条用例守的就是这个区分：
+        #   他现在就该被读、被回复（不然复查白做了），后端晚半小时知道
+        #   （用户 2026-08-29）。
+        # ① 立刻进监听名单——不等下一次会话名同步，否则中间他说的话仍然没人读
+        self.assertEqual(self.watchlist.watched(), [NAME])
+        # ② 本机也记一格，同一个人不会被排第二次
+        self.assertEqual(self.store.pending_friend_request(ACCOUNT, NAME), "")
+        # ③ 但这一刻**还没报**：先排队
+        self.assertEqual(self.contacts.reported, [])
+        self.assertEqual(self.store.pending_accepted_count(ACCOUNT), 1)
+
+        # ④ 等够半小时，报给后端的是 accepted，号是本机映射查出来的那个，remark 就是会话名
+        self.now = self.now + timedelta(seconds=ACCEPTED_REPORT_DELAY_SECONDS + 1)
+        await runner.tick()
         self.assertEqual(len(self.contacts.reported), 1)
         report = self.contacts.reported[0]
         self.assertEqual(report["status"], "accepted")
         self.assertEqual(report["number"], NUMBER)
         self.assertEqual(report["remark"], NAME)
-        # ② 本机也记一格，同一个人不会被报第二次
-        self.assertEqual(self.store.pending_friend_request(ACCOUNT, NAME), "")
-        # ③ 立刻进监听名单——不等下一次会话名同步，否则中间他说的话仍然没人读
-        self.assertEqual(self.watchlist.watched(), [NAME])
 
     async def test_没通过_什么都不报(self) -> None:
         self.store.note_friend_request(ACCOUNT, NUMBER, NAME)

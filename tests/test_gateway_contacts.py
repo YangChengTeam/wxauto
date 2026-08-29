@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,7 @@ import httpx
 from wxclient.gateway import GatewayRunner, GatewaySettings, LocalFileTicketProvider
 from wxclient.gateway.commands import CommandResult
 from wxclient.gateway.contacts import ContactDirectory
+from wxclient.gateway.runner import ACCEPTED_REPORT_DELAY_SECONDS
 from wxclient.gateway.sessions import GatewayStore
 
 
@@ -186,8 +188,14 @@ class FakeDirectory:
         self.pulled: list[str] = []
         self._rows = rows or []
 
-    async def report(self, **kwargs: Any) -> dict[str, Any]:
+    fail_next = False
+    """下一次 `report` 返回 None（后端不可达时的真实形状）。用来验「报不出去不销账」。"""
+
+    async def report(self, **kwargs: Any) -> dict[str, Any] | None:
         self.reported.append(kwargs)
+        if self.fail_next:
+            self.fail_next = False
+            return None
         return {"matched": True, "worker_id": "w-1"}
 
     async def pull(self, *, updated_since: str = "", limit: int = 200) -> list[dict[str, Any]]:
@@ -214,11 +222,13 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
         self.store = GatewayStore(root / "gateway.db")
         self.tickets = root / "tickets.json"
         self.tickets.write_text(json.dumps({"acct-1": "tkt"}), encoding="utf-8")
+        self.now = datetime(2026, 8, 29, 10, 0, 0, tzinfo=timezone.utc)
 
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
     def _runner(self, directory: FakeDirectory) -> GatewayRunner:
+        # 时钟可拨：好友通过的上报要等半小时，测试不可能真等（见 `self.now`）。
         return GatewayRunner(
             settings=GatewaySettings(ai_ws_url="ws://127.0.0.1:1/ws", local_ticket_file=self.tickets),
             ticket_provider=LocalFileTicketProvider(self.tickets),
@@ -227,7 +237,12 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
             sink=SilentSink(),
             accounts=["acct-1"],
             contacts=directory,
+            clock=lambda: self.now,
         )
+
+    def _wait_out_the_delay(self) -> None:
+        """把表拨过那半小时。"""
+        self.now = self.now + timedelta(seconds=ACCEPTED_REPORT_DELAY_SECONDS + 1)
 
     async def test_friend_state_triggers_one_report_with_original_args(self) -> None:
         d = FakeDirectory()
@@ -304,10 +319,12 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(d.reported, [])
 
     async def test_their_first_message_means_they_accepted(self) -> None:
-        """★ 对方通过了我们的申请 —— 收到他第一条消息的那一刻就报（api2 §4.1）。
+        """★ 对方通过了我们的申请 —— 收到他第一条消息就认出来（api2 §4.1）。
 
         用「来消息」当信号是因为它**免费且确定**：私聊收得到就已经是好友。
         另一条路是去查好友列表，那要真动微信、占节拍配额，为一个白捡的事实不值当。
+
+        ★ 认出来 ≠ 当场报：报要等半小时（用户 2026-08-29），见下面那条。
         """
         d = FakeDirectory()
         runner = self._runner(d)
@@ -319,9 +336,68 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
         d.reported.clear()
 
         await runner._note_friend_accepted("acct-1", "张三·普工")
+        self.assertEqual(d.reported, [], "刚通过就报 = 人家刚点完同意系统马上动起来")
+        self.assertEqual(self.store.pending_accepted_count("acct-1"), 1)
 
-        self.assertEqual(d.reported, [{"number": "13800138000", "remark": "张三·普工",
-                                       "status": "accepted"}])
+        self._wait_out_the_delay()
+        await runner.tick()
+
+        self.assertEqual(len(d.reported), 1)
+        sent = d.reported[0]
+        self.assertEqual(sent["number"], "13800138000")
+        self.assertEqual(sent["remark"], "张三·普工")
+        self.assertEqual(sent["status"], "accepted")
+        self.assertEqual(self.store.pending_accepted_count("acct-1"), 0)
+
+    async def test_the_report_says_when_it_actually_happened(self) -> None:
+        """★ `occurred_at` 是**真正通过的那一刻**，不是补报的时刻。
+
+        延迟是我们这边有意等的，不该让后端以为人家是半小时后才点的同意。
+        """
+        d = FakeDirectory()
+        runner = self._runner(d)
+        self.store.note_friend_request("acct-1", "13800138000", "张三·普工")
+        accepted_at = self.now
+
+        await runner._note_friend_accepted("acct-1", "张三·普工")
+        self._wait_out_the_delay()
+        await runner.tick()
+
+        self.assertEqual(d.reported[0]["occurred_at"], accepted_at.isoformat())
+
+    async def test_talking_a_lot_does_not_push_the_report_further_out(self) -> None:
+        """★ 重复认出不刷新计时——否则话多的人可以让这条上报永远发不出去。"""
+        d = FakeDirectory()
+        runner = self._runner(d)
+        self.store.note_friend_request("acct-1", "13800138000", "张三·普工")
+
+        await runner._note_friend_accepted("acct-1", "张三·普工")
+        for _ in range(5):                      # 他一直在说话
+            self.now = self.now + timedelta(minutes=5)
+            await runner._note_friend_accepted("acct-1", "张三·普工")
+        self.assertEqual(self.store.pending_accepted_count("acct-1"), 1)
+
+        await runner.tick()                     # 从第一次认出算已经过了 25 分钟：还不到点
+        self.assertEqual(d.reported, [])
+        self.now = self.now + timedelta(minutes=6)
+        await runner.tick()
+        self.assertEqual(len(d.reported), 1)
+
+    async def test_a_failed_report_stays_in_the_queue(self) -> None:
+        """报不出去就留着下一轮——**不丢**。后端下线半小时不该让这个人凭空消失。"""
+        d = FakeDirectory()
+        d.fail_next = True
+        runner = self._runner(d)
+        self.store.note_friend_request("acct-1", "13800138000", "张三·普工")
+
+        await runner._note_friend_accepted("acct-1", "张三·普工")
+        self._wait_out_the_delay()
+        await runner.tick()
+        self.assertEqual(self.store.pending_accepted_count("acct-1"), 1, "报失败了不能销账")
+
+        await runner.tick()
+        self.assertEqual(len(d.reported), 2, "下一趟要再试一次")
+        self.assertEqual(self.store.pending_accepted_count("acct-1"), 0)
 
     async def test_acceptance_is_reported_only_once(self) -> None:
         """报完就落地。他后面再说十句话，也不该再报十遍。"""
@@ -331,6 +407,9 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
 
         await runner._note_friend_accepted("acct-1", "张三·普工")
         await runner._note_friend_accepted("acct-1", "张三·普工")
+        self._wait_out_the_delay()
+        await runner.tick()
+        await runner.tick()
 
         self.assertEqual(len(d.reported), 1)
 
@@ -355,8 +434,14 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
             CommandResult("cmd-9", "done",
                           result={"items": ["张三·普工", "不认识的人"], "friend_state": "accepted"}),
         )
-        self.assertEqual(d.reported, [{"number": "13800138000", "remark": "张三·普工",
-                                       "status": "accepted", "command_id": "cmd-9"}])
+        # 我方通过对方申请也是「好友申请通过」，同样等半小时再报。
+        self.assertEqual(d.reported, [])
+        self._wait_out_the_delay()
+        await self._runner(d).tick()
+        self.assertEqual(
+            [(r["number"], r["remark"], r["status"], r["command_id"]) for r in d.reported],
+            [("13800138000", "张三·普工", "accepted", "cmd-9")],
+        )
 
     async def test_local_rows_do_not_move_the_sync_watermark(self) -> None:
         """★ 水位只认服务端给的时间。

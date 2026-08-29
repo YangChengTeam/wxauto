@@ -94,6 +94,12 @@ MESSAGE_EVENT_DRAIN_SECONDS = 2.0
 #: 长到正常一轮（几十秒）最多喊一两声，不会把日志刷满。这个数只影响日志，不影响超时。
 TURN_HEARTBEAT_SECONDS = 30.0
 
+#: 「对方通过了好友申请」到「报给业务后端」之间要等多久（用户 2026-08-29：隔半小时）。
+#: 后端收到 `accepted` 就会把这个人接进后续流程，刚通过就立刻报等于刚加上就被安排上——
+#: 等一会儿更像真人。**等待期跨重启**（落在 `gateway_pending_accepted` 表里），
+#: 上报时带的 `occurred_at` 仍是**真正通过的那一刻**，不是补报的时刻。
+ACCEPTED_REPORT_DELAY_SECONDS = 30 * 60.0
+
 #: 每轮往上带多少条历史。够 AI 端判「这一步走完没有」，又不至于把每轮的输入撑成一倍——
 #: 这段文本每轮都要重新发一遍，是按 token 计费的。
 HISTORY_TURNS = 30
@@ -689,6 +695,55 @@ class GatewayRunner:
             # 本机也记一格，和另外两条 accepted 路径同口径（否则同一个人下次还会被当成待通过）。
             self._store.mark_contact_status(self._account(), number, CONTACT_ACCEPTED)
 
+    # ── 好友通过后的延迟上报（用户 2026-08-29）────────────────────
+
+    def _defer_accepted_report(
+        self, account_id: str, number: str, remark: str, command_id: str = "",
+    ) -> None:
+        """认出「他通过了」→ **先排进队列，半小时后才报**给业务后端。
+
+        为什么不当场报：后端收到 `accepted` 就把这个人接进后续流程（计划、跟进），
+        刚通过就立刻报等于人家刚点完同意、系统这边马上就动起来。等一会儿更像真人。
+
+        本机那一格（`mark_contact_status`）仍然**立刻**记——它管的是「别把同一个人
+        重复当成待通过」，和对外报不报是两件事，跟着一起延迟只会让同一个人被反复排队。
+        """
+        if self._contacts is None:
+            return
+        if self._store.defer_accepted_report(
+            account_id, number, remark, self._clock(), command_id=command_id
+        ):
+            _log.info(
+                "对方通过了好友申请，先不报，等一会儿",
+                会话=remark, 等待分钟=int(ACCEPTED_REPORT_DELAY_SECONDS // 60),
+            )
+
+    async def _flush_accepted_reports(self) -> None:
+        """等够了的那几条，报给业务后端。报不出去就留着下一轮——**不丢**。
+
+        `occurred_at` 带的是**真正通过的那一刻**（`detected_at`），不是补报的时刻：
+        延迟是我们这边有意等的，不该让后端以为人家是半小时后才通过的。
+        """
+        if self._contacts is None:
+            return
+        cutoff = self._clock() - timedelta(seconds=ACCEPTED_REPORT_DELAY_SECONDS)
+        for account_id in self._accounts:
+            for row in self._store.due_accepted_reports(account_id, cutoff):
+                try:
+                    result = await self._contacts.report(
+                        number=row["number"], remark=row["remark"],
+                        status=CONTACT_ACCEPTED, command_id=row["command_id"],
+                        occurred_at=row["detected_at"],
+                    )
+                except Exception as exc:  # noqa: BLE001 —— 一条报不出去不该拖垮这一趟
+                    _log.warning("好友通过补报出错，留着下一轮", 原因=str(exc))
+                    continue
+                if result is None:
+                    # `report()` 自己已经记过为什么（缺字段 / 请求失败），这里不重复喊。
+                    continue
+                self._store.drop_accepted_report(account_id, row["number"])
+                _log.info("好友通过已上报", 会话=row["remark"])
+
     def _account(self) -> str:
         """指令归哪个号。现在一条连接一个号（`CommandExecutor` 也是取第一个）。"""
         return self._accounts[0] if self._accounts else ""
@@ -705,9 +760,7 @@ class GatewayRunner:
             if not number:
                 _log.info("通过了好友申请但本机不认识这个名字，不上报")  # 名字不进日志
                 continue
-            await self._contacts.report(
-                number=number, remark=name, status=CONTACT_ACCEPTED, command_id=command_id,
-            )
+            self._defer_accepted_report(account_id, number, name, command_id=command_id)
             self._store.mark_contact_status(account_id, number, CONTACT_ACCEPTED)
 
     async def _note_friend_accepted(self, account_id: str, peer_id: str) -> None:
@@ -715,29 +768,31 @@ class GatewayRunner:
 
         为什么用「来消息」当信号：这是**免费且确定**的一条——微信里能收到私聊消息就说明
         已经是好友了。另一条路是去查好友列表，那要真动微信、要占节拍配额，为一个能白捡的
-        事实不值得（[[wechat-rate-control]]）。只在还挂着 `requested` 时报，报完落地，
-        所以同一个人只会报一次。
+        事实不值得（[[wechat-rate-control]]）。只在还挂着 `requested` 时认，认完落地，
+        所以同一个人只会排一次队。
+
+        ★ 认出来**不等于当场报**：报要等半小时（`_defer_accepted_report`），
+          由 `_flush_accepted_reports` 在后面某一趟 tick 里发出去。
         """
         if self._contacts is None:
             return
         number = self._store.pending_friend_request(account_id, peer_id)
         if not number:
             return
-        await self._contacts.report(
-            number=number, remark=peer_id, status=CONTACT_ACCEPTED,
-        )
+        self._defer_accepted_report(account_id, number, peer_id)
         self._store.mark_contact_status(account_id, number, CONTACT_ACCEPTED)
-        _log.info("对方通过了好友申请，已上报", account=account_id)
 
     async def _on_friend_accepted(self, account_id: str, session_name: str) -> None:
         """复查确认对方通过了（093）→ 走**既有**那条上报路，并让他立刻进监听名单。
 
         这里一个字的上报逻辑都不重写：`_note_friend_accepted` 本来就是干这个的
-        （查号 → 报 `accepted` → 本机记一格），只是原来唯一的触发点是「收到他的消息」，
-        而没进名单的人根本不会被读到消息——那段代码等的调用永远不来。复查补的就是这个调用。
+        （查号 → 排队等着报 `accepted` → 本机记一格），只是原来唯一的触发点是
+        「收到他的消息」，而没进名单的人根本不会被读到消息——那段代码等的调用永远不来。
+        复查补的就是这个调用。
 
-        报完立刻重算名单：不重算的话，他要等下一次 `_sync_contacts`（默认几分钟一轮）
-        才进得来，中间他说的话仍然没人读。
+        **立刻重算名单**：注意这一条和「半小时后才报给后端」是两件事——他现在就该被读、
+        被回复（不然复查白做了），只是后端要晚半小时才知道。不重算的话，他要等下一次
+        `_sync_contacts`（默认几分钟一轮）才进得来，中间他说的话仍然没人读。
         """
         await self._note_friend_accepted(account_id, session_name)
         # 上报口没配（没登录/没接业务端）时上面那段是整段跳过的，本机那一格也就没记。
@@ -1126,6 +1181,12 @@ class GatewayRunner:
     # ────────────────────────── 生命周期 ──────────────────────────
 
     async def tick(self) -> int:
+        # 好友通过的延迟上报搭在这一趟里：轮询是分钟级的，半小时的等待不需要自己的时钟。
+        # 它出错也不许影响读消息——上报是旁路，读回复是正事。
+        try:
+            await self._flush_accepted_reports()
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("这一趟的好友通过补报没跑成，下一趟再说", 原因=str(exc))
         return await self.loop.tick()
 
     async def drain(self) -> None:

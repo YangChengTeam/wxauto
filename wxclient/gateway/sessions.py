@@ -174,6 +174,20 @@ CREATE TABLE IF NOT EXISTS gateway_auto_friend (
   at           TEXT NOT NULL,
   PRIMARY KEY (account_id, number)
 );
+CREATE TABLE IF NOT EXISTS gateway_pending_accepted (
+  -- 「检测到对方通过了好友申请」到「真的报给后端」之间的等待队列
+  -- （用户 2026-08-29：通过之后要隔半小时才 POST /client/contacts）。
+  -- ★ 落库不放内存：等待期跨得过重启，否则关一次程序这条上报就永远没了。
+  -- ★ 和 gateway_auto_friend / gateway_friend_checks 同理，**只由本机写**，同步名单不碰。
+  account_id  TEXT NOT NULL,
+  number      TEXT NOT NULL,
+  remark      TEXT NOT NULL DEFAULT '',
+  command_id  TEXT NOT NULL DEFAULT '',
+  -- 第一次检测到的时刻。**重复检测不刷新它**——否则对方每发一条消息都把半小时重新算一遍，
+  -- 一个话多的人可以让这条上报永远发不出去。
+  detected_at TEXT NOT NULL,
+  PRIMARY KEY (account_id, number)
+);
 CREATE TABLE IF NOT EXISTS gateway_friend_checks (
   -- 「已申请、还没通过」的人复查到哪一步了（093）。
   -- ★ 和 gateway_auto_friend 同样的理由**不复用 gateway_contacts**：那张表同步名单会覆盖，
@@ -736,6 +750,66 @@ class GatewayStore:
                 (account_id, (number or "").strip()),
             ).fetchone()
         return str(row[0]) if row and row[0] else ""
+
+    # ── 好友通过后的延迟上报（用户 2026-08-29）────────────────────
+
+    def defer_accepted_report(
+        self, account_id: str, number: str, remark: str, at: datetime, command_id: str = "",
+    ) -> bool:
+        """记下「这个号通过了，等到点再报」。返回 True = 这次真的排进去了（第一次检测到）。
+
+        重复检测**不覆盖** `detected_at`：同一个人可能被「收到他消息」和「复查确认」
+        两条路各认出一次，还可能每来一条消息认一次——刷新时间就等于把上报无限往后推。
+        """
+        number, remark = (number or "").strip(), (remark or "").strip()
+        if not number:
+            return False
+        with closing(self._connect()) as conn:
+            cur = conn.execute(
+                """INSERT INTO gateway_pending_accepted
+                     (account_id, number, remark, command_id, detected_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(account_id, number) DO NOTHING""",
+                (account_id, number, remark, command_id or "", at.isoformat()),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def due_accepted_reports(self, account_id: str, cutoff: datetime) -> list[dict[str, str]]:
+        """到点该报的那几条（`detected_at <= cutoff`）。"""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT number, remark, command_id, detected_at FROM gateway_pending_accepted
+                    WHERE account_id = ? AND detected_at <= ?
+                    ORDER BY detected_at""",
+                (account_id, cutoff.isoformat()),
+            ).fetchall()
+        return [
+            {"number": str(r[0]), "remark": str(r[1]), "command_id": str(r[2]),
+             "detected_at": str(r[3])}
+            for r in rows
+        ]
+
+    def drop_accepted_report(self, account_id: str, number: str) -> None:
+        """报出去了（或不必再报了）→ 从等待队列里删掉。"""
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "DELETE FROM gateway_pending_accepted WHERE account_id = ? AND number = ?",
+                (account_id, number),
+            )
+            conn.commit()
+
+    def pending_accepted_count(self, account_id: str = "") -> int:
+        """还压着几条没报（只读，给诊断和状态用）。"""
+        with closing(self._connect()) as conn:
+            if account_id:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM gateway_pending_accepted WHERE account_id = ?",
+                    (account_id,),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM gateway_pending_accepted").fetchone()
+        return int(row[0]) if row else 0
 
     def note_friend_request(self, account_id: str, number: str, session_name: str) -> None:
         """记下「我们刚给这个号发了好友申请，备注名是这个」。
