@@ -167,7 +167,10 @@ class NoEnglishLeaksTests(ChineseLogRendererTests):
             emitted |= set(call.findall(path.read_text(encoding="utf-8")))
 
         config = (root / "logging_config.py").read_text(encoding="utf-8")
-        rendered = set(re.findall(r'event == "([^"]+)"', config))
+        # 只比英文事件名这一档。网关业务层的事件名本身就是整句中文，归
+        # `GatewayLineTests` 管——混在一起的话，那边每加一条渲染都会把这里判成
+        # 「分支没人发了」。
+        rendered = set(re.findall(r'event == "([a-z0-9_.]+)"', config))
 
         self.assertFalse(emitted - rendered,
                          f"这些事件没有中文句子，会原样印英文：{sorted(emitted - rendered)}")
@@ -189,3 +192,94 @@ class NoEnglishLeaksTests(ChineseLogRendererTests):
         self.assertIn("#12345678", output)
         self.assertIn("执行器租约 丢", output)
         self.assertIn("任务租约 在", output)
+
+
+class GatewayLineTests(ChineseLogRendererTests):
+    """★ 网关业务层：「为什么没回这个人」整条链路的日志。
+
+    这一层的事件名已经是整句中文，所以躲过了 `NoEnglishLeaksTests`——但它落在通用兜底上，
+    实时日志里显示成 `本轮不回复，account="wx_1"，会话="张三"，reason="转人工：…"`。
+    人要的是「为什么没回」，看到的是 JSON 键值对（用户 2026-08-29）。
+    """
+
+    def _gateway_keys(self) -> list[str]:
+        import re
+        from pathlib import Path
+
+        config = (Path(__file__).resolve().parent.parent / "wxclient" / "logging_config.py").read_text("utf-8")
+        block = config.split("def _render_gateway_line")[1].split("def _render_event")[0]
+        return re.findall(r'event == "([^"]+)"', block)
+
+    def test_every_branch_matches_a_real_log_call(self) -> None:
+        """★ 分支的键就是 `_log.info(...)` 的第一个参数——那边改措辞，这里必须跟着改。
+
+        对不上不会报错，只会静静地落回 kv 串（正是这次要修的那个样子），所以拿测试钉住。
+        """
+        from pathlib import Path
+
+        gateway = Path(__file__).resolve().parent.parent / "wxclient" / "gateway"
+        source = "\n".join(path.read_text("utf-8") for path in gateway.glob("*.py"))
+        keys = self._gateway_keys()
+
+        self.assertTrue(keys, "一条都没解析出来，多半是 `_render_gateway_line` 改名了")
+        missing = [key for key in keys if f'"{key}"' not in source]
+        self.assertFalse(missing, f"这些分支在网关里找不到对应的日志调用：{missing}")
+
+    def test_no_branch_leaves_a_key_value_tail(self) -> None:
+        """渲染过的行不许再出现 `key="value"` 那截尾巴，也不许把 account 摆给人看。"""
+        rendered = [
+            self.render("读完这个会话", 会话="张三", 读到=6, 新消息=0, 最近一条="嗯嗯"),
+            self.render("本轮不回复", account="wx_1", 会话="张三", reason="转人工：对方在问是不是自动回复"),
+            self.render("出站被守门拦下", account="wx_1", 会话="张三", reason="不在允许发送的时间窗 09:00-20:00"),
+            self.render("已投递回复", account="wx_1", 会话="张三", segments=2),
+        ]
+        for line in rendered:
+            self.assertNotIn('="', line)
+            self.assertNotIn("account", line)
+
+    def test_read_six_but_none_new_says_so(self) -> None:
+        """真机上最迷惑的一条：读到 6 条、一条都不新，于是没有下文（2026-08-14 用户就是这么问的）。"""
+        output = self.render("读完这个会话", 会话="张三", 读到=6, 新消息=0, 最近一条="好的")
+
+        self.assertIn("读完会话「张三」：读到 6 条", output)
+        self.assertIn("没有新消息", output)
+        self.assertIn("这一轮不会回", output)
+
+    def test_not_replying_says_why(self) -> None:
+        output = self.render("本轮不回复", account="wx_1", 会话="张三",
+                             reason="转人工：对方在问是不是自动回复 / 要求真人")
+
+        self.assertEqual(
+            output,
+            "2026-08-08 17:30:00 [信息] 本轮不回复「张三」，原因：转人工：对方在问是不是自动回复 / 要求真人",
+        )
+
+    def test_blocked_by_the_guard_says_which_gate(self) -> None:
+        output = self.render("出站被守门拦下", account="wx_1", 会话="张三",
+                             reason="「发消息」在过去一小时内已做 20 次，达到上限 20")
+
+        self.assertIn("出站被守门拦下：「张三」", output)
+        self.assertIn("达到上限 20", output)
+
+    def test_all_from_self_explains_it_is_not_an_error(self) -> None:
+        output = self.render("这几条全是自己说的，不触发回复，等对方开口", 会话="张三", 条数=2)
+
+        self.assertIn("「张三」这 2 条全是自己说的", output)
+        self.assertIn("等对方开口", output)
+
+    def test_a_batch_left_pending_says_whether_it_counts_as_a_failure(self) -> None:
+        """`retry` 和 `defer` 的区别决定它会不会被放弃，看的人必须分得出来。"""
+        retry = self.render("这一轮没把话说出去，本批留在待处理队列等重投", account="wx_1",
+                            原因="AI 端这一轮没有给出结果", 计入失败=True, 已重试=3)
+        defer = self.render("这一轮没把话说出去，本批留在待处理队列等重投", account="wx_1",
+                            原因="不在允许发送的时间窗 09:00-20:00", 计入失败=False, 已重试=0)
+
+        self.assertIn("计一次失败，已重试 3 次", retry)
+        self.assertIn("不计失败（这类拦截会自己过期）", defer)
+
+    def test_an_unmatched_gateway_event_still_falls_back(self) -> None:
+        """★ 没登记的照旧走通用兜底——加这段不该让别的日志消失。"""
+        output = self.render("清掉过期聊天记录", 条数=5, 保留天数=14)
+
+        self.assertIn("清掉过期聊天记录", output)
+        self.assertIn("条数=5", output)

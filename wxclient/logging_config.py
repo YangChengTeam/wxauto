@@ -163,9 +163,103 @@ class ChineseLogRenderer:
         return f"{prefix} {message}"
 
 
+def _peer(payload: dict[str, Any]) -> str:
+    """这行日志说的是哪个会话。``会话`` 是网关业务层的惯用键，``peer`` 是少数几处的老写法。"""
+    return str(payload.get("会话") or payload.get("peer") or "-")
+
+
+def _render_gateway_line(event: str, payload: dict[str, Any]) -> str | None:
+    """网关业务层（入站轮询 → 派轮 → 出站）的日志。匹配不上返回 ``None``。
+
+    这一层和 ``wechat_api`` 层不一样：``event`` 本身就已经是一句完整中文，缺的只是
+    ``会话="张三"，reason="转人工：…"`` 那截 kv 尾巴。而「为什么没回这个人」整条链路
+    恰恰全靠这几行看——它是唯一一段落到通用兜底、在实时日志里显示成 JSON 键值对的
+    （用户 2026-08-29：不发的原因也该让 Windows 端看得明白）。
+
+    ★ 这里的键就是 `_log.info(...)` 的第一个参数。改那边的措辞要同步改这里；
+      对不上时落回通用兜底，和加这段之前一模一样——不会更糟，只是又变回 kv 串。
+    """
+    peer = _peer(payload)
+
+    # ── 读：这一趟到底读到了什么 ────────────────────────────────
+    if event == "读完这个会话":
+        fresh = int(payload.get("新消息") or 0)
+        latest = payload.get("最近一条") or "（空）"
+        head = f"读完会话「{peer}」：读到 {payload.get('读到', 0)} 条"
+        body = "没有新消息（游标之后一条都没有，所以这一轮不会回）" if fresh == 0 else f"其中 {fresh} 条是新的"
+        return f"{head}，{body}，最近一条：{latest}"
+    if event == "新消息":
+        who = payload.get("谁") or "-"
+        when = payload.get("时间") or "-"
+        return f"新消息：「{peer}」{who} {when}：{payload.get('内容') or ''}"
+    if event == "第一次读这个会话，只接尾部今天、对方发的那几条，更早的算历史不回溯":
+        return (
+            f"第一次读会话「{peer}」：读到 {payload.get('已读到', 0)} 条，"
+            f"只处理尾部今天、对方发的 {payload.get('要处理', 0)} 条，更早的算历史不回溯"
+        )
+    if event == "这些会话正在人工接管，这轮不读":
+        return f"有 {payload.get('数量', 0)} 个会话正在人工接管，这轮连读都不读（招聘老师本人在跟他聊）"
+    if event == "名单较长，本轮只读其中一段":
+        return (
+            f"监听名单共 {payload.get('名单', 0)} 个会话，本轮只读其中 {payload.get('本轮', 0)} 个"
+            f"（轮着来，免得一次开太多聊天窗口）"
+        )
+    if event == "名单里的这个会话读不到，先跳过":
+        return (
+            f"名单里的会话「{peer}」读不到，先跳过：{payload.get('原因') or '-'}"
+            f"（名字要和微信里显示的一字不差）"
+        )
+    if event == "名单里的这个会话又能读了":
+        return f"名单里的会话「{peer}」又能读了"
+    if event == "入站取消息失败":
+        return f"这一趟读消息失败：{payload.get('error') or '-'}（下一趟接着读，消息不会丢）"
+
+    # ── 派轮：读到了新消息，但不一定会触发一轮 ──────────────────
+    if event == "派发一轮给 AI 端":
+        return f"派发一轮给 AI 端：「{peer}」，本轮 {payload.get('条数', 0)} 条消息"
+    if event == "这几条全是自己说的，不触发回复，等对方开口":
+        return (
+            f"「{peer}」这 {payload.get('条数', 0)} 条全是自己说的（含刚发出去又被读回来的），"
+            f"不触发回复，等对方开口"
+        )
+    if event == "上一轮还没跑完，这几条先等着":
+        return f"「{peer}」上一轮还没跑完，这 {payload.get('条数', 0)} 条先等着，等收口后并进下一轮"
+    if event == "命中拒绝表达，已拉黑并停止自动化":
+        return "对方说了拒绝联系的话，已拉黑并停止自动化：这一轮一个字都不发，也不再派轮"
+
+    # ── 出站：AI 给了结果，但不一定发得出去 ────────────────────
+    if event == "本轮不回复":
+        return f"本轮不回复「{peer}」，原因：{payload.get('reason') or '-'}"
+    if event == "出站被守门拦下":
+        return f"出站被守门拦下：「{peer}」，原因：{payload.get('reason') or '-'}"
+    if event == "已投递回复":
+        return f"已投递回复：「{peer}」，共 {payload.get('segments', 0)} 条消息"
+    if event == "按 AI 端提案拉黑":
+        return "按 AI 端提案拉黑该联系人（AI 判定对方明确拒绝）"
+    if event == "状态回写跳过：本机不知道这个会话对应哪个候选人":
+        return f"状态回写跳过：本机不知道会话「{peer}」对应哪个候选人（等他的会话名归位后才写得回去）"
+
+    # ── 欠账：没结论的那几批 ──────────────────────────────────
+    if event == "这一轮没把话说出去，本批留在待处理队列等重投":
+        counted = "计一次失败" if payload.get("计入失败") else "不计失败（这类拦截会自己过期）"
+        return (
+            f"这一轮没把话说出去，本批留在待处理队列等重投：{payload.get('原因') or '-'}"
+            f"，{counted}，已重试 {payload.get('已重试', 0)} 次"
+        )
+    if event == "从待处理队列补投":
+        return f"从待处理队列补投 {payload.get('批次', 0)} 批"
+
+    return None
+
+
 def _render_event(event: str, payload: dict[str, Any]) -> str:
     task_type = _TASK_LABELS.get(str(payload.get("task_type") or ""), "未知任务")
     task_id = _short_id(payload.get("task_id") or payload.get("active_task_id"))
+
+    # 网关业务层先认一遍：那一层的事件名是整句中文，走通用兜底会显示成 kv 串。
+    gateway_line = _render_gateway_line(event, payload)
+    if gateway_line is not None:
+        return gateway_line
 
     if event == "worker.started":
         return f"微信任务执行器已启动，轮询间隔 {payload.get('poll_interval')} 秒"
