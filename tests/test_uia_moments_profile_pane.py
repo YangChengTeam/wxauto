@@ -271,17 +271,31 @@ class ClickingTheMomentsEntryTests(unittest.TestCase):
     def setUp(self) -> None:
         self.driver = UiaWeChatDriver(dry_run=False)
 
-    def test_点的是那个叫朋友圈的_Text(self) -> None:
+    def test_点的是标签右边那块不是标签本身(self) -> None:
+        """★ 点标签没反应（真机三轮，朋友圈窗口一次都没出来）。要点它右边那个 Button。"""
         pane = _Window("mmui::ProfileUniquePop")
-        moments = _Window("mmui::XTextView", "朋友圈")
-        pane.kids = [_Window("mmui::ContactHeadView", "Kk"), moments,
+        row = _Window("mmui::ProfileDetailLineSnsView")
+        label = _Window("mmui::XTextView", "朋友圈")
+        value = _Window("mmui::ProfileDetailValueSnsView")
+        pane.kids = [_Window("mmui::ContactHeadView", "Kk"), row, label, value,
                      _Window("mmui::ProfileBottomButton", "发消息")]
 
         self.driver._click_moments_entry(pane, _Vendor)
 
-        self.assertTrue(moments.clicked, "面板里叫「朋友圈」的那一项就是入口，别挑控件类型")
+        self.assertTrue(value.clicked, "该点的是标签右边那块缩略图")
+        self.assertFalse(label.clicked, "标签点了没用")
+        self.assertFalse(row.clicked, "有右边那块就不用退到整行")
 
-    def test_英文客户端也认(self) -> None:
+    def test_没有右边那块就退回点整行(self) -> None:
+        pane = _Window("mmui::ProfileUniquePop")
+        row = _Window("mmui::ProfileDetailLineSnsView")
+        pane.kids = [row, _Window("mmui::XTextView", "朋友圈")]
+
+        self.driver._click_moments_entry(pane, _Vendor)
+
+        self.assertTrue(row.clicked)
+
+    def test_没有那一行时退回认名字_英文客户端也认(self) -> None:
         pane = _Window("mmui::ProfileUniquePop")
         moments = _Window("mmui::XTextView", "Moments")
         pane.kids = [moments]

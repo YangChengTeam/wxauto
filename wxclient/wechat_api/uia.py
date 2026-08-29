@@ -1018,12 +1018,28 @@ class UiaWeChatDriver:
     def _click_moments_entry(self, pane: Any, Buttons: Any) -> None:
         """点资料面板里的「朋友圈」。
 
-        ★ **认名字，不认控件类型/类名**（2026-08-29 真机实测 4.1.12）：面板里那一项是
-          `mmui::XTextView` 的 **Text**，name=`朋友圈`。vendor 的 `Buttons.MomentsButton`
-          （Button + auto_id=button）和我们原来兜底的 `mmui::ProfileDetailValueSnsView`
-          在这个版本上**都不存在**——面板里只有 ContactHeadView / XTextView /
-          ProfileTextView / ProfileBottomButton 这几种。老判据留着兜底，万一别的版本上真是按钮。
+        ★ **点「朋友圈」标签右边那块，不点标签本身**（2026-08-29 真机 dump 4.1.12）。
+          那一行 `mmui::ProfileDetailLineSnsView`（L626 T304 R858 B369）长这样：
+
+              XVBoxView > XTextView「朋友圈」   L626–R683   ← 只是个标签，点了**没反应**
+              QWidget                          L683–R691
+              ProfileDetailValueSnsView(Button) L691–R858   ← 缩略图那块，点这里
+                XView > AlbumSummary > XImage ×4
+
+          实测：点标签，三轮朋友圈窗口一次都没出来；点右边那个 Button 2/2 成，
+          点整行（中心 x=742，正好落在那个 Button 里）也是 2/2 成。
+          首选那个 Button——它是个 Button，比「整行中心」少依赖一个「中心落在哪」的假设；
+          整行留作退路，认名字再退一步。
         """
+        for wanted in ("mmui::ProfileDetailValueSnsView", "SnsView"):
+            for node in pane.descendants():
+                try:
+                    class_name = node.element_info.class_name or ""
+                    if class_name == wanted or (wanted == "SnsView" and wanted in class_name):
+                        node.click_input()
+                        return
+                except Exception:
+                    continue
         for node in pane.descendants():
             try:
                 if (node.element_info.name or "").strip() in self.MOMENTS_LABELS:
