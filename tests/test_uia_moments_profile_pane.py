@@ -57,34 +57,59 @@ class _Desktop:
 
 
 class _Rect:
+    """真机 4.1.12 的左侧工具栏：L546 T160 R606 B849。"""
+
     top = 160
+    left = 546
+
+    @staticmethod
+    def width() -> int:
+        return 60
 
     @staticmethod
     def mid_point() -> Any:
         return type("P", (), {"x": 576})
 
 
-class _Toolbar:
-    @staticmethod
-    def rectangle() -> Any:
-        return _Rect()
-
-
-class _Mouse:
-    """点一下 = 开关：面板开着就收走，没开就按 `opens` 给的剧本决定这一下灵不灵。"""
+class _Clicker:
+    """记录点了哪儿的公共部分。开关语义：面板开着就收走，没开就照剧本决定灵不灵。"""
 
     def __init__(self, desktop: _Desktop, opens: list[bool]) -> None:
         self._desktop = desktop
-        self._opens = list(opens)
-        self.clicks: list[tuple[int, int]] = []
+        self._opens = opens
+        self.clicks: list[Any] = []
 
-    def click(self, coords: tuple[int, int]) -> None:
-        self.clicks.append(coords)
+    def _fire(self, where: Any) -> None:
+        self.clicks.append(where)
         if self._desktop.open:
             self._desktop.open.clear()
             return
         if self._opens and self._opens.pop(0):
             self._desktop.open.append(_Window(PANE_CLASS))
+
+
+class _Toolbar(_Clicker):
+    """工具栏控件本体。`click_input` 会先把窗口提到前台——这正是要的那一下。"""
+
+    def __init__(self, desktop: _Desktop, opens: list[bool], *, broken: bool = False) -> None:
+        super().__init__(desktop, opens)
+        self._broken = broken
+
+    @staticmethod
+    def rectangle() -> Any:
+        return _Rect()
+
+    def click_input(self, coords: tuple[int, int]) -> None:
+        if self._broken:
+            raise RuntimeError("控件没了")
+        self._fire(("控件", coords))
+
+
+class _Mouse(_Clicker):
+    """屏幕绝对坐标那条兜底路。"""
+
+    def click(self, coords: tuple[int, int]) -> None:
+        self._fire(("屏幕", coords))
 
 
 class OpeningTheProfilePaneTests(unittest.TestCase):
@@ -101,17 +126,21 @@ class OpeningTheProfilePaneTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _open(self, opens: list[bool]) -> tuple[Any, _Mouse]:
-        mouse = _Mouse(self.desktop, opens)
-        pane = self.driver._open_profile_pane(self.desktop, _Toolbar(), mouse)
-        return pane, mouse
+    def _open(self, opens: list[bool], *, broken: bool = False) -> tuple[Any, _Clicker]:
+        """两条路共用一份剧本：谁点的都算一次，`clicks` 里带着是哪条路。"""
+        script = list(opens)
+        toolbar = _Toolbar(self.desktop, script, broken=broken)
+        mouse = _Mouse(self.desktop, script)
+        pane = self.driver._open_profile_pane(self.desktop, toolbar, mouse)
+        toolbar.clicks.extend(mouse.clicks)
+        return pane, toolbar
 
     def test_一下就开出来时只点一次(self) -> None:
         pane, mouse = self._open([True])
 
         self.assertEqual(pane.element_info.class_name, PANE_CLASS)
         self.assertEqual(len(mouse.clicks), 1)
-        self.assertEqual(mouse.clicks[0], (576, 212), "还是头像那个坐标，路没换")
+        self.assertEqual(mouse.clicks[0], ("控件", (30, 52)), "走控件坐标，顺带把微信提到前台")
 
     def test_第一下没生效就再点一次(self) -> None:
         """★ 真机第 3 轮的那一下。同坐标连点会被合成双击吞掉一次。"""
@@ -153,6 +182,37 @@ class OpeningTheProfilePaneTests(unittest.TestCase):
         with self.assertRaises(WeChatApiError):
             self.driver._wait_profile_pane(self.desktop, None)
         self.assertGreaterEqual(self.clock[0] - started, 3.2, "至少要等过一次查询的耗时")
+
+
+class ClickingTheAvatarTests(unittest.TestCase):
+    """★ 点头像**不能盲点屏幕坐标**。
+
+    2026-08-29 真机：那台机器上 Chrome 最大化盖在微信上面，`mouse.click(coords=…)`
+    那一下点进了 Chrome —— 按微信窗口矩形截出来的图是一个 Chrome 页面，鼠标最后停在
+    (901,1071)。同一轮里点「通讯录」是好的，因为 `click_input()` 会先把窗口提到前台。
+    这就是线上「WeChat profile pane did not appear」的真因。
+    """
+
+    def setUp(self) -> None:
+        self.driver = UiaWeChatDriver(dry_run=False)
+        self.desktop = _Desktop()
+
+    def test_优先走控件那条_它会把微信提到前台(self) -> None:
+        toolbar = _Toolbar(self.desktop, [True])
+        mouse = _Mouse(self.desktop, [])
+
+        self.driver._click_avatar(toolbar, mouse)
+
+        self.assertEqual(toolbar.clicks, [("控件", (30, 52))])
+        self.assertEqual(mouse.clicks, [], "别再盲点屏幕坐标——盖住微信就点进别人家了")
+
+    def test_控件那条不行才退回屏幕坐标(self) -> None:
+        toolbar = _Toolbar(self.desktop, [True], broken=True)
+        mouse = _Mouse(self.desktop, [True])
+
+        self.driver._click_avatar(toolbar, mouse)
+
+        self.assertEqual(mouse.clicks, [("屏幕", (576, 212))], "兜底还在，坐标也没变")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1007,6 +1007,10 @@ class UiaWeChatDriver:
             return None
         return None
 
+    #: 头像相对左侧工具栏顶边的偏移。工具栏从 `top` 起，第一个按钮「微信」在 `top+96`
+    #: （真机实测 4.1.12：工具栏 T160、微信按钮 T256），头像就在这段空白里。
+    AVATAR_OFFSET_Y = 52
+
     #: 个人资料面板的 class。title 跟客户端语言走（4.1.12 上是 `Weixin`），所以**只认 class**。
     PROFILE_PANE_CLASS = "mmui::ProfileUniquePop"
 
@@ -1062,19 +1066,39 @@ class UiaWeChatDriver:
             logger.info("资料面板已经开着，这次不点头像（点了反而是关掉它）")
             return pane
 
-        rect = toolbar.rectangle()
-        coords = (rect.mid_point().x, rect.top + 52)
         for attempt in (1, 2):
-            mouse.click(coords=coords)
+            self._click_avatar(toolbar, mouse)
             try:
                 return self._wait_profile_pane(desktop, None, timeout=4.0)
             except WeChatApiError:
                 if attempt == 2:
                     raise
-                logger.info("点了头像但资料面板没出来，再点一次", 坐标=coords)
+                logger.info("点了头像但资料面板没出来，再点一次")
                 # 隔开一点，免得两下被合成双击（双击会被吞掉一次）
                 time.sleep(1.0)
         raise WeChatApiError("WeChat profile pane did not appear")
+
+    def _click_avatar(self, toolbar: Any, mouse: Any) -> None:
+        """点左侧工具栏顶上的头像。它**不是一个 UIA 控件**（工具栏的子控件只有
+        微信/通讯录/收藏/视频号/游戏中心/小程序面板/手机/更多），所以只能按位置点。
+
+        ★ 但**不能用屏幕绝对坐标盲点**（2026-08-29 真机实测，这就是线上那条
+          「WeChat profile pane did not appear」的真因）：那台机器上 Chrome 最大化盖在
+          微信上面，`mouse.click(coords=...)` 那一下**点进了 Chrome**，微信毫不知情。
+          同一轮里点「通讯录」却是好的——因为 `click_input()` 会先 `set_focus()`
+          把窗口提到前台，再按**控件自己的**矩形算坐标。截图为证：按微信窗口的矩形截出来
+          是一个 Chrome 页面。
+
+        所以这里走 `toolbar.click_input(coords=…)`（相对工具栏左上角），
+        顺带把微信提到前台。老的绝对坐标只作兜底。
+        """
+        rect = toolbar.rectangle()
+        try:
+            toolbar.click_input(coords=(rect.width() // 2, self.AVATAR_OFFSET_Y))
+            return
+        except Exception as exc:  # noqa: BLE001 —— 兜底那条还能试，别在这儿断掉
+            logger.info("按控件坐标点头像没成，退回屏幕坐标", 原因=str(exc))
+        mouse.click(coords=(rect.mid_point().x, rect.top + self.AVATAR_OFFSET_Y))
 
     def _normalize_moments_media_paths(self, medias: list[str]) -> list[str]:
         valid_paths: list[str] = []
