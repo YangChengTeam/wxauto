@@ -158,11 +158,14 @@ class OpeningTheProfilePaneTests(unittest.TestCase):
         self.assertEqual(pane.element_info.class_name, PANE_CLASS)
         self.assertEqual(mouse.clicks, [], "面板就在眼前，一下都不该点")
 
-    def test_两下都没开出来才报错(self) -> None:
+    def test_每次都没开出来才报错(self) -> None:
+        toolbar = _Toolbar(self.desktop, [])   # 剧本空的 = 每一下都不灵
         with self.assertRaises(WeChatApiError) as caught:
-            self._open([False, False])
+            self.driver._open_profile_pane(self.desktop, toolbar, _Mouse(self.desktop, []))
 
         self.assertIn("profile pane", str(caught.exception))
+        self.assertEqual(len(toolbar.clicks), UiaWeChatDriver.AVATAR_CLICK_TRIES,
+                         "报错之前该点的几次都要点满")
 
     def test_从头到尾不碰那条会走全树的判据(self) -> None:
         """慢的是查询本身（3 秒/次），不是面板。顶层枚举够用。"""

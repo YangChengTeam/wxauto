@@ -1011,6 +1011,9 @@ class UiaWeChatDriver:
     #: （真机实测 4.1.12：工具栏 T160、微信按钮 T256），头像就在这段空白里。
     AVATAR_OFFSET_Y = 52
 
+    #: 头像最多点几次。真机上偶尔一下不生效（前台刚切过来、或者被合成双击吞掉）。
+    AVATAR_CLICK_TRIES = 3
+
     #: 个人资料面板的 class。title 跟客户端语言走（4.1.12 上是 `Weixin`），所以**只认 class**。
     PROFILE_PANE_CLASS = "mmui::ProfileUniquePop"
 
@@ -1066,14 +1069,15 @@ class UiaWeChatDriver:
             logger.info("资料面板已经开着，这次不点头像（点了反而是关掉它）")
             return pane
 
-        for attempt in (1, 2):
+        last = self.AVATAR_CLICK_TRIES
+        for attempt in range(1, last + 1):
             self._click_avatar(toolbar, mouse)
             try:
                 return self._wait_profile_pane(desktop, None, timeout=4.0)
             except WeChatApiError:
-                if attempt == 2:
+                if attempt == last:
                     raise
-                logger.info("点了头像但资料面板没出来，再点一次")
+                logger.info("点了头像但资料面板没出来，再点一次", 第几次=attempt)
                 # 隔开一点，免得两下被合成双击（双击会被吞掉一次）
                 time.sleep(1.0)
         raise WeChatApiError("WeChat profile pane did not appear")
@@ -1094,6 +1098,13 @@ class UiaWeChatDriver:
         """
         rect = toolbar.rectangle()
         try:
+            # 先把窗口提到前台并让它稳一下再点：`click_input` 自己也会 set_focus，
+            # 但刚被提上来的窗口马上接到点击时会漏掉一下（真机 5 轮里漏过 1 轮）。
+            try:
+                toolbar.set_focus()
+                time.sleep(0.4)
+            except Exception:  # noqa: BLE001 —— 提前台失败不影响点，继续
+                pass
             toolbar.click_input(coords=(rect.width() // 2, self.AVATAR_OFFSET_Y))
             return
         except Exception as exc:  # noqa: BLE001 —— 兜底那条还能试，别在这儿断掉
