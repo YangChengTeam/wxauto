@@ -99,13 +99,15 @@ FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR", "每小时加好友上限",
           "加好友最招风控，一小时总共加几个", section="sched", default="5"),
     Field("WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS", "加好友最小间隔",
-          "两次加好友至少隔多久；调小是往风险那侧走，0=不限", section="sched", unit="秒",
+          "两次加好友至少隔多久", section="sched", unit="秒",
           default="300"),
-    # 090：默认关。放开 fail-closed 名单会让「装上就自动回复任何人」重新成为可能
-    # （069 / 需求文档 §13.1），所以必须是专员在这里主动打开的一次知情选择。
+    # 090：**默认开**（用户裁决 2026-08-29）。原来默认关，理由是「装上不会自动回复
+    # 家人朋友」——但真实用法里主动来问的人正是要接的那一类，默认关等于每台机器装完
+    # 都要有人记得来打开一次。真正兜住误伤的是后面那几道确定性闸（判不出在找工作
+    # 就一条都不发），不是这个开关默认值。不想接的人在这里关掉即可。
     Field("WXCLIENT_GATEWAY_STRANGER_INTAKE", "接待主动来问的陌生人",
-          "开了之后，主动加你、劳小智里还没有档案的人也会被自动接待；判得出他在找工作才会回话",
-          kind="bool", section="sched", default="0"),
+          "主动加你、劳小智里还没有档案的人也会被自动接待；判得出他在找工作才会回话",
+          kind="bool", section="sched", default="1"),
     Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动自动运行服务",
           kind="bool", section="boot", default="1"),
     Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", "启动后最小化到系统托盘",
