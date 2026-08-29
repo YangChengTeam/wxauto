@@ -42,7 +42,9 @@ class SlowRuntime:
         if self._boom:
             raise RuntimeError("微信没登录")
         self.calls.append(dict(payload or {}))
-        return {"result": dict(self._result), "task_id": f"t{len(self.calls)}"}
+        # 形状照抄 `WxRuntime.task_to_dict`：**必须带 status**（见 e2e 里同一条注释）。
+        return {"status": "succeeded", "result": dict(self._result),
+                "task_id": f"t{len(self.calls)}"}
 
 
 class ReservationTestCase(unittest.IsolatedAsyncioTestCase):

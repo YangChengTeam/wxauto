@@ -437,6 +437,26 @@ class CommandExecutor:
                 return CommandResult(command_id, "failed", f"{type(exc).__name__}: {exc}")
 
             result = (raw or {}).get("result") or {}
+
+            # ★ 「submit 没抛异常」不等于「这件事做成了」（2026-08-29 真机事故）：
+            #   队列的终态里还有 failed / blocked / cancelled，超时更是压根没有结论，
+            #   这些都是**正常返回**一个带 status 的 dict。原来这里不看 status 直接
+            #   `settle` + 报 done —— 发朋友圈死在「profile pane did not appear」，
+            #   AI 端却收到 done，以为已经发出去了。同 `_note_message_sent` 的口径。
+            status = str((raw or {}).get("status") or "")
+            if status != "succeeded":
+                why = str((raw or {}).get("last_error") or "").strip()
+                if (raw or {}).get("timed_out"):
+                    # 没结论：微信那边**可能已经动过**了，额度绝不能还回去（还回去 =
+                    # 下一条指令拿它再做一次同样的动作）。只把「不知道」如实报上去。
+                    reservation.settle(reservation.granted)
+                    message = why or "等超时了，没等到微信任务的结论"
+                else:
+                    reservation.release()   # 有明确终态且不是成功 —— 一件没做成，全额还回去
+                    message = why or f"微信任务{status or 'unknown'}"
+                _log.warning("微信任务没有成功", op=op, status=status or "unknown", error=why)
+                return CommandResult(command_id, "failed", message)
+
             if spec.writes:
                 # 额度在动微信**之前**就占住了（见上），这里只按真实用量结算：
                 # 预留 5 实际通过 2 → 还回 3。做多少记多少，两个方向都不许含糊。

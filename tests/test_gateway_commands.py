@@ -93,6 +93,71 @@ class CommandTestCase(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TaskFailureTests(CommandTestCase):
+    """微信任务没成，回执就不能说 done。
+
+    2026-08-29 线上：`发布朋友圈#b390a5ee` 死在「WeChat profile pane did not appear」，
+    队列里明明是 `failed`，AI 端收到的却是 `done` —— 因为执行器只在 `submit` **抛异常**
+    时才算失败，而队列的终态是**正常返回**的一个 dict。同 2026-08-27 加好友那条
+    （`5a85171`）是一个毛病：那次只在 `_friend_state` 里补了 status 判断，没往上收。
+    """
+
+    async def test_失败的任务回执是_failed_不是_done(self) -> None:
+        runtime = FakeRuntime(status="failed")
+        result = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "post_moments",
+            "args": {"text": "今天招工"},
+        })
+        self.assertEqual(result.status, "failed")
+
+    async def test_失败原因原样带回去(self) -> None:
+        class _Rt(FakeRuntime):
+            async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
+                await super().submit(task_type, payload, confirmation=confirmation)
+                return {"status": "failed", "last_error": "WeChat profile pane did not appear"}
+
+        result = await self._executor(_Rt()).execute({
+            "command_id": "c1", "op": "post_moments", "args": {"text": "今天招工"},
+        })
+        self.assertIn("profile pane", result.reason)
+
+    async def test_没做成就把额度还回去(self) -> None:
+        """额度是动微信**之前**占的。一件没做成还扣着，等于一次失败白烧一个名额。"""
+        ex = self._executor(FakeRuntime(status="failed"), max_sends_per_hour=1)
+        first = await ex.execute({
+            "command_id": "c1", "op": "send_message",
+            "args": {"to": "张三", "text": "在吗"},
+        })
+        self.assertEqual(first.status, "failed")
+
+        ok = await self._executor(FakeRuntime(), max_sends_per_hour=1).execute({
+            "command_id": "c2", "op": "send_message",
+            "args": {"to": "李四", "text": "在吗"},
+        })
+        self.assertEqual(ok.status, "done", ok.reason)
+
+    async def test_等超时了不还额度_因为微信可能已经动过(self) -> None:
+        """★ 「没结论」和「没做成」是两件事。超时那一轮微信**可能已经发出去了**，
+        额度还回去 = 下一条指令拿它把同样的动作再做一遍。只把「不知道」如实报上去。"""
+        class _Rt(FakeRuntime):
+            async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
+                await super().submit(task_type, payload, confirmation=confirmation)
+                return {"status": "running", "timed_out": True}
+
+        ex = self._executor(_Rt(), max_sends_per_hour=1)
+        first = await ex.execute({
+            "command_id": "c1", "op": "send_message",
+            "args": {"to": "张三", "text": "在吗"},
+        })
+        self.assertEqual(first.status, "failed")
+
+        again = await self._executor(FakeRuntime(), max_sends_per_hour=1).execute({
+            "command_id": "c2", "op": "send_message",
+            "args": {"to": "李四", "text": "在吗"},
+        })
+        self.assertEqual(again.status, "rejected", "名额没还，这条该被配额挡住")
+
+
 class WhitelistTests(CommandTestCase):
     async def test_known_op_is_translated_to_a_queue_task(self) -> None:
         runtime = FakeRuntime()
@@ -916,10 +981,11 @@ class AddFriendPacingTests(CommandTestCase):
 
     async def test_failures_do_not_stretch_the_interval(self) -> None:
         """★ 连着加不上也**不**放慢。这条是上面那条的另一面，专门守「别把退避加回来」。"""
-        runtime = FakeRuntime(status="failed", result={})
-        await self._add(runtime, "c1")
+        failed = await self._add(FakeRuntime(status="failed", result={}), "c1")
+        self.assertEqual(failed.status, "failed", "前提：这一次确实没加上")
+
         self.now += timedelta(seconds=301)
-        third = await self._add(runtime, "c2", "13800000002")
+        third = await self._add(FakeRuntime(), "c2", "13800000002")
         self.assertEqual(third.status, "done", third.reason)
 
     async def test_zero_turns_the_gate_off(self) -> None:

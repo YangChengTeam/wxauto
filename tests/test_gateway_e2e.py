@@ -527,7 +527,9 @@ class CommandRuntime:
 
     async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
         self.calls.append((task_type, dict(payload or {})))
-        return {"result": {"ok": True}}
+        # 形状照抄 `WxRuntime.task_to_dict`：**必须带 status**——队列的终态里还有
+        # failed / blocked / cancelled，执行器要靠它分辨「做成了」和「没抛异常」。
+        return {"status": "succeeded", "result": {"ok": True}}
 
 
 class CommandChannelTests(unittest.IsolatedAsyncioTestCase):

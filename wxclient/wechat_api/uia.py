@@ -923,12 +923,8 @@ class UiaWeChatDriver:
             main_window = Navigator.open_weixin(is_maximize=False)
             toolbar = main_window.child_window(**Main_window.Toolbar)
 
-            rect = toolbar.rectangle()
-            mouse.click(coords=(rect.mid_point().x, rect.top + 52))
-            time.sleep(1)
-
             # 2. 在弹出的 profile 面板中点「朋友圈」
-            profile_pane = self._wait_profile_pane(desktop, Windows)
+            profile_pane = self._open_profile_pane(desktop, toolbar, mouse)
             try:
                 moments_btn = profile_pane.child_window(**Buttons.MomentsButton)
                 if moments_btn.exists(timeout=2):
@@ -1011,22 +1007,73 @@ class UiaWeChatDriver:
             return None
         return None
 
-    def _wait_profile_pane(self, desktop: Any, Windows: Any) -> Any:
-        selectors = [
-            Windows.PopUpProfileWindow,
-            {
-                "control_type": "Window",
-                "class_name": "mmui::ProfileUniquePop",
-                "top_level_only": False,
-            },
-        ]
-        for selector in selectors:
+    #: 个人资料面板的 class。title 跟客户端语言走（4.1.12 上是 `Weixin`），所以**只认 class**。
+    PROFILE_PANE_CLASS = "mmui::ProfileUniquePop"
+
+    def _profile_pane_now(self, desktop: Any) -> Any | None:
+        """此刻桌面上开着的资料面板，没有就 None。**只枚举顶层窗口**。
+
+        ★ 为什么不用 `desktop.window(**判据).exists(timeout=2)`（2026-08-29 真机实测）：
+          vendor 那条判据带 `top_level_only=False`，于是 pywinauto 要走一遍整个桌面的
+          控件树。这台机器上开着 Chrome / 钉钉 / 一堆资源管理器窗口，**一次查询实测 3.0～3.2 秒**，
+          而调用方只给了 `timeout=2` —— 预算比一次尝试还短，等于只查一次、没有重试，
+          面板晚出来一点就直接判死。而面板本身**就是个顶层窗口**（真机枚举确认），
+          顶层枚举一瞬间就回来了。
+        """
+        try:
+            for window in desktop.windows():
+                try:
+                    if window.element_info.class_name == self.PROFILE_PANE_CLASS:
+                        return window
+                except Exception:
+                    continue
+        except Exception:
+            return None
+        return None
+
+    def _wait_profile_pane(self, desktop: Any, Windows: Any, timeout: float = 8.0) -> Any:
+        """等资料面板出来。轮询顶层窗口，别再用那条会走全树的判据。
+
+        `Windows` 已经不用了，留着是为了不改调用方签名（vendor 的判据表见
+        `third_party/pywechat/pyweixin/Uielements.py::PopUpProfileWindow`）。
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            pane = self._profile_pane_now(desktop)
+            if pane is not None:
+                return pane
+            if time.monotonic() >= deadline:
+                raise WeChatApiError("WeChat profile pane did not appear")
+            time.sleep(0.3)
+
+    def _open_profile_pane(self, desktop: Any, toolbar: Any, mouse: Any) -> Any:
+        """点头像把资料面板叫出来。
+
+        ★ **头像那一下是个开关**（2026-08-29 真机实测）：面板开着的时候再点一次是把它关掉。
+          上一趟如果死在后面某一步、把面板留在了屏幕上，这一趟一点就关，
+          现象就是「WeChat profile pane did not appear」，而且会自己反复下去。
+          所以先看它在不在，在就直接用，不点。
+
+        ★ 点完没出来要**再点一次**：三轮实测里有一轮第一下没生效（同一坐标的连续点击
+          会被当成双击吞掉一次）。两次之间隔开，别再凑成一个双击。
+        """
+        pane = self._profile_pane_now(desktop)
+        if pane is not None:
+            logger.info("资料面板已经开着，这次不点头像（点了反而是关掉它）")
+            return pane
+
+        rect = toolbar.rectangle()
+        coords = (rect.mid_point().x, rect.top + 52)
+        for attempt in (1, 2):
+            mouse.click(coords=coords)
             try:
-                window = desktop.window(**selector)
-                if window.exists(timeout=2):
-                    return window
-            except Exception:
-                continue
+                return self._wait_profile_pane(desktop, None, timeout=4.0)
+            except WeChatApiError:
+                if attempt == 2:
+                    raise
+                logger.info("点了头像但资料面板没出来，再点一次", 坐标=coords)
+                # 隔开一点，免得两下被合成双击（双击会被吞掉一次）
+                time.sleep(1.0)
         raise WeChatApiError("WeChat profile pane did not appear")
 
     def _normalize_moments_media_paths(self, medias: list[str]) -> list[str]:
