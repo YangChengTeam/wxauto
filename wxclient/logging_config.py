@@ -163,6 +163,20 @@ class ChineseLogRenderer:
         return f"{prefix} {message}"
 
 
+def _attempt_tail(payload: dict[str, Any]) -> str:
+    """一轮失败时的共同尾巴：第几次、什么原因、等了多久、接下来会怎样。
+
+    第 1 次和第 2 次的**后果不一样**，看的人必须分得出来：第 1 次还会重连再试，
+    第 2 次就是这一轮到此为止、消息留到下一轮重投。
+    """
+    attempt = int(payload.get("第几次") or 1)
+    after = "重连后再试一次" if attempt == 1 else "两次都没跑通，这批消息留到下一轮重投"
+    return (
+        f"原因：{payload.get('原因') or '-'}"
+        f"（第 {attempt} 次，已用 {payload.get('已用秒', 0)} 秒，{after}）"
+    )
+
+
 def _peer(payload: dict[str, Any]) -> str:
     """这行日志说的是哪个会话。``会话`` 是网关业务层的惯用键，``peer`` 是少数几处的老写法。"""
     return str(payload.get("会话") or payload.get("peer") or "-")
@@ -226,6 +240,54 @@ def _render_gateway_line(event: str, payload: dict[str, Any]) -> str | None:
         return f"「{peer}」上一轮还没跑完，这 {payload.get('条数', 0)} 条先等着，等收口后并进下一轮"
     if event == "命中拒绝表达，已拉黑并停止自动化":
         return "对方说了拒绝联系的话，已拉黑并停止自动化：这一轮一个字都不发，也不再派轮"
+
+    # ── 和 AI 端的连接：断没断、什么时候换的票 ──────────────────
+    if event == "已连接 AI 端":
+        return "已连上 AI 端"
+    if event == "已为该账号建立 AI 端连接":
+        return "这个微信账号和 AI 端的连接已建立"
+    if event == "读循环结束":
+        # ★ 这条就是「和 AI 端断了」。断开时在跑的那一轮会当场失败，消息留着重投。
+        return f"和 AI 端的连接断了：{payload.get('error') or '（对方关闭）'}（在跑的那一轮作废，消息留着重投）"
+    if event == "AI 端连接不可用":
+        return f"连不上 AI 端：{payload.get('error') or '-'}（这期间收到的消息都会攒着，通了再回）"
+    if event == "已换取短票":
+        return "已向业务后端换到新票，可以连 AI 端了"
+    if event == "已读取本地联调票":
+        return "用的是本地联调票（不是从业务后端换的）"
+    if event == "换票请求失败":
+        return f"换票失败，连不了 AI 端：{payload.get('error') or '-'}"
+    if event == "旧会话接不回，改为新建":
+        return f"「{peer}」原来那条会话接不回来了，改为新建一条（这个人之前聊的上下文会丢）"
+
+    # ── 一轮进行中：AI 端在干什么（这一段是实时的，一轮几十秒都有下文）──
+    if event == "喂给 AI 端":
+        known = "对面已归位到候选人" if payload.get("认得这个人") else "还不知道对面是哪个候选人"
+        again = f"，第 {payload.get('第几次')} 次尝试" if int(payload.get("第几次") or 1) > 1 else ""
+        return (
+            f"喂给 AI 端：「{peer}」，本轮 {payload.get('本轮', 0)} 条 + "
+            f"历史 {payload.get('历史行', 0)} 行，{known}{again}"
+        )
+    if event == "AI 端阶段":
+        return f"AI 端：{payload.get('阶段') or '-'}"
+    if event == "AI 端还在跑这一轮":
+        return (
+            f"AI 端还在跑这一轮：「{peer}」，已 {payload.get('已用秒', 0)} 秒"
+            f"（超过 {payload.get('上限秒', 0)} 秒算超时，会重连再试一次）"
+        )
+    if event == "AI 端这一轮跑完了":
+        got = "拿到卡片" if payload.get("有卡片") else "但没有卡片（出站那步会说明为什么不回）"
+        return f"AI 端这一轮跑完了：「{peer}」，用时 {payload.get('已用秒', 0)} 秒，{got}"
+    if event == "AI 端返回错误":
+        return (
+            f"AI 端返回错误：「{peer}」，错误码 {payload.get('code') or '-'}，"
+            f"原因：{payload.get('原因') or '-'}（用时 {payload.get('已用秒', 0)} 秒；"
+            f"这一轮没有结论，消息留着下一轮重投）"
+        )
+    if event == "这一轮没跑通":
+        return f"这一轮没跑通：「{peer}」，{_attempt_tail(payload)}"
+    if event == "AI 端不认这条会话了，清掉重来":
+        return f"AI 端不认「{peer}」这条会话了，已清掉重建，{_attempt_tail(payload)}"
 
     # ── 出站：AI 给了结果，但不一定发得出去 ────────────────────
     if event == "本轮不回复":

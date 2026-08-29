@@ -21,6 +21,9 @@ class TurnScript:
     """一轮的回放脚本。"""
 
     deltas: list[str] = field(default_factory=list)
+    stages: list[dict[str, Any]] = field(default_factory=list)
+    """一轮里报的阶段（055）。真 AI 端发的是 `status{state:"working", stage:{key,text}}`，
+    这里照同一个形状回放——网关侧的 `on_stage` 就是靠它把「AI 现在在干什么」打到实时日志。"""
     cards: list[dict[str, Any]] = field(default_factory=list)
     elapsed_ms: int = 1234
     error: dict[str, Any] | None = None
@@ -177,6 +180,11 @@ class FakeAgentServer:
             await self._emit(websocket, ack, "error", {"session_id": session_id, **script.error})
             return
 
+        for stage in script.stages:
+            await self._emit(
+                websocket, ack, "status",
+                {"session_id": session_id, "state": "working", "stage": stage},
+            )
         for delta in script.deltas:
             await self._emit(
                 websocket, ack, "text.delta", {"session_id": session_id, "delta": delta}

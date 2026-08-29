@@ -16,9 +16,12 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from fake_agent_ws import FakeAgentServer, TurnScript
+from structlog.testing import capture_logs
 
+import wxclient.gateway.runner as runner_module
 from wxclient.gateway import (
     GatewayRunner,
     GatewaySettings,
@@ -411,6 +414,87 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.stop()
 
+
+    # ─────────────────── 一轮进行中：Windows 端看得见 ───────────────────
+    #
+    # ★ 这一段守的是「读到了消息、没有回复、那台电脑上什么也没有」（用户 2026-08-29）。
+    #   一轮在 AI 端要跑几十秒，超时 180s 还会重试一次——中间一个字都没有的话，现场
+    #   分不出是 AI 在想、卡住了、还是整条链路断了。三条：喂了什么、跑到哪一阶、
+    #   还在跑多久了、最后成没成。
+
+    async def test_the_windows_log_follows_a_turn_from_start_to_finish(self) -> None:
+        """一轮的每一步都要落到实时日志：喂进去什么 → AI 跑到哪一阶 → 跑完用了多久。"""
+        script = TurnScript(
+            stages=[{"key": "thinking", "text": "正在思考"},
+                    {"key": "reading", "text": "正在读取资料"}],
+            cards=[wechat_card(["你好"])],
+        )
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}, turn_script=script) as server:
+            source = ScriptedSource([[inbound("还招人吗", msg_id="m1", at=T0)], []])
+            runner = self._runner(server, source, RecordingSink())
+            try:
+                await runner.tick()
+                with capture_logs() as logs:
+                    await self._advance_and_tick(runner, 10)
+                events = [entry["event"] for entry in logs]
+
+                self.assertIn("喂给 AI 端", events)
+                self.assertIn("AI 端这一轮跑完了", events)
+                # 阶段是 AI 端本来就在流里发的（055），网关此前**整个丢掉**。
+                stages = [entry["阶段"] for entry in logs if entry["event"] == "AI 端阶段"]
+                self.assertEqual(stages, ["正在思考", "正在读取资料"])
+                fed = next(entry for entry in logs if entry["event"] == "喂给 AI 端")
+                self.assertEqual(fed["会话"], PEER)
+                self.assertEqual(fed["本轮"], 1)
+                self.assertEqual(fed["第几次"], 1)
+            finally:
+                await runner.stop()
+
+    async def test_an_ai_error_names_the_code_and_the_message(self) -> None:
+        """AI 端报错时，原来只记了 code——现场看到一个错误码，猜不出发生了什么。"""
+        script = TurnScript(error={"code": "upstream_error", "message": "上游模型繁忙"})
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}, turn_script=script) as server:
+            source = ScriptedSource([[inbound("还招人吗", msg_id="m1", at=T0)], []])
+            runner = self._runner(server, source, RecordingSink())
+            try:
+                await runner.tick()
+                with capture_logs() as logs:
+                    await self._advance_and_tick(runner, 10)
+
+                failed = next(e for e in logs if e["event"] == "AI 端返回错误")
+                self.assertEqual(failed["code"], "upstream_error")
+                self.assertEqual(failed["原因"], "上游模型繁忙")
+                self.assertEqual(failed["会话"], PEER)
+            finally:
+                await runner.stop()
+
+    async def test_a_slow_turn_keeps_saying_it_is_still_running(self) -> None:
+        """★ 这条最要紧：AI 端不吭声的那几分钟里，屏幕上不能是空的。
+
+        把心跳节拍调到 50ms、让这一轮拖 400ms，就能在测试里跑出真机上「等了三分钟」
+        的形状——心跳必须是**真接在这一轮上**的，不是一个能单独跑通的协程。
+        """
+        script = TurnScript(cards=[wechat_card(["你好"])], delay_seconds=0.4)
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}, turn_script=script) as server:
+            source = ScriptedSource([[inbound("还招人吗", msg_id="m1", at=T0)], []])
+            runner = self._runner(server, source, RecordingSink())
+            try:
+                await runner.tick()
+                with (patch.object(runner_module, "TURN_HEARTBEAT_SECONDS", 0.05),
+                      capture_logs() as logs):
+                    await self._advance_and_tick(runner, 10)
+
+                beats = [e for e in logs if e["event"] == "AI 端还在跑这一轮"]
+                self.assertTrue(beats, "一轮拖了 400ms、心跳 50ms，一声都没喊")
+                self.assertEqual(beats[0]["会话"], PEER)
+                self.assertEqual(beats[0]["上限秒"], 10)   # settings 里的 turn_timeout
+                # 跑完就得停：心跳不能在这一轮收口之后还继续喊。
+                self.assertLess(
+                    [e["event"] for e in logs].index("AI 端这一轮跑完了"),
+                    len(logs) - 1 if logs[-1]["event"] == "AI 端还在跑这一轮" else len(logs),
+                )
+            finally:
+                await runner.stop()
 
     # ────────────────────────── 建连与保活 ──────────────────────────
 

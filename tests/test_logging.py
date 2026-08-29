@@ -283,3 +283,72 @@ class GatewayLineTests(ChineseLogRendererTests):
 
         self.assertIn("清掉过期聊天记录", output)
         self.assertIn("条数=5", output)
+
+class TurnProgressLineTests(ChineseLogRendererTests):
+    """★ 一轮进行中的实时日志（用户 2026-08-29）。
+
+    一轮在 AI 端要跑几十秒，超时 180s 还会重连再试一次。原来这段时间里那台 Windows
+    电脑上一个字都没有——「读到了消息、没有回复、屏幕上什么也没有」就是这么来的。
+    """
+
+    def test_it_says_what_was_fed_to_the_ai(self) -> None:
+        first = self.render("喂给 AI 端", 会话="张三", 本轮=2, 历史行=12,
+                            认得这个人=True, 第几次=1)
+        again = self.render("喂给 AI 端", 会话="张三", 本轮=2, 历史行=0,
+                            认得这个人=False, 第几次=2)
+
+        self.assertIn("喂给 AI 端：「张三」，本轮 2 条 + 历史 12 行，对面已归位到候选人", first)
+        self.assertNotIn("第 1 次", first)          # 正常那次不提「第几次」，免得每轮都刷
+        self.assertIn("还不知道对面是哪个候选人", again)
+        self.assertIn("第 2 次尝试", again)
+
+    def test_a_stage_reads_like_a_status_line(self) -> None:
+        """AI 端本来就在流里发阶段（055），网关此前整个丢掉。"""
+        self.assertIn("AI 端：正在读取资料",
+                      self.render("AI 端阶段", 会话="张三", 阶段="正在读取资料", key="reading"))
+
+    def test_the_heartbeat_says_how_long_and_what_happens_next(self) -> None:
+        output = self.render("AI 端还在跑这一轮", 会话="张三", 已用秒=45, 上限秒=180)
+
+        self.assertIn("已 45 秒", output)
+        self.assertIn("超过 180 秒算超时，会重连再试一次", output)
+
+    def test_a_finished_turn_says_whether_a_card_came_back(self) -> None:
+        got = self.render("AI 端这一轮跑完了", 会话="张三", 已用秒=38, 有卡片=True)
+        none = self.render("AI 端这一轮跑完了", 会话="张三", 已用秒=38, 有卡片=False)
+
+        self.assertIn("用时 38 秒，拿到卡片", got)
+        self.assertIn("但没有卡片", none)
+
+    def test_an_ai_error_carries_the_message_not_just_the_code(self) -> None:
+        """原来只记 code——现场看到一个错误码，猜不出发生了什么。"""
+        output = self.render("AI 端返回错误", 会话="张三", code="upstream_error",
+                             原因="上游模型繁忙", 已用秒=12)
+
+        self.assertIn("错误码 upstream_error", output)
+        self.assertIn("原因：上游模型繁忙", output)
+        self.assertIn("消息留着下一轮重投", output)
+
+    def test_a_dropped_connection_says_what_it_means_for_the_messages(self) -> None:
+        """★ 「和 AI 端断了」是这条链路最要紧的一句：断开时在跑的那一轮当场作废。"""
+        output = self.render("读循环结束", error="connection closed abnormally")
+
+        self.assertIn("和 AI 端的连接断了", output)
+        self.assertIn("消息留着重投", output)
+
+    def test_being_unable_to_connect_says_messages_are_not_lost(self) -> None:
+        output = self.render("AI 端连接不可用", account="wx_1", error="Connection refused")
+
+        self.assertIn("连不上 AI 端", output)
+        self.assertIn("攒着，通了再回", output)
+
+    def test_the_two_attempts_have_different_consequences(self) -> None:
+        """第 1 次还会重连再试，第 2 次就是这一轮到此为止——看的人必须分得出来。"""
+        first = self.render("这一轮没跑通", 会话="张三", 原因="会话 s_1 一轮超时",
+                            第几次=1, 已用秒=180)
+        second = self.render("这一轮没跑通", 会话="张三", 原因="会话 s_1 一轮超时",
+                             第几次=2, 已用秒=180)
+
+        self.assertIn("重连后再试一次", first)
+        self.assertIn("两次都没跑通，这批消息留到下一轮重投", second)
+

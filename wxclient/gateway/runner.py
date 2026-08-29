@@ -90,6 +90,10 @@ RECEIPT_MAX_AGE_HOURS = 24
 #: 本机，后端就会照旧追过去——所以宁可多等这两秒。清不完也没丢：发件箱是落盘的。
 MESSAGE_EVENT_DRAIN_SECONDS = 2.0
 
+#: 一轮跑多久没收口就往实时日志喊一声「还在跑」。30 秒：短到「卡住了」当场看得见，
+#: 长到正常一轮（几十秒）最多喊一两声，不会把日志刷满。这个数只影响日志，不影响超时。
+TURN_HEARTBEAT_SECONDS = 30.0
+
 #: 每轮往上带多少条历史。够 AI 端判「这一步走完没有」，又不至于把每轮的输入撑成一倍——
 #: 这段文本每轮都要重新发一遍，是按 token 计费的。
 HISTORY_TURNS = 30
@@ -789,6 +793,51 @@ class GatewayRunner:
             )
             return DeliveryResult(skipped_reason=f"投递失败：{exc}")
 
+    def _elapsed(self, started: datetime) -> int:
+        """从 ``started`` 到现在过了几秒（取整，只用于日志）。"""
+        return max(0, int((self._clock() - started).total_seconds()))
+
+    def _note_stage(self, peer_id: str, stage: dict[str, Any]) -> None:
+        """AI 端报了个阶段（055）→ 原样打进实时日志。
+
+        ★ 可以直接显示的理由：``stage.text`` 是**服务端映射出来的**安全短句
+          （见 AI 端 `src/ws/stage.ts`：codex 的命令行、cwd、搜索词、命令 stdout
+          一个字节都不进这个字段），网关这边不需要再洗一遍。
+
+        这个回调跑在 WS 读循环里，**只许打日志**——阻塞它就等于阻塞整条连接。
+        """
+        text = str(stage.get("text") or "").strip()
+        if not text:
+            return
+        _log.info("AI 端阶段", 会话=peer_id, 阶段=text, key=str(stage.get("key") or "-"))
+
+    async def _turn_heartbeat(self, peer_id: str, started: datetime) -> None:
+        """一轮还没收口就每隔 ``TURN_HEARTBEAT_SECONDS`` 说一声「还在跑」。
+
+        没有它的时候，AI 端超时（默认 180s）再重试一次 = 最长六分钟里那台 Windows
+        电脑上一个字都没有：「派发一轮给 AI 端」之后直接静默，看的人分不出是 AI 在想、
+        是卡住了、还是整条链路断了（用户 2026-08-29：读到了消息但没回复，屏幕上也没有）。
+
+        它**只打日志**，不参与任何判定，也不会让这一轮提前收口。
+
+        ★ 自己出错就自己停下，绝不上抛：这是一条纯观测的支路，让它有本事弄坏一次
+          真实回复就本末倒置了（开发时就撞过一次——心跳里一个 AttributeError
+          把整轮变成了「没把话说出去」）。
+        """
+        try:
+            while True:
+                await asyncio.sleep(TURN_HEARTBEAT_SECONDS)
+                _log.info(
+                    "AI 端还在跑这一轮",
+                    会话=peer_id,
+                    已用秒=self._elapsed(started),
+                    上限秒=int(self._settings.turn_timeout_seconds),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 观测支路不许影响这一轮
+            _log.warning("这一轮的心跳自己出错了，停掉它，不影响回复", 原因=str(exc))
+
     async def _run_dialog_turn(
         self,
         account_id: str,
@@ -796,39 +845,83 @@ class GatewayRunner:
         transcript: str,
         messages: Sequence[InboundMessage],
     ) -> dict[str, Any] | None:
-        """跑一轮，返回卡片。断线只重试一次——重试不了就这一轮作罢，下轮再说。"""
+        """跑一轮，返回卡片。断线只重试一次——重试不了就这一轮作罢，下轮再说。
+
+        ★ 这一轮在 Windows 端要跑几十秒，所以从头到尾都得看得见：喂进去了什么、
+          AI 端跑到哪一阶（``on_stage``，AI 端本来就在流里发，这边原来直接丢掉）、
+          还在跑多久了、最后是成了还是错了、错在哪。全部只是打日志，一处判定都没动。
+        """
+        history = self._history_for(account_id, peer_id, messages)
+        refs = self._peer_refs(account_id, peer_id)
         for attempt in (1, 2):
+            started = self._clock()
+            _log.info(
+                "喂给 AI 端",
+                会话=peer_id,
+                本轮=len(messages),
+                历史行=history.count("\n") + 1 if history else 0,
+                认得这个人=bool(refs),
+                第几次=attempt,
+            )
+            heartbeat = asyncio.create_task(self._turn_heartbeat(peer_id, started))
             try:
                 client = await self._pool.acquire(account_id)
                 session_id = await self._ensure_session(client, account_id, peer_id)
                 result = await client.send_message(
                     session_id,
                     transcript,
-                    refs=self._peer_refs(account_id, peer_id),
+                    refs=refs,
                     extra={
                         "wechat": self._turn_meta(peer_id, messages),
-                        "history": self._history_for(account_id, peer_id, messages),
+                        "history": history,
                     },
+                    on_stage=lambda stage: self._note_stage(peer_id, stage),
                 )
-            except Unauthorized:
+            except Unauthorized as exc:
                 # 票据/归属出问题：会话多半已经不属于我们了，清掉重来。
+                _log.warning(
+                    "AI 端不认这条会话了，清掉重来",
+                    会话=peer_id, 原因=str(exc), 第几次=attempt, 已用秒=self._elapsed(started),
+                )
                 self._store.drop_session(account_id, peer_id)
                 await self._pool.invalidate(account_id)
                 if attempt == 2:
                     raise
                 continue
-            except AgentWsError:
+            except AgentWsError as exc:
+                # 断线 / 一轮超时。第一次原来是**静默**重试的——现场表现就是长时间没有下文。
+                _log.warning(
+                    "这一轮没跑通",
+                    会话=peer_id, 原因=str(exc), 第几次=attempt, 已用秒=self._elapsed(started),
+                )
                 await self._pool.invalidate(account_id)
                 if attempt == 2:
                     raise
                 continue
+            finally:
+                # 收了就停。`suppress` 连普通异常一起吃掉：心跳是观测支路，
+                # 它自己怎么坏都不该改变这一轮的结果。
+                heartbeat.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await heartbeat
 
             if not result.ok:
                 # AI 端明确报错：卡片是 fallback，没有 reply_segments，出站自然不会发东西。
+                error = result.error or {}
                 _log.warning(
-                    "AI 端返回错误", account=account_id, code=(result.error or {}).get("code")
+                    "AI 端返回错误",
+                    会话=peer_id,
+                    code=error.get("code") or "-",
+                    原因=str(error.get("message") or "-"),
+                    已用秒=self._elapsed(started),
                 )
                 return None
+            _log.info(
+                "AI 端这一轮跑完了",
+                会话=peer_id,
+                已用秒=self._elapsed(started),
+                有卡片=result.card is not None,
+            )
             return result.card
         return None
 
