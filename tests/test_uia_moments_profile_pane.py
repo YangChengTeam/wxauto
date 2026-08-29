@@ -32,13 +32,41 @@ PANE_CLASS = UiaWeChatDriver.PROFILE_PANE_CLASS
 
 
 class _Info:
-    def __init__(self, class_name: str) -> None:
+    def __init__(self, class_name: str, handle: int = 0, name: str = "") -> None:
         self.class_name = class_name
+        self.handle = handle
+        self.name = name
 
 
 class _Window:
-    def __init__(self, class_name: str) -> None:
-        self.element_info = _Info(class_name)
+    _next = [1000]
+
+    def __init__(self, class_name: str, name: str = "") -> None:
+        self._next[0] += 1
+        self.element_info = _Info(class_name, self._next[0], name)
+        self.clicked = False
+
+    def click_input(self) -> None:
+        self.clicked = True
+
+    # 面板会被换成 `desktop.window(handle=…)` 的 spec 再交出去，spec 上要能 child_window
+    def descendants(self) -> list[Any]:
+        return getattr(self, "kids", [])
+
+    def child_window(self, **_: object) -> Any:
+        return _Missing()
+
+
+class _Missing:
+    """找不到的控件：`exists()` 是 False，点它就抛——和 pywinauto 一个脾气。"""
+
+    @staticmethod
+    def exists(**_: object) -> bool:
+        return False
+
+    @staticmethod
+    def click_input() -> None:
+        raise RuntimeError("控件不存在")
 
 
 class _Desktop:
@@ -51,8 +79,14 @@ class _Desktop:
     def windows(self) -> list[_Window]:
         return [_Window("Chrome_WidgetWin_1"), *self.open, _Window("Shell_TrayWnd")]
 
-    def window(self, **_: object) -> Any:  # pragma: no cover - 走到就是回归
-        self.slow_lookups += 1
+    def window(self, **kwargs: object) -> Any:
+        # 按句柄查是直接命中，允许；带判据查要走全树，不允许。
+        if set(kwargs) == {"handle"}:
+            for w in self.open:
+                if w.element_info.handle == kwargs["handle"]:
+                    return w
+            raise AssertionError("句柄查不到")
+        self.slow_lookups += 1  # pragma: no cover - 走到就是回归
         raise AssertionError("不该再用会走全树的 desktop.window() 判据")
 
 
@@ -216,6 +250,91 @@ class ClickingTheAvatarTests(unittest.TestCase):
         self.driver._click_avatar(toolbar, mouse)
 
         self.assertEqual(mouse.clicks, [("屏幕", (576, 212))], "兜底还在，坐标也没变")
+
+
+class _Vendor:
+    """vendor 的按钮判据表。4.1.12 上这条根本匹配不到东西。"""
+
+    MomentsButton = {"title": "朋友圈", "control_type": "Button", "auto_id": "button"}
+
+
+class ClickingTheMomentsEntryTests(unittest.TestCase):
+    """资料面板里的「朋友圈」——**认名字，不认控件类型**。
+
+    2026-08-29 真机 4.1.12 把面板整个 dump 出来，里面只有：
+    `mmui::ContactHeadView`(Button) / `mmui::XTextView`(Text，就是「朋友圈」这一项) /
+    `mmui::ProfileTextView`(Text) / `mmui::ProfileBottomButton`(Button「发消息」)。
+    vendor 的 `Buttons.MomentsButton` 和我们原来兜底的 `mmui::ProfileDetailValueSnsView`
+    **都不存在**——这就是线上点完之后朋友圈窗口一直不出来的原因。
+    """
+
+    def setUp(self) -> None:
+        self.driver = UiaWeChatDriver(dry_run=False)
+
+    def test_点的是那个叫朋友圈的_Text(self) -> None:
+        pane = _Window("mmui::ProfileUniquePop")
+        moments = _Window("mmui::XTextView", "朋友圈")
+        pane.kids = [_Window("mmui::ContactHeadView", "Kk"), moments,
+                     _Window("mmui::ProfileBottomButton", "发消息")]
+
+        self.driver._click_moments_entry(pane, _Vendor)
+
+        self.assertTrue(moments.clicked, "面板里叫「朋友圈」的那一项就是入口，别挑控件类型")
+
+    def test_英文客户端也认(self) -> None:
+        pane = _Window("mmui::ProfileUniquePop")
+        moments = _Window("mmui::XTextView", "Moments")
+        pane.kids = [moments]
+
+        self.driver._click_moments_entry(pane, _Vendor)
+
+        self.assertTrue(moments.clicked)
+
+    def test_一个都对不上就报错_不要静默点别的(self) -> None:
+        pane = _Window("mmui::ProfileUniquePop")
+        pane.kids = [_Window("mmui::ProfileBottomButton", "发消息")]
+
+        with self.assertRaises(WeChatApiError):
+            self.driver._click_moments_entry(pane, _Vendor)
+
+
+class FindingTheMomentsWindowTests(unittest.TestCase):
+    """朋友圈窗口**只认 class**。
+
+    线上报的是 `ElementNotFoundError: {'title': '朋友圈', … 'mmui::SNSWindow' …}`——
+    class 对上了，是**标题**没对上：vendor 把 title 写死并按版本分叉成 朋友圈/Moments，
+    而同一台机器上主窗口报 `'微信'`、资料面板报 `'Weixin'`。标题不是稳的判据。
+    """
+
+    class _Tools:
+        def __init__(self) -> None:
+            self.centered: list[int] = []
+
+        def move_window_to_center(self, Window_handle: int = 0) -> str:  # noqa: N803
+            self.centered.append(Window_handle)
+            return "朋友圈窗口"
+
+    def setUp(self) -> None:
+        self.driver = UiaWeChatDriver(dry_run=False)
+        self.desktop = _Desktop()
+        self.tools = self._Tools()
+
+    def test_标题是英文也照样找得到(self) -> None:
+        window = _Window("mmui::SNSWindow", "Moments")
+        self.desktop.open.append(window)
+
+        got = self.driver._moments_window(self.desktop, self.tools)
+
+        self.assertEqual(got, "朋友圈窗口")
+        self.assertEqual(self.tools.centered, [window.element_info.handle])
+
+    def test_没有就返回_None_不抛(self) -> None:
+        patcher = mock.patch.multiple(
+            "wxclient.wechat_api.uia.time", sleep=lambda s: None,
+            monotonic=mock.Mock(side_effect=[0.0, 9.0]))
+        patcher.start(); self.addCleanup(patcher.stop)
+
+        self.assertIsNone(self.driver._moments_window(self.desktop, self.tools))
 
 
 if __name__ == "__main__":  # pragma: no cover

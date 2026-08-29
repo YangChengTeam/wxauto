@@ -910,14 +910,13 @@ class UiaWeChatDriver:
         Buttons = Uielements.Buttons
         Edits = Uielements.Edits
         Groups = Uielements.Groups
-        Independent_window = Uielements.Independent_window
         Main_window = Uielements.Main_window
         Windows = Uielements.Windows
 
         desktop = Desktop(backend="uia")
         valid_paths = self._normalize_moments_media_paths(medias) if medias else []
 
-        moments_window = self._find_existing_moments_window(desktop, Independent_window)
+        moments_window = self._moments_window(desktop, Tools)
         if moments_window is None:
             # 1. 获取微信主窗口，点击工具栏头像
             main_window = Navigator.open_weixin(is_maximize=False)
@@ -925,26 +924,12 @@ class UiaWeChatDriver:
 
             # 2. 在弹出的 profile 面板中点「朋友圈」
             profile_pane = self._open_profile_pane(desktop, toolbar, mouse)
-            try:
-                moments_btn = profile_pane.child_window(**Buttons.MomentsButton)
-                if moments_btn.exists(timeout=2):
-                    moments_btn.click_input()
-                else:
-                    moments_btn = profile_pane.child_window(
-                        control_type="Button",
-                        class_name="mmui::ProfileDetailValueSnsView",
-                    )
-                    moments_btn.click_input()
-            except Exception:
-                moments_btn = profile_pane.child_window(
-                    control_type="Button",
-                    class_name="mmui::ProfileDetailValueSnsView",
-                )
-                moments_btn.click_input()
-            time.sleep(1.5)
+            self._click_moments_entry(profile_pane, Buttons)
 
             # 3. 定位朋友圈窗口
-            moments_window = Tools.move_window_to_center(Independent_window.MomentsWindow)
+            moments_window = self._moments_window(desktop, Tools, timeout=12.0)
+            if moments_window is None:
+                raise WeChatApiError("点了「朋友圈」但朋友圈窗口没出来")
 
         # 如果看不到发表按钮，先点返回
         post_button = moments_window.child_window(**Buttons.PostButton)
@@ -953,7 +938,7 @@ class UiaWeChatDriver:
             if back_button.exists(timeout=1):
                 back_button.click_input()
                 time.sleep(1)
-                moments_window = Tools.move_window_to_center(Independent_window.MomentsWindow)
+                moments_window = self._moments_window(desktop, Tools) or moments_window
             post_button = moments_window.child_window(**Buttons.PostButton)
 
         if not post_button.exists(timeout=2):
@@ -998,14 +983,65 @@ class UiaWeChatDriver:
         except Exception:
             pass
 
-    def _find_existing_moments_window(self, desktop: Any, Independent_window: Any) -> Any | None:
-        try:
-            window = desktop.window(**Independent_window.MomentsWindow)
-            if window.exists(timeout=0.5):
-                return window
-        except Exception:
-            return None
-        return None
+    #: 朋友圈窗口的 class。
+    MOMENTS_WINDOW_CLASS = "mmui::SNSWindow"
+
+    #: 资料面板里「朋友圈」那一项的名字（跟客户端语言走）。
+    MOMENTS_LABELS = ("朋友圈", "Moments")
+
+    def _moments_window(self, desktop: Any, Tools: Any, *, timeout: float = 2.0) -> Any | None:
+        """找朋友圈窗口并摆到屏幕中间；没有就 None。
+
+        ★ **只认 class，不认标题**（2026-08-29 真机实测）：vendor 的
+          `Independent_window.MomentsWindow` 把 `title` 写死，还按版本分叉成
+          `朋友圈` / `Moments`——而同一台机器上主窗口报 `'微信'`、资料面板报 `'Weixin'`，
+          标题根本不是个稳的判据。线上那条
+          `ElementNotFoundError: {'title': '朋友圈', …'mmui::SNSWindow'…}`
+          就是标题这一项没对上。class 在 vendor 表的每个版本分支里都是同一个值。
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                for window in desktop.windows():
+                    try:
+                        if window.element_info.class_name == self.MOMENTS_WINDOW_CLASS:
+                            return Tools.move_window_to_center(
+                                Window_handle=window.element_info.handle)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.3)
+
+    def _click_moments_entry(self, pane: Any, Buttons: Any) -> None:
+        """点资料面板里的「朋友圈」。
+
+        ★ **认名字，不认控件类型/类名**（2026-08-29 真机实测 4.1.12）：面板里那一项是
+          `mmui::XTextView` 的 **Text**，name=`朋友圈`。vendor 的 `Buttons.MomentsButton`
+          （Button + auto_id=button）和我们原来兜底的 `mmui::ProfileDetailValueSnsView`
+          在这个版本上**都不存在**——面板里只有 ContactHeadView / XTextView /
+          ProfileTextView / ProfileBottomButton 这几种。老判据留着兜底，万一别的版本上真是按钮。
+        """
+        for node in pane.descendants():
+            try:
+                if (node.element_info.name or "").strip() in self.MOMENTS_LABELS:
+                    node.click_input()
+                    return
+            except Exception:
+                continue
+        for selector in (dict(Buttons.MomentsButton),
+                         {"control_type": "Button",
+                          "class_name": "mmui::ProfileDetailValueSnsView"}):
+            try:
+                button = pane.child_window(**selector)
+                if button.exists(timeout=1):
+                    button.click_input()
+                    return
+            except Exception:
+                continue
+        raise WeChatApiError("资料面板里找不到「朋友圈」入口")
 
     #: 头像相对左侧工具栏顶边的偏移。工具栏从 `top` 起，第一个按钮「微信」在 `top+96`
     #: （真机实测 4.1.12：工具栏 T160、微信按钮 T256），头像就在这段空白里。
@@ -1020,6 +1056,10 @@ class UiaWeChatDriver:
     def _profile_pane_now(self, desktop: Any) -> Any | None:
         """此刻桌面上开着的资料面板，没有就 None。**只枚举顶层窗口**。
 
+        ★ 拿到句柄后要**换成 `desktop.window(handle=…)` 这个 WindowSpecification 再返回**：
+          `desktop.windows()` 给的是 `UIAWrapper`，**没有 `.child_window()`**，
+          而调用方下一步就要在面板里找「朋友圈」。按句柄查是直接命中，不走全树。
+
         ★ 为什么不用 `desktop.window(**判据).exists(timeout=2)`（2026-08-29 真机实测）：
           vendor 那条判据带 `top_level_only=False`，于是 pywinauto 要走一遍整个桌面的
           控件树。这台机器上开着 Chrome / 钉钉 / 一堆资源管理器窗口，**一次查询实测 3.0～3.2 秒**，
@@ -1031,7 +1071,7 @@ class UiaWeChatDriver:
             for window in desktop.windows():
                 try:
                     if window.element_info.class_name == self.PROFILE_PANE_CLASS:
-                        return window
+                        return desktop.window(handle=window.element_info.handle)
                 except Exception:
                     continue
         except Exception:
