@@ -6,7 +6,7 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import structlog
 
@@ -1059,9 +1059,16 @@ class UiaWeChatDriver:
                 continue
         raise WeChatApiError("资料面板里找不到「朋友圈」入口")
 
-    #: 头像相对左侧工具栏顶边的偏移。工具栏从 `top` 起，第一个按钮「微信」在 `top+96`
-    #: （真机实测 4.1.12：工具栏 T160、微信按钮 T256），头像就在这段空白里。
+    #: 头像相对左侧工具栏顶边的偏移，**只在量不出来的时候用**。
+    #: 真机实测 4.1.12（缩放 100%）：工具栏 T160、第一个按钮「微信」T256，头像在这段空白里，
+    #: 中心大约 T212 → 偏移 52。
+    #:
+    #: ★ 这个数只对 100% 缩放成立。见 `_avatar_offset_y`：正常路径是**现量**，不用这个常数。
     AVATAR_OFFSET_Y = 52
+
+    #: 第一个工具栏按钮（「微信」）的判据。和 vendor 的 `Buttons.WeixinButton` 一致：
+    #: **按位置认不按名字认**，所以不随客户端语言变。
+    FIRST_TOOLBAR_BUTTON: ClassVar[dict[str, object]] = {"control_type": "Button", "found_index": 0}
 
     #: 头像最多点几次。真机上偶尔一下不生效（前台刚切过来、或者被合成双击吞掉）。
     AVATAR_CLICK_TRIES = 3
@@ -1138,6 +1145,52 @@ class UiaWeChatDriver:
                 time.sleep(1.0)
         raise WeChatApiError("WeChat profile pane did not appear")
 
+    def _avatar_offset_y(self, toolbar: Any, rect: Any) -> int:
+        """头像中心离工具栏顶边多远，**现量，不写死像素**。
+
+        ★ 为什么不能写死（2026-08-30 客户机实报「同样的微信版本，我这台能发，客户那台
+          报 profile pane did not appear」）：`click_input(coords=…)` 收的是**真实像素**，
+          而 52 这个数是在缩放 100% 的机器上量的。客户那台若开着 125%/150% 缩放，
+          同样一版微信的头像中心就在 65 / 78 像素处，点 52 会落在头像上方的空白里——
+          点了个寂寞，面板当然不出来。**同版本、不同机器**的差别几乎都是这一类。
+
+        量法：头像待在**工具栏顶边**和**第一个按钮**之间那段空白里，取中点。
+        两个矩形来自同一个坐标系，所以不管系统缩放多少、这两个数一起变，比值不变。
+        真机 100% 上算出来是 (256-160)//2 = 48，实测中心 52，都落在头像圈里。
+
+        量不到（拿不到按钮、或者数看着不合理）就退回常数，并**把量到的数写进日志**——
+        下次再有机器报这个错，日志里直接就有几何数据，不必再去猜。
+        """
+        top = getattr(rect, "top", None)
+        button_top = None
+        try:
+            button = toolbar.child_window(**self.FIRST_TOOLBAR_BUTTON)
+            # ★ 先 `exists` 限一个短预算再取矩形：`rectangle()` 找不到会按 pywinauto 的默认
+            #   超时（5s）干等，而这里一轮要点三次，白等 15 秒。工具栏的子控件只有那几个按钮，
+            #   查的是**一小棵子树**（不是 `_profile_pane_now` 里那种走全桌面的判据），1.5s 绰绰有余。
+            if not button.exists(timeout=1.5):
+                raise LookupError("工具栏里没有这个按钮")
+            button_top = button.rectangle().top
+        except Exception as exc:  # noqa: BLE001 —— 量不到不是错，退回常数继续
+            logger.info("量不到第一个工具栏按钮，头像偏移退回常数", 原因=str(exc))
+
+        if isinstance(top, int) and isinstance(button_top, int):
+            gap = button_top - top
+            # 合理性闸：头像那段空白总得有点高度，也不可能比按钮还高一大截。
+            # 不合理多半是认错了控件，这时候常数比一个错的测量值可靠。
+            if 16 <= gap <= 400:
+                offset = gap // 2
+                logger.info(
+                    "现量头像位置",
+                    工具栏顶=top, 第一个按钮顶=button_top, 空白高=gap, 用的偏移=offset,
+                    写死的偏移=self.AVATAR_OFFSET_Y,
+                )
+                return offset
+            logger.info("量到的空白高看着不对，退回常数", 工具栏顶=top, 第一个按钮顶=button_top, 空白高=gap)
+
+        logger.info("头像偏移用写死的常数（只对 100% 缩放准）", 偏移=self.AVATAR_OFFSET_Y)
+        return self.AVATAR_OFFSET_Y
+
     def _click_avatar(self, toolbar: Any, mouse: Any) -> None:
         """点左侧工具栏顶上的头像。它**不是一个 UIA 控件**（工具栏的子控件只有
         微信/通讯录/收藏/视频号/游戏中心/小程序面板/手机/更多），所以只能按位置点。
@@ -1153,6 +1206,7 @@ class UiaWeChatDriver:
         顺带把微信提到前台。老的绝对坐标只作兜底。
         """
         rect = toolbar.rectangle()
+        offset_y = self._avatar_offset_y(toolbar, rect)
         try:
             # 先把窗口提到前台并让它稳一下再点：`click_input` 自己也会 set_focus，
             # 但刚被提上来的窗口马上接到点击时会漏掉一下（真机 5 轮里漏过 1 轮）。
@@ -1161,11 +1215,11 @@ class UiaWeChatDriver:
                 time.sleep(0.4)
             except Exception:  # noqa: BLE001 —— 提前台失败不影响点，继续
                 pass
-            toolbar.click_input(coords=(rect.width() // 2, self.AVATAR_OFFSET_Y))
+            toolbar.click_input(coords=(rect.width() // 2, offset_y))
             return
         except Exception as exc:  # noqa: BLE001 —— 兜底那条还能试，别在这儿断掉
             logger.info("按控件坐标点头像没成，退回屏幕坐标", 原因=str(exc))
-        mouse.click(coords=(rect.mid_point().x, rect.top + self.AVATAR_OFFSET_Y))
+        mouse.click(coords=(rect.mid_point().x, rect.top + offset_y))
 
     def _normalize_moments_media_paths(self, medias: list[str]) -> list[str]:
         valid_paths: list[str] = []

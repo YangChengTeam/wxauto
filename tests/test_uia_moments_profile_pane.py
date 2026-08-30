@@ -252,6 +252,88 @@ class ClickingTheAvatarTests(unittest.TestCase):
         self.assertEqual(mouse.clicks, [("屏幕", (576, 212))], "兜底还在，坐标也没变")
 
 
+class _ButtonRect:
+    def __init__(self, top: int) -> None:
+        self.top = top
+
+
+class _ScaledToolbar(_Toolbar):
+    """能量出第一个按钮位置的工具栏。`button_top=None` 表示量不到（老行为）。"""
+
+    def __init__(self, desktop: _Desktop, opens: list[bool], *, top: int, button_top: int | None) -> None:
+        super().__init__(desktop, opens)
+        self._top = top
+        self._button_top = button_top
+
+    def rectangle(self) -> Any:  # type: ignore[override]
+        rect = _Rect()
+        rect.top = self._top
+        return rect
+
+    def child_window(self, **_: object) -> Any:
+        top = self._button_top
+        return type("B", (), {
+            # 认不到就 exists=False——真机上 pywinauto 也是这么表达「没有」的
+            "exists": staticmethod(lambda timeout=0: top is not None),
+            "rectangle": staticmethod(lambda: _ButtonRect(top)),
+        })
+
+
+class AvatarOffsetTests(unittest.TestCase):
+    """头像点在哪：**现量，不写死像素**。
+
+    2026-08-30 客户实报：同样的微信版本，我们这台能发朋友圈，客户那台一直报
+    `WeChat profile pane did not appear`。`click_input(coords=…)` 收的是真实像素，
+    而 52 这个偏移是在**缩放 100%** 的机器上量的；客户那台开着 125% / 150% 的话，
+    头像中心就在 65 / 78 像素处，点 52 落在头像上方的空白里 —— 点了不出面板，
+    而错误信息只会说「面板没出来」，看不出是点歪了。
+
+    头像待在工具栏顶边和第一个按钮之间那段空白里，两个矩形同一个坐标系，
+    **比值不随缩放变**，所以取中点是与缩放无关的。
+    """
+
+    def setUp(self) -> None:
+        self.driver = UiaWeChatDriver(dry_run=False)
+        self.desktop = _Desktop()
+
+    def test_按几何现量_100百分比缩放(self) -> None:
+        # 真机实测：工具栏 T160、第一个按钮 T256
+        toolbar = _ScaledToolbar(self.desktop, [True], top=160, button_top=256)
+
+        self.driver._click_avatar(toolbar, _Mouse(self.desktop, []))
+
+        self.assertEqual(toolbar.clicks, [("控件", (30, 48))], "(256-160)//2=48，落在头像圈里")
+
+    def test_缩放150百分比的机器_偏移跟着变(self) -> None:
+        # 同一版微信，系统缩放 150%：所有像素乘 1.5
+        toolbar = _ScaledToolbar(self.desktop, [True], top=240, button_top=384)
+
+        self.driver._click_avatar(toolbar, _Mouse(self.desktop, []))
+
+        self.assertEqual(
+            toolbar.clicks, [("控件", (30, 72))],
+            "★ 写死 52 会点在头像上方的空白里——这就是客户那台发不出朋友圈的样子",
+        )
+
+    def test_量不到按钮_退回写死的常数(self) -> None:
+        toolbar = _ScaledToolbar(self.desktop, [True], top=160, button_top=None)
+
+        self.driver._click_avatar(toolbar, _Mouse(self.desktop, []))
+
+        self.assertEqual(toolbar.clicks, [("控件", (30, UiaWeChatDriver.AVATAR_OFFSET_Y))])
+
+    def test_量到的数不合理_也退回常数(self) -> None:
+        # 认错控件：按钮顶跟工具栏顶只差 3 像素，头像不可能挤在这儿
+        toolbar = _ScaledToolbar(self.desktop, [True], top=160, button_top=163)
+
+        self.driver._click_avatar(toolbar, _Mouse(self.desktop, []))
+
+        self.assertEqual(
+            toolbar.clicks, [("控件", (30, UiaWeChatDriver.AVATAR_OFFSET_Y))],
+            "量出来的数不合理时，常数比一个错的测量值可靠",
+        )
+
+
 class _Vendor:
     """vendor 的按钮判据表。4.1.12 上这条根本匹配不到东西。"""
 
