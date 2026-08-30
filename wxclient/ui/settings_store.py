@@ -96,16 +96,21 @@ FIELDS: tuple[Field, ...] = (
     # 用户 2026-08-28：加好友的上限和间隔都要能在界面上改（不同账号的承受力不一样）。
     # 两个数管两件事：上限管**一小时总共几个**，间隔管**两次之间隔多久**。
     # 只有上限的话，5 个全挤进一分钟也照样放行——2026-08-27 弹安全验证就是这么来的。
-    Field("WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR", "每小时加好友上限",
+    Field("WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR", "加好友上限",
           "加好友最招风控，一小时总共加几个", section="sched", default="5"),
     Field("WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS", "加好友最小间隔",
           "两次加好友至少隔多久", section="sched", unit="秒",
           default="300"),
+    # 用户 2026-08-30：「朋友圈在过去 24 小时只能发 3 个呀」——这个数原来只在代码里，
+    # 界面上看不见也改不了。它和上面两条不同，管的是**一天**不是一小时（一小时 3 条和
+    # 一天 3 条完全是两回事），所以周期写在说明里，别让人按「每小时」去理解。
+    Field("WXCLIENT_GATEWAY_MAX_MOMENTS_PER_DAY", "朋友圈上限",
+          "一天最多发几条朋友圈", section="sched", default="3"),
     # 090：**默认开**（用户裁决 2026-08-29）。原来默认关，理由是「装上不会自动回复
     # 家人朋友」——但真实用法里主动来问的人正是要接的那一类，默认关等于每台机器装完
     # 都要有人记得来打开一次。真正兜住误伤的是后面那几道确定性闸（判不出在找工作
     # 就一条都不发），不是这个开关默认值。不想接的人在这里关掉即可。
-    Field("WXCLIENT_GATEWAY_STRANGER_INTAKE", "接待主动来问的陌生人",
+    Field("WXCLIENT_GATEWAY_STRANGER_INTAKE", "来问陌生人",
           "主动加你、劳小智里还没有档案的人也会被自动接待；判得出他在找工作才会回话",
           kind="bool", section="sched", default="1"),
     Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动自动运行服务",

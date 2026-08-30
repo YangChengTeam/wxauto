@@ -1021,6 +1021,7 @@ class SettingsDefaultsTests(unittest.TestCase):
             "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": gateway.max_sends_per_hour,
             "WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR": gateway.max_friend_actions_per_hour,
             "WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS": int(gateway.friend_interval_seconds),
+            "WXCLIENT_GATEWAY_MAX_MOMENTS_PER_DAY": gateway.max_moments_per_day,
             "WXCLIENT_GATEWAY_STRANGER_INTAKE": gateway.stranger_intake,
             "WXCLIENT_UI_AUTOSTART": ui.autostart,
             "WXCLIENT_UI_START_HIDDEN": ui.start_hidden,
@@ -1045,6 +1046,36 @@ class SettingsDefaultsTests(unittest.TestCase):
         from wxclient.gateway.config import GatewaySettings
 
         GatewaySettings().validate_for_start()
+
+
+class SettingsReachTheGuardTests(unittest.TestCase):
+    """★ 配置中心里改的数，必须真的落到限流闸上。
+
+    2026-08-30 用户：「朋友圈在过去 24 小时只能发 3 个呀，这个配置也要能在配置中心配」。
+    在界面上加一格很容易，**但加完不接线就是个装饰**——人以为改了，实际还按 3 条跑，
+    而两边都不会报错。这里从环境变量一路验到配额表，把这条线钉住。
+
+    朋友圈这条的周期是**天**不是小时（一小时 3 条和一天 3 条完全是两回事），
+    顺带一起验，免得哪天被顺手改成 HOUR。
+    """
+
+    def test_界面上改的朋友圈上限_真的会变成配额(self) -> None:
+        from wxclient.gateway.config import GatewaySettings
+        from wxclient.gateway.guard import ACTION_MOMENTS, DAY, action_limits_from
+
+        with mock.patch.dict(os.environ, {"WXCLIENT_GATEWAY_MAX_MOMENTS_PER_DAY": "9"}):
+            limits = action_limits_from(GatewaySettings())
+
+        self.assertEqual(limits[ACTION_MOMENTS].max_count, 9, "配置中心改了却没生效＝白改")
+        self.assertEqual(limits[ACTION_MOMENTS].window_seconds, DAY, "★ 朋友圈按天算，不是按小时")
+
+    def test_不配的时候还是默认那三条(self) -> None:
+        from wxclient.gateway.config import GatewaySettings
+        from wxclient.gateway.guard import ACTION_MOMENTS, action_limits_from
+
+        limits = action_limits_from(GatewaySettings())
+
+        self.assertEqual(limits[ACTION_MOMENTS].max_count, 3)
 
 
 class RealActionsTests(unittest.TestCase):
