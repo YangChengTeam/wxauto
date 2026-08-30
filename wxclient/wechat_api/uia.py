@@ -4,6 +4,7 @@ import random
 import re
 import sys
 import time
+from contextlib import suppress
 from datetime import date
 from pathlib import Path
 from typing import Any, ClassVar
@@ -22,6 +23,23 @@ logger = structlog.get_logger(__name__)
 
 #: `_disable_esc_close_fallback` 只需要生效一次，模块级记一下别反复包。
 _ESC_CLOSE_FALLBACK_DISABLED = False
+
+#: 输入框「还没 enabled」时，最多等它几秒再重来一次。
+#: 3 秒是按真机现象给的：切完聊天窗口到输入框可用通常在半秒内，卡住的那次也只是差一拍。
+#: 给太长会把一次本该快速失败的调用拖成十几秒，给太短等于没等。
+EDIT_ENABLE_WAIT_SECONDS = 3.0
+EDIT_ENABLE_POLL_SECONDS = 0.2
+
+
+def _is_element_not_enabled(exc: BaseException) -> bool:
+    """这个异常是不是 pywinauto 的 ``ElementNotEnabled``。
+
+    **按类名认，不用 isinstance**：Linux 上单测环境根本没有 pywinauto，import 它会炸，
+    而「该不该重试」这段逻辑恰恰是必须在无 GUI 的机器上测的（真机测试只在发版时跑一遍，
+    这种判据错了要等到线上才发现）。
+    """
+    return type(exc).__name__ == "ElementNotEnabled"
+
 
 
 def _disable_esc_close_fallback() -> None:
@@ -653,7 +671,7 @@ class UiaWeChatDriver:
             return {"dry_run": True, "action": "send_message", "friend": friend}
         self._ensure_ready()
         Messages = self._pyweixin_class("Messages")
-        Messages.send_messages_to_friend(
+        self._with_edit_retry(friend, "send_message", lambda: Messages.send_messages_to_friend(
             friend=friend,
             messages=[text],
             search_pages=5,
@@ -661,7 +679,7 @@ class UiaWeChatDriver:
             send_delay=0.2,
             is_maximize=False,
             close_weixin=False,
-        )
+        ))
         # ★ 发后核对（075，需求文档 §12.4）：文字没发走会**留在输入框里**，
         # 而底座照样返回成功——067 的文件路径上真机踩过一模一样的坑
         # （文件躺在输入框里、回执却报 done）。宁可报失败，也不谎报「已发送」：
@@ -724,16 +742,18 @@ class UiaWeChatDriver:
             baseline=baseline,
         )
         try:
-            Files.send_files_to_friend(
-                friend=normalized_friend,
-                files=normalized_files,
-                with_messages=bool(text),
-                messages=[text] if text else [],
-                messages_first=True,
-                clear=True,
-                send_delay=send_delay,
-                is_maximize=False,
-                close_weixin=False,
+            self._with_edit_retry(
+                normalized_friend, "send_files", lambda: Files.send_files_to_friend(
+                    friend=normalized_friend,
+                    files=normalized_files,
+                    with_messages=bool(text),
+                    messages=[text] if text else [],
+                    messages_first=True,
+                    clear=True,
+                    send_delay=send_delay,
+                    is_maximize=False,
+                    close_weixin=False,
+                ),
             )
         except Exception as exc:
             raise WeChatApiError(f"发送文件失败：{exc}") from exc
@@ -745,6 +765,54 @@ class UiaWeChatDriver:
         logger.info("files.send.done", friend=normalized_friend, file_count=len(normalized_files))
         result["text_sent"] = bool(text)
         return result
+
+    def _with_edit_retry(self, friend: str, op: str, call: Any) -> Any:
+        """跑一次 pyweixin 的发送调用；撞上「输入框还没 enabled」就等它一下、重来一次。
+
+        **现象**：刚 `open_dialog_window` 切完聊天，微信的输入框已经进了 UIA 树、但还没
+        变成可操作状态，于是 vendor 里那句 `edit_area.set_text('')` 抛
+        ``pywinauto.base_wrapper.ElementNotEnabled``。它上面那道闸
+        `edit_area.exists(timeout=0.1)` 只问「在不在」、不问「能不能用」，0.1s 也太短。
+        表现是整条任务记 failed（日志里一整条堆栈），下一轮从待处理队列重投才成功——
+        白白多等一个周期，候选人那边就是回得慢（2026-08-30 用户实报，第二次才成）。
+
+        **为什么重来一次不会让对方多收到消息**（这是能不能重试的全部关键）：
+        pyweixin 那两个函数的顺序是
+        ``open_dialog_window`` → ``edit_area.exists()`` → ``if clear: edit_area.set_text('')``
+        → 之后全靠 ``pyautogui.hotkey('ctrl+v' / 'alt+s')`` 发出去。走 pywinauto
+        ``verify_actionable`` 的**只有** ``set_text('')`` 和单条消息的 ``click_input()``，
+        也就是说 **ElementNotEnabled 只可能在「一个字都还没粘进输入框」之前抛出来**。
+        而我们两处调用都只传一条消息（``messages=[text]``），不存在「前一条已发出、
+        重试又发一遍」那种半截情况。
+
+        ★ 哪天改成一次传多条消息，上面这个论证就不成立了——先把它重新想清楚再动，
+          别顺手加进来。重复骚扰候选人比慢一轮严重得多。
+        """
+        try:
+            return call()
+        except Exception as exc:
+            # 只挑这一种重来；别的错原样上抛——见上面「为什么重来一次不会多发」那段
+            if not _is_element_not_enabled(exc):
+                raise
+        logger.warning("wechat.edit_not_enabled", friend=friend, op=op)
+        ready = self._wait_chat_input_enabled(friend)
+        logger.info("wechat.edit_retry", friend=friend, op=op, 等到可用=ready)
+        return call()
+
+    def _wait_chat_input_enabled(self, friend: str) -> bool:
+        """等输入框变成可操作。返回「等到了没有」——等不到也照样重来一次。
+
+        等不到就不重试是错的：``is_enabled()`` 自己也可能查不到（控件树正好在重建），
+        那时候直接放弃等于把一次本来会成功的发送判死。宁可再试一次让它自己抛。
+        """
+        deadline = time.monotonic() + EDIT_ENABLE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            with suppress(Exception):   # 探测本身失败就当没等到，接着轮询
+                edit = self._chat_input_area(friend)
+                if edit is not None and edit.is_enabled():
+                    return True
+            time.sleep(EDIT_ENABLE_POLL_SECONDS)
+        return False
 
     def _chat_input_area(self, friend: str) -> Any | None:
         """拿到当前会话的输入框控件。拿不到返回 None（判不了，不当作失败）。"""

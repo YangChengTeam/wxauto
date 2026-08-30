@@ -481,6 +481,15 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         )
 
     # ── 发送后的落地核对（真机上「以为发了其实没发」全靠这几条留痕）──────
+    if event == "wechat.edit_not_enabled":
+        # 「第二次就好了」那件事的第一现场：切完聊天窗口，输入框还没变成可操作。
+        return (
+            f"微信输入框还没准备好（刚切过去，还不能打字），等一下重来一次：这次要做的是"
+            f"{'发文件' if payload.get('op') == 'send_files' else '发消息'}"
+        )
+    if event == "wechat.edit_retry":
+        waited = "输入框已经可用了" if payload.get("等到可用") else "没等到它变可用，仍然再试一次"
+        return f"重来一次：{waited}"
     if event == "message.send.stuck_in_input":
         return (
             f"消息卡在输入框里没发出去：「{payload.get('friend') or '-'}」，"

@@ -1,0 +1,88 @@
+"""输入框「还没 enabled」时的重来一次（2026-08-30 用户实报：发消息报 ElementNotEnabled，第二次才成）。
+
+钉的是**该不该重来**这件事，不是微信真机行为——所以这里不碰 pywinauto，也不需要图形环境。
+"""
+
+from __future__ import annotations
+
+import unittest
+from unittest import mock
+
+from wxclient.wechat_api.uia import UiaWeChatDriver, _is_element_not_enabled
+
+
+class ElementNotEnabled(Exception):
+    """冒充 pywinauto 的那个异常。判据是**类名**，所以这里同名即可（见 `_is_element_not_enabled`）。"""
+
+
+class 判据(unittest.TestCase):
+    def test_只认这一个类名(self) -> None:
+        self.assertTrue(_is_element_not_enabled(ElementNotEnabled("输入框还不能用")))
+        self.assertFalse(_is_element_not_enabled(RuntimeError("别的错")))
+        self.assertFalse(_is_element_not_enabled(Exception("ElementNotEnabled")))  # 消息里带也不算
+
+
+class 重来一次(unittest.TestCase):
+    def setUp(self) -> None:
+        self.driver = UiaWeChatDriver.__new__(UiaWeChatDriver)   # 不跑 __init__，这里只测这一段
+        # 等待那步整个换掉：真机上它要轮询几秒，单测不该为此空等
+        self.waited: list[str] = []
+        self.driver._wait_chat_input_enabled = lambda friend: (self.waited.append(friend), True)[1]
+
+    def test_撞上就重来一次并成功(self) -> None:
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise ElementNotEnabled("输入框还不能用")
+            return "发出去了"
+
+        with mock.patch("wxclient.wechat_api.uia.logger"):
+            result = self.driver._with_edit_retry("张三", "send_message", flaky)
+
+        self.assertEqual(result, "发出去了")
+        self.assertEqual(len(calls), 2, "★ 只重来一次")
+        self.assertEqual(self.waited, ["张三"], "重来之前要先等输入框可用")
+
+    def test_一次就成的不重来(self) -> None:
+        calls = []
+        with mock.patch("wxclient.wechat_api.uia.logger"):
+            self.driver._with_edit_retry("张三", "send_message", lambda: calls.append(1))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.waited, [], "没出错就别去等")
+
+    def test_别的异常原样上抛绝不重来(self) -> None:
+        """★ 这条是防线：只有「还没 enabled」能证明一个字都没发出去，别的错重来就可能重复骚扰对方。"""
+        calls = []
+
+        def boom():
+            calls.append(1)
+            raise RuntimeError("别的错")
+
+        with mock.patch("wxclient.wechat_api.uia.logger"), self.assertRaises(RuntimeError):
+            self.driver._with_edit_retry("张三", "send_message", boom)
+        self.assertEqual(len(calls), 1, "★ 一次都不许重来")
+
+    def test_重来那次再炸就照实上抛(self) -> None:
+        """重试不是无限的：第二次还不行就认了，让上游记失败、下一轮重投。"""
+        def always():
+            raise ElementNotEnabled("一直不能用")
+
+        with mock.patch("wxclient.wechat_api.uia.logger"), self.assertRaises(ElementNotEnabled):
+            self.driver._with_edit_retry("张三", "send_message", always)
+
+
+class 两处发送都接上了(unittest.TestCase):
+    """★ 改成 lambda 之后最容易犯的错是「接错一处」——两条路都得走外壳。"""
+
+    def test_发消息和发文件都过重试外壳(self) -> None:
+        import inspect
+
+        for name in ("send_message", "send_files"):
+            src = inspect.getsource(getattr(UiaWeChatDriver, name))
+            self.assertIn("_with_edit_retry", src, f"{name} 没接上重试外壳")
+
+
+if __name__ == "__main__":
+    unittest.main()
