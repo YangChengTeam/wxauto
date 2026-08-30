@@ -9,6 +9,7 @@ from typing import Any
 
 import structlog
 
+from . import logrole
 
 _LEVEL_LABELS = {
     "debug": "调试",
@@ -113,6 +114,10 @@ def configure_logging(level: str = "INFO", log_dir: Path | None = None) -> None:
     processors = [
         structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
         structlog.processors.add_log_level,
+        # 写日志的是哪个模块。**角色列全靠它**：没显式标 `对端=` 的行，靠模块名认对端
+        # （见 `logrole`）。这个 processor 同时认 structlog 原生记录和 stdlib 转进来的
+        # 外来记录（后者读 record.name），所以两条路上的行都能定到角色。
+        structlog.stdlib.add_logger_name,
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
     ]
@@ -150,12 +155,16 @@ class ChineseLogRenderer:
         timestamp = str(payload.pop("timestamp", ""))
         level = str(payload.pop("level", method_name or "info")).lower()
         event = str(payload.pop("event", ""))
-        payload.pop("_record", None)
+        record = payload.pop("_record", None)
         payload.pop("_from_structlog", None)
+        # 角色（对端）：显式 `对端=` 优先，其次按写日志的模块认。两个键都要从 payload 里
+        # 拿掉——它们是「这行日志的元信息」，不该跟着漏进消息尾巴的 kv 串里。
+        logger_name = payload.pop("logger", None) or getattr(record, "name", None)
+        role = logrole.role_of(logger_name, payload.pop(logrole.ROLE_KEY, None))
         exception = payload.pop("exception", None)
         stack = payload.pop("stack", None)
         message = _render_event(event, payload)
-        prefix = f"{timestamp} [{_LEVEL_LABELS.get(level, level)}]".strip()
+        prefix = f"{timestamp} [{_LEVEL_LABELS.get(level, level)}] [{role}]".strip()
         if exception:
             message = f"{message}\n{exception}"
         if stack:

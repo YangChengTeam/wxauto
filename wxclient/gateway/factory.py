@@ -17,6 +17,7 @@ from wxclient.config import load_settings
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
+from .. import logrole
 from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
 from .candidates import CandidateDirectory
@@ -39,6 +40,11 @@ from .wechat_io import QueueMessageSink, QueueMessageSource
 
 _log = structlog.get_logger(__name__)
 
+#: 换票走业务后端。
+_backend = _log.bind(**{logrole.ROLE_KEY: logrole.BACKEND})
+#: 能力探测直接问微信客户端。
+_wechat = _log.bind(**{logrole.ROLE_KEY: logrole.WECHAT})
+
 
 @dataclass(frozen=True)
 class Gateway:
@@ -55,7 +61,7 @@ def build_ticket_provider(
     settings: GatewaySettings, client_token: Callable[[], str] | None = None
 ) -> TicketProvider:
     if settings.local_ticket_file is not None:
-        _log.warning("使用本地票据文件（仅供联调，生产禁用）")
+        _backend.warning("使用本地票据文件（仅供联调，生产禁用）")
         return LocalFileTicketProvider(settings.local_ticket_file)
     return ClientTokenTicketProvider(
         settings.business_api_url,
@@ -140,7 +146,7 @@ def build_gateway(
                 from wxclient.uia_probe import probe_wechat_uia
             uia = probe_wechat_uia()
         except Exception as exc:  # noqa: BLE001 —— 探测失败 = 不知道 = 按做不了报
-            _log.warning("能力探测时 UIA 探测失败", error=str(exc))
+            _wechat.warning("能力探测时 UIA 探测失败", error=str(exc))
             uia = None
         return probe_capabilities(
             uia=uia,

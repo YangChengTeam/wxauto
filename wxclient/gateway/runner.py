@@ -19,6 +19,7 @@ from typing import Any
 
 import structlog
 
+from .. import logrole
 from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
 from .candidates import CandidateDirectory
@@ -58,6 +59,13 @@ from .watchlist import PUSH_EVENT, Watchlist
 from .wsclient import AgentWsClient, AgentWsError, TurnResult, Unauthorized
 
 _log = structlog.get_logger(__name__)
+
+#: 直接操作微信客户端的那几行。
+_wechat = _log.bind(**{logrole.ROLE_KEY: logrole.WECHAT})
+#: 跟 AI 端打交道的那几行（那条 WS：派轮 / 卡片 / 指令 / 回执 / 名单 / 能力）。
+_ai = _log.bind(**{logrole.ROLE_KEY: logrole.AI})
+#: 跟业务后端打交道的那几行（Client Token 走的 HTTP）。
+_backend = _log.bind(**{logrole.ROLE_KEY: logrole.BACKEND})
 
 #: 建连/保活的节拍。线上 nginx 对 /agent-ws 配的是 600s 空闲上限，30s 一拍既够续命，
 #: 也让「连接已经死了」最多 30s 就被发现（而不是攒到第一条真消息上）。
@@ -160,7 +168,7 @@ class ConnectionPool:
             await client.connect(ticket)
             self._clients[account_id] = client
             self._resumed[account_id] = set()
-            _log.info("已为该账号建立 AI 端连接", account=account_id)
+            _ai.info("已为该账号建立 AI 端连接", account=account_id)
             return client
 
     def connected_count(self) -> int:
@@ -330,7 +338,7 @@ class GatewayRunner:
         if ev == NOTICE_EVENT:
             self._on_notice(data)
             return
-        _log.debug("收到未处理的推送事件", ev=ev)
+        _ai.debug("收到未处理的推送事件", ev=ev)
 
     def _on_notice(self, data: dict[str, Any]) -> None:
         """AI 端说「这一轮发生了什么」（``wechat.notice``）——**只写日志，不做任何事**。
@@ -344,7 +352,7 @@ class GatewayRunner:
         text = str(data.get("text") or "").strip()
         if not text:
             return
-        _log.info("AI 端消息", 内容=text, 来源=str(data.get("source") or "") or None)
+        _ai.info("AI 端消息", 内容=text, 来源=str(data.get("source") or "") or None)
 
     def _on_card_update(self, data: dict[str, Any]) -> None:
         """指令回执（`kind=wechat_command_result`）。转给听众，并留一条日志。
@@ -360,16 +368,16 @@ class GatewayRunner:
         status = str(body.get("status") or "")
         reason = str(body.get("reason") or "")
         if status in {"rejected", "failed", "unsupported", "no_gateway"}:
-            _log.warning("指令没能执行", op=body.get("op"), status=status, reason=reason)
+            _ai.warning("指令没能执行", op=body.get("op"), status=status, reason=reason)
         else:
-            _log.info("指令回执", op=body.get("op"), status=status)
+            _ai.info("指令回执", op=body.get("op"), status=status)
         listener = self._command_listener
         if listener is None:
             return
         try:
             listener(dict(body))
         except Exception as exc:  # noqa: BLE001 - 界面出错不该掀翻读循环
-            _log.warning("指令回执回调异常", error=str(exc))
+            _ai.warning("指令回执回调异常", error=str(exc))
 
     def _apply_pacing(self, data: dict[str, Any]) -> None:
         """AI 端下发节拍（``wechat.pacing``）：让它按业务状态调快慢。
@@ -399,14 +407,14 @@ class GatewayRunner:
         if not commands:
             # 帧里既没有 commands 数组、op 又是空的。带了 command_id 就还回得了话；
             # 连 command_id 都没有才是真的无从回起（那条 AI 端也挂不上在途表）。
-            _log.warning("收到读不懂的微信指令帧")
+            _ai.warning("收到读不懂的微信指令帧")
             self._reject_commands(account_id, [data], "这条指令读不懂：缺少 op")
             return
         if self._commands is None:
             # ★ 不能只写日志就完事：AI 端那条指令会一直挂在在途表里等回执，业务后端
             #   超时重投又被幂等挡掉，这条计划项**永远发不出去且被记成已处理**。
             #   做不了就明说做不了（074：「做不了」和「不让做」给用户的话完全两样）。
-            _log.warning("收到微信指令但没有执行器，已回拒", 条数=len(commands))
+            _ai.warning("收到微信指令但没有执行器，已回拒", 条数=len(commands))
             self._reject_commands(account_id, commands, "这台电脑上的网关没有配指令执行器")
             return
         for command in commands:
@@ -479,7 +487,7 @@ class GatewayRunner:
             client = await self._pool.acquire(account_id)
             await client.notify(RESULT_OP, payload)
         except Exception as exc:  # noqa: BLE001
-            _log.warning("指令回执发送失败", error=str(exc), status=status, 待补发=terminal)
+            _ai.warning("指令回执发送失败", error=str(exc), status=status, 待补发=terminal)
             return
         if terminal:
             self._store.drop_receipt(account_id, command_id)
@@ -497,7 +505,7 @@ class GatewayRunner:
         )
         for row in stale:
             # 丢必须留痕：AI 端那边已经忘了这条指令（在途表 24h TTL），补也补不上了。
-            _log.warning("回执过期未送达，已丢弃", command_id=row["command_id"],
+            _ai.warning("回执过期未送达，已丢弃", command_id=row["command_id"],
                          attempts=row["attempts"], created_at=row["created_at"])
         for row in self._store.list_receipts(limit=RECEIPT_FLUSH_BATCH):
             account_id, command_id = row["account_id"], row["command_id"]
@@ -506,12 +514,12 @@ class GatewayRunner:
                 await client.notify(RESULT_OP, row["payload"])
             except Exception as exc:  # noqa: BLE001
                 attempts = self._store.bump_receipt_attempts(account_id, command_id)
-                _log.info("回执补发没成功，留着下一轮", command_id=command_id,
+                _ai.info("回执补发没成功，留着下一轮", command_id=command_id,
                           attempts=attempts, error=str(exc)[:100])
                 # 连接这会儿不通，同一轮里后面几条也是白试。
                 return
             self._store.drop_receipt(account_id, command_id)
-            _log.info("回执已补发", command_id=command_id, attempts=row["attempts"])
+            _ai.info("回执已补发", command_id=command_id, attempts=row["attempts"])
 
     async def _run_command(self, account_id: str, command: dict[str, Any]) -> None:
         assert self._commands is not None
@@ -533,7 +541,7 @@ class GatewayRunner:
         try:
             await self._report_contact(command, result)
         except Exception as exc:  # noqa: BLE001 —— 会话名上报永远不该影响回执
-            _log.warning("会话名上报异常", error=str(exc))
+            _backend.warning("会话名上报异常", error=str(exc))
         payload = (
             result.to_frame_data()
             if result is not None
@@ -559,7 +567,7 @@ class GatewayRunner:
             return
         candidate_id = self._store.contact_worker_id(account_id, peer_id)
         if not candidate_id:
-            _log.info("这个会话还没归位到候选人，入站消息不上报", account=account_id)
+            _backend.info("这个会话还没归位到候选人，入站消息不上报", account=account_id)
             return
         for message in messages:
             self._message_events.record(
@@ -609,7 +617,7 @@ class GatewayRunner:
             rows = await self._contacts.pull(updated_since=since)
             if rows:
                 saved = self._store.save_contacts(account_id, rows)
-                _log.info("候选人会话名已同步", account=account_id, saved=saved, incremental=bool(since))
+                _backend.info("候选人会话名已同步", account=account_id, saved=saved, incremental=bool(since))
             # 090：刚才还不认识的人，后端已经给他建好档、会话名也归位了 → 他不再是「陌生人」。
             # 不摘掉的话，这个人会同时出现在两份来源里，而临时准入到期时会被当成过期清掉，
             # 名单反而少了一个正经候选人。
@@ -713,7 +721,7 @@ class GatewayRunner:
         if self._store.defer_accepted_report(
             account_id, number, remark, self._clock(), command_id=command_id
         ):
-            _log.info(
+            _backend.info(
                 "对方通过了好友申请，先不报，等一会儿",
                 会话=remark, 等待分钟=int(ACCEPTED_REPORT_DELAY_SECONDS // 60),
             )
@@ -736,13 +744,13 @@ class GatewayRunner:
                         occurred_at=row["detected_at"],
                     )
                 except Exception as exc:  # noqa: BLE001 —— 一条报不出去不该拖垮这一趟
-                    _log.warning("好友通过补报出错，留着下一轮", 原因=str(exc))
+                    _backend.warning("好友通过补报出错，留着下一轮", 原因=str(exc))
                     continue
                 if result is None:
                     # `report()` 自己已经记过为什么（缺字段 / 请求失败），这里不重复喊。
                     continue
                 self._store.drop_accepted_report(account_id, row["number"])
-                _log.info("好友通过已上报", 会话=row["remark"])
+                _backend.info("好友通过已上报", 会话=row["remark"])
 
     def _account(self) -> str:
         """指令归哪个号。现在一条连接一个号（`CommandExecutor` 也是取第一个）。"""
@@ -758,7 +766,7 @@ class GatewayRunner:
                 continue
             number = self._store.contact_number_for(account_id, name)
             if not number:
-                _log.info("通过了好友申请但本机不认识这个名字，不上报")  # 名字不进日志
+                _backend.info("通过了好友申请但本机不认识这个名字，不上报")  # 名字不进日志
                 continue
             self._defer_accepted_report(account_id, number, name, command_id=command_id)
             self._store.mark_contact_status(account_id, number, CONTACT_ACCEPTED)
@@ -841,7 +849,7 @@ class GatewayRunner:
         try:
             return await self._sender.deliver(account_id, peer_id, card)
         except Exception as exc:  # noqa: BLE001 —— 见上：投递阶段不允许触发重投
-            _log.warning(
+            _wechat.warning(
                 "投递回复时出错，本批不再重投（可能已经发出去一部分，重投会重复骚扰对方）",
                 account=account_id,
                 error=str(exc),
@@ -864,7 +872,7 @@ class GatewayRunner:
         text = str(stage.get("text") or "").strip()
         if not text:
             return
-        _log.info("AI 端阶段", 会话=peer_id, 阶段=text, key=str(stage.get("key") or "-"))
+        _ai.info("AI 端阶段", 会话=peer_id, 阶段=text, key=str(stage.get("key") or "-"))
 
     async def _turn_heartbeat(self, peer_id: str, started: datetime) -> None:
         """一轮还没收口就每隔 ``TURN_HEARTBEAT_SECONDS`` 说一声「还在跑」。
@@ -882,7 +890,7 @@ class GatewayRunner:
         try:
             while True:
                 await asyncio.sleep(TURN_HEARTBEAT_SECONDS)
-                _log.info(
+                _ai.info(
                     "AI 端还在跑这一轮",
                     会话=peer_id,
                     已用秒=self._elapsed(started),
@@ -891,7 +899,7 @@ class GatewayRunner:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 —— 观测支路不许影响这一轮
-            _log.warning("这一轮的心跳自己出错了，停掉它，不影响回复", 原因=str(exc))
+            _ai.warning("这一轮的心跳自己出错了，停掉它，不影响回复", 原因=str(exc))
 
     async def _run_dialog_turn(
         self,
@@ -910,7 +918,7 @@ class GatewayRunner:
         refs = self._peer_refs(account_id, peer_id)
         for attempt in (1, 2):
             started = self._clock()
-            _log.info(
+            _ai.info(
                 "喂给 AI 端",
                 会话=peer_id,
                 本轮=len(messages),
@@ -934,7 +942,7 @@ class GatewayRunner:
                 )
             except Unauthorized as exc:
                 # 票据/归属出问题：会话多半已经不属于我们了，清掉重来。
-                _log.warning(
+                _ai.warning(
                     "AI 端不认这条会话了，清掉重来",
                     会话=peer_id, 原因=str(exc), 第几次=attempt, 已用秒=self._elapsed(started),
                 )
@@ -945,7 +953,7 @@ class GatewayRunner:
                 continue
             except AgentWsError as exc:
                 # 断线 / 一轮超时。第一次原来是**静默**重试的——现场表现就是长时间没有下文。
-                _log.warning(
+                _ai.warning(
                     "这一轮没跑通",
                     会话=peer_id, 原因=str(exc), 第几次=attempt, 已用秒=self._elapsed(started),
                 )
@@ -963,7 +971,7 @@ class GatewayRunner:
             if not result.ok:
                 # AI 端明确报错：卡片是 fallback，没有 reply_segments，出站自然不会发东西。
                 error = result.error or {}
-                _log.warning(
+                _ai.warning(
                     "AI 端返回错误",
                     会话=peer_id,
                     code=error.get("code") or "-",
@@ -971,7 +979,7 @@ class GatewayRunner:
                     已用秒=self._elapsed(started),
                 )
                 return None
-            _log.info(
+            _ai.info(
                 "AI 端这一轮跑完了",
                 会话=peer_id,
                 已用秒=self._elapsed(started),
@@ -993,7 +1001,7 @@ class GatewayRunner:
                 await client.resume_session(session_id)
             except Unauthorized:
                 # AI 端说这个会话接不回来（被驱逐/不归我们）→ 丢掉重建，别卡死这个联系人。
-                _log.info("旧会话接不回，改为新建", account=account_id)
+                _ai.info("旧会话接不回，改为新建", account=account_id)
                 self._store.drop_session(account_id, peer_id)
                 session_id = None
             else:
@@ -1186,7 +1194,7 @@ class GatewayRunner:
         try:
             await self._flush_accepted_reports()
         except Exception as exc:  # noqa: BLE001
-            _log.warning("这一趟的好友通过补报没跑成，下一趟再说", 原因=str(exc))
+            _backend.warning("这一趟的好友通过补报没跑成，下一趟再说", 原因=str(exc))
         return await self.loop.tick()
 
     async def drain(self) -> None:
@@ -1317,7 +1325,7 @@ class GatewayRunner:
                 await self._pool.heartbeat(account_id)
             except Exception as exc:  # noqa: BLE001 - 什么原因都要记下来给界面看
                 self._connect_error = f"{type(exc).__name__}: {exc}"
-                _log.warning("AI 端连接不可用", account=account_id, error=self._connect_error)
+                _ai.warning("AI 端连接不可用", account=account_id, error=self._connect_error)
             else:
                 self._connect_error = None
                 await self._report_capabilities(account_id)
@@ -1374,12 +1382,12 @@ class GatewayRunner:
         try:
             frame = capabilities_frame(self._capabilities())
         except Exception as exc:  # noqa: BLE001 —— 探测失败不该把保活带停
-            _log.warning("能力探测失败", error=str(exc))
+            _wechat.warning("能力探测失败", error=str(exc))
             return
         try:
             client = await self._pool.acquire(account_id)
         except Exception as exc:  # noqa: BLE001
-            _log.warning("能力上报失败", error=str(exc))
+            _ai.warning("能力上报失败", error=str(exc))
             return
         # ★ 「变了才报」里的**变**必须同时看连接：AI 端的网关册子是按**连接**记的
         # （连接一关就注销），而自报能力表正是这台机器入册的唯一途径。断线重连后是一条
@@ -1390,13 +1398,13 @@ class GatewayRunner:
         try:
             await client.notify(CAPABILITIES_OP, frame)
         except Exception as exc:  # noqa: BLE001
-            _log.warning("能力上报失败", error=str(exc))
+            _ai.warning("能力上报失败", error=str(exc))
             return
         self._reported_capabilities[account_id] = (client, frame["capabilities"])
         unavailable = [
             cap["label"] for cap in frame["capabilities"].values() if not cap["available"]
         ]
-        _log.info("已上报本机能力", 做不了=unavailable or "无")
+        _ai.info("已上报本机能力", 做不了=unavailable or "无")
 
     async def _keepalive_loop(self) -> None:
         while True:
@@ -1414,7 +1422,7 @@ class GatewayRunner:
             await asyncio.wait_for(self.loop.drain(), timeout=SHUTDOWN_DRAIN_SECONDS)
         except TimeoutError:
             abandoned = self.loop.cancel_inflight()
-            _log.warning("退出时还有未收口的轮次，已放弃", turns=abandoned)
+            _ai.warning("退出时还有未收口的轮次，已放弃", turns=abandoned)
         await self._drain_message_events()
         await self._pool.close_all()
 
@@ -1432,7 +1440,7 @@ class GatewayRunner:
                 self._message_events.flush(), timeout=MESSAGE_EVENT_DRAIN_SECONDS
             )
         except TimeoutError:
-            _log.warning("退出时消息事件没清完，留到下次开机再报",
+            _backend.warning("退出时消息事件没清完，留到下次开机再报",
                          pending=self._message_events.pending())
         except Exception as exc:  # noqa: BLE001 —— 退出路径上不许再抛
-            _log.warning("退出时清消息事件出错", error=type(exc).__name__)
+            _backend.warning("退出时清消息事件出错", error=type(exc).__name__)

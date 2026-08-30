@@ -15,12 +15,18 @@ from typing import Any, Protocol
 
 import structlog
 
+from .. import logrole
 from .candidates import CandidateDirectory, CandidateUpdateError
 from .guard import ACTION_GROUP, ACTION_MESSAGE, OutboundGuard
 from .inbound import FOLLOW_UP_DEFER
 from .message_events import DIRECTION_OUTBOUND, MessageEventReporter, local_message_id
 
 _log = structlog.get_logger(__name__)
+
+#: 跟业务后端打交道的那几行（Client Token 走的 HTTP）。
+_backend = _log.bind(**{logrole.ROLE_KEY: logrole.BACKEND})
+#: 这台电脑自己的事，不涉及任何对端。
+_local = _log.bind(**{logrole.ROLE_KEY: logrole.LOCAL})
 
 
 class MessageSink(Protocol):
@@ -109,7 +115,7 @@ class OutboundSender:
         await self._apply_ai_status_actions(account_id, peer_id, actions)
 
         if not segments:
-            _log.info("本轮不回复", account=account_id, 会话=peer_id, reason=no_reply_reason)
+            _local.info("本轮不回复", account=account_id, 会话=peer_id, reason=no_reply_reason)
             return DeliveryResult(skipped_reason=no_reply_reason, actions=actions)
 
         now = self._clock()
@@ -122,7 +128,7 @@ class OutboundSender:
             account_id, peer_id, now=now, action=action, count=len(segments),
         )
         if not reservation.allowed:
-            _log.info("出站被守门拦下", account=account_id, 会话=peer_id, reason=reservation.reason)
+            _local.info("出站被守门拦下", account=account_id, 会话=peer_id, reason=reservation.reason)
             # 配额用完 / 不在时间窗 = 等一等就能发，**别把候选人的话丢了**；黑名单、
             # 本机关掉了这类动作则是明确结论，销账（审计 P0-4）。
             return DeliveryResult(
@@ -161,7 +167,7 @@ class OutboundSender:
             return
         candidate_id = self._store.contact_worker_id(account_id, peer_id)
         if not candidate_id:
-            _log.info("发出的回复没能归位到候选人，不上报消息事件", account=account_id)
+            _backend.info("发出的回复没能归位到候选人，不上报消息事件", account=account_id)
             return
         now = self._clock()
         for task_id, segment in zip(task_ids, segments):
@@ -190,11 +196,11 @@ class OutboundSender:
             return
         candidate_id = self._store.contact_worker_id(account_id, peer_id)
         if not candidate_id:
-            _log.info("状态回写跳过：本机不知道这个会话对应哪个候选人", account=account_id, 会话=peer_id)
+            _backend.info("状态回写跳过：本机不知道这个会话对应哪个候选人", account=account_id, 会话=peer_id)
             return
         # 一轮只写一次：卡上真出现两条就是模型自相矛盾，取第一条，剩下的记一笔。
         if len(entries) > 1:
-            _log.warning("一张卡上有多条状态提案，只取第一条", count=len(entries))
+            _backend.warning("一张卡上有多条状态提案，只取第一条", count=len(entries))
         entry = entries[0]
         payload = entry.get("payload")
         status = (payload or {}).get("status") if isinstance(payload, dict) else None
@@ -204,7 +210,7 @@ class OutboundSender:
                 ai_status={"status": status, "reason": entry.get("reason") or ""},
             )
         except CandidateUpdateError as exc:
-            _log.warning("状态回写请求不成立", error=str(exc))
+            _backend.warning("状态回写请求不成立", error=str(exc))
 
     def _apply_blacklist_actions(
         self, account_id: str, peer_id: str, actions: Sequence[dict[str, Any]]
@@ -218,5 +224,5 @@ class OutboundSender:
                     peer_id,
                     reason=reason if isinstance(reason, str) else "AI 端判定对方拒绝联系",
                 )
-                _log.info("按 AI 端提案拉黑", account=account_id)
+                _local.info("按 AI 端提案拉黑", account=account_id)
                 return

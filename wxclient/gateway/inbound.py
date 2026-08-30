@@ -19,10 +19,18 @@ from typing import Any, Protocol
 
 import structlog
 
+from .. import logrole
 from .guard import looks_like_rejection
 from .pacing import jittered
 
 _log = structlog.get_logger(__name__)
+
+#: 跟 AI 端打交道的那几行（那条 WS：派轮 / 卡片 / 指令 / 回执 / 名单 / 能力）。
+_ai = _log.bind(**{logrole.ROLE_KEY: logrole.AI})
+#: 跟业务后端打交道的那几行（Client Token 走的 HTTP）。
+_backend = _log.bind(**{logrole.ROLE_KEY: logrole.BACKEND})
+#: 这台电脑自己的事，不涉及任何对端。
+_local = _log.bind(**{logrole.ROLE_KEY: logrole.LOCAL})
 
 PeerKey = tuple[str, str]  # (account_id, peer_id)
 
@@ -354,7 +362,7 @@ class InboundLoop:
         for message in fresh:
             if not message.from_self and looks_like_rejection(message.text):
                 self._store.blacklist(account_id, peer_id, reason="入站消息命中拒绝表达")
-                _log.info("命中拒绝表达，已拉黑并停止自动化", account=account_id)
+                _local.info("命中拒绝表达，已拉黑并停止自动化", account=account_id)
                 return
 
         # ★ 落盘再入缓冲（070）：游标在读到消息那一刻就推进了，从这里到「AI 端跑完一轮」
@@ -385,7 +393,7 @@ class InboundLoop:
         try:
             self._on_peer_messages(account_id, peer_id, messages)
         except Exception as exc:  # noqa: BLE001 —— 旁听者出错不该影响收消息
-            _log.warning("入站消息事件登记失败", error=str(exc))
+            _backend.warning("入站消息事件登记失败", error=str(exc))
 
     def _dispatch_due(self, now: datetime) -> int:
         dispatched = 0
@@ -408,7 +416,7 @@ class InboundLoop:
 
             account_id, peer_id = key
             transcript = format_transcript(messages)
-            _log.info("派发一轮给 AI 端", 会话=peer_id, 条数=len(messages))
+            _ai.info("派发一轮给 AI 端", 会话=peer_id, 条数=len(messages))
             self._quiet_notice.pop(key, None)
             self._inflight_batches.update(batch_ids or ())
             self._inflight[key] = asyncio.create_task(
@@ -426,7 +434,8 @@ class InboundLoop:
         if self._quiet_notice.get(key) == (why, count):
             return
         self._quiet_notice[key] = (why, count)
-        _log.info(why, 会话=key[1], 条数=count)
+        # 这条说的是「这批为什么不派轮」——本机的判定，不是微信那边发生了什么
+        _local.info(why, 会话=key[1], 条数=count)
 
     async def _run_handler(
         self,
@@ -472,7 +481,7 @@ class InboundLoop:
             for batch_id in batch_ids or ():
                 attempts = max(attempts, self._store.bump_pending_attempts(batch_id))
         self._pending_loaded.difference_update(batch_ids or ())
-        _log.warning(
+        _ai.warning(
             "这一轮没把话说出去，本批留在待处理队列等重投",
             account=account_id,
             原因=why or follow_up,
@@ -491,12 +500,12 @@ class InboundLoop:
         # 顺手清掉过保鲜期的聊天记录（真实 PII，不留成越来越大的本地归档）。
         dropped = self._store.purge_messages_before(now - timedelta(days=HISTORY_MAX_AGE_DAYS))
         if dropped:
-            _log.info("清掉过期聊天记录", 条数=dropped, 保留天数=HISTORY_MAX_AGE_DAYS)
+            _local.info("清掉过期聊天记录", 条数=dropped, 保留天数=HISTORY_MAX_AGE_DAYS)
 
         cutoff = now - timedelta(hours=PENDING_MAX_AGE_HOURS)
         for row in self._store.purge_pending_inbound_before(cutoff):
             self._pending_loaded.discard(row["batch_id"])
-            _log.warning(
+            _local.warning(
                 "待处理消息超过保鲜期，已丢弃（这时候再回过去反而更奇怪）",
                 account=row["account_id"],
                 条数=len(row["payload"]),
@@ -512,7 +521,7 @@ class InboundLoop:
                 continue
             if row["attempts"] >= PENDING_MAX_ATTEMPTS:
                 self._store.drop_pending_inbound(batch_id)
-                _log.warning(
+                _local.warning(
                     "待处理消息重投多次仍失败，已放弃",
                     account=row["account_id"],
                     条数=len(row["payload"]),
@@ -530,7 +539,7 @@ class InboundLoop:
             self._pending_loaded.add(batch_id)
             loaded += 1
         if loaded:
-            _log.info("从待处理队列补投", 批次=loaded)
+            _local.info("从待处理队列补投", 批次=loaded)
         return loaded
 
     @property
@@ -592,7 +601,7 @@ class InboundLoop:
             "active_seconds": self._active_interval,
             "hot_window_seconds": self._hot_window,
         }
-        _log.info("节拍已更新（AI 端下发）", **pace)
+        _ai.info("节拍已更新（AI 端下发）", **pace)
         return pace
 
     async def run(self) -> None:

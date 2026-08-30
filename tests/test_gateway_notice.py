@@ -64,14 +64,14 @@ class NoticeTests(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_it_writes_the_line_into_the_local_log(self) -> None:
-        with patch("wxclient.gateway.runner._log") as log:
+        with patch("wxclient.gateway.runner._ai") as log:
             self.runner._on_push(ACCOUNT, NOTICE_EVENT, {"text": "收到一轮任务：入职第 3 天回访", "source": "trigger"})
         log.info.assert_called_once()
         self.assertIn("入职第 3 天回访", json.dumps(log.info.call_args.kwargs, ensure_ascii=False))
 
     def test_an_empty_notice_writes_nothing(self) -> None:
         """AI 端偶尔推一条空的，不该在日志里留一行空白。"""
-        with patch("wxclient.gateway.runner._log") as log:
+        with patch("wxclient.gateway.runner._ai") as log:
             self.runner._on_push(ACCOUNT, NOTICE_EVENT, {"text": "   "})
             self.runner._on_push(ACCOUNT, NOTICE_EVENT, {})
         log.info.assert_not_called()
@@ -79,7 +79,7 @@ class NoticeTests(unittest.TestCase):
     def test_it_never_dispatches_anything(self) -> None:
         """★ 通知里就算写着看起来像指令的东西，也一条都不许下发。"""
         with patch.object(self.runner, "_dispatch_commands") as dispatch, \
-             patch("wxclient.gateway.runner._log"):
+             patch("wxclient.gateway.runner._ai"):
             self.runner._on_push(
                 ACCOUNT,
                 NOTICE_EVENT,
@@ -89,7 +89,7 @@ class NoticeTests(unittest.TestCase):
 
     def test_an_unknown_push_is_still_ignored_quietly(self) -> None:
         """AI 端将来加别的推送时，旧网关必须照跑（不抛、不断连）。"""
-        with patch("wxclient.gateway.runner._log"):
+        with patch("wxclient.gateway.runner._ai"):
             self.runner._on_push(ACCOUNT, "wechat.something.new", {"whatever": 1})
 
 

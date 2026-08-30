@@ -1020,17 +1020,24 @@ class LogLookTests(unittest.TestCase):
                 walk(child)
 
         walk(self.table)
-        self.assertEqual(set(heads), {"时间", "级别", "消息"})
+        self.assertEqual(set(heads), {"时间", "级别", "角色", "消息"})
+
+        import tkinter.font as tkfont
 
         from wxclient.ui import logtable
 
         tabs = [int(float(tab)) for tab in self.root.tk.splitlist(self.table._text.cget("tabs"))]
         pad = logtable._PAD_X
-        self.assertEqual(len(tabs), 3, "三列三个制表位——时间列也得有一个，见下一条")
+        self.assertEqual(len(tabs), 4, "四列四个制表位——时间列也得有一个，见下一条")
         self.assertEqual(heads["时间"], pad + tabs[0], "「时间」要正对时间列")
         self.assertEqual(heads["级别"], pad + tabs[1], "「级别」要正对级别列")
-        self.assertEqual(heads["消息"], pad + tabs[2], "「消息」要正对消息列")
+        # 角色格是个带底色的小标签，左右各垫一个空格，所以列头照标签的**文字**起点对
+        space = tkfont.Font(font=theme.FONT_SMALL).measure(" ")
+        self.assertEqual(heads["角色"], pad + tabs[2] + space, "「角色」要正对角色标签的字")
+        self.assertEqual(heads["消息"], pad + tabs[3], "「消息」要正对消息列")
         self.assertLess(heads["时间"], heads["级别"], "时间列在最左边")
+        self.assertLess(heads["级别"], heads["角色"])
+        self.assertLess(heads["角色"], heads["消息"])
         # ★ 用户 2026-08-15：「文字离左边不要贴着」——时间列要在色条右边空出一段
         self.assertGreaterEqual(heads["时间"] - pad - self.table._bar_w, logtable._BAR_GAP)
 
@@ -1055,6 +1062,47 @@ class LogLookTests(unittest.TestCase):
         self.assertNotEqual(self.table._text.tag_cget("bar_warn", "background"),
                             self.table._text.tag_cget("row_warn", "background"),
                             "竖条要比整行底色重，否则等于没有")
+
+    def test_角色画成一个带底色的小标签(self) -> None:
+        """★ 用户 2026-08-30：一眼看出这条是跟 AI 端还是跟业务后端打交道。"""
+        from wxclient import logrole
+        from wxclient.ui import logtable
+
+        self._feed("2026-08-15 13:29:13 [信息] [AI端] 已连上 AI 端")
+
+        self.assertIn("AI端", self._dump())
+        ranges = self.table._text.tag_ranges(f"role_{logrole.AI}")
+        self.assertTrue(ranges, "角色要单独打上 role_ 标签才上得了色")
+        self.assertEqual(self.table._text.get(*ranges[:2]), " AI端 ")
+        color, chip_bg = logtable._ROLE_STYLE[logrole.AI]
+        self.assertEqual(self.table._text.tag_cget(f"role_{logrole.AI}", "foreground"), color)
+        self.assertEqual(self.table._text.tag_cget(f"role_{logrole.AI}", "background"), chip_bg)
+
+    def test_警告行上角色标签仍然看得见(self) -> None:
+        """★ tag 优先级按配置先后算：role_ 配在 row_ 之后，才压得住整行底色。
+
+        压不住的话，「哪一端出的事」恰恰在最该看清的那两行上没了颜色。
+        """
+        from wxclient import logrole
+
+        self._feed("2026-08-15 13:29:13 [警告] [业务后端] 会话名接口被拒")
+
+        ranges = self.table._text.tag_ranges(f"role_{logrole.BACKEND}")
+        self.assertTrue(ranges)
+        names = self.table._text.tag_names(ranges[0])
+        self.assertIn("row_warn", names, "整行底色确实铺到了这一格上")
+        self.assertGreater(
+            names.index(f"role_{logrole.BACKEND}"), names.index("row_warn"),
+            "role_ 必须排在 row_ 后面（tag_names 按优先级从低到高给），否则底色被盖掉",
+        )
+
+    def test_老日志没有角色也画得出来(self) -> None:
+        """日志目录留着 30 天历史，那些行没有角色段——那一格留白，不能崩也不能写「未知」。"""
+        self._feed("2026-08-15 13:29:32 [信息] 已读取本地联调票")
+
+        text = self._dump()
+        self.assertIn("已读取本地联调票", text)
+        self.assertNotIn("未知", text)
 
     def test_the_level_column_is_a_dot_plus_an_uppercase_level(self) -> None:
         self._feed("2026-08-15 13:29:13 [警告] 站消息失败")

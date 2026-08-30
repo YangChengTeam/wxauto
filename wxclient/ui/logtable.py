@@ -1,4 +1,4 @@
-"""实时日志视图：一个只读的 ``tk.Text`` 控制台，按 时间 / 级别 / 消息 三列着色。
+"""实时日志视图：一个只读的 ``tk.Text`` 控制台，按 时间 / 级别 / 角色 / 消息 四列着色。
 
 **为什么不再用「一行一堆控件」。** 早先这里是 Canvas 里塞一串行 Frame，每行三个 Label
 加一条 1px 分隔线。做出来是好看，代价有三条：
@@ -10,8 +10,11 @@
 上色，所以「时间灰、级别按严重程度着色、消息黑」照样做得到，还白捡了选中/复制/查找。
 
 样式对着 `docs/main.png` 走：
-  · 顶上一条不滚动的表头（时间 / 级别 / 消息）+ 一条细分隔线，列头和数据列对齐；
+  · 顶上一条不滚动的表头（时间 / 级别 / 角色 / 消息）+ 一条细分隔线，列头和数据列对齐；
   · 级别列是「圆点 + 大写级别」，颜色按严重程度；
+  · **角色列**说这一行是跟谁打交道（微信 / AI端 / 业务后端 / 本机），画成一个带底色的
+    小标签——和级别列的「圆点 + 字」在视觉上分得开，扫一眼就知道该去查哪一端
+    （用户 2026-08-30：同样是超时，AI 端和业务后端要查的是两个完全不同的地方）；
   · 警告/错误整行铺一层浅底色，**左边再立一根细竖条**——扫一眼就知道哪儿不对；
   · 消息里的 ``key="value"`` 压成灰色，让人先读得懂那句人话，再看参数；
   · **一条日志占且只占一行**，长了就截断，鼠标停上去用气泡显示整条；
@@ -32,6 +35,7 @@ import tkinter.font as tkfont
 from collections import deque
 from collections.abc import Iterable
 
+from .. import logrole
 from . import theme
 from .logline import LEVEL_FILTERS, LogLine
 
@@ -61,12 +65,23 @@ _SEVERITY_STYLE = {
     "debug": (theme.GRAY, None),
 }
 
+#: 角色 → (文字色, 底色)。四个色相分得开，且**都不复用级别列那几个色**——级别说的是
+#: 「这条严不严重」，角色说的是「这条跟谁有关」，两件事撞了色就等于没分列。
+_ROLE_STYLE: dict[str, tuple[str, str]] = {
+    logrole.WECHAT: ("#0b8043", "#e9f6ee"),    # 绿：微信
+    logrole.AI: ("#4f46e5", "#eeeefc"),        # 靛：AI 端
+    logrole.BACKEND: ("#0369a1", "#e8f2fa"),   # 蓝：业务后端
+    logrole.LOCAL: ("#6b7280", "#f2f3f5"),     # 灰：本机自己的事
+}
+
 #: 日志里的结构化参数：``account="zk_weixin"``。灰掉它们，人话才浮得出来。
 _KV = re.compile(r'\S+="[^"]*"')
 
-#: 量列宽用的样板串。时间取最长的一种写法，级别取最长的那个标签。
+#: 量列宽用的样板串。时间取最长的一种写法，级别和角色各取最长的那个标签。
 _TIME_SAMPLE = "2026-08-15 13:29:13"
 _LEVEL_SAMPLE = "● DEBUG"
+#: 角色标签两边各留一个空格当内边距，所以量宽也要连着空格一起量。
+_ROLE_SAMPLE = " 业务后端 "
 
 
 #: 分隔线候选字体。线有多粗 = 这个字体的行高有多高，所以只看谁矮：Windows 自带的
@@ -133,11 +148,14 @@ class LogTable(tk.Frame):
         # ★时间列也要走制表位，不能「紧跟色条往后排」——色条那个空格在不同级别上宽度不一样
         # （见下面 bar_ tag），紧跟着排就会一行一个起点，时间列参差不齐
         # （用户 2026-08-15：「不同级别的信息对齐」）。
+        role_font = tkfont.Font(font=theme.FONT_SMALL)
         text_tab = self._bar_w + _BAR_GAP
         time_tab = text_tab + mono.measure(_TIME_SAMPLE) + _GAP
-        msg_tab = time_tab + mono_bold.measure(_LEVEL_SAMPLE) + _GAP
+        level_tab = time_tab + mono_bold.measure(_LEVEL_SAMPLE) + _GAP
+        # 角色标签自带左右内边距，列间距按半个 _GAP 给就够——给满会把消息推得太靠右。
+        msg_tab = level_tab + role_font.measure(_ROLE_SAMPLE) + _GAP // 2
 
-        self._build_head(text_tab, time_tab, msg_tab)
+        self._build_head(text_tab, time_tab, level_tab, msg_tab)
 
         body = tk.Frame(self, bg=theme.CONTENT_BG)
         body.pack(fill=tk.BOTH, expand=True)
@@ -146,7 +164,7 @@ class LogTable(tk.Frame):
             # 不换行：一条日志一行，超出右边界的部分截掉，靠气泡看全（见 `_on_motion`）
             wrap=tk.NONE, relief=tk.FLAT, highlightthickness=0, bd=0,
             padx=_PAD_X, pady=6, spacing1=7, spacing3=8, cursor="arrow",
-            tabs=(str(text_tab), str(time_tab), str(msg_tab)), insertwidth=0,
+            tabs=(str(text_tab), str(time_tab), str(level_tab), str(msg_tab)), insertwidth=0,
         )
         self._scroll = tk.Scrollbar(body, orient=tk.VERTICAL, command=self._text.yview, width=12)
         self._text.configure(yscrollcommand=self._scroll.set)
@@ -176,18 +194,28 @@ class LogTable(tk.Frame):
                                      **({"background": color} if row_bg else {}))
             if row_bg:
                 self._text.tag_configure(f"row_{severity}", background=row_bg)
+        # ★ 角色标签的 tag 必须配置在 row_ **之后**：tk 的 tag 优先级按配置先后算，
+        # 后配的压先配的。反过来的话，警告/错误那两行的整行底色会把角色标签的底色盖掉，
+        # 于是「哪一端出的事」恰恰在最该看清的两行上看不见了。
+        for role, (color, chip_bg) in _ROLE_STYLE.items():
+            self._text.tag_configure(f"role_{role}", foreground=color, background=chip_bg,
+                                     font=theme.FONT_SMALL)
         # 只读，但要留着选中和 Ctrl+C——排障时能把日志贴给别人是刚需。
         self._text.configure(state=tk.DISABLED)
         self._text.bind("<Key>", self._swallow_keys)
         self._text.bind("<Motion>", self._on_motion)
         self._text.bind("<Leave>", lambda _e: self._hide_tip())
 
-    def _build_head(self, text_tab: int, time_tab: int, msg_tab: int) -> None:
+    def _build_head(self, text_tab: int, time_tab: int, level_tab: int, msg_tab: int) -> None:
         """表头。不跟着滚——滚上去之后没人记得住第二列是什么。"""
         head = tk.Frame(self, bg=theme.CONTENT_BG, height=34)
         head.pack(fill=tk.X)
         head.pack_propagate(False)
-        for text, offset in (("时间", text_tab), ("级别", time_tab), ("消息", msg_tab)):
+        # 角色列头往右挪一格：数据格是带底色的标签、自带一个空格的内边距，
+        # 列头照标签的**文字**起点对，看着才是一列。
+        role_head = level_tab + tkfont.Font(font=theme.FONT_SMALL).measure(" ")
+        for text, offset in (("时间", text_tab), ("级别", time_tab),
+                             ("角色", role_head), ("消息", msg_tab)):
             tk.Label(head, text=text, font=theme.FONT_TABLE_HEAD, bg=theme.CONTENT_BG,
                      fg=theme.TEXT_MUTED).place(x=_PAD_X + offset, rely=0.5, anchor="w")
         tk.Frame(self, bg=theme.TABLE_HEAD_LINE, height=1).pack(fill=tk.X)
@@ -254,6 +282,7 @@ class LogTable(tk.Frame):
             self._text.insert(tk.END, f"\t{item.time or ''}\t", ("time",))
             level = f"● {item.level}" if item.level else ""
             self._text.insert(tk.END, f"{level}\t", (f"level_{severity}",))
+            self._insert_role(item.role)
             self._insert_message(item.message)
             if row_bg:
                 self._text.tag_add(f"row_{severity}", after_bar, self._text.index("end-1c"))
@@ -264,6 +293,17 @@ class LogTable(tk.Frame):
         self._text.configure(state=tk.DISABLED)
         if stick:
             self._text.see(tk.END)
+
+    def _insert_role(self, role: str) -> None:
+        """角色那一格：一个带底色的小标签。认不出角色就留白，不写「未知」。
+
+        标签本身和后面那个制表符**分开插**：制表符要是也带上角色 tag，那片底色就会一路
+        铺到消息列，看着像半行被涂了色。
+        """
+        style = _ROLE_STYLE.get(role)
+        if style is not None:
+            self._text.insert(tk.END, f" {role} ", (f"role_{role}",))
+        self._text.insert(tk.END, "\t", ("time",))
 
     def _insert_message(self, message: str) -> None:
         """人话用正文色，``key="value"`` 压成灰色。"""
@@ -303,7 +343,9 @@ class LogTable(tk.Frame):
 
     def tip_text(self, record: LogLine) -> str:
         """气泡里显示的整条日志。截断的是显示，不是内容。"""
-        return "  ".join(part for part in (record.time, record.level, record.message) if part)
+        return "  ".join(
+            part for part in (record.time, record.level, record.role, record.message) if part
+        )
 
     def _on_motion(self, event: tk.Event) -> None:
         line = int(self._text.index(f"@{event.x},{event.y}").split(".")[0])

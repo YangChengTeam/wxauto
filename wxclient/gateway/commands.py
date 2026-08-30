@@ -22,6 +22,7 @@ import structlog
 
 from wxclient.queue import TaskType
 
+from .. import logrole
 from .candidates import CandidateDirectory, CandidateUpdateError
 from .capabilities import capability_of
 from .download import DownloadError, FileRef
@@ -38,6 +39,13 @@ from .guard import (
 from .message_events import DIRECTION_OUTBOUND, MessageEventReporter, local_message_id
 
 _log = structlog.get_logger(__name__)
+
+#: 跟 AI 端打交道的那几行（那条 WS：派轮 / 卡片 / 指令 / 回执 / 名单 / 能力）。
+_ai = _log.bind(**{logrole.ROLE_KEY: logrole.AI})
+#: 跟业务后端打交道的那几行（Client Token 走的 HTTP）。
+_backend = _log.bind(**{logrole.ROLE_KEY: logrole.BACKEND})
+#: 这台电脑自己的事，不涉及任何对端。
+_local = _log.bind(**{logrole.ROLE_KEY: logrole.LOCAL})
 
 #: AI 端推指令用的事件名（server → 网关）。
 COMMAND_EVENT = "wechat.command"
@@ -310,7 +318,7 @@ class CommandExecutor:
         # 幂等：重推同一条只回上次的结果，绝不重发一遍消息。
         cached = self._store.get_command_result(self._account, command_id)
         if cached is not None:
-            _log.info("指令已执行过，直接回上次结果", op=op, status=cached.get("status"))
+            _ai.info("指令已执行过，直接回上次结果", op=op, status=cached.get("status"))
             return CommandResult(command_id, str(cached.get("status") or "done"),
                                  str(cached.get("reason") or ""), cached.get("result"))
 
@@ -332,7 +340,7 @@ class CommandExecutor:
             return await self._update_candidate(command_id, data)
         spec = COMMANDS.get(op)
         if spec is None:
-            _log.warning("收到不支持的微信指令", op=op)
+            _ai.warning("收到不支持的微信指令", op=op)
             return CommandResult(command_id, "rejected", f"不支持的能力：{op or '(空)'}")
 
         args = data.get("args")
@@ -354,7 +362,7 @@ class CommandExecutor:
                 _log.info("按后端已知的会话名设置备注", op=op)   # 名字本身不进日志
                 payload["remark"] = known
         if refs and self._fetcher is None:
-            _log.warning("收到发文件指令但没配下载通道", op=op)
+            _ai.warning("收到发文件指令但没配下载通道", op=op)
             return CommandResult(command_id, "rejected", "本机没有配取文件通道，发不了 AI 端产出的文件")
 
         # ★ 074：先问「能不能做」，再问「让不让做」。两者原因不同，给用户的话完全两样：
@@ -366,7 +374,7 @@ class CommandExecutor:
         to_group = self._to_group(peer, args)
         blocked = self._capability_blocker(op, to_group)
         if blocked:
-            _log.info("这台电脑现在做不了这个动作", op=op, reason=blocked)
+            _local.info("这台电脑现在做不了这个动作", op=op, reason=blocked)
             return CommandResult(command_id, "rejected", blocked)
 
         now = self._clock()
@@ -381,7 +389,7 @@ class CommandExecutor:
                 clamp=spec.reserve_count is not None,
             )
             if not reservation.allowed:
-                _log.info("指令被守门拦下", op=op, reason=reservation.reason)
+                _local.info("指令被守门拦下", op=op, reason=reservation.reason)
                 return CommandResult(command_id, "rejected", reservation.reason)
             if spec.reserve_count is not None:
                 # 减量放行了就把上限跟着调下来，别让微信那边照原数去做。
@@ -391,12 +399,12 @@ class CommandExecutor:
             paced = self._guard.pace_write(self._account, op, now=now)
             if not paced.allowed:
                 reservation.release()
-                _log.info("写类指令被节拍闸拦下", op=op, reason=paced.reason)
+                _local.info("写类指令被节拍闸拦下", op=op, reason=paced.reason)
                 return CommandResult(command_id, "rejected", paced.reason)
         else:
             decision = self._guard.allow_read(self._account, spec.read_action, now=now)
             if not decision.allowed:
-                _log.info("读类指令被节拍闸拦下", op=op, reason=decision.reason)
+                _local.info("读类指令被节拍闸拦下", op=op, reason=decision.reason)
                 return CommandResult(command_id, "rejected", decision.reason)
 
         # 到这里参数齐了、守门也过了，接下来就要真动微信（发文件还要先取字节）。
@@ -419,11 +427,11 @@ class CommandExecutor:
                     )
                 except DownloadError as exc:
                     reservation.release()   # 字节都没取到，微信一下没动
-                    _log.warning("取 AI 端产出文件失败", op=op, error=str(exc))
+                    _ai.warning("取 AI 端产出文件失败", op=op, error=str(exc))
                     return CommandResult(command_id, "failed", str(exc))
                 except Exception as exc:  # noqa: BLE001 —— 网络类异常也要回给上游
                     reservation.release()
-                    _log.warning("取 AI 端产出文件失败", op=op, error=str(exc))
+                    _ai.warning("取 AI 端产出文件失败", op=op, error=str(exc))
                     return CommandResult(command_id, "failed", f"取文件失败：{exc}")
                 payload[spec.files_key] = [str(p) for p in paths]
             try:
@@ -491,7 +499,7 @@ class CommandExecutor:
                 ai_status=ai_status if isinstance(ai_status, dict) else None,
             )
         except CandidateUpdateError as exc:
-            _log.warning("候选人回写请求不成立", error=str(exc))
+            _backend.warning("候选人回写请求不成立", error=str(exc))
             return CommandResult(command_id, "rejected", str(exc))
         if not result.get("updated"):
             return CommandResult(command_id, "failed", str(result.get("reason") or "候选人状态没写成"))
@@ -525,12 +533,12 @@ class CommandExecutor:
         #   等超时更是压根没有结论。只认 succeeded——报一条假的「已发送」，后端就会从一条
         #   根本没到对方手机上的消息开始算「多久没回」，真正的跟进被推后一整个跟进周期。
         if str((raw or {}).get("status") or "") != "succeeded":
-            _log.info("微信任务没有确认成功，不上报消息事件", op=op,
+            _backend.info("微信任务没有确认成功，不上报消息事件", op=op,
                       status=(raw or {}).get("status") or "unknown")
             return
         candidate_id = self._store.contact_worker_id(self._account, peer)
         if not candidate_id:
-            _log.info("发出的消息没能归位到候选人，不上报消息事件", op=op)
+            _backend.info("发出的消息没能归位到候选人，不上报消息事件", op=op)
             return
         self._message_events.record(
             self._account,
@@ -571,7 +579,7 @@ class CommandExecutor:
         #   AI 端跟着写 `ai_managed`，而微信里**什么都没发生**，这个人从此卡在那儿等一个
         #   永远不会来的通过。判不出状态时（老装配没传 raw）维持原样，别把现有链路判死。
         if raw is not None and str(raw.get("status") or "") != "succeeded":
-            _log.info("加好友任务没有确认成功，不给好友状态", op=op,
+            _backend.info("加好友任务没有确认成功，不给好友状态", op=op,
                       status=raw.get("status") or "unknown")
             return ""
         if op == "add_friend":

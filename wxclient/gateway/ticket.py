@@ -96,6 +96,9 @@ class ClientTokenTicketProvider:
             "content-type": "application/json",
         }
 
+        # 换票是「连不上 AI 端」排查链的第一环：票没换到，后面那条 WS 根本不会去连。
+        # 原来这一步只有失败才留痕，成功前是静默的——看的人分不出是没在换，还是在等。
+        _log.info("正在向业务后端换短票", account=wechat_account_id)
         try:
             if self._client is not None:
                 response = await self._client.post(

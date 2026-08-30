@@ -118,15 +118,22 @@ class AgentWsClient:
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._turns: dict[str, _Turn] = {}
         self._closed = asyncio.Event()
+        #: 这一轮已经流下来多少段增量、上一次记下来的状态。只用于日志（见 `_log_frame`）。
+        self._deltas = 0
+        self._state = ""
 
     # ────────────────────────── 连接与鉴权 ──────────────────────────
 
     async def connect(self, session_ticket: str) -> None:
         """建连并用短票鉴权。票用完即弃，不保存。"""
+        # 握手和鉴权是两步，卡住的时候要分得清卡在哪一步（票不对是鉴权失败，
+        # 连不上是网络/反代），所以两步各留一条。**票本身一个字符都不进日志。**
+        _log.info("正在连接 AI 端", url=self._url)
         self._ws = await self._connect(self._url)
         self._closed.clear()
         self._reader = asyncio.create_task(self._read_loop())
 
+        _log.info("已握手，正在用短票鉴权")
         try:
             data = await self._request("auth", {"session_ticket": session_ticket})
         except AgentWsError:
@@ -140,6 +147,7 @@ class AgentWsClient:
 
     async def close(self) -> None:
         if self._ws is not None:
+            _log.info("正在断开 AI 端连接")
             try:
                 await self._ws.close()
             except Exception:  # noqa: BLE001 —— 关闭失败不影响调用方
@@ -167,11 +175,13 @@ class AgentWsClient:
         session_id = data.get("session_id")
         if not isinstance(session_id, str) or not session_id:
             raise AgentWsError(f"session.start 未返回 session_id: {data!r}")
+        _log.info("已在 AI 端新建会话", task_type=task_type, session=session_id[:8])
         return session_id
 
     async def resume_session(self, session_id: str) -> None:
         """接回已有会话（同一 thread，历史还在）。断线重连走这条。"""
         await self._request("session.resume", {"session_id": session_id})
+        _log.info("已接回 AI 端会话", session=session_id[:8])
 
     # ────────────────────────── 对话 ──────────────────────────
 
@@ -260,9 +270,18 @@ class AgentWsClient:
         # ack 关联到本次发送（便于排障）。轮内事件仍按 session_id 归位，不依赖 ack。
         frame: dict[str, Any] = {"v": 1, "id": ack or f"{op}-{next(self._ids)}", "op": op, "data": data}
         try:
-            await self._ws.send(json.dumps(frame, ensure_ascii=False))
+            body = json.dumps(frame, ensure_ascii=False)
+            await self._ws.send(body)
         except Exception as exc:
             raise AgentWsError(f"发送 {op} 失败: {exc}") from exc
+        # 每一帧都留一行。**只记 op 和体积，不记 data**：里面有候选人说的原话、
+        # 会话名、简历字段，那是真实 PII，日志文件不该有第二份。
+        #
+        # ★ 保活的 ping/pong 例外：30 秒一拍（`runner._keepalive_loop`），照记就是每小时
+        #   往日志里灌 240 行「什么也没发生」，真正有用的那几行反而被埋掉。它通不通已经
+        #   由调用方记账了（连不上会有「AI 端连接不可用」）。
+        if op != "ping":
+            _log.info("发往 AI 端", op=op, 字节=len(body.encode("utf-8")))
 
     async def _request(self, op: str, data: dict[str, Any]) -> dict[str, Any]:
         """发一个请求-响应型 op，按 ack 对号入座。"""
@@ -288,6 +307,7 @@ class AgentWsClient:
                     _log.warning("收到无法解析的帧")
                     continue
                 if isinstance(frame, dict):
+                    self._log_frame(frame)
                     self._dispatch(frame)
         except asyncio.CancelledError:
             raise
@@ -296,6 +316,47 @@ class AgentWsClient:
         finally:
             self._closed.set()
             self._fail_all(AgentWsError("连接已断开"))
+
+    def _log_frame(self, frame: dict[str, Any]) -> None:
+        """收到的每一帧留一行——**除了 ``text.delta``**。
+
+        AI 端的回复是一个字一个字流下来的，逐条记等于把实时日志刷成一屏乱码，真正有用的
+        那几行（卡片来了没有、这一轮收口了没有）反而被埋掉。所以流式增量只数个数，
+        等这一轮 done 的时候一次说清「流了多少段」。
+
+        同样只记事件名和形状，**正文和卡片内容一个字都不记**（真实 PII）。
+        """
+        ev = frame.get("ev")
+        data = frame.get("data")
+        data = data if isinstance(data, dict) else {}
+        if ev == "text.delta":
+            self._deltas += 1
+            return
+        if ev == "pong":
+            return  # 保活的回声，同 `_send` 里 ping 的理由
+        if ev == "done" or (ev == "status" and data.get("state") == "done"):
+            _log.info("AI 端收口", 流式段=self._deltas, 已用毫秒=data.get("elapsed_ms"))
+            self._deltas = 0
+            self._state = ""
+            return
+        if ev == "status":
+            # running / working / retrying 在一轮里会重复来很多帧。**只在状态真的变了
+            # 的时候记一行**——照帧记的话，一轮几十秒就能把日志刷满同一句话。
+            # 阶段那条更细的（`stage.text`）由 runner 单独记，这里只管状态本身。
+            state = str(data.get("state") or "-")
+            if state != self._state:
+                self._state = state
+                _log.info("AI 端进度", 状态=state)
+            return
+        if ev == "card":
+            card = data.get("card")
+            kind = card.get("kind") if isinstance(card, dict) else None
+            _log.info("AI 端发来卡片", 类型=kind or "-")
+            return
+        if ev == "error":
+            _log.warning("AI 端发来错误帧", code=data.get("code") or "-")
+            return
+        _log.info("AI 端发来事件", ev=str(ev or "-"))
 
     def _dispatch(self, frame: dict[str, Any]) -> None:
         ev = frame.get("ev")

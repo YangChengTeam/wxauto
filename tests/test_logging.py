@@ -4,6 +4,7 @@ import logging
 import unittest
 from pathlib import Path
 
+from wxclient import logrole
 from wxclient.logging_config import ChineseLogRenderer
 
 
@@ -32,7 +33,7 @@ class ChineseLogRendererTests(unittest.TestCase):
         )
         self.assertEqual(
             output,
-            "2026-08-08 17:30:00 [信息] 微信任务执行成功：发送消息 #12345678",
+            "2026-08-08 17:30:00 [信息] [本机] 微信任务执行成功：发送消息 #12345678",
         )
 
     def test_renders_uia_probe_in_chinese(self) -> None:
@@ -74,13 +75,13 @@ class ChineseLogRendererTests(unittest.TestCase):
         )
         self.assertEqual(
             output,
-            "2026-08-08 17:30:00 [信息] 好友申请已提交：13800138000（张三-仓库工）",
+            "2026-08-08 17:30:00 [信息] [本机] 好友申请已提交：13800138000（张三-仓库工）",
         )
 
     def test_friend_add_line_survives_a_run_that_read_no_name(self) -> None:
         output = self.render("friend.add.done", number="13800138000")
         self.assertEqual(
-            output, "2026-08-08 17:30:00 [信息] 好友申请已提交：13800138000"
+            output, "2026-08-08 17:30:00 [信息] [本机] 好友申请已提交：13800138000"
         )
 class DailyLogFileTests(unittest.TestCase):
     """日志按天分文件（用户 2026-08-15：「里面应该是按日期天的日志」）。"""
@@ -251,7 +252,7 @@ class GatewayLineTests(ChineseLogRendererTests):
 
         self.assertEqual(
             output,
-            "2026-08-08 17:30:00 [信息] 本轮不回复「张三」，原因：转人工：对方在问是不是自动回复 / 要求真人",
+            "2026-08-08 17:30:00 [信息] [本机] 本轮不回复「张三」，原因：转人工：对方在问是不是自动回复 / 要求真人",
         )
 
     def test_blocked_by_the_guard_says_which_gate(self) -> None:
@@ -352,3 +353,100 @@ class TurnProgressLineTests(ChineseLogRendererTests):
         self.assertIn("重连后再试一次", first)
         self.assertIn("两次都没跑通，这批消息留到下一轮重投", second)
 
+
+
+class LogRoleTests(unittest.TestCase):
+    """角色列（对端）：这一行日志说的是跟谁打交道。"""
+
+    def setUp(self) -> None:
+        self.renderer = ChineseLogRenderer()
+
+    def render(self, *, logger_name: str | None = None, **payload: object) -> str:
+        event_dict: dict[str, object] = {
+            "timestamp": "2026-08-30 09:00:00",
+            "level": "info",
+            "event": "随便一句",
+            **payload,
+        }
+        if logger_name is not None:
+            event_dict["logger"] = logger_name
+        return self.renderer(logging.getLogger("t"), "info", event_dict)
+
+    def test_模块默认角色(self) -> None:
+        """一个模块只跟一方打交道的，登记一次就够，不必逐条标。"""
+        self.assertEqual(logrole.module_role("wxclient.gateway.wsclient"), logrole.AI)
+        self.assertEqual(logrole.module_role("wxclient.gateway.ticket"), logrole.BACKEND)
+        self.assertEqual(logrole.module_role("wxclient.wechat_api.uia"), logrole.WECHAT)
+        self.assertEqual(logrole.module_role("wxclient.ui.status_reporter"), logrole.BACKEND)
+
+    def test_没登记的算本机(self) -> None:
+        """宁可少认，不可乱认——猜错的角色比没有角色更误导人。"""
+        self.assertEqual(logrole.module_role("wxclient.gateway.runner"), logrole.LOCAL)
+        self.assertEqual(logrole.module_role("third_party.pywechat.whatever"), logrole.LOCAL)
+        self.assertEqual(logrole.module_role(None), logrole.LOCAL)
+        self.assertEqual(logrole.module_role(""), logrole.LOCAL)
+
+    def test_子模块盖得住父包(self) -> None:
+        """取最长的那条前缀：`queue.worker` 是微信，`queue` 别的东西不是。"""
+        self.assertEqual(logrole.module_role("wxclient.queue.worker"), logrole.WECHAT)
+        self.assertEqual(logrole.module_role("wxclient.queue.store"), logrole.LOCAL)
+
+    def test_显式标注盖过模块默认(self) -> None:
+        """混着跟两三方打交道的模块靠这条：调用处说了算。"""
+        self.assertEqual(
+            logrole.role_of("wxclient.gateway.wsclient", logrole.BACKEND), logrole.BACKEND
+        )
+        self.assertEqual(logrole.role_of("wxclient.gateway.runner", logrole.AI), logrole.AI)
+        # 空串/非字符串不算「说了」，退回模块默认
+        self.assertEqual(logrole.role_of("wxclient.gateway.ticket", "  "), logrole.BACKEND)
+        self.assertEqual(logrole.role_of("wxclient.gateway.ticket", None), logrole.BACKEND)
+
+    def test_角色进前缀(self) -> None:
+        line = self.render(logger_name="wxclient.gateway.wsclient")
+        self.assertEqual(line, "2026-08-30 09:00:00 [信息] [AI端] 随便一句")
+
+    def test_显式对端进前缀(self) -> None:
+        line = self.render(logger_name="wxclient.gateway.runner", **{logrole.ROLE_KEY: logrole.AI})
+        self.assertEqual(line, "2026-08-30 09:00:00 [信息] [AI端] 随便一句")
+
+    def test_对端和logger都不漏进消息尾巴(self) -> None:
+        """这两个键是「这行日志的元信息」，不是业务参数，不该出现在 kv 串里。"""
+        line = self.render(
+            logger_name="wxclient.gateway.runner", 会话="张三", **{logrole.ROLE_KEY: logrole.AI}
+        )
+        self.assertNotIn("对端=", line)
+        self.assertNotIn("logger=", line)
+        self.assertIn("张三", line)
+
+    def test_认不出模块也有角色(self) -> None:
+        """第三方库直接写进来的行也得有一格，不能是空的方括号。"""
+        line = self.render()
+        self.assertEqual(line, "2026-08-30 09:00:00 [信息] [本机] 随便一句")
+
+
+class BoundRoleLoggerTests(unittest.TestCase):
+    """混着跟几方打交道的模块，绑出来的 logger 真的带上了角色吗。
+
+    钉的是**接线**而不是措辞：`runner._ai` 这类绑定一旦写错（比如漏了 ROLE_KEY），
+    渲染出来照样是一行正常日志，只是角色列悄悄退回「本机」——界面上看不出错。
+    """
+
+    def test_绑定的角色渲染得出来(self) -> None:
+        from wxclient.gateway import commands, inbound, outbound, runner
+
+        cases = [
+            (runner._ai, logrole.AI),
+            (runner._backend, logrole.BACKEND),
+            (runner._wechat, logrole.WECHAT),
+            (inbound._ai, logrole.AI),
+            (inbound._backend, logrole.BACKEND),
+            (inbound._local, logrole.LOCAL),
+            (outbound._backend, logrole.BACKEND),
+            (outbound._local, logrole.LOCAL),
+            (commands._ai, logrole.AI),
+            (commands._backend, logrole.BACKEND),
+            (commands._local, logrole.LOCAL),
+        ]
+        for bound, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(bound._context.get(logrole.ROLE_KEY), expected)

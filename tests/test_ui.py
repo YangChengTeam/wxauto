@@ -1489,6 +1489,27 @@ class LogLineTests(unittest.TestCase):
         self.assertEqual(parsed.level, "")
         self.assertEqual(parsed.message, "Traceback (most recent call last):")
 
+    def test_角色单独成一列(self) -> None:
+        parsed = logline.parse("2026-08-30 09:00:00 [信息] [AI端] 已连上 AI 端")
+
+        self.assertEqual(parsed.role, "AI端")
+        self.assertEqual(parsed.message, "已连上 AI 端")
+        self.assertEqual(parsed.level, "INFO")
+
+    def test_老日志没有角色也照样解析(self) -> None:
+        """日志目录里留着 30 天的历史文件，那些行没有角色段——不能因此变成解析不了。"""
+        parsed = logline.parse("2026-08-12 16:38:47 [信息] 网关启动，accounts=1")
+
+        self.assertEqual(parsed.role, "")
+        self.assertEqual(parsed.message, "网关启动，accounts=1")
+
+    def test_不是角色的方括号原样留在正文里(self) -> None:
+        """判据是「正好是认得的那几个角色之一」，否则当正文——猜错会吃掉半句话。"""
+        parsed = logline.parse("2026-08-30 09:00:00 [警告] [pyweixin] 库自己打的一行")
+
+        self.assertEqual(parsed.role, "")
+        self.assertEqual(parsed.message, "[pyweixin] 库自己打的一行")
+
 
 class AccountNormalizationTests(unittest.TestCase):
     def test_splits_dedupes_and_trims(self) -> None:
