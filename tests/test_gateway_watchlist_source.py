@@ -16,6 +16,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from structlog.testing import capture_logs
+
 from wxclient.gateway import GatewayRunner, GatewaySettings, LocalFileTicketProvider
 from wxclient.gateway.sessions import GatewayStore
 from wxclient.gateway.watchlist import Watchlist, WatchScope
@@ -198,6 +200,109 @@ class FailClosedTests(unittest.TestCase):
         restored.apply_scope(saved[-1])
         self.assertEqual(restored.watched(), ["张三"])
         self.assertTrue(restored.ready)
+
+
+class DerivedEmptyIsLoudTests(unittest.TestCase):
+    """★ 派生出来是空的，必须**喊出来**（2026-08-31 事故）。
+
+    `Watchlist.warn_if_idle()` 只在名单**真空着**时喊。一旦有别的东西把名单填上了
+    （迁移期 AI 端那条推送、或上次落盘的那份），`ready` 就是 True，于是
+    「后端这条路其实早就不出货了」一声不响。现场就这样连着几天：
+    `GET /client/contacts` 被 409 顶回、派生恒为空，机器跑在一份旧名单上，
+    日志/界面/AI 端三头都看不出异常，最后靠登进 Windows 翻 sqlite 才查出来。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.store = GatewayStore(root / "gateway.db")
+        self.tickets = root / "tickets.json"
+        self.tickets.write_text(json.dumps({ACCOUNT: "tkt"}), encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _runner(self, watchlist: Watchlist) -> GatewayRunner:
+        return GatewayRunner(
+            settings=GatewaySettings(ai_ws_url="ws://127.0.0.1:1/ws", local_ticket_file=self.tickets),
+            ticket_provider=LocalFileTicketProvider(self.tickets),
+            store=self.store,
+            source=_SilentSource(),
+            sink=_SilentSink(),
+            accounts=[ACCOUNT],
+            watchlist=watchlist,
+        )
+
+    @staticmethod
+    def _notes(logs: list[dict]) -> list[dict]:
+        return [line for line in logs if "这一轮不接管" in str(line.get("event", ""))]
+
+    def test_x_名单被别处填上时_派生为空不再静默(self) -> None:
+        """机器没全哑（AI 端推送顶着），恰恰因此以前一个字都不说。"""
+        wl = Watchlist()
+        wl.apply_push({"only": ["旧名单里的人"]})
+        runner = self._runner(wl)
+
+        with capture_logs() as logs:
+            self.assertEqual(runner._apply_derived_watchlist(), 0)
+
+        notes = self._notes(logs)
+        self.assertEqual(len(notes), 1, "派生为空必须说一次")
+        self.assertEqual(notes[0]["现在在盯"], 1, "要说明此刻真正生效的是几个会话")
+        self.assertEqual(notes[0]["本机会话名"], 0, "0 = 同步就没成功过，去看错误码")
+
+    def test_有会话名但都没通过_数字分得开这两种情况(self) -> None:
+        """`本机会话名>0` 而 `可自动回复=0` = 人全是 requested，这不是故障。"""
+        self.store.save_contacts(ACCOUNT, [_row("138", "还没通过的人", status="requested")])
+        runner = self._runner(Watchlist())
+
+        with capture_logs() as logs:
+            runner._apply_derived_watchlist()
+
+        self.assertEqual(self._notes(logs)[0]["本机会话名"], 1)
+
+    def test_情况没变就不再重复喊(self) -> None:
+        """同步 120 秒一轮，照喊会把日志刷满，反把状态真变化那一刻埋掉。"""
+        runner = self._runner(Watchlist())
+        with capture_logs() as logs:
+            for _ in range(3):
+                runner._apply_derived_watchlist()
+        self.assertEqual(len(self._notes(logs)), 1)
+
+    def test_x_同一种故障复发_不能被去重吃掉(self) -> None:
+        """去重态必须在派生成功时清掉，否则**第二次同样的故障永远静默**。
+
+        ★ 这一条第一版是假绿：当时让两次故障处在不同状态（本机会话名 0→1），签名本来
+        就不同，去重压根没机会生效，摘掉清零那行照样全绿。要真测到它，两次故障的三个数
+        必须**一模一样**——现实里这正是最常见的形态：409 来了又走、走了又来，而本机
+        contacts 的条数自始至终没变。
+        """
+        self.store.save_contacts(ACCOUNT, [_row("138", "张三")])
+        runner = self._runner(Watchlist())
+        runner._apply_derived_watchlist()                                        # 正常出货
+        flip = lambda status: self.store.save_contacts(ACCOUNT, [_row("138", "张三", status=status)])
+
+        flip("requested")
+        with capture_logs() as first:
+            runner._apply_derived_watchlist()                                    # 第一次故障 → 喊
+        flip("accepted")
+        runner._apply_derived_watchlist()                                        # 自愈
+        flip("requested")
+        with capture_logs() as again:
+            runner._apply_derived_watchlist()                                    # 同样的故障复发
+
+        self.assertEqual(len(self._notes(first)), 1)
+        self.assertEqual(self._notes(first)[0], self._notes(again)[0] if self._notes(again) else None,
+                         "两次故障的三个数必须一致，否则这条测不到去重")
+        self.assertEqual(len(self._notes(again)), 1, "同一种故障复发不能被去重吃掉")
+
+    def test_派生正常时一个字都不说(self) -> None:
+        self.store.save_contacts(ACCOUNT, [_row("138", "张三")])
+        runner = self._runner(Watchlist())
+        with capture_logs() as logs:
+            runner._apply_derived_watchlist()
+        self.assertEqual(self._notes(logs), [])
+
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from structlog.testing import capture_logs
 
 from wxclient.gateway import GatewayRunner, GatewaySettings, LocalFileTicketProvider
 from wxclient.gateway.commands import CommandResult
@@ -470,6 +471,66 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
         await runner._sync_contacts_once()
         # 第一次没水位（全量），第二次带上本机已知的最新时间
         self.assertEqual(d.pulled, ["", "2026-08-18T09:12:00.000Z"])
+
+
+class RejectionReasonTests(unittest.IsolatedAsyncioTestCase):
+    """★ 被拒时要连**原因码**一起记（2026-08-31 事故）。
+
+    原来 4xx 只留一个状态码，于是「被拒了」和「为什么被拒」之间差着一次登机器翻源码。
+    现场吃过一次：`GET /client/contacts` 连着几天回 409，日志里只有 `status=409`，
+    真正的原因是 `WECHAT_ACCOUNT_NOT_BOUND`（这台设备当前没绑微信账号——一个分身两台
+    设备时落败那台就是这样）。会话名同步因此整段冻住、派生监听名单跟着停在那一刻。
+    """
+
+    @staticmethod
+    def _rejects(logs: list[dict]) -> dict:
+        return next(line for line in logs if line.get("event") == "会话名接口被拒")
+
+    async def test_x_409_把错误码记下来(self) -> None:
+        def handler(_: httpx.Request) -> httpx.Response:
+            return httpx.Response(409, json={"error": {
+                "code": "WECHAT_ACCOUNT_NOT_BOUND",
+                "message": "请先完成当前微信账号连接，再同步联系人",
+            }})
+
+        with capture_logs() as logs:
+            self.assertEqual(await directory(handler).pull(), [])
+        line = self._rejects(logs)
+        self.assertEqual(line["status"], 409)
+        self.assertEqual(line["错误码"], "WECHAT_ACCOUNT_NOT_BOUND")
+        self.assertIn("微信账号连接", line["说明"])
+
+    async def test_x_details_里的_PII_绝不进日志(self) -> None:
+        """错误信封的 `details` 会回显请求内容，而请求体里有姓名和手机号。"""
+        def handler(_: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"error": {
+                "code": "VALIDATION_ERROR", "message": "参数格式错误",
+                "details": [{"path": ["session_name"], "received": "张三", "number": "13800001111"}],
+            }})
+
+        with capture_logs() as logs:
+            await directory(handler).pull()
+        blob = json.dumps(self._rejects(logs), ensure_ascii=False)
+        self.assertNotIn("张三", blob)
+        self.assertNotIn("13800001111", blob)
+        self.assertIn("VALIDATION_ERROR", blob)
+
+    async def test_响应不是_JSON_也不能炸(self) -> None:
+        def handler(_: httpx.Request) -> httpx.Response:
+            return httpx.Response(502, text="<html>bad gateway</html>")
+
+        with capture_logs() as logs:
+            self.assertEqual(await directory(handler).pull(), [])
+        self.assertEqual(self._rejects(logs)["错误码"], "")
+
+    async def test_说明过长要截断_一行日志不该被撑爆(self) -> None:
+        def handler(_: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, json={"error": {"code": "X", "message": "很长" * 500}})
+
+        with capture_logs() as logs:
+            await directory(handler).pull()
+        self.assertLessEqual(len(self._rejects(logs)["说明"]), 200)
+
 
 
 if __name__ == "__main__":

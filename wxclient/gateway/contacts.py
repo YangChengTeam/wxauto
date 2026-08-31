@@ -22,7 +22,7 @@ from typing import Any
 
 import structlog
 
-from .backend_client import BackendEndpoint
+from .backend_client import BackendEndpoint, error_of
 
 _log = structlog.get_logger(__name__)
 
@@ -124,7 +124,13 @@ class ContactDirectory(BackendEndpoint):
         if response is None:
             return None
         if response.status_code >= 400:
-            _log.warning("会话名接口被拒", path=path, status=response.status_code)
+            # 原因码一起记：光有 409 看不出是「这台设备没绑微信账号」还是别的
+            # （2026-08-31 那次冻住的会话名同步就是 WECHAT_ACCOUNT_NOT_BOUND）。
+            code, message = error_of(response)
+            _log.warning(
+                "会话名接口被拒", path=path, status=response.status_code,
+                错误码=code, 说明=message,
+            )
             return None
         try:
             body = response.json()

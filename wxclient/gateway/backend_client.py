@@ -21,6 +21,32 @@ import structlog
 _log = structlog.get_logger(__name__)
 
 
+def error_of(response: httpx.Response) -> tuple[str, str]:
+    """从错误响应里取出**原因码**，取不出就空着。
+
+    ★ 为什么非要这一步：原来 4xx 只记一个状态码，于是「被拒了」和「为什么被拒」之间
+    差着一次登机器翻代码。2026-08-31 就吃过一次——`GET /client/contacts` 连着几天回 409，
+    日志里只有 `status=409`，而真正的原因码是 `WECHAT_ACCOUNT_NOT_BOUND`（这台设备
+    当前没绑微信账号，一个分身两台设备时落败那台就是这样）。会话名同步因此整段冻住、
+    派生监听名单跟着停在那一刻，而现场看不出任何异常。有这个码就是一眼的事。
+
+    **只取 `error.code` 与 `error.message`，绝不取 `details`**：业务端的错误信封
+    （`{error:{code,message,details?}}`）里 `details` 会回显请求内容，而请求体里有候选人
+    姓名、手机号、会话名——那是真实 PII，日志里不该有第二份（同 `_send` 的口径）。
+    """
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 —— 错误响应不一定是 JSON，取不到就算了
+        return "", ""
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return "", ""
+    code = str(error.get("code") or "")
+    # 截断：这条是给人看的一行日志，后端哪天回一段长文不该把日志撑爆。
+    message = str(error.get("message") or "")[:200]
+    return code, message
+
+
 class BackendEndpoint:
     """一条 W 面接口的底座。子类自己解释响应，这里只负责把请求送出去。"""
 
@@ -86,5 +112,11 @@ class BackendEndpoint:
             # 只记异常类型与 path：url 之外的细节可能带上凭证片段（同 ticket.py 的口径）。
             _log.warning("业务接口请求失败", path=path, error=type(exc).__name__)
             return None
-        _log.info("业务接口已回应", method=method, path=path, status=response.status_code)
+        extra: dict[str, str] = {}
+        if response.status_code >= 400:
+            # 取不到就**不加这两个键**：5xx 常常压根不是 JSON，硬塞两个空字段只会让日志变脏。
+            code, message = error_of(response)
+            if code or message:
+                extra = {"错误码": code, "说明": message}
+        _log.info("业务接口已回应", method=method, path=path, status=response.status_code, **extra)
         return response

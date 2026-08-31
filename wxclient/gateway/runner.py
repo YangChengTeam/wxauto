@@ -255,6 +255,8 @@ class GatewayRunner:
         self._reported_capabilities: dict[str, tuple[Any, dict[str, Any]]] = {}
         self._command_tasks: set[asyncio.Task[None]] = set()
         self._debug_session_id: str | None = None
+        #: `_note_derived_empty` 的去重签名（本机会话名数:生效名单数:来源）。纯日志用。
+        self._derived_empty_note = ""
         self._command_listener: Callable[[dict[str, Any]], None] | None = None
         self._pool = ConnectionPool(
             ws_url=settings.ai_ws_url,
@@ -648,9 +650,48 @@ class GatewayRunner:
                     seen.add(name)
                     names.append(name)
         if not names:
+            self._note_derived_empty()
             return 0
+        # 恢复出货了 → 把「空」的去重态清掉，下次再空还得再喊一次。
+        self._derived_empty_note = ""
         self._watchlist.apply_backend({"only": names})
         return len(names)
+
+    def _note_derived_empty(self) -> None:
+        """派生出来是空的——**把它喊出来**，只在情况变了的时候喊一次。
+
+        ★ 这里原来是一句 `return 0`，完全静默，而它恰恰是最需要看见的那个状态。
+        `Watchlist.warn_if_idle()` 只在**名单真空着**时才喊；一旦有别的东西把名单填上了
+        （迁移期 AI 端那条推送、或者上次落盘的那份），`ready` 就是 True，于是
+        「后端这条路其实早就不出货了」一声不响。2026-08-31 的现场就是这样：连着几天
+        `GET /client/contacts` 被 409 顶回、派生恒为空，机器一直跑在一份旧名单上，
+        而日志、界面、AI 端三头都看不出异常，最后是登进 Windows 翻 sqlite 才查出来。
+
+        喊的内容要能直接分诊，所以带上三个数：
+        - `本机会话名=0` → 同步就没成功过（新装机还没拉第一轮，或者被后端拒了——
+          那就去看 `会话名接口被拒` 那条的**错误码**）。
+        - `本机会话名>0` 而 `可自动回复=0` → 名单里的人全是 `requested`：好友申请发出去了，
+          对方一个都还没通过。这不是故障。
+        - `现在在盯` + `来源` → 此刻**真正生效**的是哪一份、有几个会话。这一项是关键：
+          它说明机器并没有全哑，只是没在用后端那份。
+
+        只在这三个数变化时说一次：同步是 120 秒一轮，照打会把日志刷满，反而把状态
+        真正变化的那一刻埋掉（同 `BackendEndpoint._note_not_ready` 的口径）。
+        """
+        known = sum(len(self._store.known_session_names(a)) for a in self._accounts)
+        effective = self._watchlist.watched() if self._watchlist is not None else []
+        origin = self._watchlist.scope.origin if self._watchlist is not None else ""
+        signature = f"{known}:{len(effective)}:{origin}"
+        if self._derived_empty_note == signature:
+            return
+        self._derived_empty_note = signature
+        _backend.warning(
+            "后端派生的监听名单是空的，这一轮不接管——现在生效的是另一份",
+            本机会话名=known,
+            可自动回复=0,
+            现在在盯=len(effective),
+            来源=origin,
+        )
 
     async def _report_contact(self, command: dict[str, Any], result: CommandResult | None) -> None:
         """加好友这条链走到一步就报一次会话名（api2 §4.1）。
