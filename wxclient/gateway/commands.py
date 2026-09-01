@@ -505,6 +505,12 @@ class CommandExecutor:
             return CommandResult(command_id, "failed", str(result.get("reason") or "候选人状态没写成"))
         return CommandResult(command_id, "done", result=result)
 
+    @property
+    def allow_real(self) -> bool:
+        """这台机器有没有开真实动作。外部（runner）判「刚才那一下是不是真动了微信」要用它，
+        别去摸 `_allow_real`——私有名一改，外面就静默失效了。"""
+        return self._allow_real
+
     def _note_message_sent(
         self,
         command_id: str,

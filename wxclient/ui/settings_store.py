@@ -89,6 +89,14 @@ FIELDS: tuple[Field, ...] = (
           default="180"),
     Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔",
           "单独的节拍，0=不查", section="sched", unit="秒", default="900"),
+    Field("WXCLIENT_GATEWAY_FRIEND_RECHECK_INTERVAL_SECONDS", "查好友通过间隔",
+          "加了好友之后，多久去微信里搜一次看对方通过了没有；0=不搜。"
+          "实际仍受「查好友」那档 ≥300 秒的整机节拍约束，填更小也不会更快",
+          section="sched", unit="秒", default="900"),
+    Field("WXCLIENT_GATEWAY_FRIEND_RECHECK_DEADLINE_HOURS", "查好友通过期限",
+          "申请发出后最多再搜多久就不搜了；0=一直搜。"
+          "到期只是别让他占住名额，不代表判定对方不会通过",
+          section="sched", unit="小时", default="72"),
     Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "如 09:00-21:00，窗外不动微信",
           section="sched", default="09:00-21:00"),
     Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "每小时发送上限", "防止消息风控",

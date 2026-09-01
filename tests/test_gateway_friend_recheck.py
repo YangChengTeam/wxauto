@@ -22,8 +22,7 @@ from wxclient.gateway import (
     GatewayStore,
     LocalFileTicketProvider,
 )
-from wxclient.gateway.friendcheck import MAX_CHECKS, PendingFriendWatcher
-from wxclient.gateway.runner import ACCEPTED_REPORT_DELAY_SECONDS
+from wxclient.gateway.friendcheck import DEFAULT_DEADLINE_HOURS, PendingFriendWatcher
 from wxclient.gateway.watchlist import Watchlist
 from wxclient.queue import TaskType
 
@@ -74,36 +73,67 @@ class _Base(unittest.IsolatedAsyncioTestCase):
         params.update(kwargs)
         return PendingFriendWatcher(**params)
 
-    def requested(self, number: str = NUMBER, name: str = NAME) -> None:
+    def requested(self, number: str = NUMBER, name: str = NAME, at=None) -> None:
         """本机记一条「申请发出去了，还没通过」。"""
-        self.store.note_friend_request(ACCOUNT, number, name)
+        self.store.note_friend_request(ACCOUNT, number, name, (at or self.now).isoformat())
+
+    def not_before(self, hours: float = DEFAULT_DEADLINE_HOURS) -> str:
+        """按期限算出「早于这个时刻就不再查」的界。"""
+        return (self.now - timedelta(hours=hours)).isoformat()
 
 
 class TestPicksWhoToCheck(_Base):
-    def test_只挑还没通过的人(self) -> None:
+    def test_通过了就销账不再挑他(self) -> None:
         self.requested()
-        self.store.mark_contact_status(ACCOUNT, "13900139000", "accepted")
         self.requested("13900139000", "李四")
-        # 上面那条 note_friend_request 不会把 accepted 退回 requested（CASE WHEN 保护）
-        number, name = self.store.next_friend_check(ACCOUNT, max_checks=MAX_CHECKS)
+        self.store.drop_friend_request(ACCOUNT, "13900139000")
+        number, name = self.store.next_friend_check(ACCOUNT, not_before=self.not_before())
         self.assertEqual((number, name), (NUMBER, NAME))
 
     def test_没有会话名的不挑(self) -> None:
         self.store.note_friend_request(ACCOUNT, NUMBER, "   ")
-        self.assertEqual(self.store.next_friend_check(ACCOUNT, max_checks=MAX_CHECKS), ("", ""))
+        self.assertEqual(
+            self.store.next_friend_check(ACCOUNT, not_before=self.not_before()), ("", "")
+        )
 
     def test_最久没查的优先(self) -> None:
         self.requested()
         self.requested("13900139000", "李四")
-        self.store.note_friend_check(ACCOUNT, NUMBER, T0.isoformat(), counted=True)
-        number, _ = self.store.next_friend_check(ACCOUNT, max_checks=MAX_CHECKS)
+        self.store.note_friend_check(ACCOUNT, NUMBER, T0.isoformat())
+        number, _ = self.store.next_friend_check(ACCOUNT, not_before=self.not_before())
         self.assertEqual(number, "13900139000")  # 没查过的排最前
 
-    def test_查够次数就不再挑他(self) -> None:
+    def test_过了期限就不再挑他(self) -> None:
+        """期限从**申请那一刻**算起：查得慢不该让他无限续期。"""
+        self.requested(at=T0 - timedelta(hours=100))
+        self.assertEqual(
+            self.store.next_friend_check(ACCOUNT, not_before=self.not_before(72.0)), ("", "")
+        )
+
+    def test_期限内的照挑(self) -> None:
+        self.requested(at=T0 - timedelta(hours=10))
+        number, _ = self.store.next_friend_check(ACCOUNT, not_before=self.not_before(72.0))
+        self.assertEqual(number, NUMBER)
+
+    def test_后端写的requested不算数(self) -> None:
+        """`gateway_contacts` 里那条是「计划点名要加谁」，我们根本还没加——不能拿去搜。"""
+        self.store.save_contacts(ACCOUNT, [
+            {"number": "13700137000", "session_name": "王五", "contact_status": "requested"},
+        ])
+        self.assertEqual(
+            self.store.next_friend_check(ACCOUNT, not_before=self.not_before()), ("", "")
+        )
+
+    def test_同步把状态冲掉也还认得出他(self) -> None:
+        """后端没回 contact_status → `gateway_contacts.status` 被写成空串。
+        台账只由本机写，冲不掉，所以「他通过了」仍然认得出来。"""
         self.requested()
-        for _ in range(MAX_CHECKS):
-            self.store.note_friend_check(ACCOUNT, NUMBER, T0.isoformat(), counted=True)
-        self.assertEqual(self.store.next_friend_check(ACCOUNT, max_checks=MAX_CHECKS), ("", ""))
+        self.store.save_contacts(ACCOUNT, [
+            {"number": NUMBER, "session_name": NAME, "contact_status": ""},
+        ])
+        self.assertEqual(self.store.pending_friend_request(ACCOUNT, NAME), NUMBER)
+        number, _ = self.store.next_friend_check(ACCOUNT, not_before=self.not_before())
+        self.assertEqual(number, NUMBER)
 
 
 class TestVerdict(_Base):
@@ -122,17 +152,17 @@ class TestVerdict(_Base):
         self.assertEqual(self.accepted, [])
 
     async def test_搜失败不算还没通过(self) -> None:
-        """★ 搜不到 ≠ 搜失败：搜失败那一趟既不报通过，也不许计进放弃次数。
+        """★ 搜不到 ≠ 搜失败：搜失败那一趟不报通过，也不该让他丢掉被查的资格。
 
-        计过次的话，一段「微信没起来」就能把人一路计到放弃阈值上，
-        他真通过了也再没人去看一眼。所以这里断言的是**次数没动**（`max_checks=1` 还挑得到他），
+        断言两件事：**他还在待查集里**（一段「微信没起来」不该把人搜没了），
         而**时间动了**（否则下一轮还卡在同一个人身上，后面排队的谁也轮不上）。
+        放弃现在只看期限（从申请那一刻算起），搜失败多少次都不会提前把人耗掉。
         """
         self.requested()
         watcher = self.watcher(_Runtime(boom=True))
         self.assertEqual(await watcher.tick(), [])
         self.assertEqual(self.accepted, [])
-        self.assertEqual(self.store.next_friend_check(ACCOUNT, max_checks=1), (NUMBER, NAME))
+        self.assertEqual(self.store.next_friend_check(ACCOUNT, not_before=self.not_before()), (NUMBER, NAME))
         self.assertNotEqual(self.store.friend_check_mark(ACCOUNT, NUMBER), "")
 
     async def test_dry_run_空壳不算还没通过(self) -> None:
@@ -140,7 +170,7 @@ class TestVerdict(_Base):
         self.assertEqual(await self.watcher(_Runtime({"dry_run": True})).tick(), [])
         self.assertEqual(self.accepted, [])
         self.assertEqual(
-            self.store.next_friend_check(ACCOUNT, max_checks=1), (NUMBER, NAME)
+            self.store.next_friend_check(ACCOUNT, not_before=self.not_before()), (NUMBER, NAME)
         )  # 次数没加，还轮得到他
 
     async def test_任务没成功也不下结论(self) -> None:
@@ -257,10 +287,13 @@ class _Contacts:
 class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
     """★ 这组才是这次改动的重点：复查确认之后，**走的是既有那条上报路**。
 
-    `runner._note_friend_accepted`（「收到他的消息 = 他通过了」）一直存在，但它唯一的触发点
-    是入站对话——而没进名单的人根本不会被读到消息，所以那段代码从来没被调用过。
-    复查补的就是这个调用，不重写一个字的上报逻辑。
+    `runner._note_friend_accepted`（「和他有过一次成功的消息往来 = 他通过了」）一直存在，
+    但 2026-09-01 之前唯一的触发点是入站对话——而没进名单的人根本不会被读到消息，
+    所以那段代码从来没被调用过。复查补的就是这个调用，不重写一个字的上报逻辑。
     """
+
+    def not_before(self, hours: float = 72.0) -> str:
+        return (T0 - timedelta(hours=hours)).isoformat()
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -303,25 +336,20 @@ class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
         runner = self._runner(checker)          # 装配那一下会把 on_accepted 挂上
         self.assertEqual(await checker.tick(), [NAME])
 
-        # ★ 「进名单」和「报给后端」现在是两个节奏，这条用例守的就是这个区分：
-        #   他现在就该被读、被回复（不然复查白做了），后端晚半小时知道
-        #   （用户 2026-08-29）。
         # ① 立刻进监听名单——不等下一次会话名同步，否则中间他说的话仍然没人读
         self.assertEqual(self.watchlist.watched(), [NAME])
-        # ② 本机也记一格，同一个人不会被排第二次
-        self.assertEqual(self.store.pending_friend_request(ACCOUNT, NAME), "")
-        # ③ 但这一刻**还没报**：先排队
-        self.assertEqual(self.contacts.reported, [])
-        self.assertEqual(self.store.pending_accepted_count(ACCOUNT), 1)
-
-        # ④ 等够半小时，报给后端的是 accepted，号是本机映射查出来的那个，remark 就是会话名
-        self.now = self.now + timedelta(seconds=ACCEPTED_REPORT_DELAY_SECONDS + 1)
-        await runner.tick()
+        # ② **当场就报**（用户 2026-09-01 去掉了原来那半小时的延迟队列）
         self.assertEqual(len(self.contacts.reported), 1)
         report = self.contacts.reported[0]
         self.assertEqual(report["status"], "accepted")
         self.assertEqual(report["number"], NUMBER)
         self.assertEqual(report["remark"], NAME)
+        # ③ 报成功了才销账：销了之后复查不会再挑中他
+        self.assertEqual(self.store.pending_friend_request(ACCOUNT, NAME), "")
+        self.assertEqual(
+            self.store.next_friend_check(ACCOUNT, not_before=self.not_before()), ("", "")
+        )
+        _ = runner
 
     async def test_没通过_什么都不报(self) -> None:
         self.store.note_friend_request(ACCOUNT, NUMBER, NAME)
@@ -337,10 +365,12 @@ class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.contacts.reported, [])
         self.assertEqual(self.watchlist.watched(), [])
 
-    async def test_没配上报口也不会每轮重查同一个人(self) -> None:
-        """没登录/没接业务端时 `_note_friend_accepted` 整段跳过，本机那一格得有人兜。
+    async def test_报不出去就留着下一轮再报(self) -> None:
+        """没登录/没接业务端时报不出去——**台账要留着**，下一轮复查再确认再报。
 
-        不兜的话复查每轮都重新确认同一个人、白动一次微信搜索，后面排队的谁也轮不上。
+        代价是后端不可达时会重复搜同一个人（受 15 分钟间隔和 ≥300s 共享闸约束）；
+        换来的是上报绝不会静默丢掉，而那正是 2026-09-01 要治的病：
+        requested 报上去了、人也通过了，accepted 再没上来过。
         """
         self.store.note_friend_request(ACCOUNT, NUMBER, NAME)
         checker = PendingFriendWatcher(
@@ -353,7 +383,9 @@ class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
         self.contacts = None            # 没配上报口
         self._runner(checker)
         self.assertEqual(await checker.tick(), [NAME])
-        self.assertEqual(self.store.next_friend_check(ACCOUNT, max_checks=MAX_CHECKS), ("", ""))
+        # 没销账：下一轮还会挑中他，直到真报出去为止
+        number, _ = self.store.next_friend_check(ACCOUNT, not_before=self.not_before())
+        self.assertEqual(number, NUMBER)
 
 
 if __name__ == "__main__":

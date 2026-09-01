@@ -87,9 +87,25 @@
 - 所以要能稳稳回消息，加好友时**就得带 `remark`**（例：`张三-仓库工`），别指望昵称。
 - 读不到昵称不算失败（`name` 给 `null`，走 `friend.add.fallback`）；但**号码搜不到会直接报错**，
   不再静默返回成功——否则 AI 端会一直等一个根本没发出去的申请。
-- `add_friend` 成功只代表**申请已发出**，不代表能发消息了。对方哪天点通过是之后的事：
-  由 `gateway/friendcheck.py` 隔一阵复查一次（093，判据 = `search_contacts` 精确命中
-  说明他已经在通讯录里了），确认之后才报 `accepted`、才进监听名单。
+- `add_friend` 成功只代表**申请已发出**，不代表能发消息了。对方哪天点通过是之后的事，
+  有**两条**路认出来（2026-09-01 用户改口径）：
+  ① `gateway/friendcheck.py` 隔一阵去搜一次（判据 = `search_contacts` 精确命中说明他已经
+     在通讯录里了）。间隔和期限都在**配置中心**里（`friend_recheck_interval_seconds` /
+     `friend_recheck_deadline_hours`），期限从**申请那一刻**算起，取代了原来按次数的
+     `MAX_CHECKS`。搜的名称 = 我们报给业务端的那个（备注优先、没备注才退回昵称）。
+  ② 业务端下发的**发消息指令发成功了** → 他早就通过了（`_note_sent_to_pending_friend`）。
+     白捡的一条，不额外动微信。
+  两条都汇到 `_report_accepted_now`：**当场**报 `accepted`，不再压半小时
+  （原 `gateway_pending_accepted` 延迟队列 2026-09-01 已删）。
+- ★ **不为「等通过」开轮询**（用户 2026-09-01：「业务端会发消息过来 不用轮询」）。
+  `requested` 的人**始终不进监听名单**——名单只收 `accepted`（085 fail-closed）。
+  放开它的代价是每人每轮白开一次不存在的会话窗口，而且 `requested` 有**两个来源**，
+  另一个是后端推计划写的「计划点名要加谁」，那些人我们根本还没加，放进名单等于
+  可能给一个从没打过招呼的人自动回复。
+- ★ 「我们真发出过申请」的权威是**本机台账** `gateway_friend_checks`（只由本机写），
+  不是 `gateway_contacts.status='requested'`——后者被同步名单无条件覆盖
+  （`save_contacts`，后端没回 `contact_status` 就写成空串），一冲掉这个人就既不被复查、
+  也认不出通过，而且一声不吭。
   ⚠️ `check_new_friends` 不是这个信号——那是**别人申请加我们**的列表，
   和「我们申请的对方通过了」是两件事。
 

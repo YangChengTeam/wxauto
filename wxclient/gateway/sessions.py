@@ -174,30 +174,29 @@ CREATE TABLE IF NOT EXISTS gateway_auto_friend (
   at           TEXT NOT NULL,
   PRIMARY KEY (account_id, number)
 );
-CREATE TABLE IF NOT EXISTS gateway_pending_accepted (
-  -- 「检测到对方通过了好友申请」到「真的报给后端」之间的等待队列
-  -- （用户 2026-08-29：通过之后要隔半小时才 POST /client/contacts）。
-  -- ★ 落库不放内存：等待期跨得过重启，否则关一次程序这条上报就永远没了。
-  -- ★ 和 gateway_auto_friend / gateway_friend_checks 同理，**只由本机写**，同步名单不碰。
-  account_id  TEXT NOT NULL,
-  number      TEXT NOT NULL,
-  remark      TEXT NOT NULL DEFAULT '',
-  command_id  TEXT NOT NULL DEFAULT '',
-  -- 第一次检测到的时刻。**重复检测不刷新它**——否则对方每发一条消息都把半小时重新算一遍，
-  -- 一个话多的人可以让这条上报永远发不出去。
-  detected_at TEXT NOT NULL,
-  PRIMARY KEY (account_id, number)
-);
 CREATE TABLE IF NOT EXISTS gateway_friend_checks (
-  -- 「已申请、还没通过」的人复查到哪一步了（093）。
-  -- ★ 和 gateway_auto_friend 同样的理由**不复用 gateway_contacts**：那张表同步名单会覆盖，
-  --   而这里记的是本机自己的复查进度，被覆盖就等于从头再查一遍。只由本机写。
-  account_id TEXT NOT NULL,
-  number     TEXT NOT NULL,
+  -- 「**这台机器真的发出过**好友申请、还在等对方通过」的台账（093 → 2026-09-01 改口径）。
+  --
+  -- ★★ 为什么这张表是权威、而不是 `gateway_contacts.status='requested'`：
+  --   `requested` 有**两个来源**，只有一个能算数——
+  --     ① 我们 `add_friend` 真的把申请发出去了（这里记的就是它）；
+  --     ② 业务后端推计划时自己写的一条「计划点名要加谁」，那个人**我们根本还没加**。
+  --   搜索复查和放行进监听名单都只认 ①。认了 ② 就是把没申请过的人放进 fail-closed
+  --   名单（085），有可能给一个我们从没打过招呼的人自动回复。
+  -- ★ 只由本机写，同步名单一个字都不碰它——所以后端把 `contact_status` 回成空串
+  --   （`save_contacts` 无条件覆盖 status）也冲不掉这条链路。
+  account_id   TEXT NOT NULL,
+  number       TEXT NOT NULL,
+  -- 申请发出去时我们报给业务端的那个名称（= 备注优先、没备注才退回昵称）。
+  -- 复查搜的就是它：和 `POST /client/contacts` 报上去的是同一个字符串。
+  session_name TEXT NOT NULL DEFAULT '',
+  -- 申请发出去的时刻。**搜索期限从它算起**（配置中心「查多久」），不是从上次查算起。
+  requested_at TEXT NOT NULL DEFAULT '',
   -- 上一次**真去微信里查过**他的时间（查失败也算，否则下一轮还挑中同一个人）
-  last_at    TEXT NOT NULL DEFAULT '',
-  -- **确认过「还没通过」**的次数（查失败不计）。到上限就不再查
-  checks     INTEGER NOT NULL DEFAULT 0,
+  last_at      TEXT NOT NULL DEFAULT '',
+  -- 历史列：曾经的「确认过还没通过」次数上限（MAX_CHECKS=96）。2026-09-01 用户改成
+  -- 按**期限**放弃，这一列不再参与判断，只留着不删（删列不可逆）。
+  checks       INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (account_id, number)
 );
 CREATE TABLE IF NOT EXISTS gateway_read_marks (
@@ -288,6 +287,29 @@ class GatewayStore:
             _ensure_column(conn, "gateway_send_log", "action", "TEXT NOT NULL DEFAULT 'message'")
             _ensure_column(conn, "gateway_candidate_mode", "source", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(conn, "gateway_candidate_mode", "server_updated_at", "TEXT NOT NULL DEFAULT ''")
+            # 093 改口径（2026-09-01）：复查台账从「进度」升级成「我们真发过申请」的权威，
+            # 老库那两列不补就是 "no such column"。
+            _ensure_column(conn, "gateway_friend_checks", "session_name", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(conn, "gateway_friend_checks", "requested_at", "TEXT NOT NULL DEFAULT ''")
+            # ★ 补列之后还要**回填**：老库里这两列是空的，而复查按 `session_name` 搜、
+            #   按 `requested_at` 算期限——不回填，升级那一刻**所有在途的人当场消失**，
+            #   一个都不会再被查（正是这次要治的病，不能靠升级又制造一遍）。
+            #   只 UPDATE 已有行、不 INSERT 新行：已有行是老复查循环真的在跟的人；
+            #   凭 `gateway_contacts.status='requested'` 新造行会把后端写的
+            #   「计划点名要加谁」也拉进来，那些人我们根本没加过（见建表注释）。
+            #   `requested_at` 补成当下：老库没记过申请时刻，给它一个完整的期限窗，
+            #   宁可多查几天，也好过升级即丢。
+            conn.execute(
+                """UPDATE gateway_friend_checks
+                      SET session_name = COALESCE((
+                            SELECT c.session_name FROM gateway_contacts AS c
+                             WHERE c.account_id = gateway_friend_checks.account_id
+                               AND c.number = gateway_friend_checks.number
+                               AND TRIM(c.session_name) <> ''), ''),
+                          requested_at = ?
+                    WHERE TRIM(session_name) = '' OR TRIM(requested_at) = ''""",
+                (_utcnow().isoformat(),),
+            )
             # 连续失败次数（加好友退避用）。老库没有这一列，不补就 "no such column"。
             conn.commit()
 
@@ -694,53 +716,61 @@ class GatewayStore:
 
     # ─────────── 已申请、还没通过的好友：复查台账（093）───────────
 
-    def next_friend_check(self, account_id: str, *, max_checks: int) -> tuple[str, str]:
-        """下一个该复查的「已申请、还没通过」的人：``(number, session_name)``；没有就 ``("", "")``。
+    def next_friend_check(self, account_id: str, *, not_before: str) -> tuple[str, str]:
+        """下一个该复查的「我们真发过申请、还在等通过」的人：``(number, session_name)``。
 
-        取的是 `gateway_contacts` 里 `requested` 那些行——**他们不在监听名单里**
-        （`watched_session_names` 只要 `accepted`），所以除了复查这条循环，
-        没有任何一段代码会再提起他们。
+        取的是**本机台账**（见建表注释），不是 `gateway_contacts.status='requested'`——
+        后者混着业务后端写的「计划点名要加谁」，那些人我们根本还没加，不能拿去搜、
+        更不能据此认定谁通过了。
+
+        ``not_before`` = 搜索期限的起点（配置中心「查多久」换算出来的时刻）：
+        申请发出时间早于它的就不再查了。**期限从申请那一刻算起**，不是从上次查算起——
+        否则一个查得慢的人可以无限续期。2026-09-01 用户改口径，取代原来按次数的 MAX_CHECKS。
 
         排序「最久没查过的优先」：没查过的 `last_at` 是空串，天然排最前。
-        已经确认过 `max_checks` 次还没通过的不再取——对方大概率不会通过了，
-        再查下去只是每轮白动一次微信。
         """
         with closing(self._connect()) as conn:
             row = conn.execute(
-                """SELECT c.number, c.session_name
-                     FROM gateway_contacts AS c
-                     LEFT JOIN gateway_friend_checks AS k
-                       ON k.account_id = c.account_id AND k.number = c.number
-                    WHERE c.account_id = ? AND c.status = 'requested'
-                      AND TRIM(c.session_name) <> ''
-                      AND COALESCE(k.checks, 0) < ?
-                 ORDER BY COALESCE(k.last_at, ''), c.number
+                """SELECT number, session_name
+                     FROM gateway_friend_checks
+                    WHERE account_id = ?
+                      AND TRIM(session_name) <> ''
+                      AND requested_at >= ?
+                 ORDER BY last_at, number
                     LIMIT 1""",
-                (account_id, int(max_checks)),
+                (account_id, not_before),
             ).fetchone()
         return (str(row[0]), str(row[1]).strip()) if row else ("", "")
 
-    def note_friend_check(self, account_id: str, number: str, at: str, *, counted: bool) -> None:
-        """记下「这一趟真去微信里查过他了」。
+    def note_friend_check(self, account_id: str, number: str, at: str) -> None:
+        """记下「这一趟真去微信里查过他了」。查成功查失败都记。
 
-        ``counted=False`` 是**没判出来**的那一趟（搜索本身失败）：时间照记——不记的话
-        下一轮还挑中同一个人，一直卡在他身上；次数不记——那一趟并没有证明「他还没通过」，
-        拿它去凑放弃阈值，等于把「查不动」算成了「他不来」。
+        不记的话下一轮还会挑中同一个人（排序按 `last_at`），后面排队的谁也轮不上。
+        原来还按「确认过还没通过」计次、到 96 次放弃，2026-09-01 改成按期限放弃，
+        计次那一列留着不删但不再参与判断。
         """
         number = (number or "").strip()
         if not number:
             return
-        step = 1 if counted else 0
         with closing(self._connect()) as conn:
             conn.execute(
-                """INSERT INTO gateway_friend_checks (account_id, number, last_at, checks)
-                   VALUES (?,?,?,?)
-                   ON CONFLICT(account_id, number) DO UPDATE SET
-                     last_at = excluded.last_at,
-                     checks  = gateway_friend_checks.checks + ?""",
-                (account_id, number, at, step, step),
+                "UPDATE gateway_friend_checks SET last_at = ? WHERE account_id = ? AND number = ?",
+                (at, account_id, number),
             )
             conn.commit()
+
+    def drop_friend_request(self, account_id: str, number: str) -> None:
+        """销账：他通过了（或已经不用再等了）。销掉之后复查循环就不会再挑中他。"""
+        number = (number or "").strip()
+        if not number:
+            return
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "DELETE FROM gateway_friend_checks WHERE account_id = ? AND number = ?",
+                (account_id, number),
+            )
+            conn.commit()
+
 
     def friend_check_mark(self, account_id: str, number: str) -> str:
         """上一次**真去微信里查过他**的时间；没查过是空串。排查和测试用。"""
@@ -751,77 +781,37 @@ class GatewayStore:
             ).fetchone()
         return str(row[0]) if row and row[0] else ""
 
-    # ── 好友通过后的延迟上报（用户 2026-08-29）────────────────────
-
-    def defer_accepted_report(
-        self, account_id: str, number: str, remark: str, at: datetime, command_id: str = "",
-    ) -> bool:
-        """记下「这个号通过了，等到点再报」。返回 True = 这次真的排进去了（第一次检测到）。
-
-        重复检测**不覆盖** `detected_at`：同一个人可能被「收到他消息」和「复查确认」
-        两条路各认出一次，还可能每来一条消息认一次——刷新时间就等于把上报无限往后推。
-        """
-        number, remark = (number or "").strip(), (remark or "").strip()
-        if not number:
-            return False
-        with closing(self._connect()) as conn:
-            cur = conn.execute(
-                """INSERT INTO gateway_pending_accepted
-                     (account_id, number, remark, command_id, detected_at)
-                   VALUES (?, ?, ?, ?, ?)
-                   ON CONFLICT(account_id, number) DO NOTHING""",
-                (account_id, number, remark, command_id or "", at.isoformat()),
-            )
-            conn.commit()
-            return cur.rowcount > 0
-
-    def due_accepted_reports(self, account_id: str, cutoff: datetime) -> list[dict[str, str]]:
-        """到点该报的那几条（`detected_at <= cutoff`）。"""
-        with closing(self._connect()) as conn:
-            rows = conn.execute(
-                """SELECT number, remark, command_id, detected_at FROM gateway_pending_accepted
-                    WHERE account_id = ? AND detected_at <= ?
-                    ORDER BY detected_at""",
-                (account_id, cutoff.isoformat()),
-            ).fetchall()
-        return [
-            {"number": str(r[0]), "remark": str(r[1]), "command_id": str(r[2]),
-             "detected_at": str(r[3])}
-            for r in rows
-        ]
-
-    def drop_accepted_report(self, account_id: str, number: str) -> None:
-        """报出去了（或不必再报了）→ 从等待队列里删掉。"""
-        with closing(self._connect()) as conn:
-            conn.execute(
-                "DELETE FROM gateway_pending_accepted WHERE account_id = ? AND number = ?",
-                (account_id, number),
-            )
-            conn.commit()
-
-    def pending_accepted_count(self, account_id: str = "") -> int:
-        """还压着几条没报（只读，给诊断和状态用）。"""
-        with closing(self._connect()) as conn:
-            if account_id:
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM gateway_pending_accepted WHERE account_id = ?",
-                    (account_id,),
-                ).fetchone()
-            else:
-                row = conn.execute("SELECT COUNT(*) FROM gateway_pending_accepted").fetchone()
-        return int(row[0]) if row else 0
-
-    def note_friend_request(self, account_id: str, number: str, session_name: str) -> None:
-        """记下「我们刚给这个号发了好友申请，备注名是这个」。
+    def note_friend_request(
+        self, account_id: str, number: str, session_name: str, at: str = "",
+    ) -> None:
+        """记下「我们刚给这个号发了好友申请，报给业务端的名称是这个」。
 
         为的是**以后能认出对方通过了**：通过之后我们收到的第一条消息只带会话名，
         而上报要的是 `number`（api2 §4.1 必填）——两者的桥就是这一行。
-        重启也要还在，所以落库不放内存。服务端同步回来的行会覆盖它（那边才是权威）。
+        重启也要还在，所以落库不放内存。
+
+        ★ 写**两张表**，各有各的用处，别合并：
+          · `gateway_contacts` —— 给别的链路看的那份，服务端同步回来会覆盖它（那边是权威）。
+          · `gateway_friend_checks` —— **本机台账**，同步一个字都不碰。复查搜谁、
+            以及「发消息发成功了说明他通过了」查谁，都只认这一份。
+            2026-09-01 之前只写前者，于是后端把 `contact_status` 回成空串就能把
+            `status='requested'` 冲掉，这个人从此既不被复查、也认不出通过——一声不吭。
         """
         number, session_name = (number or "").strip(), (session_name or "").strip()
         if not number or not session_name:
             return
+        at = at or _utcnow().isoformat()
         with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT INTO gateway_friend_checks
+                     (account_id, number, session_name, requested_at, last_at, checks)
+                   VALUES (?, ?, ?, ?, '', 0)
+                   ON CONFLICT(account_id, number) DO UPDATE SET
+                     session_name = excluded.session_name,
+                     requested_at = excluded.requested_at,
+                     last_at      = ''""",
+                (account_id, number, session_name, at),
+            )
             conn.execute(
                 """INSERT INTO gateway_contacts
                      (account_id, number, session_name, profile_name, status, worker_id, updated_at)
@@ -835,14 +825,19 @@ class GatewayStore:
             conn.commit()
 
     def pending_friend_request(self, account_id: str, session_name: str) -> str:
-        """这个会话名对应的号，如果我们还在等他通过的话。不等了或不认识 → 空串。"""
+        """这个会话名对应的号，如果我们还在等他通过的话。不等了或不认识 → 空串。
+
+        ★ 查的是**本机台账**，不是 `gateway_contacts.status='requested'`：
+          后者被同步名单无条件覆盖（`save_contacts`，后端没回 `contact_status` 就是空串），
+          一冲掉这里就再也认不出「他通过了」。台账只由本机写，冲不掉。
+        """
         session_name = (session_name or "").strip()
         if not session_name:
             return ""
         with closing(self._connect()) as conn:
             row = conn.execute(
-                """SELECT number FROM gateway_contacts
-                   WHERE account_id = ? AND session_name = ? AND status = 'requested' LIMIT 1""",
+                """SELECT number FROM gateway_friend_checks
+                   WHERE account_id = ? AND session_name = ? LIMIT 1""",
                 (account_id, session_name),
             ).fetchone()
         return str(row[0]) if row and row[0] else ""

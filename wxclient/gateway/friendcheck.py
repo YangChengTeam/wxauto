@@ -9,6 +9,17 @@
 结果就是：**我们主动加的人一旦通过，系统里没有任何一处会发现。**
 现场表现是这个人在计划里永远停在「等对方通过」，而对方其实早就通过了。
 
+★ 2026-09-01 用户改口径，本模块跟着变了三处（别照旧注释改回去）：
+  · **间隔和期限进配置中心**（`friend_recheck_interval_seconds` /
+    `friend_recheck_deadline_hours`），期限从**申请那一刻**算起，
+    取代原来按次数放弃的 `MAX_CHECKS = 96`——次数换算不出来是几天，期限看得懂。
+  · **搜谁的权威改成本机台账** `gateway_friend_checks`（`next_friend_check`）。
+    原来取 `gateway_contacts.status='requested'`，而那张表被同步名单无条件覆盖：
+    后端没回 `contact_status` 就写成空串，人从此不在待查集里，一声不吭。
+  · **认出通过之后当场报**，不再压半小时（`gateway_pending_accepted` 队列已删）。
+还有一条**不在本模块**、但和本模块一正一反：业务端下发的发消息指令发成功了，
+也说明他早就通过了（`runner._note_sent_to_pending_friend`），那条不额外动微信。
+
 **本模块只做一件事：判「他通过了没有」，通过了就交给现成的那条上报路**
 （`runner._note_friend_accepted` → `POST /client/contacts` → 进监听名单）。
 不新造管子：判据、上报、名单派生全是现成的。
@@ -38,7 +49,7 @@ from __future__ import annotations
 import asyncio
 import random
 from collections.abc import Callable, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import structlog
 
@@ -50,12 +61,14 @@ from .sessions import GatewayStore
 
 _log = structlog.get_logger(__name__)
 
-#: 确认过这么多次「还没通过」就不再查他。
+#: 兜底期限（小时）。配置中心没给「查多久」时用它。
 #:
-#: 只在工作时间窗里跑、每轮最多查一个人、还要过 ≥300s 那道共享闸，所以 96 次实际横跨好几天。
-#: 上限本身不是精度问题，是**别让一个永远不会通过的号占住每轮那一个名额**——
+#: 取代原来按次数的 MAX_CHECKS（96 次，2026-09-01 用户改口径）：次数是个换算不出来的数——
+#: 每轮最多查一个人、还要过 ≥300s 共享闸和工作时间窗，96 次实际横跨好几天，
+#: 谁也说不准是几天。期限是**看得懂、改得动**的一个数。
+#: 期限本身不是精度问题，是**别让一个永远不会通过的号一直占住每轮那一个名额**——
 #: 名额被占住，后面新申请的人就一直排不上。
-MAX_CHECKS = 96
+DEFAULT_DEADLINE_HOURS = 72.0
 
 
 class PendingFriendWatcher:
@@ -68,6 +81,7 @@ class PendingFriendWatcher:
         runtime,  # WeChatRuntime，或任何提供 submit(TaskType, payload) 的对象
         store: GatewayStore,
         interval_seconds: float,
+        deadline_hours: float = DEFAULT_DEADLINE_HOURS,
         active_hours: str = "",
         on_accepted: Callable[[str, str], object] | None = None,
         clock: Callable[[], datetime] | None = None,
@@ -77,6 +91,8 @@ class PendingFriendWatcher:
         self._runtime = runtime
         self._store = store
         self._interval = float(interval_seconds)
+        #: 申请发出后搜多久就不再搜（配置中心「查多久」）。``<= 0`` = 不设期限，一直搜。
+        self._deadline_hours = float(deadline_hours)
         self._active_hours = active_hours
         #: async (account_id, session_name) -> None：确认通过之后怎么落地。
         #: runner 拼好之后再装（上报和名单派生都在它手上）。
@@ -108,11 +124,16 @@ class PendingFriendWatcher:
 
     async def _check_one(self, account_id: str) -> str:
         """这个账号下复查**一个**人。一趟只查一个：查一个人 = 动一次微信搜索。"""
-        number, session_name = self._store.next_friend_check(account_id, max_checks=MAX_CHECKS)
+        now = self._clock()
+        # 期限从**申请发出那一刻**算起：早于这个时刻的不再查。0 或负数 = 不设期限。
+        not_before = (
+            (now - timedelta(hours=self._deadline_hours)).isoformat()
+            if self._deadline_hours > 0 else ""
+        )
+        number, session_name = self._store.next_friend_check(account_id, not_before=not_before)
         if not number or not session_name:
             return ""
 
-        now = self._clock()
         # ★ 先给「主动加好友」让路（2026-08-27 安全验证）。刚搜过一个陌生号，紧接着再搜
         #   一个人，在微信那边就是连着两次搜索——正是弹安全验证的形状。
         #   让路的必须是本循环：复查是死循环，这轮不查下轮再查；AI 端下发的加好友被拒
@@ -132,8 +153,8 @@ class PendingFriendWatcher:
 
         verdict = await self._is_contact(session_name)
         # 真去微信里查过了就记时间（判没判出来都记），否则下一轮还挑中同一个人，
-        # 后面排队的谁也轮不上。次数只在**确认还没通过**时才加（见 note_friend_check）。
-        self._store.note_friend_check(account_id, number, now.isoformat(), counted=verdict is False)
+        # 后面排队的谁也轮不上。放弃与否现在只看期限，不再计次。
+        self._store.note_friend_check(account_id, number, now.isoformat())
         if verdict is not True:
             if verdict is None:
                 _log.info("没能确认对方通过了没有，这轮不动结论")

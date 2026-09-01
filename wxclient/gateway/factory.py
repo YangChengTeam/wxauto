@@ -251,6 +251,7 @@ def build_gateway(
             runtime=runtime,
             store=store,
             interval_seconds=gateway_settings.friend_recheck_interval_seconds,
+            deadline_hours=gateway_settings.friend_recheck_deadline_hours,
             active_hours=gateway_settings.active_hours,
         ),
         # 090：陌生人主动发起。**默认关**（`stranger_intake`）——放开 fail-closed 名单
