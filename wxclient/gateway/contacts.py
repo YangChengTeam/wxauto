@@ -22,7 +22,7 @@ from typing import Any
 
 import structlog
 
-from .backend_client import BackendEndpoint, error_of
+from .backend_client import BackendEndpoint, error_of, error_shape
 
 _log = structlog.get_logger(__name__)
 
@@ -130,6 +130,8 @@ class ContactDirectory(BackendEndpoint):
             _log.warning(
                 "会话名接口被拒", path=path, status=response.status_code,
                 错误码=code, 说明=message,
+                # 码取不出来时把响应体的形状记一笔，否则这条日志等于只有一个 409。
+                **({} if code else {"响应形状": error_shape(response)}),
             )
             return None
         try:

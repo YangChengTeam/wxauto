@@ -47,6 +47,27 @@ def error_of(response: httpx.Response) -> tuple[str, str]:
     return code, message
 
 
+def error_shape(response: httpx.Response) -> str:
+    """错误响应的**顶层键名**，只在 `error_of` 什么都取不出来时用来兜底。
+
+    ★ 为什么要这一条（2026-09-01）：`error_of` 只认 `{error:{code,message}}` 这一种信封，
+    形状对不上就**静默**返回空。真机上 `GET /client/contacts` 连着回 409，而日志里
+    `错误码`/`说明` 两个字段都是空的——于是「被拒了」和「为什么被拒」之间又差着一次登机器，
+    正是 `error_of` 当初要消灭的那件事，只是换了个形状溜回来。
+
+    **只记键名，不记值**：`details` 会回显请求内容，里面有候选人姓名、手机号、会话名，
+    那是真实 PII（同 `error_of` 的口径）。键名本身不承载 PII。
+    """
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001 —— 不是 JSON 就如实说，别猜
+        text = (response.text or "").strip()
+        return "非 JSON" if text else "空响应体"
+    if isinstance(body, dict):
+        return "键：" + "、".join(sorted(body)[:12]) if body else "空对象"
+    return type(body).__name__
+
+
 class BackendEndpoint:
     """一条 W 面接口的底座。子类自己解释响应，这里只负责把请求送出去。"""
 

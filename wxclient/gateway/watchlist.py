@@ -150,7 +150,7 @@ class Watchlist:
         if self._backend_seen:
             if not self._warned_ai_push_ignored:
                 self._warned_ai_push_ignored = True
-                _log.info("名单已由业务后端接管，忽略 AI 端推送（spec 085）")
+                _log.info("监听名单以业务后端为准，这条推送不采用")
             return False
         return self._merge(data, "AI 端推送", "监听列表推送格式不对，忽略")
 
