@@ -63,7 +63,8 @@ Thumbs.db
 .vscode/
 .claude/
 .codex/
-CLAUDE.md
+# CLAUDE.md 不再忽略：它现在是指向 AGENTS.md 的软链，随仓入库，
+# 好让每个克隆都拿到同一份规约（一份文档不会和自己对不上）。
 
 # 打包机上还留着这份 vendored GPL-3.0 源（omni_visual 驱动已删，仓里也从未跟踪过它）。
 # 继续忽略：它不该被谁 git add 进来。
