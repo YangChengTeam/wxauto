@@ -947,6 +947,39 @@ class PackagingTests(unittest.TestCase):
             self.assertTrue(_check_wechat_driver(lines))
         self.assertIn("pyweixin=ok", lines)
 
+    def test_self_check_separates_no_wechat_from_missing_module(self) -> None:
+        """★ 「本机没装微信」不能和「包里缺 pyweixin」判成同一件事。
+
+        `pyweixin/Config.py` 在**模块顶层**读注册表找微信版本，没装就抛 `NotInstalledError`
+        ——于是任何没装微信的机器（CI 的 Windows runner 就是）`import pyweixin` 必炸。
+        以前两件事都报 FAIL，提示语还写着「多半是 spec 的 excludes 砍掉了依赖」，
+        指向一个不存在的问题。
+
+        放行的判据必须是**正向且严格**的：`NotInstalledError` 这个类得真的来自 pyweixin。
+        只对名字不对来路的话，随便哪个库抛个同名异常都能把这道闸糊弄过去。
+        """
+        from wxclient.ui.__main__ import _check_wechat_driver
+
+        class NotInstalledError(Exception):
+            pass
+
+        # ① 真的来自 pyweixin：证明模块被找到并执行过了 → 放行
+        NotInstalledError.__module__ = "pyweixin.Errors"
+        lines: list[str] = []
+        with mock.patch("wxclient.wechat_api.uia.UiaWeChatDriver._pyweixin_class",
+                        side_effect=NotInstalledError("未找到微信注册表路径")):
+            self.assertTrue(_check_wechat_driver(lines))
+        self.assertTrue(any(line.startswith("pyweixin=ok") for line in lines), lines)
+        self.assertFalse(any("FAIL" in line for line in lines), lines)
+
+        # ② 同名但不是 pyweixin 抛的 → 仍然判失败，别让别的库蒙混过关
+        NotInstalledError.__module__ = "some_other_lib"
+        lines.clear()
+        with mock.patch("wxclient.wechat_api.uia.UiaWeChatDriver._pyweixin_class",
+                        side_effect=NotInstalledError("未找到微信注册表路径")):
+            self.assertFalse(_check_wechat_driver(lines))
+        self.assertTrue(any("pyweixin=FAIL" in line for line in lines), lines)
+
     def test_upgrading_wipes_the_previous_internal_dir(self) -> None:
         """★ 升级安装必须先删掉上一版的 `_internal`，否则装出来的是**两版的并集**。
 

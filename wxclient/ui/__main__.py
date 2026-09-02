@@ -152,10 +152,36 @@ def _check_wechat_driver(lines: list[str]) -> bool:
         driver._pyweixin_class("Tools")
         driver._pyweixin_submodule("Uielements")
     except Exception as exc:  # noqa: BLE001 - 自检本来就是来抓这个的
+        if _is_wechat_not_installed(exc):
+            # **「这台机器没装微信」不是「包里缺 pyweixin」。** 两件事以前都报同一句
+            # FAIL，于是在没装微信的机器上打包，得到的提示是「多半是 spec 的 excludes
+            # 砍掉了依赖」——指向一个根本不存在的问题。
+            #
+            # 判据是**正向**的：`NotInstalledError` 这个类只可能来自
+            # `pyweixin/Errors.py`，能拿到它就证明 `pyweixin` 已经被找到并执行了
+            # （registry 那句在 `Config.py` 的模块顶层，import 时就跑）。这恰好就是
+            # 这条自检要证明的事，所以放行不等于放水。
+            #
+            # ⚠️ 但覆盖面确实变窄了：这条路上只证到「模块在包里」，证不到
+            # `WeChatAuto` / `WeChatTools` 那些重家伙收全了没有。**所以在没装微信的
+            # 机器上打的包，不能当作验过**——那仍然只有真机装一次才算数。
+            lines.append("pyweixin=ok(仅验到模块在包里：本机没装微信4.0，驱动连不上)")
+            return True
         lines.append(f"pyweixin=FAIL {type(exc).__name__}: {exc}")
         return False
     lines.append("pyweixin=ok")
     return True
+
+
+def _is_wechat_not_installed(exc: BaseException) -> bool:
+    """这个异常是不是「本机没装微信」——而不是「包里缺东西」。
+
+    不 `from pyweixin.Errors import NotInstalledError` 来比对：那句 import 会连带执行
+    `pyweixin/__init__.py`，而它正是刚才抛异常的那条路，在这里再走一遍只会再炸一次。
+    改看异常类自己的身份——类名加它所属的模块，两样都得对得上。
+    """
+    return (type(exc).__name__ == "NotInstalledError"
+            and str(getattr(type(exc), "__module__", "")).startswith("pyweixin"))
 
 
 def _check_images(lines: list[str]) -> bool:
