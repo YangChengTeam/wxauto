@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# 提交前闸。**只查确定性的东西**——每一条都对应 AGENTS.md 里已经写下的规矩或一次真实事故，
+# 不在这里发明新规则。
+#
+# 启用（每个克隆各做一次，core.hooksPath 是本地配置、不随仓走）：
+#     git config core.hooksPath .githooks
+# 应急放行：
+#     git commit --no-verify        # 整条闸
+#     LXZ_SKIP_VERSION_CHECK=1 ...  # 只放行版本号那条
+#
+# 设计取向：**宁可漏报也别误报**。一条动不动就拦错的闸，三天之内就会被 --no-verify 常态化，
+# 那时它一条都拦不住了。所以这里只放进「拦下来一定是对的」那几项，测试不在其中（太慢）。
+set -uo pipefail
+
+RED=$'\033[1;31m'; YEL=$'\033[1;33m'; GRN=$'\033[1;32m'; OFF=$'\033[0m'
+fail=0
+say(){ printf '%s[pre-commit]%s %s\n' "$GRN" "$OFF" "$*"; }
+bad(){ printf '%s[pre-commit] 拦下:%s %s\n' "$RED" "$OFF" "$*" >&2; fail=1; }
+warn(){ printf '%s[pre-commit] 提醒:%s %s\n' "$YEL" "$OFF" "$*" >&2; }
+
+# ── ⓪ 两条软链不许被拆成普通文件 ──────────────────────────────────────────
+# CLAUDE.md -> AGENTS.md、.claude -> .agents。拆了的表现是「两份规约又开始各自漂」，
+# 而且 git 里看是一个正常的文本文件，谁也不会多看一眼。120000 就是 git 的软链模式。
+#
+# ★ 这条必须排在「暂存为空就退出」前面，而且**直接读索引**、不依赖下面那份清单：
+#   软链变普通文件在 git 里是 **T（类型变更）**，第一版的 --diff-filter=ACM 不含 T，
+#   于是整个钩子在第一行就空手退出、一声不吭地放行。变异测试才抓出来的。
+for link in CLAUDE.md .agents .claude; do
+  mode="$(git ls-files --stage -- "$link" 2>/dev/null | awk '{print $1}' | head -1)"
+  [ -n "$mode" ] || continue
+  case "$link" in
+    .agents) [ "$mode" = "160000" ] && bad ".agents 变成了 submodule（$mode），它该是普通目录";;
+    *) [ "$mode" = "120000" ] || bad "$link 在索引里是 $mode，不是软链（120000）。别 rm 了重建成普通文件。";;
+  esac
+done
+
+# 本次暂存的文件。**T 和 R 一定要带上**：T=类型变更（软链↔普通文件）、R=改名，
+# 少一个字母就是一整类改动从闸前面溜过去。
+staged="$(git diff --cached --name-only --diff-filter=ACMRT)"
+if [ -z "$staged" ]; then
+  [ "$fail" = 0 ] && exit 0 || exit 1
+fi
+
+# ── ① 永不入库清单 ────────────────────────────────────────────────────────
+# AGENTS.md §14「永不入库」。这些多数已被 .gitignore 挡住，这道闸管的是**绕过去的那条路**：
+# `git add -f`、改了个文件名、或者哪天有人手滑把 .gitignore 那行删了。
+NEVER='(^|/)(\.env($|\.)|tickets\.json$|.*\.tickets\.json$|console-account\.json$|console-ui\.json$|gateway\.env$|gateway\.remote\.env$|client-session\.json$)|^dist/|^build/|\.log$|__pycache__/|^\.wxclient/'
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  case "$f" in *.env.example) continue;; esac        # 唯一允许入库的那一个
+  printf '%s\n' "$f" | grep -Eq "$NEVER" && bad "永不入库：$f"
+done <<< "$staged"
+
+# ── ② 生产机地址不进任何入库文件 ──────────────────────────────────────────
+# AGENTS.md §5.1 红线原话：「部署机的真实 IP、账号、口令不写进任何入库文件」。
+# 只拦这一个确定的字面量，零误报；口令那类靠人眼和 ① 的文件名闸。
+if git diff --cached -U0 | grep -qE '^\+.*121\.196\.149\.175'; then
+  bad "暂存内容里出现生产机 IP（AGENTS.md §5.1 红线）。地址只能进环境变量或本地未入库配置。"
+fi
+
+# ── ③ 别人会话留下的临时产物 ──────────────────────────────────────────────
+# 仓库根常年躺着别的会话留下的未跟踪文件。AGENTS.md §14 禁 `git add .` 就是为了它们，
+# 但禁令拦不住手滑——这里按文件名兜一道。
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  printf '%s\n' "$f" | grep -Eq '^win[a-z]*[0-9]*\.txt$|^probe_.*\.py$' \
+    && bad "像是临时产物，别入库：$f（真要入库就 --no-verify）"
+done <<< "$staged"
+
+# ── ④ 改了客户端代码就得升版本号 ──────────────────────────────────────────
+# 用户 2026-08-30 定的规矩，AGENTS.md §13 也写着：代码进仓 ≠ 到用户手里，版本号是这两件事
+# 之间唯一看得见的凭据。真踩过——角色列改完、测试全绿、提交了，但没升版本也没打包，
+# 用户装的还是上一版，他以为功能没做出来。
+#
+# 只在**真有代码行变动**时才拦：纯注释/空行改动放行（AGENTS.md 明说文档注释类不算）。
+if [ "${LXZ_SKIP_VERSION_CHECK:-0}" != "1" ]; then
+  code_changed="$(git diff --cached -U0 -- 'wxclient/*.py' 'wxclient/**/*.py' \
+    | grep -E '^[+-]' | grep -Ev '^(\+\+\+|---)' \
+    | sed -E 's/^[+-][[:space:]]*//' \
+    | grep -Ev '^#' | grep -Ev '^$' || true)"
+  if [ -n "$code_changed" ]; then
+    ver_now="$(git show :wxclient/__init__.py 2>/dev/null | grep -oE '__version__ *= *"[^"]+"' | head -1)"
+    ver_head="$(git show HEAD:wxclient/__init__.py 2>/dev/null | grep -oE '__version__ *= *"[^"]+"' | head -1)"
+    if [ -n "$ver_head" ] && [ "$ver_now" = "$ver_head" ]; then
+      bad "改了 wxclient/ 的代码但没升 __version__（现在还是 ${ver_head#*= })。
+            唯一来源是 wxclient/__init__.py，别在 pyproject.toml 里另写一份。
+            确实不该升（纯注释/文档）就 LXZ_SKIP_VERSION_CHECK=1 git commit ..."
+    fi
+  fi
+fi
+
+# ── ⑤ ruff 只查暂存的 Python ──────────────────────────────────────────────
+# AGENTS.md §14：提交前 ruff 必须绿。没装 ruff 就放行（fail-open）——在没配好环境的机器上
+# 把人挡在门外，只会让人整条 --no-verify。
+py="$(printf '%s\n' "$staged" | grep -E '\.py$' | grep -v '^third_party/' || true)"
+if [ -n "$py" ]; then
+  RUFF=""
+  for c in ./.venv/bin/ruff ruff; do command -v "$c" >/dev/null 2>&1 && { RUFF="$c"; break; }; done
+  if [ -z "$RUFF" ]; then
+    warn "没找到 ruff，跳过静态检查（装了才查）"
+  else
+    # shellcheck disable=SC2086
+    if ! $RUFF check $py; then
+      bad "ruff 没过（上面就是）"
+    fi
+  fi
+fi
+
+if [ "$fail" != 0 ]; then
+  printf '\n%s提交已拦下。%s确实要强行提交：git commit --no-verify\n' "$RED" "$OFF" >&2
+  exit 1
+fi
+say "通过"

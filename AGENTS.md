@@ -525,6 +525,14 @@ cutting OpenCV, anchoring the data directory, deleting the previous `_internal` 
   - scope ∈ `gateway` / `runtime` / `queue` / `wechat` / `uia` / `ui` / `ci` / `docs`
   - e.g. `feat(gateway): 入站轮询 + 去抖聚合`
 - `ruff` and `unittest` must both be green before committing.
+- **A pre-commit gate lives in [`.githooks/`](.githooks/README.md)**; enable it once per clone with
+  `git config core.hooksPath .githooks` (`core.hooksPath` is local config and does not travel with the repo).
+  It checks only deterministic things that already appear in this file: the two symlinks are still symlinks,
+  nothing from the never-commit list is staged, the production host IP is not in the diff, other sessions'
+  scratch files are not swept in, a `wxclient/` code change bumps `__version__`, and staged Python passes
+  ruff. Escape hatches: `git commit --no-verify`, or `LXZ_SKIP_VERSION_CHECK=1` for the version check alone.
+  **After changing a hook, re-run `bash .githooks/selftest.sh`** — the first version of the symlink check was
+  a false green and only a real mutation caught it.
 - **Push only when explicitly asked**; commit locally by default.
 - Commit once the work is done and verified; **never revert workspace changes unrelated to the user's task**.
 
