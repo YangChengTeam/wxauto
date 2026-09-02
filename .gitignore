@@ -61,8 +61,11 @@ gateway.remote.env
 Thumbs.db
 .idea/
 .vscode/
-.claude/
 .codex/
+# AI 助手的配置/技能目录：真身是 `.agents/`，`.claude` 是指向它的软链，两者都入库
+# （skill 要随仓分发）。★ 只有个人设置不入库——注意它是**穿过软链**落到 .agents/ 下的，
+# 写 `.claude/settings.local.json` 拦不住。
+.agents/settings.local.json
 # CLAUDE.md 不再忽略：它现在是指向 AGENTS.md 的软链，随仓入库，
 # 好让每个克隆都拿到同一份规约（一份文档不会和自己对不上）。
 
