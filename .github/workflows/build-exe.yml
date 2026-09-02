@@ -132,6 +132,11 @@ jobs:
           $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
           $size = '{0:N0}' -f $setup.Length
           "sha256=$hash" >> $env:GITHUB_OUTPUT
+          # 也打进日志。摘要页给人看，日志给 grep 用——摘要页调接口取不到，
+          # 而发版时这串值要贴到产品站页面上，得能从外面抓下来核对。
+          Write-Host "package=$($setup.Name)"
+          Write-Host "bytes=$($setup.Length)"
+          Write-Host "sha256=$hash"
           # 写进任务摘要：上架时产品站页面上要贴这串真值——包没有代码签名，
           # 它是用户唯一能自证「下对了」的东西，别手抄别的地方的。
           "### $($setup.Name)"                >> $env:GITHUB_STEP_SUMMARY
