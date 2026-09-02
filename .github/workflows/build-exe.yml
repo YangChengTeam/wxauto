@@ -1,0 +1,154 @@
+# 在 GitHub 的 Windows 机器上打安装包，产出和真机 `python packaging/build.py` 同一件东西：
+#   dist\劳小智微信助手_v<版本>_安装包.exe
+#
+# 为什么值得有这条：打包机环境是**唯一**决定包里有什么的东西（PyInstaller 收的是本机装了
+# 什么，不是仓库声明了什么）。真机上那个 venv 是长年累月攒出来的，出过两回事故——
+#   · 杂物包被打进去：33.7MB → 换干净 venv 重打 25.0MB，多出来的 logger/yaml/simplejson
+#     全仓一处都没 import；
+#   · `dist/` 没清干净，上一版残留混进新包，体积莫名其妙跳到 33MB。
+# CI 每次都是一台新机器 + `pip install -e ".[build]"` 装出来的 pyproject 闭包 + 空的
+# `dist/`，这两类问题结构上就不会发生。
+#
+# ★ 它**不替代**真机验收。CI 只证明「包能打出来、自检没炸」；「装到别人机器上真能驱动微信」
+#   还是得装一次真机——见 docs 里的发版记录，两回「微信明明开着却说找不到微信」都是装完
+#   才看得见的。
+#
+# 拿到包之后照旧走上架那一步（页面先改、包后传，publish.sh 会核版本和 hash）。
+
+name: 打 Windows 安装包
+
+on:
+  # 平时手动跑：想验一下「换个干净环境还打不打得出来」随时点。
+  workflow_dispatch:
+  # 打了 v<版本> 标签就自动打包并建 Release。标签必须和 wxclient/__init__.py 的
+  # __version__ 对得上，对不上当场停——版本号唯一来源只有那一处。
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write        # 建 Release 要写；除此之外不需要任何权限
+
+concurrency:
+  # 同一个 ref 只跑一次。打包十几分钟，重复排队没意义。
+  group: build-exe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # ★ 钉死镜像版本，别用 windows-latest。整条工作流的意义就是「环境是确定的」，
+    #   而 latest 会在某天悄悄换掉 Windows SDK / VC 运行库，于是包里的 DLL 跟着变，
+    #   表现就是体积或行为莫名其妙地动了一下——那正是我们想根除的那类噪声。
+    #   GitHub 同时只保 2 个 GA 镜像，2022 会是先被下架的那个；到那天**有意识地**
+    #   往上钉一档（并留意包体积有没有跟着变），别顺手改成 latest。
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    env:
+      # ★ 必须。Windows 控制台默认 GBK，build.py 最后一行打印中文路径就能把整条打包
+      #   炸掉（UnicodeEncodeError），而包其实早打好了。顺带让文件名也走 UTF-8——
+      #   产物名里有中文。
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 读版本号
+        id: version
+        shell: pwsh
+        run: |
+          # 版本号唯一来源。pyproject 和 installer.iss 都是从这里拿的，这里也一样。
+          $m = Select-String -Path wxclient/__init__.py -Pattern '^__version__\s*=\s*"([^"]+)"'
+          if (-not $m) { throw 'wxclient/__init__.py 里找不到 __version__' }
+          $v = $m.Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          Write-Host "版本 $v"
+
+      - name: 标签和版本号对一遍
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          # 对不上就是发错版：包名里写着一个号、Release 挂着另一个号，
+          # 上架时 publish.sh 那道版本巡检会拦，但那时候包都传一半了。这里先拦。
+          $tag = '${{ github.ref_name }}'
+          $expected = 'v${{ steps.version.outputs.version }}'
+          if ($tag -ne $expected) {
+            throw "标签 $tag 和 wxclient/__init__.py 的 $expected 对不上——先改版本号再打标签"
+          }
+
+      - uses: actions/setup-python@v5
+        with:
+          # 钉死小版本档：installer.iss 的 MinVersion=10.0 就是按 Python 3.12
+          # 不支持 Win7 这件事定的，换档要一起改。
+          python-version: '3.12'
+
+      - name: 装依赖（= pyproject 的闭包，不多不少）
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[build]"
+
+      - name: 装 Inno Setup 6
+        shell: pwsh
+        run: |
+          # build.py 自己按 %ProgramFiles(x86)% 找 ISCC.exe，装完不用再配 PATH。
+          # 没钉版本：安装包只做「解压 + 建快捷方式 + 写卸载信息」，Inno 小版本差异碰不到
+          # 这几件事；真要钉，加 `--version=<号>` 并同步记一笔为什么钉在那一档。
+          choco install innosetup -y --no-progress
+
+      - name: 打包（含 exe 自检）
+        shell: pwsh
+        run: |
+          # 这一条里已经包含：生成两张图 → PyInstaller onedir → 跑打出来的 exe
+          # `--self-check`（真 import pyweixin、真出一张图、真探一次微信）→ ISCC。
+          # 自检里「未找到微信窗口」是这台机器上的正常结果，不影响出包；
+          # 自检**抛异常**才算失败，那时候 build.py 自己会停。
+          python packaging/build.py
+
+      - name: 算 SHA-256
+        id: pkg
+        shell: pwsh
+        run: |
+          # dist 顶层只有安装包这一个 exe（onedir 的那个在子目录里），所以 *.exe 就够，
+          # 不必把带中文的文件名写进 yaml。
+          $setup = Get-ChildItem dist -Filter '*.exe' | Select-Object -First 1
+          if (-not $setup) { throw 'dist 下没找到安装包' }
+          $hash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          $size = '{0:N0}' -f $setup.Length
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          # 写进任务摘要：上架时产品站页面上要贴这串真值——包没有代码签名，
+          # 它是用户唯一能自证「下对了」的东西，别手抄别的地方的。
+          "### $($setup.Name)"                >> $env:GITHUB_STEP_SUMMARY
+          ""                                  >> $env:GITHUB_STEP_SUMMARY
+          "| 项 | 值 |"                       >> $env:GITHUB_STEP_SUMMARY
+          "|---|---|"                         >> $env:GITHUB_STEP_SUMMARY
+          "| 版本 | ${{ steps.version.outputs.version }} |" >> $env:GITHUB_STEP_SUMMARY
+          "| 字节 | $size |"                  >> $env:GITHUB_STEP_SUMMARY
+          "| SHA-256 | ``$hash`` |"           >> $env:GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wxauto-installer-v${{ steps.version.outputs.version }}
+          # dist 顶层只有安装包这一个 exe。下载下来解开是原名
+          # `劳小智微信助手_v<版本>_安装包.exe`，可以直接喂给 publish.sh。
+          path: dist/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 建 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 用自带的 gh，不引第三方 action：多一个第三方就多一处要盯的供应链。
+          $notes = @"
+          SHA-256: ``${{ steps.pkg.outputs.sha256 }}``
+
+          由 GitHub Actions 在干净环境打出（提交 ${{ github.sha }}）。
+          **上架前仍需真机装一次验收**：CI 只证明包打得出来、自检没炸，
+          「装完真能驱动微信」只有真机看得见。
+          "@
+          gh release create '${{ github.ref_name }}' (Get-ChildItem dist -Filter '*.exe').FullName `
+            --title '劳小智微信助手 ${{ github.ref_name }}' --notes $notes

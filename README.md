@@ -146,6 +146,17 @@ pyinstaller --noconfirm packaging\lxz-wechat-gateway.spec
 `simplejson`、`tzdata`、`markupsafe`、`werkzeug` 等等**全仓一处都没 import**，是上一台打包
 环境里的杂物。体积对不上先查这个，别急着怀疑包打漏了（自检那一步会告诉你漏没漏）。
 
+### 在 GitHub Actions 上打（[`.github/workflows/build-exe.yml`](.github/workflows/build-exe.yml)）
+
+上一段那个「venv 必须正好是闭包」的要求，在 CI 里是**结构上**满足的：每次都是一台新的
+Windows 机器、`pip install -e ".[build]"` 装出来的闭包、空的 `dist/`——环境杂物和
+「上一版残留混进新包」这两类事故都不可能发生。手动触发随时可跑；打 `v<版本>` 标签会自动
+打包、核对标签和 `__version__` 对不对、建 Release 并把 SHA-256 写进任务摘要。
+
+★ **它不替代真机验收。** CI 只证明「包打得出来、`--self-check` 没炸」；
+「装到别人机器上真能驱动微信」只有真机装一次才看得见（那两回「微信明明开着却说找不到微信」
+都是装完才暴露的）。上架仍走 `publish.sh`，顺序照旧是**页面先改、包后传**。
+
 四条定下来的事，改之前先读 `installer.iss` 顶上的理由：
 
 | 决定 | 为什么 |
