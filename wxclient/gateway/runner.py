@@ -585,6 +585,7 @@ class GatewayRunner:
                 # 这是本机能给出的最接近的真话）。
                 occurred_at=message.at,
                 content=message.text,
+                message_type=message.message_type,
                 source="inbound_poll",
             )
 

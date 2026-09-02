@@ -66,6 +66,9 @@ class InboundMessage:
     有它就用它：``at`` 是**网关读到这条的时刻**，不是对方发出的时刻。改成直接读会话
     之后（不再依赖未读），读到的很可能是几分钟前甚至昨天的消息——把读取时刻当发送时刻
     喂给模型，它就会对着一条昨晚的消息说「你刚才说」。"""
+    message_type: str = "text"
+    """``text`` / ``voice``。语音是微信自动转文字后读到的（``text`` 已是转写正文），
+    要让模型知道这是听写来的（可能有错字），上报后端时 ``messageType`` 也照实填。"""
 
     @property
     def key(self) -> PeerKey:
@@ -81,6 +84,7 @@ def message_to_row(message: InboundMessage) -> dict:
         "from_self": message.from_self,
         "peer_name": message.peer_name,
         "at_text": message.at_text,
+        "message_type": message.message_type,
     }
 
 
@@ -99,6 +103,7 @@ def message_from_row(account_id: str, peer_id: str, row: dict) -> InboundMessage
         from_self=bool(row.get("from_self")),
         peer_name=str(row.get("peer_name") or peer_id),
         at_text=str(row.get("at_text") or ""),
+        message_type=str(row.get("message_type") or "text"),
     )
 
 
@@ -139,8 +144,15 @@ def format_transcript(messages: Iterable[InboundMessage]) -> str:
     for message in messages:
         who = "专员本人" if message.from_self else "对方"
         when = message.at_text or f"{message.at:%H:%M}"
-        lines.append(f"[{who} · {when}] {message.text}")
+        lines.append(f"[{who} · {when}] {voice_marked(message.message_type, message.text)}")
     return "\n".join(lines)
+
+
+def voice_marked(message_type: str, text: str) -> str:
+    """语音消息在上下文里标出来：正文是微信听写的，模型要知道可能有错字、别逐字较真。"""
+    if message_type == "voice" and text:
+        return f"（语音转文字）{text}"
+    return text
 
 
 def format_history(rows: Iterable[dict]) -> str:
@@ -159,7 +171,7 @@ def format_history(rows: Iterable[dict]) -> str:
         text = str(row.get("text") or "").strip()
         if not text:
             continue
-        lines.append(f"[{who} · {when}] {text}")
+        lines.append(f"[{who} · {when}] {voice_marked(str(row.get('message_type') or ''), text)}")
     return "\n".join(lines)
 
 

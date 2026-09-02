@@ -60,6 +60,50 @@ def is_timestamp_row(raw: dict[str, Any]) -> bool:
     return bool(raw.get("is_timestamp"))
 
 
+#: 语音气泡转写还没出来时，最多等几轮轮询。微信的转写是服务端做的，通常一两秒；
+#: 等了这么多轮还没有就当它转不出来（没说话、方言、网络），别让后面的消息一直压着。
+VOICE_TRANSCRIPT_STRIKES = 3
+
+#: 放弃等转写后喂给 AI 的正文。要让模型知道「对方发了语音但听不到内容」，
+#: 它才会请对方打字，而不是对着一句空话接茬。
+VOICE_UNTRANSCRIBED_TEXT = "[语音消息，微信没能转成文字]"
+
+
+def is_pending_voice(raw: dict[str, Any]) -> bool:
+    """语音气泡、转写正文还没出来（`uia._annotate_voice_row` 标的）。"""
+    return bool(raw.get("transcript_pending"))
+
+
+def hold_pending_voice(
+    raw_messages: Sequence[dict[str, Any]],
+    waits: dict[tuple[str, str], int],
+    peer_id: str,
+) -> tuple[list[dict[str, Any]], int]:
+    """转写没出来的语音：从它起整段先不处理，返回 (可处理的前段, 被压住的条数)。
+
+    只能整段压住、不能单独跳过它：游标要是越过它推到后面的消息上，下一轮转写出来了，
+    它已经在游标前面——永远不会被当成新消息。压住的代价是它后面的消息晚一两轮，
+    轮询本来就是分钟级的。
+
+    连续 ``VOICE_TRANSCRIPT_STRIKES`` 轮还没出来就不等了：正文写成
+    ``VOICE_UNTRANSCRIBED_TEXT`` 照常处理。放弃的记录**不清**（计数停在上限）：
+    微信转不出来的那条以后每轮都还是「未就绪」，清了就会每三轮压一次后面的消息。
+    """
+    kept: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_messages):
+        if not is_pending_voice(raw):
+            kept.append(raw)
+            continue
+        key = (peer_id, str(raw.get("voice_label") or ""))
+        strikes = min(waits.get(key, 0) + 1, VOICE_TRANSCRIPT_STRIKES)
+        waits[key] = strikes
+        if strikes < VOICE_TRANSCRIPT_STRIKES:
+            return kept, len(raw_messages) - index
+        raw = dict(raw, text=VOICE_UNTRANSCRIBED_TEXT, transcript_pending=False)
+        kept.append(raw)
+    return kept, 0
+
+
 def message_signature(raw: dict[str, Any]) -> str:
     """一条消息的签名（游标用）。没有稳定 id，只能拿文本凑。
 
@@ -76,6 +120,11 @@ def message_signature(raw: dict[str, Any]) -> str:
     文本是唯一两次读取都稳定的字段，就只拿它。同文重复的代价是定位到最后一次出现，
     比"永远定位不到"轻得多。
     """
+    label = str(raw.get("voice_label") or "")
+    if label:
+        # 语音气泡：转写出来之前 text 是空、出来之后是正文，同一条消息两种 text。
+        # 只有「语音12"秒」这段前后不变，签它。
+        return sha256(f"voice\x00{label}".encode()).hexdigest()[:32]
     return sha256(str(raw.get("text") or "").encode()).hexdigest()[:32]
 
 
@@ -204,6 +253,7 @@ def to_inbound(
         from_self=is_self_message(raw),
         peer_name=peer_id,
         at_text=str(raw.get("timestamp_text") or "").strip(),
+        message_type=str(raw.get("message_type") or "text"),
     )
 
 
@@ -235,6 +285,8 @@ class QueueMessageSource:
         self._on_unreachable = on_unreachable
         # 会话名 → 连续读不到了几轮（092：从 set 改成计数）
         self._unreachable: dict[str, int] = {}
+        # (会话名, 语音标签) → 转写等了几轮（见 `hold_pending_voice`）
+        self._voice_waits: dict[tuple[str, str], int] = {}
         # 上一轮因人工接管被跳过的会话，只为「变了才喊一声」（见 `_drop_handed_off`）
         self._paused_peers: set[str] = set()
 
@@ -344,6 +396,10 @@ class QueueMessageSource:
         # 时间分隔行必须在切游标**之前**滤掉：它会被当成一条消息发给 AI，还会把游标钉在
         # 一个随时间变化的字符串上（真机读回来过一行「18:28」）。
         raw_messages = [raw for raw in raw_messages if not is_timestamp_row(raw)]
+        # 语音气泡转写还没出来：从它起先压住，游标停在它前面，下一轮再看（见 hold_pending_voice）。
+        raw_messages, held = hold_pending_voice(raw_messages, self._voice_waits, peer_id)
+        if held:
+            _log.info("有语音还没转成文字，这段先不处理，下一轮再看", 会话=peer_id, 压住=held)
 
         # 是不是群只有打开会话才判得出来（未读列表里没有这个信息）。记下来只为诊断和日志——
         # **不再拿它决定处理与否**（069）：群和单聊一样都只看监听名单。

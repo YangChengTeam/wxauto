@@ -2230,32 +2230,44 @@ class UiaWeChatDriver:
             class_name = _safe_call(node.class_name)
             control_type = _safe_call(node.friendly_class_name)
             text = (_safe_call(node.window_text) or "").strip()
-            if not text:
+            # 语音气泡没转文字时名称可能是空的，但这条消息本身不能丢——留成「转写未就绪」
+            # 的行，由网关决定等还是不等（见 `wechat_io.hold_pending_voice`）。
+            voice = _annotate_voice_row(class_name, text)
+            if not text and voice is None:
                 continue
             is_message_class = class_name in message_classes
             is_message_control = _looks_like_chat_message_control(class_name, control_type)
             if not is_message_class and not is_message_control:
                 continue
             runtime_id = _safe_runtime_id(node)
-            key = (str(runtime_id), text) if runtime_id else (str(class_name), text)
+            dedupe_text = text or str((voice or {}).get("voice_label") or "")
+            key = (str(runtime_id), dedupe_text) if runtime_id else (str(class_name), dedupe_text)
             if key in seen:
                 continue
             seen.add(key)
             rect = _safe_call(getattr(node, "rectangle", None))
             metrics = _rect_metrics(rect)
-            rows.append(
-                {
-                    "class_name": class_name,
-                    "control_type": control_type,
-                    "text": text,
-                    "raw_text": text,
-                    "runtime_id": runtime_id,
-                    "is_self": _infer_message_is_self(rect, container_rect),
-                    "is_timestamp": _is_timestamp_row(class_name, text),
-                    "order": order,
-                    **metrics,
-                }
-            )
+            row = {
+                "class_name": class_name,
+                "control_type": control_type,
+                "text": text,
+                "raw_text": text,
+                "runtime_id": runtime_id,
+                "is_self": _infer_message_is_self(rect, container_rect),
+                "is_timestamp": _is_timestamp_row(class_name, text),
+                "order": order,
+                **metrics,
+            }
+            if voice is not None:
+                row.update(voice)
+                # 真机上语音气泡的名称到底长什么样，只有这条日志能告诉我们（SSH 会话里
+                # 看不到微信的 UI 树，见 memory `wxauto-win-realmachine`）。截断，别把整段转写刷进日志。
+                logger.info(
+                    "chat.voice.row",
+                    raw=text[:60],
+                    ready=not voice["transcript_pending"],
+                )
+            rows.append(row)
         messages = _attach_message_timestamps(_sort_message_rows(rows))
         if log_collection:
             logger.debug(
@@ -3291,6 +3303,43 @@ def _is_self_activity_row(row: dict[str, Any]) -> bool:
     if text.startswith(self_prefixes):
         return True
     return "\u91cd\u65b0\u7f16\u8f91" in text  # 重新编辑
+
+
+VOICE_ITEM_CLASS = "mmui::ChatVoiceItemView"
+
+#: 语音气泡的 UIA 名称：微信把「语音 + 时长」放前面，开了「聊天中的语音消息自动转成文字」后
+#: 转写正文跟在后面。vendor `pyweixin/utils.py` 的 ``Audio_pattern``（`(?<=语音)\d+"秒(.*)$`）
+#: 就是按这个形状写的；这里放宽了空格/引号/单位，中英繁都认。
+_VOICE_TEXT_RE = re.compile(
+    r'^\s*(?P<label>(?:语音|語音|Audio|Voice)\s*\d+\s*["″”\']?\s*(?:秒|sec|s)?)\s*[:：]?\s*(?P<body>.*)$',
+    re.S,
+)
+
+
+def _annotate_voice_row(class_name: Any, text: str) -> dict[str, Any] | None:
+    """语音气泡 → 附加字段；不是语音气泡返回 None。
+
+    - ``voice_label``：``语音12"秒`` 这段——它在转写前后**都不变**，游标就签它
+      （`wechat_io.message_signature`）。同一条消息的 ``text`` 会从空变成正文，签 text 就会
+      「游标已滚出读取窗口」。
+    - ``text``：转写正文；还没出来就是空串，并标 ``transcript_pending``。
+    只按控件类名判定，不按文本猜——一条恰好以「语音」开头的文字消息不该被当成语音。
+    """
+    if str(class_name or "") != VOICE_ITEM_CLASS:
+        return None
+    match = _VOICE_TEXT_RE.match(text or "")
+    if match:
+        label = " ".join(match.group("label").split())
+        body = match.group("body").strip()
+    else:
+        label = (text or "").strip() or "语音"
+        body = ""
+    return {
+        "message_type": "voice",
+        "voice_label": label,
+        "text": body,
+        "transcript_pending": not body,
+    }
 
 
 def _is_timestamp_row(class_name: Any, text: str) -> bool:

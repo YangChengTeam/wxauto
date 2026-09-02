@@ -434,6 +434,9 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"聊天记录读取完成：{payload.get('friend') or '-'}，"
             f"共 {payload.get('message_count', 0)} 条"
         )
+    if event == "chat.voice.row":
+        state = "已转成文字" if payload.get("ready") else "还没转成文字"
+        return f"读到一条语音（{state}）：{payload.get('raw') or '（名称为空）'}"
     if event == "files.send.start":
         return (
             f"开始发送文件给「{payload.get('friend') or '-'}」："
