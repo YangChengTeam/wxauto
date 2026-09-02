@@ -14,17 +14,32 @@
 #   才看得见的。
 #
 # 拿到包之后照旧走上架那一步（页面先改、包后传，publish.sh 会核版本和 hash）。
+#
+# ★ **这是私有仓，Actions 不是免费的。** 免费无限量只对公开仓；私有仓吃账号的每月额度，
+#   而且 **Windows runner 按 2 倍分钟计费**（Linux 1 倍、macOS 10 倍）。这条工作流一跑
+#   十几分钟，落到额度上是三十分钟上下。所以触发面收得很紧：只有 `refactor/drop-mcp`
+#   的推送和 `v*` 标签。**想再省就把 branches 那两行删掉**，剩下只在打标签时跑。
 
 name: 打 Windows 安装包
 
 on:
-  # 平时手动跑：想验一下「换个干净环境还打不打得出来」随时点。
+  # 手动跑。★ 这个按钮只有 workflow 文件在**默认分支**上时才出现——本仓默认分支是
+  # `master`，而这条工作流只活在 `refactor/drop-mcp` 上，所以现在点不了。留着是为了
+  # 哪天合进 master 就能用，别指望它现在能用。
   workflow_dispatch:
-  # 打了 v<版本> 标签就自动打包并建 Release。标签必须和 wxclient/__init__.py 的
-  # __version__ 对得上，对不上当场停——版本号唯一来源只有那一处。
   push:
+    # ★ 只在 `refactor/drop-mcp` 上打包。这是当下唯一在推进的分支，也是唯一需要出包的
+    #   地方；别加 `master` 或通配分支——这是私有仓，Windows runner 按 2 倍计费
+    #   （下面那段账），每多一个分支就是多一份钱。
+    branches:
+      - 'refactor/drop-mcp'
+    # 打了 v<版本> 标签也打包，并建一个 Release 当发版留痕。标签必须和
+    # wxclient/__init__.py 的 __version__ 对得上，对不上当场停——版本号唯一来源只有那一处。
     tags:
       - 'v*'
+    # ⚠️ 这里**故意不加 `paths` 过滤**。`paths` 会同时作用在 branches 和 tags 上，
+    #    而标签推送的「改了哪些文件」由 GitHub 自己推断，结果是发版那一跑可能被静默跳过。
+    #    宁可多打几次包，也不要「打了标签却什么都没发生」。
 
 permissions:
   contents: write        # 建 Release 要写；除此之外不需要任何权限
