@@ -1007,3 +1007,103 @@ class AddFriendPacingTests(CommandTestCase):
                 "args": {"to": "张三", "text": "在吗"},
             })
             self.assertEqual(r.status, "done", r.reason)
+
+
+class LikeMomentsTests(CommandTestCase):
+    """朋友圈点赞（用户 2026-09-07：时间线形态，一天上限 20）。
+
+    形态是**刷自己的时间线**，不逐个好友翻——逐个翻是搜人 → 开资料 → 进相册那条路，
+    和加好友前搜号同形，正是风控最盯的动作。这里守三件事：一条指令按 limit 预留、
+    按真点了几个结算；一天的配额是按**天**算的 20；两趟之间有最小间隔。
+    """
+
+    def _like(self, runtime: FakeRuntime, cid: str = "c1", **kwargs: Any):
+        return self._executor(runtime, **kwargs).execute({
+            "command_id": cid, "op": "like_moments", "args": {},
+        })
+
+    async def test_默认一趟最多点_20_个_且只算真点了的(self) -> None:
+        runtime = FakeRuntime(result={"liked": 4, "scanned": 6, "already_liked": 2, "stopped": "older"})
+        result = await self._like(runtime)
+        self.assertEqual(result.status, "done", result.reason)
+        task_type, payload, _conf = runtime.calls[0]
+        self.assertEqual(task_type, TaskType.LIKE_MOMENTS)
+        self.assertEqual(payload["limit"], 20)
+        self.assertFalse(payload["dry_run"], "写类指令，真动微信")
+        used = self.store.sends_since(ACCOUNT, self.now - timedelta(hours=24), action="moments_like")
+        self.assertEqual(used, 4, "预留 20、真点 4 → 只记 4，剩下的额度还回去")
+        self.assertEqual(result.result["liked"], 4)
+
+    async def test_一天的额度用完就减量_减到零就拒(self) -> None:
+        """额度不够时**减量放行**（点 5 个总比一个不点强），一个都不剩才拒。"""
+        first = await self._like(FakeRuntime(result={"liked": 15}), "c1", write_intervals={"moments_like_write": 0.0})
+        self.assertEqual(first.status, "done", first.reason)
+
+        runtime = FakeRuntime(result={"liked": 5})
+        second = await self._like(runtime, "c2", write_intervals={"moments_like_write": 0.0})
+        self.assertEqual(second.status, "done", second.reason)
+        self.assertEqual(runtime.calls[0][1]["limit"], 5, "只剩 5 个名额，就让微信最多点 5 个")
+
+        runtime = FakeRuntime(result={"liked": 1})
+        third = await self._like(runtime, "c3", write_intervals={"moments_like_write": 0.0})
+        self.assertEqual(third.status, "rejected")
+        self.assertIn("朋友圈点赞", third.reason)
+        self.assertIn("20", third.reason)
+        self.assertEqual(runtime.calls, [], "额度为零时一下微信都不该动")
+
+    async def test_额度按天算_过了一天恢复(self) -> None:
+        await self._like(FakeRuntime(result={"liked": 20}), "c1")
+        self.now += timedelta(hours=5)
+        self.assertEqual((await self._like(FakeRuntime(result={"liked": 1}), "c2")).status, "rejected",
+                         "5 小时后还在同一天的窗口里")
+        self.now += timedelta(hours=20)
+        ok = await self._like(FakeRuntime(result={"liked": 1}), "c3")
+        self.assertEqual(ok.status, "done", ok.reason)
+
+    async def test_两趟之间要隔够时间(self) -> None:
+        """连着开关朋友圈窗口不像人。默认 600 秒，可配。"""
+        runtime = FakeRuntime(result={"liked": 3})
+        self.assertEqual((await self._like(runtime, "c1")).status, "done")
+        self.now += timedelta(seconds=120)
+        second = await self._like(runtime, "c2")
+        self.assertEqual(second.status, "rejected")
+        self.assertIn("600", second.reason)
+        self.assertEqual(len(runtime.calls), 1)
+        used = self.store.sends_since(ACCOUNT, self.now - timedelta(hours=24), action="moments_like")
+        self.assertEqual(used, 3, "被节拍挡下的那趟不占配额")
+
+        self.now += timedelta(seconds=500)
+        self.assertEqual((await self._like(runtime, "c3")).status, "done")
+
+    async def test_没做成就把额度全还回去(self) -> None:
+        failed = await self._like(FakeRuntime(status="failed", result={}), "c1")
+        self.assertEqual(failed.status, "failed")
+        used = self.store.sends_since(ACCOUNT, self.now - timedelta(hours=24), action="moments_like")
+        self.assertEqual(used, 0)
+
+    async def test_不在时间窗内一律不点(self) -> None:
+        self.now = MIDNIGHT
+        runtime = FakeRuntime(result={"liked": 1})
+        result = await self._like(runtime)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("时间窗", result.reason)
+        self.assertEqual(runtime.calls, [])
+
+    async def test_点赞不算联系了某个人_不上报消息事件(self) -> None:
+        """朋友圈点赞没有收件人：不进 MESSAGE_EVENT_OPS，不该被当成给谁发了条微信。"""
+        from wxclient.gateway.commands import MESSAGE_EVENT_OPS
+        self.assertNotIn("like_moments", MESSAGE_EVENT_OPS)
+
+    def test_只走流程的机器如实报做不了(self) -> None:
+        from wxclient.gateway.capabilities import CAP_MOMENTS_LIKE
+        caps = probe_capabilities(
+            uia={"logged_in": True, "uia_exposed": True},
+            allow_real_actions=False, has_file_channel=True,
+        )
+        self.assertFalse(caps[CAP_MOMENTS_LIKE].available)
+        self.assertEqual(capability_of("like_moments"), CAP_MOMENTS_LIKE)
+        real = probe_capabilities(
+            uia={"logged_in": True, "uia_exposed": True},
+            allow_real_actions=True, has_file_channel=True,
+        )
+        self.assertTrue(real[CAP_MOMENTS_LIKE].available)

@@ -178,6 +178,13 @@ class GatewaySettings(BaseSettings):
     max_moments_per_day: int = 3
     """发朋友圈，每 **天** 上限——一小时发 3 条和一天发 3 条完全是两回事。"""
 
+    max_moment_likes_per_day: int = 20
+    """给朋友圈点赞，每 **天** 上限（用户 2026-09-07 定的 20）。只刷自己的时间线、只点今天的。"""
+
+    moment_like_interval_seconds: float = 600.0
+    """两趟朋友圈点赞之间至少隔多久（秒）。一趟 = 打开朋友圈刷一遍；连着开关窗口不像人。
+    `0` = 这道闸关掉，只剩配额。"""
+
     active_hours: str = "09:00-21:00"
 
     allow_insecure_transport: bool = False

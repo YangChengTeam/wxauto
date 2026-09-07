@@ -31,6 +31,7 @@ from .guard import (
     ACTION_GROUP,
     ACTION_MESSAGE,
     ACTION_MOMENTS,
+    ACTION_MOMENTS_LIKE,
     READ_ACTION,
     READ_FRIENDS_ACTION,
     OutboundGuard,
@@ -223,6 +224,16 @@ COMMANDS: dict[str, CommandSpec] = {
         lambda a: {"text": _req(a, "text")},
         action=ACTION_MOMENTS,
         files_key="medias",
+    ),
+    # 刷自己的朋友圈时间线，给今天的动态点赞。**不逐个好友翻**（那条路和搜号同形，
+    # 是风控最盯的动作）。一条指令 = 最多 limit 个赞：按 limit 预留、按真点了几个结算，
+    # 额度不够就减量放行——点 5 个总比一个不点强。没有具体对象，target 是空串。
+    "like_moments": CommandSpec(
+        TaskType.LIKE_MOMENTS, True,
+        lambda a: {"limit": _limit(a, 20, 20)},
+        action=ACTION_MOMENTS_LIKE,
+        reserve_count=lambda a: _limit(a, 20, 20),
+        counts=lambda _args, result: int(result.get("liked") or 0),
     ),
     # ── 读类 ──
     "search_contacts": CommandSpec(

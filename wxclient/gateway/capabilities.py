@@ -24,6 +24,7 @@ CAP_SEND_FILES = "send_files"
 CAP_ADD_FRIEND = "add_friend"
 CAP_ACCEPT_FRIEND = "accept_friend"
 CAP_MOMENTS = "moments"
+CAP_MOMENTS_LIKE = "moments_like"
 CAP_READ = "read"
 
 #: 网关 → AI 端上报能力用的 op。
@@ -36,6 +37,7 @@ CAPABILITY_LABELS: dict[str, str] = {
     CAP_ADD_FRIEND: "加好友",
     CAP_ACCEPT_FRIEND: "通过好友申请",
     CAP_MOMENTS: "发朋友圈",
+    CAP_MOMENTS_LIKE: "给朋友圈点赞",
     CAP_READ: "查看联系人/聊天记录/朋友圈",
 }
 
@@ -46,6 +48,7 @@ CAPABILITY_OF_OP: dict[str, str] = {
     "add_friend": CAP_ADD_FRIEND,
     "accept_new_friends": CAP_ACCEPT_FRIEND,
     "post_moments": CAP_MOMENTS,
+    "like_moments": CAP_MOMENTS_LIKE,
 }
 
 
@@ -126,7 +129,7 @@ def probe_capabilities(
     # 写类能力的额外前提。
     write_keys = (
         CAP_PRIVATE_MESSAGE, CAP_GROUP_MESSAGE, CAP_SEND_FILES,
-        CAP_ADD_FRIEND, CAP_ACCEPT_FRIEND, CAP_MOMENTS,
+        CAP_ADD_FRIEND, CAP_ACCEPT_FRIEND, CAP_MOMENTS, CAP_MOMENTS_LIKE,
     )
     if not allow_real_actions:
         for key in write_keys:

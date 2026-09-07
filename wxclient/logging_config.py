@@ -36,6 +36,7 @@ _TASK_LABELS = {
     "read_visible_messages": "读取可见消息",
     "post_moments": "发布朋友圈",
     "read_recent_moments": "读取最近朋友圈",
+    "like_moments": "朋友圈点赞",
 }
 
 #: 日志目录里留多少天。半个月足够回溯一次「上周三那单怎么回事」，又不会把盘吃掉。
@@ -409,6 +410,15 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         return f"朋友圈发布失败：{payload.get('error') or '-'}"
     if event == "moments.post.media.missing":
         return f"朋友圈媒体文件不存在：{_json(payload.get('paths'))}"
+    if event == "moments.like.start":
+        return f"开始给朋友圈点赞：只点今天的，最多 {payload.get('limit', 0)} 条"
+    if event == "moments.like.done":
+        return (
+            f"朋友圈点赞完成：点了 {payload.get('liked', 0)} 条，"
+            f"看过 {payload.get('scanned', 0)} 条，已点过 {payload.get('already_liked', 0)} 条"
+        )
+    if event == "moments.like.failed":
+        return f"朋友圈点赞失败：{payload.get('error') or '-'}"
     if event == "chat.sessions.read":
         return (
             f"会话列表读取完成：共 {payload.get('session_count', 0)} 个，"

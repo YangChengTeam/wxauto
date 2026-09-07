@@ -35,6 +35,7 @@ class TaskType(str, Enum):
     WATCH_CHATS = "watch_chats"
     POST_MOMENTS = "post_moments"
     READ_RECENT_MOMENTS = "read_recent_moments"
+    LIKE_MOMENTS = "like_moments"
 
 
 REAL_WRITE_TASK_TYPES = frozenset(
@@ -44,6 +45,8 @@ REAL_WRITE_TASK_TYPES = frozenset(
         TaskType.SEND_MESSAGE,
         TaskType.SEND_FILES,
         TaskType.POST_MOMENTS,
+        # 点赞也是「别人看得见」的动作：对方手机上会弹一条「XX 赞了你」。
+        TaskType.LIKE_MOMENTS,
     }
 )
 

@@ -116,6 +116,12 @@ FIELDS: tuple[Field, ...] = (
     # 一天 3 条完全是两回事），所以周期写在说明里，别让人按「每小时」去理解。
     Field("WXCLIENT_GATEWAY_MAX_MOMENTS_PER_DAY", "朋友圈上限",
           "每天最多几条", section="sched", default="3"),
+    # 用户 2026-09-07：朋友圈自动点赞，一天上限 20。同样按**天**算；间隔管两趟之间隔多久。
+    Field("WXCLIENT_GATEWAY_MAX_MOMENT_LIKES_PER_DAY", "朋友圈点赞上限",
+          "每天最多点几个赞", section="sched", default="20"),
+    Field("WXCLIENT_GATEWAY_MOMENT_LIKE_INTERVAL_SECONDS", "朋友圈点赞最小间隔",
+          "两趟之间至少隔多久", section="sched", unit="秒",
+          default="600"),
     # 090：**默认开**（用户裁决 2026-08-29）。原来默认关，理由是「装上不会自动回复
     # 家人朋友」——但真实用法里主动来问的人正是要接的那一类，默认关等于每台机器装完
     # 都要有人记得来打开一次。真正兜住误伤的是后面那几道确定性闸（判不出在找工作

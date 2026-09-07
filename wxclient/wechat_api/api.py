@@ -165,6 +165,18 @@ class WeChatApi:
             dry_run=dry_run,
         )
 
+    def like_recent_moments(
+        self,
+        limit: int = 20,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """给朋友圈时间线里**今天**的动态点赞，最多 ``limit`` 条。只刷自己的时间线，不逐个好友翻。"""
+        return self._run_driver(
+            "like_recent_moments",
+            limit=limit,
+            dry_run=dry_run,
+        )
+
     def send_current_chat_message(
         self,
         text: str,

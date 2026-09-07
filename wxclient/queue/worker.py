@@ -255,6 +255,11 @@ class OperationWorker:
                 limit=int(payload.get("limit", 5)),
                 dry_run=payload.get("dry_run"),
             )
+        if task.type == TaskType.LIKE_MOMENTS:
+            return self.api.like_recent_moments(
+                limit=int(payload.get("limit", 20)),
+                dry_run=payload.get("dry_run"),
+            )
         raise ValueError(f"不支持的任务类型：{task.type}")
 
     def _scan_messages(self, payload: dict[str, Any]) -> dict[str, Any]:

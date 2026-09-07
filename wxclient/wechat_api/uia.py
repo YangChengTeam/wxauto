@@ -4,6 +4,7 @@ import random
 import re
 import sys
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import date
 from pathlib import Path
@@ -958,18 +959,179 @@ class UiaWeChatDriver:
             "post_count": len(posts),
         }
 
+    def like_recent_moments(
+        self,
+        limit: int = 20,
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """刷一遍自己的朋友圈时间线，给**今天**发的动态点赞，最多 ``limit`` 条。
+
+        刻意**不做**「逐个好友翻他的朋友圈」：那条路是搜人 → 开资料 → 进他的相册 → 翻，
+        和加好友前搜号是同一条路、正是风控最盯的动作（2026-08-27 81 秒两次搜索就弹
+        安全验证）。刷自己的时间线只开一个窗口、只按方向键翻，动作形状就是真人刷朋友圈。
+
+        已经点过的不再点：点开省略号后弹的是「取消」而不是「赞」，认不到「赞」就跳过——
+        再点一下等于**取消赞**，对方手机上会先弹「XX 赞了你」再消失，比不点还糟。
+        """
+        if self._is_dry_run(dry_run):
+            return {"dry_run": True, "action": "like_moments", "liked": 0, "scanned": 0,
+                    "already_liked": 0, "stopped": "dry_run"}
+        self._ensure_ready()
+        safe_limit = min(max(int(limit), 1), 20)
+        logger.info("moments.like.start", limit=safe_limit)
+        try:
+            outcome = self._like_recent_moments_impl(safe_limit)
+        except Exception as exc:
+            logger.info("moments.like.failed", error=str(exc)[:200])
+            raise
+        logger.info("moments.like.done", **outcome)
+        return {"dry_run": False, "action": "like_moments", **outcome}
+
+    #: 时间线列表里**不是一条动态**的项：评论区、「余下 x 条」、广告。跟 vendor `like_posts` 一致。
+    MOMENTS_NON_POST_CLASSES = (
+        "mmui::TimelineCommentCell", "mmui::TimelineCell", "mmui::TimelineAdGridImageCell",
+    )
+
+    #: 翻多少下还没到头就收手。20 条上限 × 每条动态在列表里最多占几项，再留余量；
+    #: 这是防死循环的硬边，不是节拍——正常一趟远远到不了。
+    MOMENTS_MAX_STEPS = 160
+
+    def _like_recent_moments_impl(self, limit: int) -> dict[str, Any]:
+        import pyautogui
+        from pywinauto import Desktop
+
+        Navigator = self._pyweixin_class("Navigator")
+        Tools = self._pyweixin_class("Tools")
+        Uielements = self._pyweixin_submodule("Uielements")
+        utils = self._pyweixin_submodule("utils")
+        Buttons = Uielements.Buttons
+        Lists = Uielements.Lists
+        Main_window = Uielements.Main_window
+
+        desktop = Desktop(backend="uia")
+        moments_window, _post_button = self._open_moments_timeline(
+            desktop, Navigator, Tools, Main_window, Buttons,
+        )
+        _human_pause("moments_open")
+        moments_list = moments_window.child_window(**Lists.MomentsList)
+        if not moments_list.exists(timeout=5):
+            raise WeChatApiError("朋友圈窗口里找不到动态列表")
+        like_button = moments_window.child_window(**Buttons.LikeButton)
+        try:
+            return self._like_timeline(
+                moments_list, like_button,
+                timestamp=utils.Regex_Patterns.Sns_Timestamp_pattern,
+                older_marks=(utils.Special_Labels.Yesterday, utils.Special_Labels.DaysAgo),
+                click_ellipsis=utils.ColorMatch.click_gray_ellipsis_button,
+                limit=limit,
+            )
+        finally:
+            # 点完关窗口：留着的话下一趟 `_moments_window` 会直接复用，停在哪一页说不准。
+            try:
+                pyautogui.press("esc")
+                time.sleep(0.3)
+                moments_window.close()
+            except Exception:
+                pass
+
+    def _like_timeline(
+        self,
+        moments_list: Any,
+        like_button: Any,
+        *,
+        timestamp: Any,
+        older_marks: tuple[str, ...],
+        click_ellipsis: Callable[[Any], Any],
+        limit: int,
+    ) -> dict[str, Any]:
+        """从列表顶端往下翻，逐条判「是不是今天的动态」再决定点不点。纯 UIA 逻辑，可用假控件测。
+
+        - 只认时间戳里**没有**「昨天」「x 天前」的（`older_marks`）；一碰到就停，时间线是按时间排的。
+        - 认不出时间戳的项（评论、广告、「余下 x 条」）跳过不动。
+        - 省略号点开后**必须看到「赞」**才点；看到的是「取消」= 已经点过，跳过。
+        - 翻到底（按方向键焦点不再动）就停；另有 `MOMENTS_MAX_STEPS` 硬边防死循环。
+        """
+        liked = scanned = already = 0
+        stopped = "end"
+        moments_list.type_keys("{HOME}")
+        last_key: tuple[str, str] | None = None
+        for _ in range(self.MOMENTS_MAX_STEPS):
+            moments_list.type_keys("{DOWN}", pause=0.1)
+            _human_pause("moments_scroll")
+            focused = [item for item in moments_list.children(control_type="ListItem")
+                       if item.has_keyboard_focus()]
+            if not focused:
+                continue
+            item = focused[0]
+            key = (str(item.class_name()), str(item.window_text()))
+            if key == last_key:
+                break                       # 焦点没动 = 到底了
+            last_key = key
+            if key[0] in self.MOMENTS_NON_POST_CLASSES:
+                continue
+            found = timestamp.search(key[1])
+            if found is None:
+                continue                    # 认不出时间就不碰它
+            when = found.group(0)
+            if any(mark and mark in when for mark in older_marks):
+                stopped = "older"
+                break
+            scanned += 1
+            click_ellipsis(item.rectangle())
+            _human_pause("before_like")
+            if like_button.exists(timeout=1.5):
+                like_button.click_input()
+                liked += 1
+                _human_pause("after_like")
+            else:
+                already += 1
+            if liked >= limit:
+                stopped = "limit"
+                break
+        return {"liked": liked, "scanned": scanned, "already_liked": already, "stopped": stopped}
+
+    def _open_moments_timeline(
+        self, desktop: Any, Navigator: Any, Tools: Any, Main_window: Any, Buttons: Any,
+    ) -> tuple[Any, Any]:
+        """打开朋友圈窗口并停在时间线主页（看得到「发表」按钮）。发朋友圈和点赞共用。
+
+        1. 桌面上已经有朋友圈窗口就直接用；没有就点主窗口工具栏头像 → 资料面板 → 「朋友圈」
+        2. 进的不是主页（看不到发表按钮）就点返回
+        """
+        from pywinauto import mouse
+
+        moments_window = self._moments_window(desktop, Tools)
+        if moments_window is None:
+            main_window = Navigator.open_weixin(is_maximize=False)
+            toolbar = main_window.child_window(**Main_window.Toolbar)
+            profile_pane = self._open_profile_pane(desktop, toolbar, mouse)
+            self._click_moments_entry(profile_pane, Buttons)
+            moments_window = self._moments_window(desktop, Tools, timeout=12.0)
+            if moments_window is None:
+                raise WeChatApiError("点了「朋友圈」但朋友圈窗口没出来")
+
+        post_button = moments_window.child_window(**Buttons.PostButton)
+        if not post_button.exists(timeout=2):
+            back_button = moments_window.child_window(**Buttons.BackButton)
+            if back_button.exists(timeout=1):
+                back_button.click_input()
+                time.sleep(1)
+                moments_window = self._moments_window(desktop, Tools) or moments_window
+            post_button = moments_window.child_window(**Buttons.PostButton)
+        if not post_button.exists(timeout=2):
+            raise WeChatApiError("无法找到朋友圈发表按钮")
+        return moments_window, post_button
+
     def _post_moments_impl(self, text: str, medias: list[str]) -> None:
         """用 pyweixin 底层 UIA 操作发朋友圈。
 
         流程：
-        1. 点击主窗口工具栏头像 → 弹出 profile 面板
-        2. 在 profile 面板点「朋友圈」→ 打开朋友圈窗口
-        3. 如果进入的不是主页面（看不到发表按钮），点返回
+        1–3. 打开朋友圈窗口并停在主页（`_open_moments_timeline`）
         4. 右键发表按钮 → 有图片选图片模式，没图片选纯文字
         5. 填入文字 → 点击发表
         """
         import pyautogui
-        from pywinauto import Desktop, mouse
+        from pywinauto import Desktop
 
         Navigator = self._pyweixin_class("Navigator")
         Tools = self._pyweixin_class("Tools")
@@ -984,33 +1146,9 @@ class UiaWeChatDriver:
         desktop = Desktop(backend="uia")
         valid_paths = self._normalize_moments_media_paths(medias) if medias else []
 
-        moments_window = self._moments_window(desktop, Tools)
-        if moments_window is None:
-            # 1. 获取微信主窗口，点击工具栏头像
-            main_window = Navigator.open_weixin(is_maximize=False)
-            toolbar = main_window.child_window(**Main_window.Toolbar)
-
-            # 2. 在弹出的 profile 面板中点「朋友圈」
-            profile_pane = self._open_profile_pane(desktop, toolbar, mouse)
-            self._click_moments_entry(profile_pane, Buttons)
-
-            # 3. 定位朋友圈窗口
-            moments_window = self._moments_window(desktop, Tools, timeout=12.0)
-            if moments_window is None:
-                raise WeChatApiError("点了「朋友圈」但朋友圈窗口没出来")
-
-        # 如果看不到发表按钮，先点返回
-        post_button = moments_window.child_window(**Buttons.PostButton)
-        if not post_button.exists(timeout=2):
-            back_button = moments_window.child_window(**Buttons.BackButton)
-            if back_button.exists(timeout=1):
-                back_button.click_input()
-                time.sleep(1)
-                moments_window = self._moments_window(desktop, Tools) or moments_window
-            post_button = moments_window.child_window(**Buttons.PostButton)
-
-        if not post_button.exists(timeout=2):
-            raise WeChatApiError("无法找到朋友圈发表按钮")
+        moments_window, post_button = self._open_moments_timeline(
+            desktop, Navigator, Tools, Main_window, Buttons,
+        )
 
         # 4. 右键发表按钮 → 选择模式
         post_button.right_click_input()
@@ -2452,13 +2590,23 @@ _PAUSES: dict[str, tuple[float, float]] = {
     "before_confirm": (0.8, 2.0),  # 都填好了，点确定之前
 }
 
+#: 朋友圈点赞的停顿档。**另开一张表**：`_PAUSES` 是加好友那一趟的每一步，测试拿它的长度
+#: 断言「加好友每步都停了」（`test_add_friend_humanized`），混进来就把那条断言打歪。
+#: 真人刷朋友圈是「翻一条、看一眼、偶尔点个赞」，每一步都不等长。
+_MOMENTS_PAUSES: dict[str, tuple[float, float]] = {
+    "moments_open": (2.0, 4.0),    # 朋友圈窗口出来了，等它刷新、扫一眼
+    "moments_scroll": (0.8, 2.4),  # 翻到下一条，看看是谁发的
+    "before_like": (0.6, 1.6),     # 省略号点开了，看清是「赞」还是「取消」再动
+    "after_like": (1.5, 4.5),      # 点完赞，看一会儿再翻
+}
+
 #: 逐字输入时每个键之间停多久（秒）。人打字大约每分钟 60~200 个字符。
 _KEYSTROKE_PAUSE = (0.05, 0.18)
 
 
 def _human_pause(what: str) -> None:
-    """按 `_PAUSES` 里那一档随机停一会儿。表里没有的名字不停（不静默乱猜一个值）。"""
-    span = _PAUSES.get(what)
+    """按 `_PAUSES` / `_MOMENTS_PAUSES` 里那一档随机停一会儿。表里没有的名字不停（不静默乱猜一个值）。"""
+    span = _PAUSES.get(what) or _MOMENTS_PAUSES.get(what)
     if span is None:
         return
     time.sleep(random.uniform(*span))
