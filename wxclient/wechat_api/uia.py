@@ -987,6 +987,44 @@ class UiaWeChatDriver:
         logger.info("moments.like.done", **outcome)
         return {"dry_run": False, "action": "like_moments", **outcome}
 
+    #: 一条评论指令最多评几条。和网关那档「一天 5 条」默认同数——评论是**公开文字**，
+    #: 挂在别人的动态下面，所有共同好友都看得见，量必须比点赞小一个量级。
+    MOMENTS_COMMENT_MAX = 5
+
+    def comment_recent_moments(
+        self,
+        comments: list[dict[str, Any]],
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """给时间线里**今天**的、指定的那几条动态各写一条评论。
+
+        每条 ``{"content": 动态正文, "text": 评论}``。**按正文认动态**：正文去掉空白后是
+        列表项文本的子串就算认到（正文本来就是 ``read_recent_moments`` 从同一段文本里
+        抠出来的）。认不到的一条都不评——评错一条动态比漏评十条难看得多，而且撤不回来。
+        同一趟里同一段正文只评一次（两个好友转了同一条，也只评先看到的那条）。
+        """
+        wanted = _normalize_comment_requests(comments, self.MOMENTS_COMMENT_MAX)
+        if self._is_dry_run(dry_run):
+            return {
+                "dry_run": True, "action": "comment_moments",
+                "commented": 0, "scanned": 0, "matched": 0,
+                "commented_contents": [], "missed": [c["content"][:30] for c in wanted],
+                "stopped": "dry_run",
+            }
+        self._ensure_ready()
+        logger.info("moments.comment.start", count=len(wanted))
+        try:
+            outcome = self._comment_recent_moments_impl(wanted)
+        except Exception as exc:
+            logger.info("moments.comment.failed", error=str(exc)[:200])
+            raise
+        logger.info(
+            "moments.comment.done",
+            commented=outcome["commented"], scanned=outcome["scanned"],
+            matched=outcome["matched"], missed=len(outcome["missed"]), stopped=outcome["stopped"],
+        )
+        return {"dry_run": False, "action": "comment_moments", **outcome}
+
     #: 时间线列表里**不是一条动态**的项：评论区、「余下 x 条」、广告。跟 vendor `like_posts` 一致。
     MOMENTS_NON_POST_CLASSES = (
         "mmui::TimelineCommentCell", "mmui::TimelineCell", "mmui::TimelineAdGridImageCell",
@@ -1089,6 +1127,138 @@ class UiaWeChatDriver:
                 stopped = "limit"
                 break
         return {"liked": liked, "scanned": scanned, "already_liked": already, "stopped": stopped}
+
+    def _comment_recent_moments_impl(self, wanted: list[dict[str, str]]) -> dict[str, Any]:
+        import pyautogui
+        from pywinauto import Desktop
+
+        Navigator = self._pyweixin_class("Navigator")
+        Tools = self._pyweixin_class("Tools")
+        SystemSettings = self._pyweixin_class("SystemSettings")
+        Uielements = self._pyweixin_submodule("Uielements")
+        utils = self._pyweixin_submodule("utils")
+        Buttons = Uielements.Buttons
+        Lists = Uielements.Lists
+        Main_window = Uielements.Main_window
+
+        desktop = Desktop(backend="uia")
+        moments_window, _post_button = self._open_moments_timeline(
+            desktop, Navigator, Tools, Main_window, Buttons,
+        )
+        _human_pause("moments_open")
+        moments_list = moments_window.child_window(**Lists.MomentsList)
+        if not moments_list.exists(timeout=5):
+            raise WeChatApiError("朋友圈窗口里找不到动态列表")
+        comment_button = moments_window.child_window(**Buttons.CommentButton)
+
+        def type_text(text: str) -> None:
+            # vendor 的写法：清空输入框、剪贴板贴进去。中文用 pyautogui 逐字打不进去，
+            # 只能贴；贴完按字数停一会儿，像是人打完在看一遍。
+            pyautogui.hotkey("ctrl", "a")
+            pyautogui.press("backspace")
+            SystemSettings.copy_text_to_clipboard(text)
+            pyautogui.hotkey("ctrl", "v")
+            time.sleep(min(len(text) * random.uniform(0.06, 0.12), 8.0))
+
+        def click_send(item: Any) -> None:
+            # 评论输入框出现在这条动态**下面那一项**里，发送键按它的矩形找（vendor 同法）。
+            following = Tools.get_next_item(moments_list, item)
+            rect = (following or item).rectangle()
+            utils.ColorMatch.click_green_send_button(rect, x_offset=70, y_offset=42)
+
+        try:
+            return self._comment_timeline(
+                moments_list, comment_button,
+                timestamp=utils.Regex_Patterns.Sns_Timestamp_pattern,
+                older_marks=(utils.Special_Labels.Yesterday, utils.Special_Labels.DaysAgo),
+                click_ellipsis=utils.ColorMatch.click_gray_ellipsis_button,
+                type_text=type_text,
+                click_send=click_send,
+                comments=wanted,
+            )
+        finally:
+            try:
+                pyautogui.press("esc")
+                time.sleep(0.3)
+                moments_window.close()
+            except Exception:  # noqa: BLE001, S110 —— 收尾关窗，关不上不影响结果
+                pass
+
+    def _comment_timeline(
+        self,
+        moments_list: Any,
+        comment_button: Any,
+        *,
+        timestamp: Any,
+        older_marks: tuple[str, ...],
+        click_ellipsis: Callable[[Any], Any],
+        type_text: Callable[[str], None],
+        click_send: Callable[[Any], None],
+        comments: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        """从列表顶端往下翻，逐条看「是不是今天的、是不是要评的那几条之一」。纯 UIA 逻辑，可用假控件测。
+
+        - 翻法、跳过、到底、「昨天」即停，全同 `_like_timeline`。
+        - 认动态只认正文：去掉空白后是这一项文本的子串。认到了就点省略号 → 「评论」→ 贴文字 → 发送。
+        - 省略号点开后没看到「评论」按钮（这条动态不让评/控件变了）→ 这条记 missed，不硬点。
+        - 要评的都评完了就收手，不把时间线翻到底。
+        """
+        pending = list(comments)
+        commented = scanned = matched = 0
+        done_contents: list[str] = []
+        unclickable: list[str] = []
+        stopped = "end"
+        moments_list.type_keys("{HOME}")
+        last_key: tuple[str, str] | None = None
+        for _ in range(self.MOMENTS_MAX_STEPS):
+            moments_list.type_keys("{DOWN}", pause=0.1)
+            _human_pause("moments_scroll")
+            focused = [item for item in moments_list.children(control_type="ListItem")
+                       if item.has_keyboard_focus()]
+            if not focused:
+                continue
+            item = focused[0]
+            key = (str(item.class_name()), str(item.window_text()))
+            if key == last_key:
+                break                       # 焦点没动 = 到底了
+            last_key = key
+            if key[0] in self.MOMENTS_NON_POST_CLASSES:
+                continue
+            found = timestamp.search(key[1])
+            if found is None:
+                continue
+            when = found.group(0)
+            if any(mark and mark in when for mark in older_marks):
+                stopped = "older"
+                break
+            scanned += 1
+            haystack = _squash(key[1])
+            hit = next((c for c in pending if c["key"] in haystack), None)
+            if hit is None:
+                continue
+            matched += 1
+            pending.remove(hit)
+            click_ellipsis(item.rectangle())
+            _human_pause("before_comment")
+            if not comment_button.exists(timeout=1.5):
+                unclickable.append(hit["content"][:30])
+                continue
+            comment_button.click_input()
+            _human_pause("before_typing")
+            type_text(hit["text"])
+            _human_pause("before_send")
+            click_send(item)
+            commented += 1
+            done_contents.append(hit["content"])
+            _human_pause("after_comment")
+            if not pending:
+                stopped = "all"
+                break
+        missed = unclickable + [c["content"][:30] for c in pending]
+        return {
+            "commented": commented, "scanned": scanned, "matched": matched,
+            "commented_contents": done_contents, "missed": missed, "stopped": stopped,
+        }
 
     def _open_moments_timeline(
         self, desktop: Any, Navigator: Any, Tools: Any, Main_window: Any, Buttons: Any,
@@ -2598,7 +2768,38 @@ _MOMENTS_PAUSES: dict[str, tuple[float, float]] = {
     "moments_scroll": (0.8, 2.4),  # 翻到下一条，看看是谁发的
     "before_like": (0.6, 1.6),     # 省略号点开了，看清是「赞」还是「取消」再动
     "after_like": (1.5, 4.5),      # 点完赞，看一会儿再翻
+    "before_comment": (0.6, 1.6),  # 省略号点开了，找「评论」
+    "before_typing": (0.8, 2.0),   # 输入框出来了，想一下说什么
+    "before_send": (1.0, 2.6),     # 打完了再看一眼
+    "after_comment": (3.0, 8.0),   # 评完一条，多停会儿——评论比点赞重得多
 }
+
+
+def _squash(text: str) -> str:
+    """认动态用的归一：去掉所有空白。列表项文本里换行/空格的位置和读回来的正文对不上。"""
+    return re.sub(r"\s+", "", str(text or ""))
+
+
+def _normalize_comment_requests(comments: Any, cap: int) -> list[dict[str, str]]:
+    """把上游给的评论清单整理成 ``[{content, text, key}]``：空的丢、重复正文只留第一条、超过 ``cap`` 截断。
+
+    正文太短（去空白后不足 2 个字）也丢：拿一个字去认动态几乎必然认错。
+    """
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in comments if isinstance(comments, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        content = str(raw.get("content") or "").strip()
+        text = str(raw.get("text") or "").strip()
+        key = _squash(content)
+        if len(key) < 2 or not text or key in seen:
+            continue
+        seen.add(key)
+        out.append({"content": content, "text": text, "key": key})
+        if len(out) >= cap:
+            break
+    return out
 
 #: 逐字输入时每个键之间停多久（秒）。人打字大约每分钟 60~200 个字符。
 _KEYSTROKE_PAUSE = (0.05, 0.18)

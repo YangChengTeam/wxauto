@@ -104,6 +104,7 @@ ACTION_GROUP = "group_message"    # 发到群里
 ACTION_FRIEND = "friend"          # 加好友 / 通过好友申请
 ACTION_MOMENTS = "moments"        # 发朋友圈
 ACTION_MOMENTS_LIKE = "moments_like"  # 给朋友圈点赞
+ACTION_MOMENTS_COMMENT = "moments_comment"  # 给朋友圈评论
 
 ACTION_LABELS = {
     ACTION_MESSAGE: "私聊",
@@ -111,6 +112,7 @@ ACTION_LABELS = {
     ACTION_FRIEND: "加好友",
     ACTION_MOMENTS: "朋友圈",
     ACTION_MOMENTS_LIKE: "朋友圈点赞",
+    ACTION_MOMENTS_COMMENT: "朋友圈评论",
 }
 
 
@@ -139,6 +141,9 @@ DEFAULT_ACTION_LIMITS: dict[str, RateLimit] = {
     # 点赞同样按天：一天 20 个赞是真人刷朋友圈的量（用户 2026-09-07 定的数）。
     # 一条指令最多点 20 个，所以这档实际上就是「一天一趟」的形状。
     ACTION_MOMENTS_LIKE: RateLimit(20, DAY),
+    # 评论比点赞重一个量级：一段公开文字挂在别人动态下面，所有共同好友都看得见。
+    # 默认一天 5 条，可在配置中心改（用户 2026-09-07：「做成可配置」）。
+    ACTION_MOMENTS_COMMENT: RateLimit(5, DAY),
 }
 
 
@@ -154,6 +159,7 @@ def action_limits_from(settings) -> dict[str, RateLimit]:
         ACTION_FRIEND: RateLimit(settings.max_friend_actions_per_hour, HOUR),
         ACTION_MOMENTS: RateLimit(settings.max_moments_per_day, DAY),
         ACTION_MOMENTS_LIKE: RateLimit(settings.max_moment_likes_per_day, DAY),
+        ACTION_MOMENTS_COMMENT: RateLimit(settings.max_moment_comments_per_day, DAY),
     }
 
 
@@ -170,6 +176,7 @@ READ_INTERVALS: dict[str, float] = {
 
 FRIEND_WRITE_ACTION = "friend_write"  # 主动加好友（搜陌生号，风控最敏感的那一下）
 MOMENTS_LIKE_WRITE_ACTION = "moments_like_write"  # 开朋友圈刷一趟点赞
+MOMENTS_COMMENT_WRITE_ACTION = "moments_comment_write"  # 开朋友圈评一趟
 
 #: 写类动作也要过最小间隔的，登记在这儿：**指令名** → （节拍账, 最小间隔秒, 人话名字）。
 #:
@@ -194,15 +201,19 @@ WRITE_PACING: dict[str, tuple[str, str]] = {
     # 点赞一趟就是「打开朋友圈刷一遍」。配额管一天点几个，这本账管两趟之间隔多久——
     # 连着两趟开关朋友圈窗口，中间隔几秒，不是人会做的事。
     "like_moments": (MOMENTS_LIKE_WRITE_ACTION, "朋友圈点赞"),
+    "comment_moments": (MOMENTS_COMMENT_WRITE_ACTION, "朋友圈评论"),
 }
 
 #: 两趟朋友圈点赞之间的默认最小间隔（秒）。
 MIN_MOMENTS_LIKE_INTERVAL_SECONDS = 600.0
+#: 两趟朋友圈评论之间的默认最小间隔（秒）。
+MIN_MOMENTS_COMMENT_INTERVAL_SECONDS = 600.0
 
 #: 各本写侧节拍账的默认间隔（秒）。可被 `OutboundGuard(write_intervals=...)` 覆盖。
 WRITE_INTERVALS: dict[str, float] = {
     FRIEND_WRITE_ACTION: MIN_FRIEND_INTERVAL_SECONDS,
     MOMENTS_LIKE_WRITE_ACTION: MIN_MOMENTS_LIKE_INTERVAL_SECONDS,
+    MOMENTS_COMMENT_WRITE_ACTION: MIN_MOMENTS_COMMENT_INTERVAL_SECONDS,
 }
 
 
@@ -211,6 +222,7 @@ def write_intervals_from(settings) -> dict[str, float]:
     return {
         FRIEND_WRITE_ACTION: float(settings.friend_interval_seconds),
         MOMENTS_LIKE_WRITE_ACTION: float(settings.moment_like_interval_seconds),
+        MOMENTS_COMMENT_WRITE_ACTION: float(settings.moment_comment_interval_seconds),
     }
 
 

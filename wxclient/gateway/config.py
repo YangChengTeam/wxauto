@@ -185,6 +185,13 @@ class GatewaySettings(BaseSettings):
     """两趟朋友圈点赞之间至少隔多久（秒）。一趟 = 打开朋友圈刷一遍；连着开关窗口不像人。
     `0` = 这道闸关掉，只剩配额。"""
 
+    max_moment_comments_per_day: int = 5
+    """给朋友圈评论，每 **天** 上限（用户 2026-09-07：「做成可配置」，默认 5）。
+    评论是公开文字，比点赞重一个量级，默认值刻意小。"""
+
+    moment_comment_interval_seconds: float = 600.0
+    """两趟朋友圈评论之间至少隔多久（秒）。`0` = 这道闸关掉，只剩配额。"""
+
     active_hours: str = "09:00-21:00"
 
     allow_insecure_transport: bool = False

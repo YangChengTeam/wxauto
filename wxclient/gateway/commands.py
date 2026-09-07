@@ -15,7 +15,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
@@ -31,6 +31,7 @@ from .guard import (
     ACTION_GROUP,
     ACTION_MESSAGE,
     ACTION_MOMENTS,
+    ACTION_MOMENTS_COMMENT,
     ACTION_MOMENTS_LIKE,
     READ_ACTION,
     READ_FRIENDS_ACTION,
@@ -150,6 +151,49 @@ def _limit(args: dict[str, Any], default: int, cap: int) -> int:
     return max(1, min(value, cap))
 
 
+#: 一条评论指令最多评几条。跟默认日上限同数；要多评就多下几条指令，网关按剩余额度减量放行。
+MOMENTS_COMMENT_MAX = 5
+#: 评论最长几个字。朋友圈评论本来就是一两句话；再长就是在别人动态下面发文章。
+MOMENTS_COMMENT_TEXT_MAX = 200
+
+
+def _squash(text: str) -> str:
+    return "".join(str(text or "").split())
+
+
+def _comment_requests(args: dict[str, Any]) -> list[dict[str, str]]:
+    """`comments`：``[{content: 动态正文, text: 评论}]``。**形状不对当场拒**，不猜、不补默认值。
+
+    正文是 `read_recent_moments` 读回来的那段，网关按它在时间线上认动态。太短（去空白不足
+    2 字）认不准，拒；评论空的没意义，拒；同一段正文出现两次只留第一条；超过
+    `MOMENTS_COMMENT_MAX` 条拒——AI 端那边本来就按这个数出，多了说明有一边坏了。
+    """
+    raw = args.get("comments")
+    if not isinstance(raw, list) or not raw:
+        raise CommandError("缺少必填参数 comments（要评哪几条、各说什么）")
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise CommandError("comments 里每一项都要是 {content, text}")
+        content = str(entry.get("content") or "").strip()
+        text = str(entry.get("text") or "").strip()
+        if len(_squash(content)) < 2:
+            raise CommandError("comments[].content 要是那条动态的正文（至少 2 个字），网关按它认动态")
+        if not text:
+            raise CommandError("comments[].text 不能为空")
+        if len(text) > MOMENTS_COMMENT_TEXT_MAX:
+            raise CommandError(f"评论太长了：最多 {MOMENTS_COMMENT_TEXT_MAX} 字")
+        key = _squash(content)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"content": content, "text": text})
+    if len(out) > MOMENTS_COMMENT_MAX:
+        raise CommandError(f"一条指令最多评 {MOMENTS_COMMENT_MAX} 条动态")
+    return out
+
+
 def _file_refs(args: dict[str, Any], *, required: bool = True) -> list[FileRef]:
     """067：`files` 里是**文件描述符**（`{file_id, file_name, content_b64}`），不是路径。
 
@@ -234,6 +278,16 @@ COMMANDS: dict[str, CommandSpec] = {
         action=ACTION_MOMENTS_LIKE,
         reserve_count=lambda a: _limit(a, 20, 20),
         counts=lambda _args, result: int(result.get("liked") or 0),
+    ),
+    # 给时间线里今天的、指定的那几条动态各写一条评论（用户 2026-09-07：由业务端计划触发，
+    # 评论文字由 AI 端按计划素材现写）。按要评几条预留、按真评了几条结算、减量放行。
+    # 评论是公开文字，自己一档配额（默认一天 5，可配）和自己一本节拍账。
+    "comment_moments": CommandSpec(
+        TaskType.COMMENT_MOMENTS, True,
+        lambda a: {"comments": _comment_requests(a)},
+        action=ACTION_MOMENTS_COMMENT,
+        reserve_count=lambda a: len(_comment_requests(a)),
+        counts=lambda _args, result: int(result.get("commented") or 0),
     ),
     # ── 读类 ──
     "search_contacts": CommandSpec(
@@ -390,6 +444,19 @@ class CommandExecutor:
 
         now = self._clock()
         action = self._action_for(spec, to_group)
+        if op == "comment_moments":
+            # ★ 同一条动态只评一次。计划重投 / AI 端读回同一批动态再写一遍，微信上分不出
+            #   「我们评过没有」，只能靠本机这本台账挡。全都评过了 = 这条指令**做完了**
+            #   （不是拒：一个字都不用再发），回执如实写 already_commented。
+            fresh, already = self._drop_commented(payload["comments"], now)
+            if not fresh:
+                _local.info("这几条动态都评论过了，这次不再评", op=op, already=already)
+                return CommandResult(command_id, "done", result={
+                    "commented": 0, "scanned": 0, "matched": 0, "missed": [],
+                    "already_commented": already, "stopped": "already",
+                })
+            payload["comments"] = fresh
+            payload["already_commented"] = already
         # ★ 写类：**先占住额度再动微信**（判一次记一次的老写法在并发下等于没有守门）。
         #    读类：不占额度，但要过节拍闸（最小间隔）。两条路都在动微信之前。
         reservation = Reservation()
@@ -405,6 +472,9 @@ class CommandExecutor:
             if spec.reserve_count is not None:
                 # 减量放行了就把上限跟着调下来，别让微信那边照原数去做。
                 payload["limit"] = reservation.granted
+                if op == "comment_moments":
+                    # 评论没有 limit 这回事——要评的是一张清单，减量就是砍清单尾巴。
+                    payload["comments"] = payload["comments"][:reservation.granted]
             # ★ 额度之外还有**节奏**：加好友自己有一本 300s 的账（2026-08-27 安全验证）。
             #   排在 reserve 之后，是因为被节拍挡下的这一趟微信一下都没动，不该白占一次配额。
             paced = self._guard.pace_write(self._account, op, now=now)
@@ -480,12 +550,27 @@ class CommandExecutor:
                 # 额度在动微信**之前**就占住了（见上），这里只按真实用量结算：
                 # 预留 5 实际通过 2 → 还回 3。做多少记多少，两个方向都不许含糊。
                 reservation.settle(spec.counts(args, result))
+            if op == "comment_moments":
+                # 真评上的那几条记进台账；被这趟砍掉/没认出来的不记，下次还能评。
+                done_keys = [_squash(c) for c in (result.get("commented_contents") or []) if isinstance(c, str)]
+                self._store.record_moment_comments(self._account, done_keys, now)
+                if payload.get("already_commented"):
+                    result = {**result, "already_commented": payload["already_commented"]}
             _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
             self._note_message_sent(command_id, op, peer, args, raw)
             state = self._friend_state(op, result, raw)
             if state:
                 result = {**result, "friend_state": state}
             return CommandResult(command_id, "done", result=result)
+
+    def _drop_commented(
+        self, comments: list[dict[str, str]], now: datetime,
+    ) -> tuple[list[dict[str, str]], int]:
+        """把台账里 30 天内评过的那几条从清单里去掉。返回 (还要评的, 去掉了几条)。"""
+        keys = [_squash(c["content"]) for c in comments]
+        done = self._store.commented_moment_keys(self._account, keys, now - timedelta(days=30))
+        fresh = [c for c, k in zip(comments, keys, strict=True) if k not in done]
+        return fresh, len(comments) - len(fresh)
 
     async def _update_candidate(self, command_id: str, data: dict[str, Any]) -> CommandResult:
         """把候选人的资料/AI 状态写回业务后端（api2 §9）。

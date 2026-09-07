@@ -1107,3 +1107,131 @@ class LikeMomentsTests(CommandTestCase):
             allow_real_actions=True, has_file_channel=True,
         )
         self.assertTrue(real[CAP_MOMENTS_LIKE].available)
+
+
+class CommentMomentsTests(CommandTestCase):
+    """朋友圈评论（用户 2026-09-07：业务端计划触发、AI 端写字、一天几条可配）。
+
+    本机只管三件事：按正文认动态（在 uia 层）、按量（这里：按要评几条预留、按真评了几条
+    结算、一天的配额按**天**、两趟隔够时间）、**同一条动态只评一次**（本机台账）。
+    """
+
+    POSTS = (
+        {"content": "新到一批岗位，包吃住", "text": "包吃住太香了，求详情"},
+        {"content": "周末去爬山", "text": "好地方，注意安全"},
+    )
+
+    def _comment(self, runtime: FakeRuntime, cid: str = "c1", comments=None, **kwargs: Any):
+        return self._executor(runtime, **kwargs).execute({
+            "command_id": cid, "op": "comment_moments",
+            "args": {"comments": list(self.POSTS) if comments is None else comments},
+        })
+
+    async def test_按要评几条预留_按真评了几条结算(self) -> None:
+        runtime = FakeRuntime(result={
+            "commented": 1, "scanned": 4, "matched": 2,
+            "commented_contents": ["新到一批岗位，包吃住"], "missed": ["周末去爬山"], "stopped": "all",
+        })
+        result = await self._comment(runtime)
+        self.assertEqual(result.status, "done", result.reason)
+        task_type, payload, _conf = runtime.calls[0]
+        self.assertEqual(task_type, TaskType.COMMENT_MOMENTS)
+        self.assertEqual([c["content"] for c in payload["comments"]], [p["content"] for p in self.POSTS])
+        self.assertFalse(payload["dry_run"], "写类指令，真动微信")
+        used = self.store.sends_since(ACCOUNT, self.now - timedelta(hours=24), action="moments_comment")
+        self.assertEqual(used, 1, "预留 2、真评 1 → 只记 1")
+        self.assertEqual(result.result["commented"], 1)
+
+    async def test_形状不对当场拒_不动微信(self) -> None:
+        runtime = FakeRuntime()
+        for bad in (
+            {},
+            {"comments": []},
+            {"comments": "字符串"},
+            {"comments": [{"content": "一", "text": "正文太短"}]},
+            {"comments": [{"content": "好岗位", "text": ""}]},
+            {"comments": [{"content": "好岗位", "text": "x" * 201}]},
+            {"comments": [{"content": f"第{i}条", "text": "x"} for i in range(6)]},
+        ):
+            result = await self._executor(runtime).execute({"command_id": "c", "op": "comment_moments", "args": bad})
+            self.assertEqual(result.status, "rejected", bad)
+        self.assertEqual(runtime.calls, [])
+
+    async def test_同一条动态只评一次_第二次直接算做完(self) -> None:
+        """★ 计划重投 / 读回同一批动态再写一遍，微信上分不出评过没有，靠本机台账挡。"""
+        first = await self._comment(FakeRuntime(result={
+            "commented": 2, "commented_contents": [p["content"] for p in self.POSTS], "missed": [],
+        }), "c1", write_intervals={"moments_comment_write": 0.0})
+        self.assertEqual(first.status, "done", first.reason)
+
+        runtime = FakeRuntime(result={"commented": 2})
+        second = await self._comment(runtime, "c2", write_intervals={"moments_comment_write": 0.0})
+        self.assertEqual(second.status, "done", "全评过了 = 做完了，不是拒")
+        self.assertEqual(runtime.calls, [], "一下微信都不动")
+        self.assertEqual(second.result["commented"], 0)
+        self.assertEqual(second.result["already_commented"], 2)
+
+        # 混着一条新的：只评新的那条，评过的那条不再发。
+        runtime = FakeRuntime(result={"commented": 1, "commented_contents": ["新的一条"]})
+        third = await self._comment(runtime, "c3", comments=[
+            self.POSTS[0], {"content": "新的一条", "text": "评"},
+        ], write_intervals={"moments_comment_write": 0.0})
+        self.assertEqual(third.status, "done", third.reason)
+        self.assertEqual([c["content"] for c in runtime.calls[0][1]["comments"]], ["新的一条"])
+        self.assertEqual(third.result["already_commented"], 1)
+
+    async def test_没评上的不进台账_下次还能评(self) -> None:
+        await self._comment(FakeRuntime(result={
+            "commented": 1, "commented_contents": [self.POSTS[0]["content"]], "missed": ["周末去爬山"],
+        }), "c1", write_intervals={"moments_comment_write": 0.0})
+        runtime = FakeRuntime(result={"commented": 1, "commented_contents": ["周末去爬山"]})
+        again = await self._comment(runtime, "c2", write_intervals={"moments_comment_write": 0.0})
+        self.assertEqual(again.status, "done", again.reason)
+        self.assertEqual([c["content"] for c in runtime.calls[0][1]["comments"]], ["周末去爬山"])
+
+    async def test_一天的额度用完就减量_减到零就拒(self) -> None:
+        many = [{"content": f"第{i}条动态", "text": "评"} for i in range(5)]
+        first = await self._comment(FakeRuntime(result={
+            "commented": 4, "commented_contents": [f"第{i}条动态" for i in range(4)],
+        }), "c1", comments=many, write_intervals={"moments_comment_write": 0.0})
+        self.assertEqual(first.status, "done", first.reason)
+
+        runtime = FakeRuntime(result={"commented": 1, "commented_contents": ["A条"]})
+        second = await self._comment(runtime, "c2", comments=[
+            {"content": "A条", "text": "a"}, {"content": "B条", "text": "b"},
+        ], write_intervals={"moments_comment_write": 0.0})
+        self.assertEqual(second.status, "done", second.reason)
+        self.assertEqual([c["content"] for c in runtime.calls[0][1]["comments"]], ["A条"],
+                         "只剩 1 个名额，清单砍到 1 条")
+
+        runtime = FakeRuntime(result={"commented": 1})
+        third = await self._comment(runtime, "c3", comments=[{"content": "C条", "text": "c"}],
+                                    write_intervals={"moments_comment_write": 0.0})
+        self.assertEqual(third.status, "rejected")
+        self.assertIn("朋友圈评论", third.reason)
+        self.assertEqual(runtime.calls, [])
+
+    async def test_两趟之间要隔够时间_且被挡的不占配额(self) -> None:
+        runtime = FakeRuntime(result={"commented": 1, "commented_contents": ["新到一批岗位，包吃住"]})
+        self.assertEqual((await self._comment(runtime, "c1")).status, "done")
+        self.now += timedelta(seconds=120)
+        second = await self._comment(runtime, "c2", comments=[{"content": "另一条", "text": "x"}])
+        self.assertEqual(second.status, "rejected")
+        self.assertIn("600", second.reason)
+        self.assertEqual(len(runtime.calls), 1)
+        used = self.store.sends_since(ACCOUNT, self.now - timedelta(hours=24), action="moments_comment")
+        self.assertEqual(used, 1)
+
+    async def test_没做成就把额度全还回去(self) -> None:
+        failed = await self._comment(FakeRuntime(status="failed", result={}), "c1")
+        self.assertEqual(failed.status, "failed")
+        used = self.store.sends_since(ACCOUNT, self.now - timedelta(hours=24), action="moments_comment")
+        self.assertEqual(used, 0)
+
+    async def test_不在时间窗内一律不评(self) -> None:
+        self.now = MIDNIGHT
+        runtime = FakeRuntime(result={"commented": 1})
+        result = await self._comment(runtime)
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("时间窗", result.reason)
+        self.assertEqual(runtime.calls, [])

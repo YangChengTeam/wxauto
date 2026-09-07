@@ -177,6 +177,22 @@ class WeChatApi:
             dry_run=dry_run,
         )
 
+    def comment_recent_moments(
+        self,
+        comments: list[dict[str, Any]],
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """给时间线里**今天**的、指定的那几条动态各写一条评论。
+
+        每条 ``{"content": 动态正文, "text": 评论}``——正文就是 ``read_recent_moments`` 读回来的那段，
+        按它在时间线上认动态；认不到的一条都不评。
+        """
+        return self._run_driver(
+            "comment_recent_moments",
+            comments=comments,
+            dry_run=dry_run,
+        )
+
     def send_current_chat_message(
         self,
         text: str,

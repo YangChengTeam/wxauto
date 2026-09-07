@@ -1062,6 +1062,9 @@ class SettingsDefaultsTests(unittest.TestCase):
             "WXCLIENT_GATEWAY_MAX_MOMENT_LIKES_PER_DAY": gateway.max_moment_likes_per_day,
             "WXCLIENT_GATEWAY_MOMENT_LIKE_INTERVAL_SECONDS":
                 int(gateway.moment_like_interval_seconds),
+            "WXCLIENT_GATEWAY_MAX_MOMENT_COMMENTS_PER_DAY": gateway.max_moment_comments_per_day,
+            "WXCLIENT_GATEWAY_MOMENT_COMMENT_INTERVAL_SECONDS":
+                int(gateway.moment_comment_interval_seconds),
             "WXCLIENT_GATEWAY_STRANGER_INTAKE": gateway.stranger_intake,
             "WXCLIENT_UI_AUTOSTART": ui.autostart,
             "WXCLIENT_UI_START_HIDDEN": ui.start_hidden,
@@ -1142,6 +1145,32 @@ class SettingsReachTheGuardTests(unittest.TestCase):
 
         defaults = action_limits_from(GatewaySettings())
         self.assertEqual(defaults[ACTION_MOMENTS_LIKE].max_count, 20, "用户定的一天 20")
+
+    def test_界面上改的评论上限和间隔_真的会落到闸上(self) -> None:
+        """朋友圈评论（用户 2026-09-07：「做成可配置」）：上限进配额表、间隔进节拍表。"""
+        from wxclient.gateway.config import GatewaySettings
+        from wxclient.gateway.guard import (
+            ACTION_MOMENTS_COMMENT,
+            DAY,
+            MOMENTS_COMMENT_WRITE_ACTION,
+            action_limits_from,
+            write_intervals_from,
+        )
+
+        with mock.patch.dict(os.environ, {
+            "WXCLIENT_GATEWAY_MAX_MOMENT_COMMENTS_PER_DAY": "3",
+            "WXCLIENT_GATEWAY_MOMENT_COMMENT_INTERVAL_SECONDS": "900",
+        }):
+            settings = GatewaySettings()
+            limits = action_limits_from(settings)
+            intervals = write_intervals_from(settings)
+
+        self.assertEqual(limits[ACTION_MOMENTS_COMMENT].max_count, 3)
+        self.assertEqual(limits[ACTION_MOMENTS_COMMENT].window_seconds, DAY, "★ 评论按天算")
+        self.assertEqual(intervals[MOMENTS_COMMENT_WRITE_ACTION], 900.0)
+
+        defaults = action_limits_from(GatewaySettings())
+        self.assertEqual(defaults[ACTION_MOMENTS_COMMENT].max_count, 5, "评论是公开文字，默认比点赞小一个量级")
 
 
 class RealActionsTests(unittest.TestCase):

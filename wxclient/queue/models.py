@@ -36,6 +36,7 @@ class TaskType(str, Enum):
     POST_MOMENTS = "post_moments"
     READ_RECENT_MOMENTS = "read_recent_moments"
     LIKE_MOMENTS = "like_moments"
+    COMMENT_MOMENTS = "comment_moments"
 
 
 REAL_WRITE_TASK_TYPES = frozenset(
@@ -47,6 +48,8 @@ REAL_WRITE_TASK_TYPES = frozenset(
         TaskType.POST_MOMENTS,
         # 点赞也是「别人看得见」的动作：对方手机上会弹一条「XX 赞了你」。
         TaskType.LIKE_MOMENTS,
+        # 评论更是：一段公开的文字，挂在别人的动态下面，所有共同好友都看得见。
+        TaskType.COMMENT_MOMENTS,
     }
 )
 

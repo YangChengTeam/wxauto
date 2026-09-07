@@ -199,6 +199,12 @@ CREATE TABLE IF NOT EXISTS gateway_friend_checks (
   checks       INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (account_id, number)
 );
+CREATE TABLE IF NOT EXISTS gateway_moment_comments (
+  account_id  TEXT NOT NULL,
+  content_key TEXT NOT NULL,
+  created_at  TEXT NOT NULL,
+  PRIMARY KEY (account_id, content_key)
+);
 CREATE TABLE IF NOT EXISTS gateway_read_marks (
   account_id  TEXT NOT NULL,
   action      TEXT NOT NULL,
@@ -1790,6 +1796,40 @@ class GatewayStore:
         except ValueError:
             return None
         return (at - last).total_seconds()
+
+    # ────────────────────────── 朋友圈评论台账 ──────────────────────────
+    # 同一条动态只评一次。计划重投、AI 端读回同一批动态再写一遍，都靠这本账挡：
+    # 微信上看不出「我们评过没有」（评论区只显示昵称，本机不可靠地知道自己叫什么）。
+
+    def commented_moment_keys(self, account_id: str, keys: Iterable[str], since: datetime) -> set[str]:
+        wanted = [k for k in keys if k]
+        if not wanted:
+            return set()
+        marks = ",".join("?" * len(wanted))
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"SELECT content_key FROM gateway_moment_comments "
+                f"WHERE account_id=? AND created_at>=? AND content_key IN ({marks})",
+                (account_id, since.isoformat(), *wanted),
+            ).fetchall()
+        return {str(r[0]) for r in rows}
+
+    def record_moment_comments(self, account_id: str, keys: Iterable[str], at: datetime) -> None:
+        rows = [(account_id, k, at.isoformat()) for k in keys if k]
+        if not rows:
+            return
+        with closing(self._connect()) as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO gateway_moment_comments (account_id, content_key, created_at) "
+                "VALUES (?,?,?)",
+                rows,
+            )
+            # 顺手清掉早于 30 天的：只认「今天」的动态，台账不用留更久。
+            conn.execute(
+                "DELETE FROM gateway_moment_comments WHERE account_id=? AND created_at<?",
+                (account_id, (at - timedelta(days=30)).isoformat()),
+            )
+            conn.commit()
 
     def sends_since(self, account_id: str, since: datetime, action: str | None = None) -> int:
         """``action=None`` = 所有写动作（总闸）；给了就只数那一档。"""

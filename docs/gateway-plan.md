@@ -184,6 +184,8 @@ WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR  加好友+通过申请，每小时
 WXCLIENT_GATEWAY_MAX_MOMENTS_PER_DAY          朋友圈，每**天**，默认 3
 WXCLIENT_GATEWAY_MAX_MOMENT_LIKES_PER_DAY     朋友圈点赞，每**天**，默认 20（用户 2026-09-07）
 WXCLIENT_GATEWAY_MOMENT_LIKE_INTERVAL_SECONDS 两趟朋友圈点赞之间的最小间隔，默认 600
+WXCLIENT_GATEWAY_MAX_MOMENT_COMMENTS_PER_DAY  朋友圈评论，每**天**，默认 5（用户 2026-09-07，可配）
+WXCLIENT_GATEWAY_MOMENT_COMMENT_INTERVAL_SECONDS 两趟朋友圈评论之间的最小间隔，默认 600
 ```
 
 只有一个总闸的时候，「今天一条消息没发」就能换来「连着加 30 个好友」——而加好友
@@ -192,7 +194,8 @@ WXCLIENT_GATEWAY_MOMENT_LIKE_INTERVAL_SECONDS 两趟朋友圈点赞之间的最�
 桌面端「参数设置」摆的是**专员真的会去调**的那些。原来「各档配额」整类都只留环境变量，
 但实际用下来配额恰恰是最需要按账号调的：不同微信号的承受力差很远，而唯一的反馈是
 「又被限了」。已经搬上界面的：私聊上限（「每小时发送上限」）、加好友上限、加好友最小间隔、
-朋友圈上限（一天几条，用户 2026-08-30 提的）、朋友圈点赞上限与最小间隔（2026-09-07）、来问陌生人。
+朋友圈上限（一天几条，用户 2026-08-30 提的）、朋友圈点赞上限与最小间隔（2026-09-07）、
+朋友圈评论上限与最小间隔（2026-09-07，评论文字由 AI 端按计划素材现写，本机只认动态、只管量）、来问陌生人。
 其余（task_type / 去抖 / 单轮上限 / 群消息配额）仍只留环境变量，手工写进 `gateway.env` 依然生效。
 
 ### 4.1 节拍与风控（2026-08-12 事故后定的）

@@ -122,6 +122,12 @@ FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_MOMENT_LIKE_INTERVAL_SECONDS", "朋友圈点赞最小间隔",
           "两趟之间至少隔多久", section="sched", unit="秒",
           default="600"),
+    # 用户 2026-09-07：朋友圈评论由业务端计划触发，一天几条「做成可配置」。评论是公开文字，默认 5。
+    Field("WXCLIENT_GATEWAY_MAX_MOMENT_COMMENTS_PER_DAY", "朋友圈评论上限",
+          "每天最多评几条", section="sched", default="5"),
+    Field("WXCLIENT_GATEWAY_MOMENT_COMMENT_INTERVAL_SECONDS", "朋友圈评论最小间隔",
+          "两趟之间至少隔多久", section="sched", unit="秒",
+          default="600"),
     # 090：**默认开**（用户裁决 2026-08-29）。原来默认关，理由是「装上不会自动回复
     # 家人朋友」——但真实用法里主动来问的人正是要接的那一类，默认关等于每台机器装完
     # 都要有人记得来打开一次。真正兜住误伤的是后面那几道确定性闸（判不出在找工作
