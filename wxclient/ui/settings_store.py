@@ -80,24 +80,26 @@ SECTIONS: tuple[Section, ...] = (
 #: 抄漏了由 `tests/test_ui.py::SettingsDefaultsTests` 当场判死——它会去比对两边。
 FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_BUSINESS_API_URL", "业务端地址",
-          "登录和换票都用它，默认已填好正式地址",
+          "默认已填好正式地址",
           default=DEFAULT_BUSINESS_API_URL),
     Field("WXCLIENT_GATEWAY_AI_WS_URL", "AI 端地址", "默认已填好正式地址",
           default=DEFAULT_AI_WS_URL),
     Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔",
-          "没人在聊时多久看一次未读；正聊着会自动加快", section="sched", unit="秒",
+          "空闲时多久看一次未读", section="sched", unit="秒",
           default="180"),
     Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔",
-          "单独的节拍，0=不查", section="sched", unit="秒", default="900"),
+          "0=不查", section="sched", unit="秒", default="900"),
+    # 用户 2026-09-07：说明太长把输入框挤坏了（调度配置一行两组），全部精简成半句。
+    # 原来写在说明里的两条限定挪到这里：① 通过检测实际仍受「查好友」那档 ≥300 秒的
+    # 整机节拍约束，填更小也不会更快；② 期限到了只是别让他占住名额，不代表判定对方
+    # 不会通过。工作时间窗格式形如 09:00-21:00（placeholder/default 已经示范了）。
     Field("WXCLIENT_GATEWAY_FRIEND_RECHECK_INTERVAL_SECONDS", "查好友通过间隔",
-          "加了好友之后，多久去微信里搜一次看对方通过了没有；0=不搜。"
-          "实际仍受「查好友」那档 ≥300 秒的整机节拍约束，填更小也不会更快",
+          "多久搜一次是否通过；0=不搜",
           section="sched", unit="秒", default="900"),
     Field("WXCLIENT_GATEWAY_FRIEND_RECHECK_DEADLINE_HOURS", "查好友通过期限",
-          "申请发出后最多再搜多久就不搜了；0=一直搜。"
-          "到期只是别让他占住名额，不代表判定对方不会通过",
+          "超过就不再搜；0=一直搜",
           section="sched", unit="小时", default="72"),
-    Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "如 09:00-21:00，窗外不动微信",
+    Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "窗外不动微信",
           section="sched", default="09:00-21:00"),
     Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "每小时发送上限", "防止消息风控",
           section="sched", default="30"),
@@ -105,21 +107,21 @@ FIELDS: tuple[Field, ...] = (
     # 两个数管两件事：上限管**一小时总共几个**，间隔管**两次之间隔多久**。
     # 只有上限的话，5 个全挤进一分钟也照样放行——2026-08-27 弹安全验证就是这么来的。
     Field("WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR", "加好友上限",
-          "加好友最招风控，一小时总共加几个", section="sched", default="5"),
+          "每小时最多加几个", section="sched", default="5"),
     Field("WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS", "加好友最小间隔",
-          "两次加好友至少隔多久", section="sched", unit="秒",
+          "两次之间至少隔多久", section="sched", unit="秒",
           default="300"),
     # 用户 2026-08-30：「朋友圈在过去 24 小时只能发 3 个呀」——这个数原来只在代码里，
     # 界面上看不见也改不了。它和上面两条不同，管的是**一天**不是一小时（一小时 3 条和
     # 一天 3 条完全是两回事），所以周期写在说明里，别让人按「每小时」去理解。
     Field("WXCLIENT_GATEWAY_MAX_MOMENTS_PER_DAY", "朋友圈上限",
-          "一天最多发几条朋友圈", section="sched", default="3"),
+          "每天最多几条", section="sched", default="3"),
     # 090：**默认开**（用户裁决 2026-08-29）。原来默认关，理由是「装上不会自动回复
     # 家人朋友」——但真实用法里主动来问的人正是要接的那一类，默认关等于每台机器装完
     # 都要有人记得来打开一次。真正兜住误伤的是后面那几道确定性闸（判不出在找工作
     # 就一条都不发），不是这个开关默认值。不想接的人在这里关掉即可。
     Field("WXCLIENT_GATEWAY_STRANGER_INTAKE", "来问陌生人",
-          "主动加你、劳小智里还没有档案的人也会被自动接待；判得出他在找工作才会回话",
+          "没档案的人来问也接待，判出求职才回话",
           kind="bool", section="sched", default="1"),
     Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动自动运行服务",
           kind="bool", section="boot", default="1"),
