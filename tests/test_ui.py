@@ -1065,6 +1065,11 @@ class SettingsDefaultsTests(unittest.TestCase):
             "WXCLIENT_GATEWAY_MAX_MOMENT_COMMENTS_PER_DAY": gateway.max_moment_comments_per_day,
             "WXCLIENT_GATEWAY_MOMENT_COMMENT_INTERVAL_SECONDS":
                 int(gateway.moment_comment_interval_seconds),
+            "WXCLIENT_GATEWAY_MOMENTS_POLL_INTERVAL_SECONDS":
+                int(gateway.moments_poll_interval_seconds),
+            "WXCLIENT_GATEWAY_MOMENTS_AUTO_LIKE": gateway.moments_auto_like,
+            "WXCLIENT_GATEWAY_MOMENTS_AUTO_COMMENT": gateway.moments_auto_comment,
+            "WXCLIENT_GATEWAY_MOMENTS_COMMENT_MATERIAL": gateway.moments_comment_material,
             "WXCLIENT_GATEWAY_STRANGER_INTAKE": gateway.stranger_intake,
             "WXCLIENT_UI_AUTOSTART": ui.autostart,
             "WXCLIENT_UI_START_HIDDEN": ui.start_hidden,
@@ -1145,6 +1150,23 @@ class SettingsReachTheGuardTests(unittest.TestCase):
 
         defaults = action_limits_from(GatewaySettings())
         self.assertEqual(defaults[ACTION_MOMENTS_LIKE].max_count, 20, "用户定的一天 20")
+
+    def test_界面上的朋友圈巡看四格_真的会落到配置上(self) -> None:
+        """本机朋友圈巡看（用户 2026-09-08）：间隔、点赞、评论、素材四格都要能从配置中心进 GatewaySettings。"""
+        from wxclient.gateway.config import GatewaySettings
+
+        with mock.patch.dict(os.environ, {
+            "WXCLIENT_GATEWAY_MOMENTS_POLL_INTERVAL_SECONDS": "900",
+            "WXCLIENT_GATEWAY_MOMENTS_AUTO_LIKE": "1",
+            "WXCLIENT_GATEWAY_MOMENTS_AUTO_COMMENT": "1",
+            "WXCLIENT_GATEWAY_MOMENTS_COMMENT_MATERIAL": "本周新增夜班岗",
+        }):
+            settings = GatewaySettings()
+        self.assertEqual(settings.moments_poll_interval_seconds, 900.0)
+        self.assertTrue(settings.moments_auto_like)
+        self.assertTrue(settings.moments_auto_comment)
+        self.assertEqual(settings.moments_comment_material, "本周新增夜班岗")
+        self.assertEqual(GatewaySettings().moments_poll_interval_seconds, 0.0, "默认关")
 
     def test_界面上改的评论上限和间隔_真的会落到闸上(self) -> None:
         """朋友圈评论（用户 2026-09-07：「做成可配置」）：上限进配额表、间隔进节拍表。"""

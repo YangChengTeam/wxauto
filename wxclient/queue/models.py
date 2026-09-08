@@ -37,6 +37,7 @@ class TaskType(str, Enum):
     READ_RECENT_MOMENTS = "read_recent_moments"
     LIKE_MOMENTS = "like_moments"
     COMMENT_MOMENTS = "comment_moments"
+    SCAN_MOMENTS = "scan_moments"
 
 
 REAL_WRITE_TASK_TYPES = frozenset(
@@ -50,6 +51,8 @@ REAL_WRITE_TASK_TYPES = frozenset(
         TaskType.LIKE_MOMENTS,
         # 评论更是：一段公开的文字，挂在别人的动态下面，所有共同好友都看得见。
         TaskType.COMMENT_MOMENTS,
+        # 巡看一趟顺手给新动态点赞（like_limit>0 时），所以也算写类。
+        TaskType.SCAN_MOMENTS,
     }
 )
 

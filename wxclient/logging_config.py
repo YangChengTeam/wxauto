@@ -38,6 +38,7 @@ _TASK_LABELS = {
     "read_recent_moments": "读取最近朋友圈",
     "like_moments": "朋友圈点赞",
     "comment_moments": "朋友圈评论",
+    "scan_moments": "朋友圈巡看",
 }
 
 #: 日志目录里留多少天。半个月足够回溯一次「上周三那单怎么回事」，又不会把盘吃掉。
@@ -429,6 +430,29 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         )
     if event == "moments.comment.failed":
         return f"朋友圈评论失败：{payload.get('error') or '-'}"
+    if event == "moments.scan.start":
+        return (
+            f"开始巡看朋友圈：只看新动态，最多收 {payload.get('limit', 0)} 条，"
+            f"顺手点赞 {payload.get('like_limit', 0)} 个"
+        )
+    if event == "moments.scan.done":
+        return (
+            f"朋友圈巡看完成：新动态 {payload.get('new', 0)} 条，点了 {payload.get('liked', 0)} 个赞，"
+            f"已点过 {payload.get('already_liked', 0)} 个"
+        )
+    if event == "moments.scan.failed":
+        return f"朋友圈巡看失败：{payload.get('error') or '-'}"
+    if event == "moments.poll.done":
+        return (
+            f"朋友圈巡看一趟：新动态 {payload.get('new', 0)} 条，点了 {payload.get('liked', 0)} 个赞，"
+            f"已点过 {payload.get('already_liked', 0)} 个"
+        )
+    if event == "moments.poll.failed":
+        return f"朋友圈巡看这趟没成：{payload.get('error') or '-'}"
+    if event == "moments.poll.skip":
+        return f"这趟朋友圈巡看跳过：{payload.get('reason') or '-'}"
+    if event == "moments.poll.comment.failed":
+        return f"交给劳小智写评论没成：{payload.get('error') or '-'}"
     if event == "chat.sessions.read":
         return (
             f"会话列表读取完成：共 {payload.get('session_count', 0)} 个，"

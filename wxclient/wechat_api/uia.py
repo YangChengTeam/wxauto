@@ -987,6 +987,140 @@ class UiaWeChatDriver:
         logger.info("moments.like.done", **outcome)
         return {"dry_run": False, "action": "like_moments", **outcome}
 
+    def scan_recent_moments(
+        self,
+        limit: int = 10,
+        like_limit: int = 0,
+        until_key: str = "",
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """本机朋友圈巡看（和读消息轮询同形）：只收上次看过之后**新出**的今天的动态。
+
+        游标是上一趟看到的第一条动态的键（正文去空白；纯图动态用去掉时间戳的整段文本），
+        这一趟翻到它就停。时间戳不进键：「5分钟前」下一趟就变成「20分钟前」了。
+        顺手给新动态点赞（``like_limit`` 个，0 = 不点），判据同 ``like_recent_moments``。
+        """
+        if self._is_dry_run(dry_run):
+            return {"dry_run": True, "action": "scan_moments", "posts": [], "liked": 0, "already_liked": 0,
+                    "scanned": 0, "first_key": "", "stopped": "dry_run"}
+        self._ensure_ready()
+        safe_limit = min(max(int(limit), 1), 20)
+        safe_like = min(max(int(like_limit), 0), 20)
+        logger.info("moments.scan.start", limit=safe_limit, like_limit=safe_like, has_cursor=bool(until_key))
+        try:
+            outcome = self._scan_recent_moments_impl(safe_limit, safe_like, str(until_key or ""))
+        except Exception as exc:
+            logger.info("moments.scan.failed", error=str(exc)[:200])
+            raise
+        logger.info(
+            "moments.scan.done",
+            new=len(outcome["posts"]), liked=outcome["liked"], already_liked=outcome["already_liked"],
+            scanned=outcome["scanned"], stopped=outcome["stopped"],
+        )
+        return {"dry_run": False, "action": "scan_moments", **outcome}
+
+    def _scan_recent_moments_impl(self, limit: int, like_limit: int, until_key: str) -> dict[str, Any]:
+        import pyautogui
+        from pywinauto import Desktop
+
+        Navigator = self._pyweixin_class("Navigator")
+        Tools = self._pyweixin_class("Tools")
+        Uielements = self._pyweixin_submodule("Uielements")
+        utils = self._pyweixin_submodule("utils")
+        Buttons = Uielements.Buttons
+        Lists = Uielements.Lists
+        Main_window = Uielements.Main_window
+
+        desktop = Desktop(backend="uia")
+        moments_window, _post_button = self._open_moments_timeline(
+            desktop, Navigator, Tools, Main_window, Buttons,
+        )
+        _human_pause("moments_open")
+        moments_list = moments_window.child_window(**Lists.MomentsList)
+        if not moments_list.exists(timeout=5):
+            raise WeChatApiError("朋友圈窗口里找不到动态列表")
+        like_button = moments_window.child_window(**Buttons.LikeButton)
+        try:
+            return self._scan_timeline(
+                moments_list, like_button,
+                timestamp=utils.Regex_Patterns.Sns_Timestamp_pattern,
+                images_pattern=utils.Regex_Patterns.Contain_Images_pattern,
+                older_marks=(utils.Special_Labels.Yesterday, utils.Special_Labels.DaysAgo),
+                click_ellipsis=utils.ColorMatch.click_gray_ellipsis_button,
+                limit=limit, like_limit=like_limit, until_key=until_key,
+            )
+        finally:
+            try:
+                pyautogui.press("esc")
+                time.sleep(0.3)
+                moments_window.close()
+            except Exception:  # noqa: BLE001, S110 —— 收尾关窗，关不上不影响结果
+                pass
+
+    def _scan_timeline(
+        self,
+        moments_list: Any,
+        like_button: Any,
+        *,
+        timestamp: Any,
+        images_pattern: Any,
+        older_marks: tuple[str, ...],
+        click_ellipsis: Callable[[Any], Any],
+        limit: int,
+        like_limit: int,
+        until_key: str,
+    ) -> dict[str, Any]:
+        """翻法同 `_like_timeline`；多了「翻到上次看过的那条就停」和「把新动态收回来」。纯 UIA 逻辑，可用假控件测。"""
+        posts: list[dict[str, Any]] = []
+        liked = already = scanned = 0
+        first_key = ""
+        stopped = "end"
+        moments_list.type_keys("{HOME}")
+        last_key: tuple[str, str] | None = None
+        for _ in range(self.MOMENTS_MAX_STEPS):
+            moments_list.type_keys("{DOWN}", pause=0.1)
+            _human_pause("moments_scroll")
+            focused = [item for item in moments_list.children(control_type="ListItem")
+                       if item.has_keyboard_focus()]
+            if not focused:
+                continue
+            item = focused[0]
+            key = (str(item.class_name()), str(item.window_text()))
+            if key == last_key:
+                break
+            last_key = key
+            if key[0] in self.MOMENTS_NON_POST_CLASSES:
+                continue
+            found = timestamp.search(key[1])
+            if found is None:
+                continue
+            when = found.group(0)
+            if any(mark and mark in when for mark in older_marks):
+                stopped = "older"
+                break
+            post = _parse_post_text(key[1], when, timestamp, images_pattern)
+            if not first_key:
+                first_key = post["key"]
+            if until_key and post["key"] == until_key:
+                stopped = "cursor"
+                break
+            scanned += 1
+            posts.append(post)
+            if like_limit and liked < like_limit:
+                click_ellipsis(item.rectangle())
+                _human_pause("before_like")
+                if like_button.exists(timeout=1.5):
+                    like_button.click_input()
+                    liked += 1
+                    _human_pause("after_like")
+                else:
+                    already += 1
+            if len(posts) >= limit:
+                stopped = "limit"
+                break
+        return {"posts": posts, "liked": liked, "already_liked": already, "scanned": scanned,
+                "first_key": first_key, "stopped": stopped}
+
     #: 一条评论指令最多评几条。和网关那档「一天 5 条」默认同数——评论是**公开文字**，
     #: 挂在别人的动态下面，所有共同好友都看得见，量必须比点赞小一个量级。
     MOMENTS_COMMENT_MAX = 5
@@ -2778,6 +2912,29 @@ _MOMENTS_PAUSES: dict[str, tuple[float, float]] = {
 def _squash(text: str) -> str:
     """认动态用的归一：去掉所有空白。列表项文本里换行/空格的位置和读回来的正文对不上。"""
     return re.sub(r"\s+", "", str(text or ""))
+
+
+def _parse_post_text(text: str, when: str, timestamp: Any, images_pattern: Any) -> dict[str, Any]:
+    """把时间线一项的文本拆成 ``{content, posted_at, photos, videos, key}``。
+
+    正文 = 去掉「包含 N 张图片」「视频」和时间戳之后的部分（和 vendor ``dump_recent_posts`` 同一套抠法，
+    所以 AI 端拿它去认动态对得上）。``key`` 是去空白的正文；纯图/纯视频动态没正文，
+    键取去掉时间戳后的整段（时间戳会变，绝不能进键）。
+    """
+    photos = 0
+    found = images_pattern.search(text)
+    if found:
+        try:
+            photos = int(found.group(1))
+        except (TypeError, ValueError):
+            photos = 0
+    videos = 1 if re.search(r"\s(视频|Video|影片)\s", text) else 0
+    content = images_pattern.sub(" ", text)
+    content = re.sub(r"\s(视频|Video|影片)\s", " ", content)
+    content = timestamp.sub(" ", content)
+    content = re.sub(r"\s+", " ", content).strip()
+    key = _squash(content) or _squash(timestamp.sub("", text))
+    return {"content": content, "posted_at": when, "photos": photos, "videos": videos, "key": key}
 
 
 def _normalize_comment_requests(comments: Any, cap: int) -> list[dict[str, str]]:

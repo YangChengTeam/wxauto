@@ -186,7 +186,20 @@ WXCLIENT_GATEWAY_MAX_MOMENT_LIKES_PER_DAY     朋友圈点赞，每**天**，默
 WXCLIENT_GATEWAY_MOMENT_LIKE_INTERVAL_SECONDS 两趟朋友圈点赞之间的最小间隔，默认 600
 WXCLIENT_GATEWAY_MAX_MOMENT_COMMENTS_PER_DAY  朋友圈评论，每**天**，默认 5（用户 2026-09-07，可配）
 WXCLIENT_GATEWAY_MOMENT_COMMENT_INTERVAL_SECONDS 两趟朋友圈评论之间的最小间隔，默认 600
+WXCLIENT_GATEWAY_MOMENTS_POLL_INTERVAL_SECONDS  本机朋友圈巡看间隔（秒），0 = 不巡看（默认），地板 300
+WXCLIENT_GATEWAY_MOMENTS_AUTO_LIKE              巡看时给新动态点赞，默认关；配额/节拍走上面「点赞」两档
+WXCLIENT_GATEWAY_MOMENTS_AUTO_COMMENT           巡看时把新动态交给 AI 端写评论，默认关；配额/节拍走「评论」两档
+WXCLIENT_GATEWAY_MOMENTS_COMMENT_MATERIAL       自动评论的素材（想传达什么、什么口吻），清空 = 不评；有一句缺省口吻
 ```
+
+**本机朋友圈巡看**（用户 2026-09-08：「本地做一个，和轮询消息一样，只对最新的朋友圈进行」，
+`gateway/moments.py`）：按自己的间隔开一趟朋友圈，翻到**上一趟看到的第一条**（游标
+`gateway_moment_cursor`，键 = 正文去空白，时间戳不进键）就停，中间的就是新动态。
+新动态当场点赞（和计划触发的 `like_moments` 共用同一本账、同一个节拍闸：先占额度再过节拍，
+节拍没到就这趟只看不点）；评论不由本机写——把新动态连同素材以一条 `comment_moments`
+触发项**自触发 AI 端**（`runner._comment_new_moments`，多带 `gateway_posts`，AI 端就不再
+回投一次读），AI 端回来的 `comment_moments` 指令照旧过能力闸、配额、节拍和「同一条只评一次」
+的台账。失败不前移游标，宁重不漏；dry-run 空壳不动游标。
 
 只有一个总闸的时候，「今天一条消息没发」就能换来「连着加 30 个好友」——而加好友
 恰恰是风控最敏感的动作。配成 `0` = 本机不开放该类动作（不是「无限」）。
@@ -195,7 +208,8 @@ WXCLIENT_GATEWAY_MOMENT_COMMENT_INTERVAL_SECONDS 两趟朋友圈评论之间的�
 但实际用下来配额恰恰是最需要按账号调的：不同微信号的承受力差很远，而唯一的反馈是
 「又被限了」。已经搬上界面的：私聊上限（「每小时发送上限」）、加好友上限、加好友最小间隔、
 朋友圈上限（一天几条，用户 2026-08-30 提的）、朋友圈点赞上限与最小间隔（2026-09-07）、
-朋友圈评论上限与最小间隔（2026-09-07，评论文字由 AI 端按计划素材现写，本机只认动态、只管量）、来问陌生人。
+朋友圈评论上限与最小间隔（2026-09-07，评论文字由 AI 端按计划素材现写，本机只认动态、只管量）、
+本机朋友圈巡看四格（2026-09-08：间隔 / 自动点赞 / 自动评论 / 评论素材）、来问陌生人。
 其余（task_type / 去抖 / 单轮上限 / 群消息配额）仍只留环境变量，手工写进 `gateway.env` 依然生效。
 
 ### 4.1 节拍与风控（2026-08-12 事故后定的）

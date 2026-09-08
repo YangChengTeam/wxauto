@@ -30,6 +30,7 @@ from .friendcheck import PendingFriendWatcher
 from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from, write_intervals_from
 from .message_events import MessageEventReporter
+from .moments import MomentsWatcher
 from .pacing import MIN_FRIEND_INTERVAL_SECONDS, clamp_interval
 from .runner import GatewayRunner
 from .sessions import GatewayStore
@@ -192,16 +193,19 @@ def build_gateway(
         client_token or (lambda: ""),
     )
 
+    # 一把闸两处用：AI 端下发的指令和本机朋友圈巡看的点赞，同一本账（计数在 store 里，
+    # 实例本身无状态；给同一个实例只是让「同一把闸」这件事看得见）。
+    guard = OutboundGuard(
+        store,
+        max_sends_per_hour=gateway_settings.max_sends_per_hour,
+        active_hours=gateway_settings.active_hours,
+        action_limits=action_limits_from(gateway_settings),
+        write_intervals=write_intervals_from(gateway_settings),
+    )
     command_executor = CommandExecutor(
         runtime=runtime,
         store=store,
-        guard=OutboundGuard(
-            store,
-            max_sends_per_hour=gateway_settings.max_sends_per_hour,
-            active_hours=gateway_settings.active_hours,
-            action_limits=action_limits_from(gateway_settings),
-            write_intervals=write_intervals_from(gateway_settings),
-        ),
+        guard=guard,
         account_id=resolved_accounts[0],
         allow_real_actions=allow_real_actions,
         confirmation=REAL_ACTION_CONFIRMATION,
@@ -264,6 +268,20 @@ def build_gateway(
             enabled=gateway_settings.stranger_intake,
             active_hours=gateway_settings.active_hours,
             allow_real_actions=allow_real_actions,
+        ),
+        # 用户 2026-09-08：本机自己巡看朋友圈，只碰新动态。**默认关**（间隔 0）。
+        moments_watcher=MomentsWatcher(
+            accounts=resolved_accounts,
+            runtime=runtime,
+            store=store,
+            guard=guard,
+            interval_seconds=gateway_settings.moments_poll_interval_seconds,
+            auto_like=gateway_settings.moments_auto_like,
+            auto_comment=gateway_settings.moments_auto_comment,
+            comment_material=gateway_settings.moments_comment_material,
+            active_hours=gateway_settings.active_hours,
+            allow_real_actions=allow_real_actions,
+            confirmation=REAL_ACTION_CONFIRMATION,
         ),
     )
     return Gateway(

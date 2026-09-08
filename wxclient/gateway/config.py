@@ -192,6 +192,22 @@ class GatewaySettings(BaseSettings):
     moment_comment_interval_seconds: float = 600.0
     """两趟朋友圈评论之间至少隔多久（秒）。`0` = 这道闸关掉，只剩配额。"""
 
+    # ── 本机朋友圈巡看（用户 2026-09-08：「本地做一个，和轮询消息一样，只对最新的朋友圈进行」）──
+    moments_poll_interval_seconds: float = 0.0
+    """多久开一趟朋友圈看**新**动态（秒）。`0` = 不巡看（默认关：每趟都要开一次朋友圈窗口，
+    是风控看得见的动作，开不开是专员的知情选择）。只碰上次看过之后新出的、今天的动态。"""
+
+    moments_auto_like: bool = False
+    """巡看时顺手给新动态点赞。配额与节拍走「朋友圈点赞」那两档。"""
+
+    moments_auto_comment: bool = False
+    """巡看到新动态时交给 AI 端按素材写评论（本机自己触发 AI 端，不经业务端计划）。
+    配额与节拍走「朋友圈评论」那两档；同一条只评一次的台账照旧。"""
+
+    moments_comment_material: str = "岗位、招工、上班生活相关的动态可以接一句；语气自然、简短，不硬推销"
+    """自动评论的素材：想传达什么、什么口吻。清空 = 自动评论不生效（没素材 AI 端写不出有分寸的话）。
+    给一句缺省口吻是为了界面上不出现空格子；真正的开关是 `moments_auto_comment`。"""
+
     active_hours: str = "09:00-21:00"
 
     allow_insecure_transport: bool = False

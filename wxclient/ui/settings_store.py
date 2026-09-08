@@ -128,6 +128,17 @@ FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_MOMENT_COMMENT_INTERVAL_SECONDS", "朋友圈评论最小间隔",
           "两趟之间至少隔多久", section="sched", unit="秒",
           default="600"),
+    # 用户 2026-09-08：本机自己巡看朋友圈，只碰新动态。默认关（每趟开一次朋友圈窗口）。
+    Field("WXCLIENT_GATEWAY_MOMENTS_POLL_INTERVAL_SECONDS", "朋友圈巡看间隔",
+          "多久开一趟看新动态，0 = 不巡看", section="sched", unit="秒",
+          default="0"),
+    Field("WXCLIENT_GATEWAY_MOMENTS_AUTO_LIKE", "巡看时自动点赞",
+          "只给新动态点，走点赞上限与间隔", kind="bool", section="sched", default="0"),
+    Field("WXCLIENT_GATEWAY_MOMENTS_AUTO_COMMENT", "巡看时自动评论",
+          "新动态交给劳小智按素材写评论", kind="bool", section="sched", default="0"),
+    Field("WXCLIENT_GATEWAY_MOMENTS_COMMENT_MATERIAL", "朋友圈评论素材",
+          "想传达什么、什么口吻，清空就不评", section="sched",
+          default="岗位、招工、上班生活相关的动态可以接一句；语气自然、简短，不硬推销"),
     # 090：**默认开**（用户裁决 2026-08-29）。原来默认关，理由是「装上不会自动回复
     # 家人朋友」——但真实用法里主动来问的人正是要接的那一类，默认关等于每台机器装完
     # 都要有人记得来打开一次。真正兜住误伤的是后面那几道确定性闸（判不出在找工作

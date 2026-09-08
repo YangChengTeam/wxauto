@@ -205,6 +205,11 @@ CREATE TABLE IF NOT EXISTS gateway_moment_comments (
   created_at  TEXT NOT NULL,
   PRIMARY KEY (account_id, content_key)
 );
+CREATE TABLE IF NOT EXISTS gateway_moment_cursor (
+  account_id TEXT PRIMARY KEY,
+  first_key  TEXT NOT NULL,
+  seen_at    TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS gateway_read_marks (
   account_id  TEXT NOT NULL,
   action      TEXT NOT NULL,
@@ -1796,6 +1801,26 @@ class GatewayStore:
         except ValueError:
             return None
         return (at - last).total_seconds()
+
+    # ────────────────────────── 朋友圈巡看游标 ──────────────────────────
+    # 上一趟看到的第一条动态的键。下一趟翻到它就停 = 只碰新出的。
+
+    def moment_cursor(self, account_id: str) -> str:
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT first_key FROM gateway_moment_cursor WHERE account_id=?", (account_id,),
+            ).fetchone()
+        return str(row[0]) if row else ""
+
+    def set_moment_cursor(self, account_id: str, first_key: str, at: datetime) -> None:
+        if not first_key:
+            return
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO gateway_moment_cursor (account_id, first_key, seen_at) VALUES (?,?,?)",
+                (account_id, first_key, at.isoformat()),
+            )
+            conn.commit()
 
     # ────────────────────────── 朋友圈评论台账 ──────────────────────────
     # 同一条动态只评一次。计划重投、AI 端读回同一批动态再写一遍，都靠这本账挡：

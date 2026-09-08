@@ -177,6 +177,23 @@ class WeChatApi:
             dry_run=dry_run,
         )
 
+    def scan_recent_moments(
+        self,
+        limit: int = 10,
+        like_limit: int = 0,
+        until_key: str = "",
+        dry_run: bool | None = None,
+    ) -> dict[str, Any]:
+        """本机巡看：从时间线顶端往下翻，只收**今天**且**上次没看过**的动态（翻到 ``until_key`` 就停），
+        顺手给新动态点赞（最多 ``like_limit`` 个，0 = 不点）。"""
+        return self._run_driver(
+            "scan_recent_moments",
+            limit=limit,
+            like_limit=like_limit,
+            until_key=until_key,
+            dry_run=dry_run,
+        )
+
     def comment_recent_moments(
         self,
         comments: list[dict[str, Any]],

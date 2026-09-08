@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
@@ -50,6 +52,7 @@ from .inbound import (
     format_history,
 )
 from .message_events import DIRECTION_INBOUND, MessageEventReporter, local_message_id
+from .moments import MomentsWatcher
 from .outbound import DeliveryResult, MessageSink, OutboundSender
 from .pacing import MIN_READ_INTERVAL_SECONDS, PACING_EVENT, clamp_interval
 from .schedule import ScheduleLoop, parse_schedule_at
@@ -114,6 +117,12 @@ DEBUG_PEER_ID = "__debug__"
 #: 这轮告诉 AI 端「我在跟谁说话」用的名字（078 拿它当关系记忆的键）。
 #: 明写成调试，免得调试时说的话被记成某个真实联系人的关系记忆。
 DEBUG_PEER_LABEL = "调试会话"
+
+#: 本机朋友圈巡看自触发 AI 端写评论时用的「对端」（同 DEBUG_PEER_ID 的造法）。
+#: 长命会话：AI 端在同一条会话里能看见前几趟评过什么，不至于每趟同一句话。
+MOMENTS_PEER_ID = "__moments__"
+#: 自触发 AI 端用的 task_type——102 的评论轮就走这一种（`content_mode: comment_moments`）。
+MOMENTS_TASK_TYPE = "wechat_outreach"
 
 #: 退出时最多等在途的一轮收口多久。超了就放弃那一轮——丢一轮远好过界面卡住不动。
 SHUTDOWN_DRAIN_SECONDS = 3.0
@@ -227,6 +236,7 @@ class GatewayRunner:
         candidate_mode: CandidateModeClient | None = None,
         auto_friend: AutoFriendWatcher | None = None,
         friend_checker: PendingFriendWatcher | None = None,
+        moments_watcher: MomentsWatcher | None = None,
     ) -> None:
         self._settings = settings
         self._store = store
@@ -239,6 +249,11 @@ class GatewayRunner:
         self._commands = command_executor
         self._auto_friend = auto_friend
         self._friend_checker = friend_checker
+        # 本机朋友圈巡看（用户 2026-09-08）：新动态点赞在它自己手上；评论要 AI 端写，
+        # 由它回调这里自触发一轮（`_comment_new_moments`）。
+        self._moments = moments_watcher
+        if self._moments is not None:
+            self._moments.on_new_posts = self._comment_new_moments
         self._contacts = contacts
         self._candidates = candidates
         self._message_events = message_events
@@ -845,6 +860,64 @@ class GatewayRunner:
             return
         await self._report_accepted_now(account_id, number, peer_id)
 
+    async def _comment_new_moments(self, account_id: str, posts: list[dict[str, Any]]) -> None:
+        """本机巡看到新动态 → **自己给 AI 端起一轮** `comment_moments`，让它按素材写评论。
+
+        走的是 102 那条现成的计划触发路，只是触发方从业务端换成了本机：
+        发给 AI 端的就是一条触发项 JSON（`content_mode: comment_moments` + 素材），
+        多带一份 `gateway_posts`——本机刚看回来的动态。AI 端认出是网关自己送来的，
+        就直接用这份，不再往回投一条 `read_recent_moments`（省一次开朋友圈窗口）。
+        AI 端回来的 `comment_moments` 指令走 `_on_push` → `_dispatch_commands`，
+        能力闸、配额、节拍、同一条只评一次的台账一道不绕——评论那一侧一个字不新写。
+
+        触发号按「账号 + 这批动态的键」派生：同一批动态再交一次（上一趟 AI 端没接住、
+        游标没前移）AI 端按幂等认领挡掉，不会评两遍。
+        """
+        material = self._settings.moments_comment_material.strip()
+        if not material or not posts:
+            return
+        digest = hashlib.sha1(  # 只是派生一个幂等键，不是安全用途
+            "\n".join(f"{account_id}\t{post.get('content', '')}" for post in posts).encode("utf-8")
+        ).hexdigest()[:16]
+        trigger = {
+            "trigger_id": f"local-moments:{digest}",
+            "kind": "promotion",
+            "reason": "本机朋友圈巡看发现新动态，请按素材给它们写评论",
+            "content_mode": "comment_moments",
+            "content_text": material,
+            "gateway_posts": [
+                {
+                    "content": str(post.get("content") or ""),
+                    "posted_at": str(post.get("posted_at") or ""),
+                    "photos": int(post.get("photos") or 0),
+                    "videos": int(post.get("videos") or 0),
+                }
+                for post in posts
+            ],
+        }
+        text = json.dumps(trigger, ensure_ascii=False)
+        for attempt in (1, 2):
+            try:
+                client = await self._pool.acquire(account_id)
+                session_id = await self._ensure_session(
+                    client, account_id, MOMENTS_PEER_ID, MOMENTS_TASK_TYPE
+                )
+                result = await client.send_message(session_id, text)
+                _ai.info(
+                    "新动态已交给劳小智写评论", account=account_id, count=len(posts),
+                    cards=len(result.cards),
+                )
+                return
+            except Unauthorized:
+                self._store.drop_session(account_id, MOMENTS_PEER_ID)
+                await self._pool.invalidate(account_id)
+                if attempt == 2:
+                    raise
+            except AgentWsError:
+                await self._pool.invalidate(account_id)
+                if attempt == 2:
+                    raise
+
     async def _on_friend_accepted(self, account_id: str, session_name: str) -> None:
         """复查确认对方通过了（093）→ 走**既有**那条上报路，并让他立刻进监听名单。
 
@@ -1396,6 +1469,9 @@ class GatewayRunner:
             side_tasks.append(
                 asyncio.create_task(self._friend_checker.run(), name="gw-friend-check")
             )
+        # 本机朋友圈巡看：默认关（间隔 0），开了才起循环（见 `MomentsWatcher.enabled`）。
+        if self._moments is not None:
+            side_tasks.append(asyncio.create_task(self._moments.run(), name="gw-moments"))
         # 会话名同步放**后台**跑：它是「换机之后别把同一个人叫成两个名字」的补课，
         # 不该挡住网关起来（后端慢或没登录时，同步失败只记账，见 ContactDirectory）。
         # ★ 它同时是**监听名单**的来源（085，用户 2026-08-20：就用 /client/contacts，不新增接口），
