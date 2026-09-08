@@ -24,6 +24,7 @@ from wxclient.gateway import (
     TurnTimeout,
     Unauthorized,
 )
+from wxclient.gateway.wsclient import TurnResult
 
 WECHAT_CARD = {
     "type": "info",
@@ -104,6 +105,42 @@ class WsClientTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 await client.close()
+
+    async def test_reply_card_wins_over_an_earlier_notice_card(self) -> None:
+        """同一轮先来一张 failed 通知卡、再来真的 wechat_reply 卡 → `card` 取后者。
+
+        2026-09-07 事故：模型探路时跑了个不存在的子命令，AI 端先出了张「回复没能生成」的
+        通知卡，两分钟后才出真卡；原来取首张 → 出站看到通知卡 → 「本轮不回复」，候选人没被回。
+        """
+        notice = {
+            "card_id": "wx_err_1",
+            "type": "info",
+            "status": "failed",
+            "body": {"kind": "notice", "notice_code": "reply_failed", "note": "处理时遇到点状况"},
+        }
+        script = TurnScript(cards=[notice, WECHAT_CARD])
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}, turn_script=script) as server:
+            client = AgentWsClient(server.url)
+            await client.connect("tkt-ok")
+            try:
+                session_id = await client.start_session("wechat_reply")
+                result = await client.send_message(session_id, "[对方 · 21:20] 什么岗位都可以")
+                self.assertTrue(result.ok)
+                self.assertEqual(len(result.cards), 2)
+                self.assertEqual(result.card["body"]["kind"], "wechat_reply")
+                self.assertEqual(result.card["body"]["reply_segments"], WECHAT_CARD["body"]["reply_segments"])
+            finally:
+                await client.close()
+
+    def test_card_picks_the_last_reply_card_and_falls_back_to_the_first(self) -> None:
+        """两张 wechat_reply 以后一张为准；一张 wechat_reply 都没有就退回首张。"""
+        first_reply = {"body": {"kind": "wechat_reply", "reply_segments": ["第一稿"]}}
+        second_reply = {"body": {"kind": "wechat_reply", "reply_segments": ["改过的"]}}
+        notice = {"status": "failed", "body": {"kind": "notice", "note": "x"}}
+        self.assertIs(TurnResult("s", cards=[first_reply, second_reply]).card, second_reply)
+        self.assertIs(TurnResult("s", cards=[notice, first_reply]).card, first_reply)
+        self.assertIs(TurnResult("s", cards=[notice]).card, notice)
+        self.assertIsNone(TurnResult("s", cards=[]).card)
 
     async def test_auth_failure_raises_unauthorized(self) -> None:
         """票无效 → Unauthorized，且连接关闭（调用方需重新换票）。"""

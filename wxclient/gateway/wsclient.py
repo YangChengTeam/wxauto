@@ -61,7 +61,20 @@ class TurnResult:
 
     @property
     def card(self) -> dict[str, Any] | None:
-        """首张卡片。网关只关心一张，但多张也不丢（见 cards）。"""
+        """这一轮的**结论卡**。网关只关心一张，但多张也不丢（见 cards）。
+
+        ★ 不是「首张」。2026-09-07 事故：模型探路时跑了个不存在的子命令，AI 端先出了一张
+          ``failed`` 通知卡，两分钟后才出真的 ``wechat_reply`` 卡；这里原来取 ``cards[0]``，
+          于是出站看到的是通知卡 → 「本轮不回复」，候选人的三条消息一个字没回。
+
+        取法：最后一张 ``body.kind == "wechat_reply"`` 的卡（同一轮出了两张就以后一张为准——
+        那是它改过主意之后的结论）；一张都没有再退回首张（通知卡也好、别的卡也好，
+        让出站按它的 kind 如实记「为什么不回」）。
+        """
+        for card in reversed(self.cards):
+            body = card.get("body")
+            if isinstance(body, dict) and body.get("kind") == "wechat_reply":
+                return card
         return self.cards[0] if self.cards else None
 
 
@@ -350,8 +363,10 @@ class AgentWsClient:
             return
         if ev == "card":
             card = data.get("card")
-            kind = card.get("kind") if isinstance(card, dict) else None
-            _log.info("AI 端发来卡片", 类型=kind or "-")
+            # kind 在 body 里（顶层没有这个键）；原来读顶层，这行日志永远是 "-"。
+            body = card.get("body") if isinstance(card, dict) else None
+            kind = body.get("kind") if isinstance(body, dict) else None
+            _log.info("AI 端发来卡片", 类型=kind or "-", 状态=str(card.get("status") or "-") if isinstance(card, dict) else "-")
             return
         if ev == "error":
             _log.warning("AI 端发来错误帧", code=data.get("code") or "-")
