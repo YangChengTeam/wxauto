@@ -158,6 +158,24 @@ class TaskFailureTests(CommandTestCase):
         self.assertEqual(again.status, "rejected", "名额没还，这条该被配额挡住")
 
 
+class SentEchoRecordTests(CommandTestCase):
+    """计划发出去的那句话，下一轮读回来也要认得出是自己说的（2026-09-09 自问自答事故）。"""
+
+    async def test_send_message_records_its_text(self) -> None:
+        await self._executor(FakeRuntime()).execute({
+            "command_id": "c1", "op": "send_message",
+            "args": {"to": "张三", "text": "您好，看到您在找普工"},
+        })
+        self.assertTrue(self.store.claim_sent_echo(ACCOUNT, "张三", "您好，看到您在找普工"))
+
+    async def test_failed_send_records_nothing(self) -> None:
+        await self._executor(FakeRuntime(status="failed")).execute({
+            "command_id": "c1", "op": "send_message",
+            "args": {"to": "张三", "text": "在吗"},
+        })
+        self.assertFalse(self.store.claim_sent_echo(ACCOUNT, "张三", "在吗"))
+
+
 class WhitelistTests(CommandTestCase):
     async def test_known_op_is_translated_to_a_queue_task(self) -> None:
         runtime = FakeRuntime()

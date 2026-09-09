@@ -1232,6 +1232,107 @@ class PacingTests(unittest.TestCase):
         self.assertGreater(len(set(values)), 150, "间隔还是整齐的，等于没抖")
 
 
+class OwnEchoTests(StoreTestCase):
+    """★ 自己发出去的回复被读回来时，不能被当成对方的新消息（2026-09-09 真机：自问自答）。
+
+    读回来的每一条「是不是我发的」全靠 `uia.py` 的启发式（气泡左右位置 / 截图 / 右键菜单），
+    任何一条判错就是「对方说了句新的」→ 网关对着自己的话再回一轮。而我们自己发了什么是
+    确定知道的：出站时记原文，读回来按原文认亲，认一次销一条。
+    """
+
+    PEER = "候选人-王建国"
+
+    def _source(self, runtime: FakeRuntime) -> QueueMessageSource:
+        return QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[self.PEER])
+        )
+
+    async def test_echo_misjudged_by_ui_is_still_ours(self) -> None:
+        runtime = FakeRuntime(unread=[], history={self.PEER: [{"text": "还招人吗", "is_self": False}]})
+        source = self._source(runtime)
+        await source.fetch("acct-1")                       # 建游标
+
+        # 我们回了一句；下一轮微信把它读回来，UI 却把它判成了对方发的。
+        self.store.remember_sent_text("acct-1", self.PEER, "在的，岗位还在招")
+        runtime.history[self.PEER].append({"text": "在的，岗位还在招", "is_self": False})
+        with capture_logs() as logs:
+            messages = await source.fetch("acct-1")
+        self.assertEqual([(m.text, m.from_self) for m in messages], [("在的，岗位还在招", True)])
+        self.assertTrue(any("自己刚发出去" in entry["event"] for entry in logs), logs)
+
+    async def test_echo_with_no_is_self_field_at_all(self) -> None:
+        """真机上多数行压根没有 is_self / sender 字段——这时更只能靠原文认。"""
+        runtime = FakeRuntime(unread=[], history={self.PEER: [{"text": "还招人吗"}]})
+        source = self._source(runtime)
+        await source.fetch("acct-1")
+        self.store.remember_sent_text("acct-1", self.PEER, "  在的，\n岗位还在招  ")
+        runtime.history[self.PEER].append({"text": "在的， 岗位还在招"})   # 微信折叠了换行/空白
+        messages = await source.fetch("acct-1")
+        self.assertEqual([(m.text, m.from_self) for m in messages], [("在的， 岗位还在招", True)])
+
+    async def test_peer_repeating_our_words_is_still_the_peer(self) -> None:
+        """认一次销一条：对方原样复读「好的」时，第二次出现的才是对方说的，不能被吞。"""
+        runtime = FakeRuntime(unread=[], history={self.PEER: [{"text": "还招人吗", "is_self": False}]})
+        source = self._source(runtime)
+        await source.fetch("acct-1")
+        self.store.remember_sent_text("acct-1", self.PEER, "好的")
+        runtime.history[self.PEER].append({"text": "好的", "is_self": False})   # 我们的回声（UI 判错）
+        runtime.history[self.PEER].append({"text": "好的", "is_self": False})   # 对方复读
+        messages = await source.fetch("acct-1")
+        self.assertEqual([m.from_self for m in messages], [True, False])
+
+    async def test_ui_correct_echo_still_consumes_the_record(self) -> None:
+        """UI 判对了也要销账，否则记录留到对方哪天说同一句时把真话吞掉。"""
+        runtime = FakeRuntime(unread=[], history={self.PEER: [{"text": "还招人吗", "is_self": False}]})
+        source = self._source(runtime)
+        await source.fetch("acct-1")
+        self.store.remember_sent_text("acct-1", self.PEER, "好的")
+        runtime.history[self.PEER].append({"text": "好的", "is_self": True})
+        await source.fetch("acct-1")
+        self.assertFalse(self.store.claim_sent_echo("acct-1", self.PEER, "好的"), "已认领的记录该销掉")
+
+    async def test_first_read_after_plan_outreach(self) -> None:
+        """计划先发了第一句、再把人加进名单：第一次读时我们那句得认出来，
+        否则 first_seen_fresh 停不住，会把它前面的老历史一并当新消息倒给模型。"""
+        self.store.remember_sent_text("acct-1", self.PEER, "您好，看到您在找普工的工作")
+        runtime = FakeRuntime(unread=[], history={self.PEER: [
+            {"text": "去年聊过的老消息"},
+            {"text": "您好，看到您在找普工的工作"},        # 计划发的，UI 没标
+        ]})
+        messages = await self._source(runtime).fetch("acct-1")
+        self.assertEqual(messages, [], "尾部是自己说的 → 一条都不接")
+
+    async def test_records_are_scoped_per_peer(self) -> None:
+        runtime = FakeRuntime(unread=[], history={self.PEER: [{"text": "还招人吗", "is_self": False}]})
+        source = self._source(runtime)
+        await source.fetch("acct-1")
+        self.store.remember_sent_text("acct-1", "别的人", "好的")
+        runtime.history[self.PEER].append({"text": "好的", "is_self": False})
+        messages = await source.fetch("acct-1")
+        self.assertEqual([m.from_self for m in messages], [False], "给别人发的话不能拿来认这个人的")
+
+    def test_purge_drops_only_stale_records(self) -> None:
+        t0 = datetime(2026, 9, 9, 10, 0, tzinfo=timezone.utc)
+        self.store.remember_sent_text("acct-1", self.PEER, "旧", at=t0 - timedelta(days=3))
+        self.store.remember_sent_text("acct-1", self.PEER, "新", at=t0)
+        self.assertEqual(self.store.purge_sent_echo_before(t0 - timedelta(hours=48)), 1)
+        self.assertFalse(self.store.claim_sent_echo("acct-1", self.PEER, "旧"))
+        self.assertTrue(self.store.claim_sent_echo("acct-1", self.PEER, "新"))
+
+    async def test_outbound_sender_records_each_sent_segment(self) -> None:
+        now = datetime(2026, 8, 10, 14, 0, tzinfo=timezone.utc)
+        sender = OutboundSender(
+            sink=FakeSink(),
+            guard=OutboundGuard(self.store, active_hours="00:00-23:59"),
+            store=self.store,
+            clock=lambda: now,
+        )
+        await sender.deliver("a", "p", reply_card(["第一句", "第二句"]))
+        self.assertTrue(self.store.claim_sent_echo("a", "p", "第一句"))
+        self.assertTrue(self.store.claim_sent_echo("a", "p", "第二句"))
+        self.assertFalse(self.store.claim_sent_echo("a", "p", "第一句"), "认一次销一条")
+
+
 class QuietHoursTests(StoreTestCase):
     """非工作时段**一个微信动作都不做**——连读都不读，不只是不发。"""
 

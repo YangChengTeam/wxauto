@@ -125,6 +125,11 @@ FOLLOW_UP_DEFER = "defer"
 """被规则挡下（额度用完、不在时间窗）——留着重投，**不计失败**：这类拦截一定会自己过期。"""
 
 HISTORY_MAX_AGE_DAYS = 14
+
+#: 「我们发过的原文」记录留多久没被读回来就清（`GatewayStore.remember_sent_text`）。
+#: 读取窗口只有二十来条，发出去几小时还没读回来就是不会再读回来了；留太久反而会
+#: 在对方哪天复读同一句时把真话吞掉。
+SENT_ECHO_MAX_AGE_HOURS = 48
 """聊天记录留多久（喂给 AI 端当背景用的，不是聊天归档）。
 
 这份记录里是候选人对话原文——真实 PII 落在专员自己的电脑上。留够判「这一步走完没有」
@@ -513,6 +518,8 @@ class InboundLoop:
         dropped = self._store.purge_messages_before(now - timedelta(days=HISTORY_MAX_AGE_DAYS))
         if dropped:
             _local.info("清掉过期聊天记录", 条数=dropped, 保留天数=HISTORY_MAX_AGE_DAYS)
+        # 发出去却一直没被读回来的原文记录也要清：留着，几天后对方恰好说同一句会被吞掉。
+        self._store.purge_sent_echo_before(now - timedelta(hours=SENT_ECHO_MAX_AGE_HOURS))
 
         cutoff = now - timedelta(hours=PENDING_MAX_AGE_HOURS)
         for row in self._store.purge_pending_inbound_before(cutoff):

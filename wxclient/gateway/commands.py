@@ -556,6 +556,10 @@ class CommandExecutor:
                 self._store.record_moment_comments(self._account, done_keys, now)
                 if payload.get("already_commented"):
                     result = {**result, "already_commented": payload["already_commented"]}
+            if op in MESSAGE_EVENT_OPS and peer and str(payload.get("text") or "").strip():
+                # 计划发出去的那句话同样会被下一轮轮询读回来，同样要认得出是自己说的
+                # （见 `GatewayStore.remember_sent_text`）。
+                self._store.remember_sent_text(self._account, peer, str(payload["text"]), at=now)
             _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
             self._note_message_sent(command_id, op, peer, args, raw)
             state = self._friend_state(op, result, raw)

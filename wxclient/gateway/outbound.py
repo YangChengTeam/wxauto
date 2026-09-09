@@ -141,6 +141,9 @@ class OutboundSender:
         try:
             for segment in segments:
                 task_ids.append(await self._sink.send(account_id, peer_id, segment))
+                # ★ 发成功一段就记一段原文：下一轮从微信读回来时靠它认出「这是我说的」，
+                #   不再全押在 UI 的左右气泡判定上（判错 = 自问自答刷屏）。
+                self._store.remember_sent_text(account_id, peer_id, segment, at=now)
         finally:
             # 发到一半炸了：没发出去的那几段不该占着额度（发出去的照记）。
             reservation.settle(len(task_ids))

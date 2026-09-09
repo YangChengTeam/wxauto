@@ -232,10 +232,27 @@ CREATE TABLE IF NOT EXISTS gateway_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_peer_time
   ON gateway_messages (account_id, peer_id, at);
+CREATE TABLE IF NOT EXISTS gateway_sent_echo (
+  account_id TEXT NOT NULL,
+  peer_id    TEXT NOT NULL,
+  text_key   TEXT NOT NULL,
+  sent_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sent_echo_peer
+  ON gateway_sent_echo (account_id, peer_id, text_key);
 """
 
 
 _log = structlog.get_logger(__name__)
+
+
+def _echo_key(text: str) -> str:
+    """发送原文 → 读回来时可比对的键：去首尾空白、把所有空白折成一个空格。
+
+    微信把一段文字显示成气泡时会吞掉首尾换行、UIA 读到的 name 再被 `strip()`；
+    多行文本的换行在不同版本里读回来可能是换行也可能是空格。按原文逐字比对就会漏认。
+    """
+    return " ".join(str(text or "").split())
 
 
 def _utcnow() -> datetime:
@@ -1651,6 +1668,63 @@ class GatewayStore:
         """
         with closing(self._connect()) as conn:
             cur = conn.execute("DELETE FROM gateway_messages WHERE at < ?", (cutoff.isoformat(),))
+            conn.commit()
+            return cur.rowcount or 0
+
+    # ────────────────────────── 自己发过的原文（读回来认亲）──────────────────────────
+
+    def remember_sent_text(
+        self, account_id: str, peer_id: str, text: str, at: datetime | None = None
+    ) -> None:
+        """记下「我们刚给这个会话发了这句原文」，等它被读回来时认亲（`claim_sent_echo`）。
+
+        ★ 为什么要有这张表（2026-09-09 真机事故）：网关发出去的回复，下一轮从微信读回来时
+        「是不是我发的」全靠 `uia.py` 的启发式（气泡左右位置 / 截图 / 右键菜单），任何一条
+        判错就成了「对方的新消息」——网关对着自己的话再回一轮，自问自答刷屏。
+        而**我们自己发了什么，我们是确定知道的**，不该把这件事交给 UI 去猜。
+        只记归一化后的文本（`_echo_key`）：微信显示时会吞掉首尾空白、折叠换行。
+        """
+        key = _echo_key(text)
+        if not key:
+            return
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "INSERT INTO gateway_sent_echo (account_id, peer_id, text_key, sent_at) "
+                "VALUES (?,?,?,?)",
+                (account_id, peer_id, key, (at or _utcnow()).isoformat()),
+            )
+            conn.commit()
+
+    def claim_sent_echo(self, account_id: str, peer_id: str, text: str) -> bool:
+        """读回来的这一条是不是我们自己刚发的原文。**认一次销一条**。
+
+        一条记录只能认一次：对方要是原样复读了我们那句（「好的」「收到」），
+        第一次匹配的是我们的回声（它在时间线上一定排在前面），第二次就是对方真说的，
+        不能再被吞掉。所以匹配到就删掉最早那一条。
+        """
+        key = _echo_key(text)
+        if not key:
+            return False
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT rowid FROM gateway_sent_echo
+                   WHERE account_id=? AND peer_id=? AND text_key=?
+                   ORDER BY sent_at ASC, rowid ASC LIMIT 1""",
+                (account_id, peer_id, key),
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute("DELETE FROM gateway_sent_echo WHERE rowid=?", (row[0],))
+            conn.commit()
+            return True
+
+    def purge_sent_echo_before(self, cutoff: datetime) -> int:
+        """清掉太久没被读回来的记录（发送成功但微信没显示、读取窗口滚过去了）。
+
+        留着不清，几天后对方恰好说了同一句就会被当成我们的回声吞掉一次。
+        """
+        with closing(self._connect()) as conn:
+            cur = conn.execute("DELETE FROM gateway_sent_echo WHERE sent_at < ?", (cutoff.isoformat(),))
             conn.commit()
             return cur.rowcount or 0
 

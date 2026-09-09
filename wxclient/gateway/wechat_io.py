@@ -369,6 +369,29 @@ class QueueMessageSource:
         """
         self._on_unreachable = handler
 
+    def _claim_own_echoes(
+        self, account_id: str, peer_id: str, raw_messages: Sequence[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """把「我们自己刚发过的原文」标成自己发的，不管 UI 怎么判。
+
+        判据是确定性的：文本跟 `GatewayStore.remember_sent_text` 记下的某一条一致，
+        且那条还没被认领过（认一次销一条，见 `claim_sent_echo`）。UI 已经判成自己的
+        也照样销账——否则那条记录会留到对方哪天复读同一句时把真话吞掉。
+        """
+        out: list[dict[str, Any]] = []
+        for raw in raw_messages:
+            if not self._store.claim_sent_echo(account_id, peer_id, str(raw.get("text") or "")):
+                out.append(raw)
+                continue
+            if not is_self_message(raw):
+                _log.info(
+                    "这条是自己刚发出去的回复被读回来了，按自己说的算（UI 没认出来）",
+                    会话=peer_id,
+                    内容=preview(raw),
+                )
+            out.append(dict(raw, is_self=True, sender=SELF_SENDER))
+        return out
+
     async def _fetch_peer(self, account_id: str, peer_id: str) -> list[InboundMessage]:
         history = await self._runtime.submit(
             TaskType.READ_CHAT_HISTORY, {"friend": peer_id, "limit": self._history_limit}
@@ -407,7 +430,14 @@ class QueueMessageSource:
             self._store.mark_peer_kind(account_id, peer_id, is_group=True)
 
         last_signature, seq = self._store.get_cursor(account_id, peer_id)
+        # ★ 自己发过的原文读回来要认亲（2026-09-09 真机：自己的回复被当成对方的新消息，
+        #   自问自答）。第一次读这个会话时整段都还没处理过，整段认；有游标时只认游标
+        #   之后的那几条——游标之前的早已处理，再拿它们销账会把后面真正的回声漏掉。
+        if last_signature is None:
+            raw_messages = self._claim_own_echoes(account_id, peer_id, raw_messages)
         fresh, new_signature = split_new_messages(raw_messages, last_signature)
+        if last_signature is not None:
+            fresh = self._claim_own_echoes(account_id, peer_id, fresh)
         if last_signature is None and raw_messages:
             # 第一次读这个会话：只接尾部今天、对方发的那几条（见 first_seen_fresh），
             # 更早的算历史不回溯。**必须说出来**——不然日志上就是「读完了 N 条」然后
