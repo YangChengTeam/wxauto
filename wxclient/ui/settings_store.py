@@ -150,6 +150,8 @@ FIELDS: tuple[Field, ...] = (
           kind="bool", section="boot", default="1"),
     Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", "启动后最小化到系统托盘",
           kind="bool", section="boot", default="1"),
+    Field("WXCLIENT_UI_AUTO_UPDATE", "自动检查更新", "有新版本时在左侧提示，点击即可安装",
+          kind="bool", section="boot", default="1"),
 )
 
 

@@ -60,8 +60,8 @@ def tearDownModule() -> None:
 if HAS_TK:
     from wxclient.logging_config import configure_logging
     from wxclient.ui import theme
-    from wxclient.ui.logbuffer import LogBuffer, LogPipeline
     from wxclient.ui import window as window_module
+    from wxclient.ui.logbuffer import LogBuffer, LogPipeline
     from wxclient.ui.service import (
         GatewayService,
         GatewayStatus,
@@ -1441,7 +1441,7 @@ class WatchRemovalTests(unittest.TestCase):
         made: list[tuple[Any, str, str]] = []
         real_init = window_module.dialog._Dialog.__init__
 
-        def spy_init(inner, parent, title, message, **kw):  # noqa: ANN001, ANN202
+        def spy_init(inner, parent, title, message, **kw):
             real_init(inner, parent, title, message, **kw)
             made.append((parent, title, message))
             self.addCleanup(_destroy, inner)
@@ -1484,7 +1484,7 @@ class WatchRemovalTests(unittest.TestCase):
 
     def test_confirming_asks_the_ai_side_and_waits_for_it(self) -> None:
         self.future = _PendingFuture()
-        made, patches = self._dialogs(True)
+        _made, patches = self._dialogs(True)
         with patches[0], patches[1]:
             self.window._ask_remove_watched("候选人-王建国")
 
@@ -2252,6 +2252,97 @@ class CandidateTakeoverButtonTests(unittest.TestCase):
 
         tell.assert_called_once()
         self.assertIn("没在运行", " ".join(str(a) for a in tell.call_args.args))
+
+
+
+@unittest.skipUnless(HAS_TK, "没有 tkinter / 显示环境，窗口层测不了")
+class UpdateBadgeTests(unittest.TestCase):
+    """自动更新在窗口上的那一行（`window.set_update_context`）。查/下都是假的，只看界面态。"""
+
+    def setUp(self) -> None:
+        from wxclient.ui.updater import Release, Updater
+
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.window = MainWindow(
+            self.root, LogBuffer(), GatewayService(lambda: None),
+            data_dir=Path(tempfile.mkdtemp()), probe_wechat=False,
+        )
+        self.installed: list[Path] = []
+        self.updater = Updater("0.1.53", self.window.data_dir, open_url=lambda *_: None,
+                               spawn=lambda *_: None, installable=True)
+        self.window.set_update_context(self.updater, on_install=self.installed.append)
+        self.release = Release(version="0.1.60", url="https://x/y_v0.1.60.exe",
+                               sha256="0" * 64, size=1000, released_at="2026-09-10")
+        self.addCleanup(self._teardown)
+
+    def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.window)
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+    def _badge(self) -> str:
+        return str(self.window._update_item.cget("text")) if self.window._update_item.winfo_manager() else ""
+
+    def test_nothing_shows_until_there_is_a_newer_version(self) -> None:
+        self.assertEqual(self._badge(), "")
+
+        self.window._check_finished(None, None)
+        self.assertEqual(self._badge(), "", "已是最新时不占位，免得真有更新那天被当成背景")
+
+        self.window._check_finished(self.release, None)
+        self.assertIn("v0.1.60", self._badge())
+        self.assertIn("点击安装", self._badge())
+        self.assertEqual(self.window.update_state, "available")
+
+    def test_download_progress_then_install_hands_the_package_to_main(self) -> None:
+        self.window._check_finished(self.release, None)
+        with mock.patch.object(window_module.dialog, "ask", return_value=True), \
+                mock.patch.object(self.updater, "download_async", return_value=True) as download:
+            self.window.update_clicked()
+        self.assertTrue(download.called)
+        self.assertEqual(self.window.update_state, "downloading")
+
+        self.window._update_progressed(420, 1000)
+        self.assertIn("42%", self._badge())
+
+        package = self.window.data_dir / "updates" / "y_v0.1.60.exe"
+        self.window._download_finished(package, None)
+        self.assertEqual(self.window.update_state, "installing")
+        self.assertIn("正在安装", self._badge())
+        self.assertEqual(self.installed, [package], "包交给 __main__ 去「收尾后起安装程序」")
+
+    def test_a_failed_download_becomes_a_retry_line_not_a_dead_end(self) -> None:
+        from wxclient.ui.updater import UpdateError
+
+        self.window._check_finished(self.release, None)
+        with mock.patch.object(window_module.dialog, "tell") as tell:
+            self.window._download_finished(None, UpdateError("安装包校验不通过"))
+        self.assertTrue(tell.called)
+        self.assertEqual(self.window.update_state, "failed")
+        self.assertIn("点击重试", self._badge())
+        self.assertEqual(self.installed, [])
+
+    def test_declining_the_prompt_leaves_the_badge_in_place(self) -> None:
+        self.window._check_finished(self.release, None)
+        with mock.patch.object(window_module.dialog, "ask", return_value=False), \
+                mock.patch.object(self.updater, "download_async") as download:
+            self.window.update_clicked()
+        self.assertFalse(download.called)
+        self.assertIn("点击安装", self._badge())
+
+    def test_a_source_checkout_opens_the_site_instead_of_installing(self) -> None:
+        import webbrowser
+
+        self.updater._installable = False
+        self.window._check_finished(self.release, None)
+        with mock.patch.object(webbrowser, "open") as opened, \
+                mock.patch.object(self.updater, "download_async") as download:
+            self.window.update_clicked()
+        self.assertTrue(opened.called)
+        self.assertFalse(download.called)
 
 
 if __name__ == "__main__":

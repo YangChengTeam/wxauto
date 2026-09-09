@@ -1073,6 +1073,7 @@ class SettingsDefaultsTests(unittest.TestCase):
             "WXCLIENT_GATEWAY_STRANGER_INTAKE": gateway.stranger_intake,
             "WXCLIENT_UI_AUTOSTART": ui.autostart,
             "WXCLIENT_UI_START_HIDDEN": ui.start_hidden,
+            "WXCLIENT_UI_AUTO_UPDATE": ui.auto_update,
         }
         for field in settings_store.FIELDS:
             want = expected[field.key]

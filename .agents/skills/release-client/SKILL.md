@@ -112,8 +112,13 @@ bash packages/product-site/scripts/publish.sh --site-only
 ```
 
 脚本自己会做：版本串与日期巡检 → 包名版本对齐 → 页面 SHA 与包对齐 → 传包 → **传完立刻核远端 hash**
-（传输截断不报错，只会让用户装到半个包）→ 同步四页 → 兜底重建软链接
-（`/var/www/lxz_business/wxauto` → `/var/www/lxz_wxauto`，业务端发版可能把它删掉）→ 线上验证。
+（传输截断不报错，只会让用户装到半个包）→ 同步四页 → **写 `latest.json`**（客户端自动更新的唯一来源：
+版本 / URL / SHA-256 / 字节数 / 日期 / changelog 条目，全部从**本次上传的包**算）→ 兜底重建软链接
+（`/var/www/lxz_business/wxauto` → `/var/www/lxz_wxauto`，业务端发版可能把它删掉）→ 线上验证
+（含把 `latest.json` 读回来核版本与 SHA）。
+
+★ `latest.json` 一写出去，**所有已装 0.1.53+ 的客户端 6 小时内都会提示更新**——发版就是推送。
+所以 ③④ 那两步（真机装一次、跑一次）在这之前必须做完；发出去才发现有问题，只能再发一版更高的。
 
 **禁止**用 `scp` / `ssh` / `rsync` 手工拼这几步代替脚本。这条是仓库根的硬规矩，
 理由就是上面那一串「每步都能悄悄半途而废」。
@@ -124,7 +129,8 @@ bash packages/product-site/scripts/publish.sh --site-only
 
 ```bash
 curl -fsS https://worker.laoxiaozhi.cn/wxauto/ | grep -o 'v[0-9.]*' | head -3   # 首页版本
-# 页面上贴的 SHA、整包拉回来重算、旧版链接仍 200，三样都要看
+curl -fsS "https://worker.laoxiaozhi.cn/wxauto/latest.json?t=$(date +%s)"       # 客户端会拿到的清单
+# 页面上贴的 SHA、整包拉回来重算、旧版链接仍 200、latest.json 的 version/sha256 与包一致，四样都要看
 ```
 
 **旧包一个都不删**——有人拿着旧链接。

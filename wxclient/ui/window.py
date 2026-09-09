@@ -24,11 +24,21 @@ import structlog
 
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 
-from . import dialog, logline, theme, widgets
+from . import dialog, logline, settings_store, theme, widgets
 from .logbuffer import LogBuffer
 from .logfeed import FLUSH_MS, LogFeed, is_log_on_screen
 from .logtable import LEVEL_FILTERS, LogTable
 from .service import GatewayService, ServiceState
+from .updater import (
+    CHECK_INTERVAL_SECONDS,
+    FIRST_CHECK_DELAY_SECONDS,
+    RETRY_INTERVAL_SECONDS,
+    SITE_URL,
+    Release,
+    UpdateError,
+    Updater,
+    describe,
+)
 
 _STATE_TEXT = {
     ServiceState.RUNNING: "运行中",
@@ -214,6 +224,14 @@ class MainWindow:
         self._logging_out = False  # 正在退出登录（转圈中）；防连点，也防重复排定时器
         self._quit_action: Callable[[], None] | None = None  # 点 × 真退出时走它
         self._version = ""
+        # 自动更新（`updater.py`）：查到的新版本、现在走到哪一步、下好校验过的包。
+        self._updater: Updater | None = None
+        self._install_action: Callable[[Path], None] | None = None
+        self._update_release: Release | None = None
+        self._update_package: Path | None = None
+        self._update_state = "idle"  # idle | checking | available | downloading | installing | failed
+        self._update_progress = (0, 0)
+        self._update_manual = False  # 这一次查是人点的「检查更新」（要回话），还是后台定时（不打扰）
 
         root.title(WINDOW_TITLE)
         self._apply_window_icon()
@@ -320,6 +338,13 @@ class MainWindow:
             row.bind("<Button-1>", lambda _e, p=page: self._show_page(p))
             self._nav[page] = item
             self._nav_marks[page] = mark
+
+        # 有新版本时亮在导航下面的那一行（`updater.py`）。平时不占位：没更新就什么都不显示，
+        # 而不是挂一句「已是最新」——那句话每天看一百遍之后，真有更新时也会被当成背景。
+        self._update_item = tk.Label(bar, text="", font=theme.FONT_SMALL, bg=theme.SIDEBAR_BG,
+                                     fg=theme.GREEN_BRIGHT, anchor="w", justify=tk.LEFT,
+                                     wraplength=244, cursor="hand2")
+        self._update_item.bind("<Button-1>", lambda _e: self.update_clicked())
 
         # ★ 底部**只有一个**「退出登录」（用户 2026-08-15：「退出登录和退出服务是一个意思」）。
         # 服务本来就只在登录之后才起（见 `__main__`），所以「不再用了」这件事只有一种表达：
@@ -892,6 +917,7 @@ class MainWindow:
             scroller, inner = self._build_scroller(self._config_page)
             self._settings_page = SettingsPage(
                 inner, self.data_dir, on_saved=self._on_settings_saved,
+                version=self._version, on_check_update=self.check_updates,
             )
             # ★ 动作条**先** pack（side=BOTTOM）再 pack 滚动区：反过来的话 expand 的滚动区
             # 会把它挤出可视范围，参数一多就得先滚到底才找得到「保存」。
@@ -1160,7 +1186,12 @@ class MainWindow:
         self._shutting_down = True
         self._status_label.configure(text="正在停止…", fg=theme.ORANGE)
         self._live_dot.configure(fg=theme.ORANGE)
-        self.set_busy("正在停止服务，请稍候")
+        # 为装更新而退出时，那几秒该说的是「正在安装更新」而不是「正在停止」——
+        # 后者会让人以为自己点错了什么。
+        if self._update_state == "installing":
+            self.set_busy("正在安装更新，客户端会自动重新打开")
+        else:
+            self.set_busy("正在停止服务，请稍候")
         return True
 
     def set_busy(self, text: str) -> None:
@@ -1232,6 +1263,178 @@ class MainWindow:
             self._unsubscribe()
             self._unsubscribe = None
         self.root.destroy()
+
+    # ── 自动更新 ──────────────────────────────────────────────────
+
+    def set_update_context(self, updater: Updater, *,
+                           on_install: Callable[[Path], None]) -> None:
+        """接上更新器。``on_install(package)`` 在包下好并校验过之后被叫（tk 线程），
+        由 `ui/__main__` 接到退出流程上：收完尾再起安装程序。
+
+        是否自动查看配置中心「自动检查更新」——**每次到点都现读**，改了开关不用重启。
+        """
+        self._updater = updater
+        self._install_action = on_install
+        self._later(FIRST_CHECK_DELAY_SECONDS * 1000, self._auto_check)
+
+    def _auto_update_enabled(self) -> bool:
+        values = settings_store.effective(self.data_dir)
+        return settings_store.as_bool(values.get("WXCLIENT_UI_AUTO_UPDATE", ""), default=True)
+
+    def _auto_check(self) -> None:
+        if self._destroyed or self._updater is None:
+            return
+        if not self._auto_update_enabled():
+            self._later(CHECK_INTERVAL_SECONDS * 1000, self._auto_check)
+            return
+        if self._update_state in ("downloading", "installing"):
+            return
+        self.check_updates(manual=False)
+
+    def check_updates(self, manual: bool = True) -> None:
+        """查一次。``manual`` = 人点的：没更新也要回一句、出错也要说。后台定时查两者都不说。"""
+        if self._updater is None or self._destroyed:
+            return
+        if self._update_state in ("downloading", "installing"):
+            if manual:
+                self._note_update("正在更新中", theme.ORANGE)
+            return
+        self._update_manual = manual
+        if manual:
+            self._note_update("正在检查更新…", theme.TEXT_MUTED)
+
+        def done(release: Release | None, error: UpdateError | None) -> None:
+            self._hop(lambda: self._check_finished(release, error))
+
+        if not self._updater.check_async(done):
+            return  # 后台已经在查了，等它回来
+        if self._update_state == "idle":
+            self._update_state = "checking"
+
+    def _check_finished(self, release: Release | None, error: UpdateError | None) -> None:
+        if self._destroyed:
+            return
+        manual = self._update_manual
+        if error is not None:
+            if self._update_state == "checking":
+                self._update_state = "idle"
+            self._note_update(str(error), theme.RED if manual else theme.TEXT_MUTED)
+            self._render_update_badge()
+            # 定时查失败了早点再来一次；人点的失败不自动重试，人会再点。
+            if not manual:
+                self._later(RETRY_INTERVAL_SECONDS * 1000, self._auto_check)
+            return
+        if release is None:
+            self._update_release = None
+            self._update_state = "idle"
+            self._note_update(f"已是最新版本 v{self._updater.current_version if self._updater else ''}",
+                              theme.GREEN)
+            self._render_update_badge()
+            if not manual:
+                self._later(CHECK_INTERVAL_SECONDS * 1000, self._auto_check)
+            return
+        self._update_release = release
+        self._update_state = "available"
+        self._note_update(f"有新版本 v{release.version}，点左侧「有新版本」安装", theme.GREEN)
+        self._render_update_badge()
+        if manual:
+            self.update_clicked()
+        else:
+            self._later(CHECK_INTERVAL_SECONDS * 1000, self._auto_check)
+
+    def update_clicked(self) -> None:
+        """点了侧栏那行。有更新 → 问一句 → 下载 → 装；下载失败那行变成「点击重试」。"""
+        release = self._update_release
+        if release is None or self._updater is None or self._update_state in ("downloading", "installing"):
+            return
+        if not self._updater.installable:
+            # 从源码跑的：装不了，带人去产品站
+            import webbrowser
+
+            webbrowser.open(SITE_URL)
+            return
+        if not dialog.ask(self.root, f"更新到 v{release.version}", describe(release),
+                          confirm="立即更新", cancel="以后再说"):
+            return
+        self._start_update_download(release)
+
+    def _start_update_download(self, release: Release) -> None:
+        assert self._updater is not None
+        self._update_state = "downloading"
+        self._update_progress = (0, release.size)
+        self._render_update_badge()
+
+        def progress(done_bytes: int, total: int) -> None:
+            self._hop(lambda: self._update_progressed(done_bytes, total))
+
+        def done(package: Path | None, error: UpdateError | None) -> None:
+            self._hop(lambda: self._download_finished(package, error))
+
+        if not self._updater.download_async(release, progress=progress, done=done):
+            self._update_state = "available"
+            self._render_update_badge()
+
+    def _update_progressed(self, done_bytes: int, total: int) -> None:
+        if self._update_state != "downloading":
+            return
+        self._update_progress = (done_bytes, total)
+        self._render_update_badge()
+
+    def _download_finished(self, package: Path | None, error: UpdateError | None) -> None:
+        if self._destroyed:
+            return
+        if error is not None or package is None:
+            self._update_state = "failed"
+            self._render_update_badge()
+            dialog.tell(self.root, "更新没有下载成功", f"{error or '安装包不见了'}\n\n点左侧那行可以重试。",
+                        tone="error")
+            return
+        self._update_package = package
+        self._update_state = "installing"
+        self._render_update_badge()
+        self.set_busy("正在安装更新，客户端会自动重新打开")
+        if self._install_action is None:
+            _log.warning("更新包已就绪，但没有接安装动作")
+            return
+        self._install_action(package)
+
+    def _render_update_badge(self) -> None:
+        release = self._update_release
+        state = self._update_state
+        if release is None or state in ("idle", "checking"):
+            self._update_item.pack_forget()
+            return
+        if state == "downloading":
+            done_bytes, total = self._update_progress
+            percent = int(done_bytes * 100 / total) if total else 0
+            text, color = f"正在下载 v{release.version}… {percent}%", theme.ORANGE
+        elif state == "installing":
+            text, color = f"v{release.version} 已下载，正在安装…", theme.ORANGE
+        elif state == "failed":
+            text, color = f"v{release.version} 下载失败，点击重试", theme.RED
+        else:
+            text, color = f"有新版本 v{release.version}，点击安装", theme.GREEN_BRIGHT
+        self._update_item.configure(text=text, fg=color)
+        if not self._update_item.winfo_manager():
+            self._update_item.pack(anchor="w", padx=28, pady=(18, 0))
+
+    def _note_update(self, text: str, color: str) -> None:
+        """配置中心「关于」那一行的话。页面还没建就算了——它建出来时会自己问一遍状态。"""
+        if self._settings_page is not None:
+            self._settings_page.show_update_note(text, color)
+
+    @property
+    def update_state(self) -> str:
+        return self._update_state
+
+    def _hop(self, callback: Callable[[], None]) -> None:
+        """后台线程 → tk 线程。窗口已经销毁时静默丢掉（退出过程里回来的回调没人要了）。"""
+        if self._destroyed:
+            return
+        try:
+            self.root.after(0, callback)
+        except (tk.TclError, RuntimeError):
+            pass
 
     # ── 动作 ──────────────────────────────────────────────────────
 

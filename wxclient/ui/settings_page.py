@@ -34,10 +34,15 @@ class SettingsPage(tk.Frame):
         data_dir: Path,
         *,
         on_saved: Callable[[bool], None] | None = None,
+        version: str = "",
+        on_check_update: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent, bg=theme.CONTENT_BG)
         self.data_dir = Path(data_dir)
         self.on_saved = on_saved
+        self._version = version
+        self._on_check_update = on_check_update
+        self._update_note: tk.Label | None = None
         self._values = settings_store.effective(self.data_dir)
         self._vars: dict[str, tk.Variable] = {}
         self._secret_touched: dict[str, bool] = {}
@@ -53,6 +58,7 @@ class SettingsPage(tk.Frame):
         # 「保存到：…」那行就够了。
         for section in SECTIONS:
             self._build_section(section)
+        self._build_about()
 
         tk.Label(
             self,
@@ -63,6 +69,35 @@ class SettingsPage(tk.Frame):
         ).pack(anchor="w", padx=24, pady=(18, 4))
 
     # ── 版式 ─────────────────────────────────────────────────────
+
+    def _build_about(self) -> None:
+        """「关于」：当前版本 + 手动「检查更新」。自动查在后台默默做（`updater.py`），
+        这里是人想**现在就知道**时的那一下——结果写在按钮旁边，不弹窗。
+        """
+        wrap = tk.Frame(self, bg=theme.CONTENT_BG)
+        wrap.pack(fill=tk.X, padx=24, pady=(20, 0))
+        head = tk.Frame(wrap, bg=theme.CONTENT_BG)
+        head.pack(fill=tk.X)
+        tk.Label(head, text="关于", font=theme.FONT_HEADING,
+                 bg=theme.CONTENT_BG, fg=theme.TEXT).pack(side=tk.LEFT)
+        tk.Label(head, text=f"当前版本 v{self._version}" if self._version else "当前版本未知",
+                 font=theme.FONT_SMALL, bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED).pack(
+            side=tk.LEFT, padx=(14, 0))
+        widgets.ghost_button(head, "检查更新", self._check_update).pack(side=tk.RIGHT)
+        self._update_note = tk.Label(head, text="", font=theme.FONT_SMALL,
+                                     bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
+        self._update_note.pack(side=tk.RIGHT, padx=(0, 12))
+        tk.Frame(wrap, bg=theme.ROW_LINE, height=1).pack(fill=tk.X, pady=(10, 6))
+
+    def _check_update(self) -> None:
+        if self._on_check_update is None:
+            self.show_update_note("这份没有接更新器", theme.TEXT_MUTED)
+            return
+        self._on_check_update()
+
+    def show_update_note(self, text: str, color: str) -> None:
+        if self._update_note is not None:
+            self._update_note.configure(text=text, fg=color)
 
     def _build_section(self, section: Section) -> None:
         wrap = tk.Frame(self, bg=theme.CONTENT_BG)

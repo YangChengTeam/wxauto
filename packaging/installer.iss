@@ -121,8 +121,17 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "立即运行 {#AppName}"; Flags: nowait postinstall skipifsilent
+; ★ 客户端自动更新（`wxclient/ui/updater.py`）用 `/SILENT ... /AUTOUPDATE=1` 起本安装程序：
+;   旧版已经自己退干净了，装完要把新版**拉起来**，不然用户看到的是「点了更新，程序没了」。
+;   只认这个参数，别改成 WizardSilent：管理员批量静默部署时不该在每台机器上弹出程序。
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: LaunchedByUpdater
 
 [Code]
+function LaunchedByUpdater: Boolean;
+begin
+  Result := ExpandConstant('{param:AUTOUPDATE|0}') = '1';
+end;
+
 { 卸载时问一句要不要连数据一起删。默认「否」——卸载多半只是为了装新版。 }
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var

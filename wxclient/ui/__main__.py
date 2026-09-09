@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -230,7 +231,7 @@ def _log_tk_callback_errors(root: tk.Tk) -> None:
     """
     import traceback
 
-    def report(exc_type, exc_value, exc_tb) -> None:  # noqa: ANN001 - tk 规定的签名
+    def report(exc_type, exc_value, exc_tb) -> None:  # tk 规定的签名
         _log.error(
             "界面回调出错",
             error=f"{exc_type.__name__}: {exc_value}",
@@ -275,6 +276,7 @@ def main(argv: list[str] | None = None) -> int:
     from .single_instance import SingleInstance, raise_existing_window
     from .status_reporter import StatusReporter
     from .tray import Tray
+    from .updater import Updater
     from .window import WINDOW_TITLE, MainWindow
 
     splash.stage("正在读取配置…")
@@ -477,6 +479,23 @@ def main(argv: list[str] | None = None) -> int:
     # 不用再 after 绕一圈。登进来之后点 × 还是缩托盘，判断在 window.close_requested 里。
     window.set_quit_action(quit_requested)
 
+    # 自动更新：查/下都在后台，装只在退出收尾之后（理由见 `updater.py` 顶上第 3 条）。
+    updater = Updater(__version__, wechat_settings.data_dir,
+                      manifest_url=settings.update_manifest_url)
+
+    def install_update(package: Path) -> None:
+        _log.info("更新包已就绪，退出后由安装程序完成升级", package=package.name)
+
+        def launch() -> None:
+            try:
+                updater.launch_installer(package)
+            except Exception:  # noqa: BLE001 - 服务已经停了，这里只能把原因留在日志里
+                _log.exception("安装程序没有启动，请到产品站手动安装")
+
+        shutdown(root, window, service, tray, reporter, after_stop=launch)
+
+    window.set_update_context(updater, on_install=install_update)
+
     # ★ **登录之前一概不起服务**（用户 2026-08-15：「登录前不应该启动相关的服务，
     # 登录之后才有」）。所以窗口一定要露面——不然就是一个缩在托盘里、什么都不干、
     # 也不说为什么的图标。服务只在 `start_service()` 一处起。
@@ -542,7 +561,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def shutdown(root: tk.Tk, window: MainWindow, service: GatewayService, tray: Tray,
-             reporter: Any = None) -> None:
+             reporter: Any = None, after_stop: Callable[[], None] | None = None) -> None:
     """退出：界面立刻响应，真正的收尾扔到后台线程。
 
     ``service.stop()`` 要等网关线程收口（最长 15s），放在 tkinter 主线程上跑，这段时间
@@ -556,12 +575,19 @@ def shutdown(root: tk.Tk, window: MainWindow, service: GatewayService, tray: Tra
 
     def finish() -> None:
         try:
-            # ★ 先把「我要下线了」送出去，再停服务（契约 §7：**没有心跳**，服务端不会
-            # 自己把 online 改成 offline；漏了这一步，企业端会一直显示这台机器在线）。
-            # 它最多等 3 秒——退出不能被网络卡住。
-            if reporter is not None:
-                reporter.shutdown()
-            service.stop()
+            try:
+                # ★ 先把「我要下线了」送出去，再停服务（契约 §7：**没有心跳**，服务端不会
+                # 自己把 online 改成 offline；漏了这一步，企业端会一直显示这台机器在线）。
+                # 它最多等 3 秒——退出不能被网络卡住。
+                if reporter is not None:
+                    reporter.shutdown()
+                service.stop()
+            except Exception:  # noqa: BLE001 - 收尾出错也要退出；原因留在日志里
+                _log.exception("退出收尾出错，照样退出")
+            # 自动更新：网关已收口、offline 已送出，这时候才轮到安装程序（`updater.py`）。
+            # 放在上面那层 try 外面：收尾出了错也不该把已经下好校验过的更新丢掉。
+            if after_stop is not None:
+                after_stop()
         finally:
             root.after(0, lambda: (window.destroy(), root.quit()))
             _exit_backstop()

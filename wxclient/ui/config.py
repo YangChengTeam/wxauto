@@ -33,5 +33,11 @@ class UiSettings(BaseSettings):
     start_hidden: bool = True
     """启动后直接缩到右下角托盘，不弹窗。"""
 
+    auto_update: bool = True
+    """后台定时查产品站有没有新版本（`ui/updater.py`）。关掉只是不自动查，配置中心里仍能手动查。"""
+
+    update_manifest_url: str = ""
+    """版本清单地址；空 = 产品站的 `latest.json`。只给测试/预发指向别处用，不进配置中心。"""
+
     log_lines: int = 2000
     """日志窗口最多保留多少行。"""

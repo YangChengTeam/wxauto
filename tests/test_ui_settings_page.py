@@ -80,6 +80,24 @@ class ConfigLookTests(unittest.TestCase):
             self.assertIn(title, texts)
             self.assertIn(desc, texts, "★ 段标题旁边那句说明也是设计稿的一部分")
 
+    def test_about_shows_the_version_and_a_check_update_button(self) -> None:
+        """「关于」一段：当前版本摆在明处，「检查更新」是这一页唯一的手动入口。"""
+        clicks: list[str] = []
+        page = SettingsPage(self.root, self.dir, version="0.1.53",
+                            on_check_update=lambda: clicks.append("check"))
+        _KEEP_ALIVE.append(page)
+        texts = self._labels(page)
+
+        self.assertIn("关于", texts)
+        self.assertIn("当前版本 v0.1.53", texts)
+        self.assertIn("检查更新", texts)
+
+        page._check_update()
+        self.assertEqual(clicks, ["check"])
+        page.show_update_note("已是最新版本 v0.1.53", theme.GREEN)
+        self.assertIn("已是最新版本 v0.1.53", self._labels(page))
+
+
     def test_scheduling_rows_sit_two_to_a_line(self) -> None:
         """★ 调度这几项在设计稿上是两列。一行一项会把这一页拉得老长，还得滚。"""
         sched = settings_store.fields_of("sched")

@@ -498,6 +498,11 @@ cutting OpenCV, anchoring the data directory, deleting the previous `_internal` 
 - **The release chain** is documented as a skill: [`.agents/skills/release-client/SKILL.md`](.agents/skills/release-client/SKILL.md).
   In short: bump `__version__` → test → build → edit the product site → `publish.sh` → verify online.
   Read the skill before releasing; it carries the ordering constraints and the traps.
+- **Publishing is pushing.** `publish.sh` writes `latest.json` next to the package, and every installed
+  client (0.1.53+) polls it every 6 hours and offers a one-click silent install (`wxclient/ui/updater.py`,
+  README 「桌面端」). A published package reaches users' machines without anyone re-downloading, so the
+  real-machine install-and-run step before publishing is not optional. Only a higher version can undo a
+  bad publish — the client never downgrades.
 - **The only source of the version number is `__version__` in `wxclient/__init__.py`.** `pyproject.toml`
   reads it dynamically and `packaging/build.py` reads it too — never write a second copy anywhere.
 - **Bump the version in the same batch as the client code change**, never "later, when we release": code in
