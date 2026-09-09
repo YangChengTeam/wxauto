@@ -208,6 +208,14 @@ class GatewaySettings(BaseSettings):
     """自动评论的素材：想传达什么、什么口吻。清空 = 自动评论不生效（没素材 AI 端写不出有分寸的话）。
     给一句缺省口吻是为了界面上不出现空格子；真正的开关是 `moments_auto_comment`。"""
 
+    # ── 对方发来的图片 / 文件（104）──
+    inbound_attachments: bool = True
+    """对方在微信里发来的图片、文件要不要另存到本机、随对话轮送给 AI 端（简历解析、证件识别）。
+
+    关掉时只在上下文里告诉模型「对方发了一张图片」，不另存、不上传。另存要在聊天窗口里
+    右键一次、过一个系统保存对话框，是风控看得见的动作之一；另存下来的文件是真实 PII，
+    只在本机留 24 小时（`attachments.RETENTION_HOURS`）。"""
+
     active_hours: str = "09:00-21:00"
 
     allow_insecure_transport: bool = False

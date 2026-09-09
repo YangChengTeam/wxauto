@@ -22,9 +22,10 @@ from typing import Any
 import structlog
 
 from .. import logrole
+from .attachments import attachment_bytes, inline_attachments
 from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
-from .candidates import CandidateDirectory
+from .candidates import CandidateDirectory, CandidateUpdateError
 from .capabilities import CAPABILITIES_OP, Capability, capabilities_frame
 from .commands import (
     COMMAND_EVENT,
@@ -974,7 +975,7 @@ class GatewayRunner:
                 skipped_reason="AI 端这一轮没有给出结果", follow_up=FOLLOW_UP_RETRY
             )
         try:
-            return await self._sender.deliver(account_id, peer_id, card)
+            result = await self._sender.deliver(account_id, peer_id, card)
         except Exception as exc:  # noqa: BLE001 —— 见上：投递阶段不允许触发重投
             _wechat.warning(
                 "投递回复时出错，本批不再重投（可能已经发出去一部分，重投会重复骚扰对方）",
@@ -982,6 +983,56 @@ class GatewayRunner:
                 error=str(exc),
             )
             return DeliveryResult(skipped_reason=f"投递失败：{exc}")
+        # 104：卡上认领的证件/简历 → 连文件带识别结果传业务后端。放在投递之后、只记账不上抛：
+        # 微信那边的回复已经发出去了，簿记失败不该让这一批重投。
+        await self._upload_documents(account_id, peer_id, card, messages)
+        return result
+
+    async def _upload_documents(
+        self,
+        account_id: str,
+        peer_id: str,
+        card: dict[str, Any],
+        messages: Sequence[InboundMessage],
+    ) -> None:
+        """卡片 ``body.documents[]``（104）→ ``CandidateDirectory.upload_material``。
+
+        **候选人 ID 由本机反查**（同状态回写那条）：反查不到就如实跳过，绝不拿别人的 ID 顶上。
+        文件按 ``file_name`` 回指这一批另存下来的附件；卡上写了个不存在的名字就跳过那条。
+        """
+        body = card.get("body") if isinstance(card.get("body"), dict) else card
+        documents = body.get("documents") if isinstance(body, dict) else None
+        if not isinstance(documents, list) or not documents:
+            return
+        if self._candidates is None or not self._candidates.configured:
+            _backend.info("识别到证件/简历，但本机没配业务接口地址，不上传", 份数=len(documents))
+            return
+        candidate_id = self._store.contact_worker_id(account_id, peer_id)
+        if not candidate_id:
+            _backend.info("识别到证件/简历，但本机不知道这个会话对应哪个候选人，不上传", 会话=peer_id)
+            return
+        for entry in documents:
+            if not isinstance(entry, dict):
+                continue
+            file_name = str(entry.get("file_name") or "").strip()
+            data = attachment_bytes(messages, file_name) if file_name else None
+            if data is None:
+                _backend.warning("卡上认领的材料在这一批附件里找不到，跳过", 文件=file_name[:60])
+                continue
+            try:
+                result = await self._candidates.upload_material(
+                    candidate_id,
+                    material_type=str(entry.get("material_type") or ""),
+                    file_name=file_name,
+                    data=data,
+                    fields=entry.get("fields") if isinstance(entry.get("fields"), dict) else None,
+                    consent_note=str(entry.get("consent_note") or ""),
+                )
+            except CandidateUpdateError as exc:
+                _backend.warning("材料上传请求不成立", error=str(exc))
+                continue
+            if not result.get("uploaded"):
+                _backend.info("材料没传上去", 原因=str(result.get("reason") or ""), 类型=entry.get("material_type"))
 
     def _elapsed(self, started: datetime) -> int:
         """从 ``started`` 到现在过了几秒（取整，只用于日志）。"""
@@ -1043,6 +1094,13 @@ class GatewayRunner:
         """
         history = self._history_for(account_id, peer_id, messages)
         refs = self._peer_refs(account_id, peer_id)
+        # 104：这一批消息另存下来的图片/文件，随轮送过去（AI 端落到会话 inbox）。
+        attachments, left_behind = inline_attachments(messages)
+        if left_behind:
+            _ai.info("这一轮有附件没能带上（超出个数/体积上限或已过期）", 会话=peer_id, 个数=left_behind)
+        extra_turn: dict[str, Any] = {}
+        if attachments:
+            extra_turn["attachments"] = attachments
         for attempt in (1, 2):
             started = self._clock()
             _ai.info(
@@ -1051,6 +1109,7 @@ class GatewayRunner:
                 本轮=len(messages),
                 历史行=history.count("\n") + 1 if history else 0,
                 认得这个人=bool(refs),
+                附件=len(attachments),
                 第几次=attempt,
             )
             heartbeat = asyncio.create_task(self._turn_heartbeat(peer_id, started))
@@ -1064,6 +1123,7 @@ class GatewayRunner:
                     extra={
                         "wechat": self._turn_meta(peer_id, messages),
                         "history": history,
+                        **extra_turn,
                     },
                     on_stage=lambda stage: self._note_stage(peer_id, stage),
                 )

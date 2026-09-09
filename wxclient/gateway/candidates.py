@@ -14,6 +14,8 @@ AI 端算出「这个人该往前走一格」→ 把那一格**投回来**（`op
 
 from __future__ import annotations
 
+import json
+import mimetypes
 from typing import Any
 
 import structlog
@@ -32,6 +34,19 @@ AI_STATUSES = frozenset(
 _REASON_REQUIRED = frozenset({"human_takeover", "blocked"})
 #: §9.1：`profile` 里我们只写这三样。别的字段由人在网页上改，分身不碰。
 _PROFILE_KEYS = frozenset({"wechatName", "wechatAdded", "remark"})
+
+
+#: 104：候选人在微信里发来的证件/简历，落到业务后端「入职材料」的四种材料类型。
+#: 与 `lxz_agent_backend/docs/21_wechat_inbound_attachments_contract.md` §3 同口径。
+MATERIAL_TYPES = frozenset({"id_card_front", "id_card_back", "bank_card", "resume"})
+#: 每种材料随行的识别字段白名单（同上 §3.2）。不在名单里的键**不发**——后端 zod 是 strict 的，
+#: 多一个键整个请求 400，而我们这边还以为传上去了。
+_MATERIAL_FIELDS: dict[str, frozenset[str]] = {
+    "id_card_front": frozenset({"name", "gender", "ethnicity", "birth_date", "address", "id_number"}),
+    "id_card_back": frozenset({"issuing_authority", "valid_from", "valid_to"}),
+    "bank_card": frozenset({"card_number", "bank_name", "card_type", "holder_name"}),
+    "resume": frozenset({"name", "phone", "gender", "age", "expected_position", "expected_city"}),
+}
 
 
 class CandidateUpdateError(Exception):
@@ -99,6 +114,69 @@ class CandidateDirectory(BackendEndpoint):
         )
         return {"updated": True, **({"version": version} if version is not None else {})}
 
+    async def upload_material(
+        self,
+        candidate_id: str,
+        *,
+        material_type: str,
+        file_name: str,
+        data: bytes,
+        fields: dict[str, Any] | None = None,
+        consent_note: str = "",
+    ) -> dict[str, Any]:
+        """把候选人微信里发来的证件/简历连同识别结果传给业务后端（104，契约 `docs/21` §3）。
+
+        `POST /recruitment-agent/client/candidates/{id}/onboarding-materials`，multipart：
+        ``material_type``、``file``、``fields``（JSON 字符串）、``consent``（JSON 字符串）。
+        **后端实现之前这条会 404**：如实回 `{"uploaded": False, "reason": …}`，不重试、不上抛——
+        微信那边的回复已经发出去了，簿记失败不该把它撤回。
+        """
+        candidate_id = (candidate_id or "").strip()
+        if not candidate_id:
+            raise CandidateUpdateError("没说材料属于哪个候选人")
+        material_type = str(material_type or "").strip()
+        if material_type not in MATERIAL_TYPES:
+            raise CandidateUpdateError(f"不认识的材料类型：{material_type or '(空)'}")
+        if not data:
+            raise CandidateUpdateError("材料文件是空的")
+        if not self.configured:
+            return {"uploaded": False, "reason": "本机没配业务接口地址"}
+
+        allowed = _MATERIAL_FIELDS[material_type]
+        clean_fields = {
+            k: v for k, v in (fields or {}).items()
+            if k in allowed and isinstance(v, (str, int, float)) and str(v).strip()
+        }
+        consent = {"source": "wechat_chat", "note": str(consent_note or "").strip()[:200]}
+        safe_id = candidate_id.replace("/", "").replace("?", "").replace("#", "")
+        url = f"{self._base_url}{CANDIDATES_PATH}/{safe_id}/onboarding-materials"
+        response = await self._send(
+            "POST",
+            url,
+            data={
+                "material_type": material_type,
+                "fields": json.dumps(clean_fields, ensure_ascii=False),
+                "consent": json.dumps(consent, ensure_ascii=False),
+            },
+            files={"file": (file_name, data, _content_type(file_name))},
+        )
+        if response is None:
+            return {"uploaded": False, "reason": "业务接口没回应"}
+        if response.status_code == 404:
+            # 契约拟好了、后端还没接（同 090 的先例）。说清楚是「后端还没这个接口」。
+            _log.warning("入职材料接口后端尚未实现（404），这份材料没传上去", material_type=material_type)
+            return {"uploaded": False, "reason": "后端还没有入职材料接口"}
+        if response.status_code >= 400:
+            _log.warning("入职材料上传被拒", status=response.status_code, material_type=material_type)
+            return {"uploaded": False, "reason": f"业务接口拒绝（{response.status_code}）"}
+        try:
+            parsed = response.json()
+        except Exception:  # noqa: BLE001
+            parsed = {}
+        material_id = parsed.get("materialId") if isinstance(parsed, dict) else None
+        _log.info("入职材料已上传", material_type=material_type, fields=sorted(clean_fields))
+        return {"uploaded": True, **({"material_id": material_id} if material_id else {})}
+
     async def _request(self, candidate_id: str, body: dict[str, Any]) -> dict[str, Any] | None:
         # candidate_id 是后端给的 UUID，直接拼进路径前先挡掉分隔符——多一道，别让它跑出这条路径。
         safe_id = candidate_id.replace("/", "").replace("?", "").replace("#", "")
@@ -118,3 +196,8 @@ class CandidateDirectory(BackendEndpoint):
         except Exception:  # noqa: BLE001
             return {}
         return parsed if isinstance(parsed, dict) else {}
+
+
+def _content_type(file_name: str) -> str:
+    guessed, _ = mimetypes.guess_type(file_name)
+    return guessed or "application/octet-stream"

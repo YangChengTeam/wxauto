@@ -229,6 +229,23 @@ class WeChatApi:
     def read_chat_history(self, friend: str, limit: int = 50) -> dict[str, Any]:
         return self._run_driver("read_chat_history", friend=friend, limit=limit)
 
+    def save_message_attachment(
+        self,
+        friend: str,
+        target_dir: str,
+        runtime_id: str = "",
+        order: int = -1,
+        text: str = "",
+    ) -> dict[str, Any]:
+        return self._run_driver(
+            "save_message_attachment",
+            friend=friend,
+            target_dir=target_dir,
+            runtime_id=runtime_id,
+            order=order,
+            text=text,
+        )
+
     def scan_messages(
         self,
         friend: str,

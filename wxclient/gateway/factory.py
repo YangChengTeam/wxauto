@@ -18,6 +18,7 @@ from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
 from .. import logrole
+from .attachments import AttachmentFetcher
 from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
 from .candidates import CandidateDirectory
@@ -219,7 +220,18 @@ def build_gateway(
         settings=gateway_settings,
         ticket_provider=ticket_provider,
         store=store,
-        source=QueueMessageSource(runtime=runtime, store=store, watchlist=watchlist),
+        source=QueueMessageSource(
+            runtime=runtime,
+            store=store,
+            watchlist=watchlist,
+            # 104：对方发来的图片/文件另存到本机随轮送 AI 端。目录跟 gateway.db 放一起，
+            # 同样在 `.wxclient/` 下、同样禁止入库。
+            attachment_fetcher=(
+                AttachmentFetcher(runtime=runtime, root=database_path.parent / "attachments")
+                if gateway_settings.inbound_attachments
+                else None
+            ),
+        ),
         sink=QueueMessageSink(
             runtime=runtime,
             allow_real_actions=allow_real_actions,

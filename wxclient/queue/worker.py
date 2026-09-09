@@ -239,6 +239,14 @@ class OperationWorker:
                 friend=str(payload["friend"]),
                 limit=int(payload.get("limit", 50)),
             )
+        if task.type == TaskType.SAVE_MESSAGE_ATTACHMENT:
+            return self.api.save_message_attachment(
+                friend=str(payload["friend"]),
+                target_dir=str(payload["target_dir"]),
+                runtime_id=str(payload.get("runtime_id") or ""),
+                order=int(payload.get("order", -1)),
+                text=str(payload.get("text") or ""),
+            )
         if task.type == TaskType.READ_VISIBLE_MESSAGES:
             return self.api.read_visible_messages(
                 friend=str(payload["friend"]),

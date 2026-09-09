@@ -478,6 +478,13 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"聊天记录读取完成：{payload.get('friend') or '-'}，"
             f"共 {payload.get('message_count', 0)} 条"
         )
+    if event == "chat.attachment.save.start":
+        return f"开始另存对方发来的附件：「{payload.get('friend') or '-'}」，气泡：{payload.get('text') or '-'}"
+    if event == "chat.attachment.save.done":
+        return (
+            f"附件已另存：「{payload.get('friend') or '-'}」，"
+            f"{payload.get('name') or '-'}（{payload.get('bytes', 0)} 字节）"
+        )
     if event == "chat.voice.row":
         state = "已转成文字" if payload.get("ready") else "还没转成文字"
         return f"读到一条语音（{state}）：{payload.get('raw') or '（名称为空）'}"

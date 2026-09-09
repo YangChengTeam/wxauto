@@ -25,6 +25,7 @@ import structlog
 
 from wxclient.queue import TaskStatus, TaskType
 
+from .attachments import SAVABLE_TYPES as SAVABLE_ATTACHMENT_TYPES
 from .inbound import InboundMessage
 from .sessions import HUMAN_TAKEOVER, GatewayStore
 from .watchlist import Watchlist
@@ -104,8 +105,13 @@ def hold_pending_voice(
     return kept, 0
 
 
-def message_signature(raw: dict[str, Any]) -> str:
+def message_signature(raw: dict[str, Any], dup_index: int = 0) -> str:
     """一条消息的签名（游标用）。没有稳定 id，只能拿文本凑。
+
+    ``dup_index``（104）：这条之前、同一窗口里已有几条**同文**的行。图片气泡读出来
+    全是「图片」两个字——对方连发两张身份证正反面，游标停在第一张上，下一轮从后往前找
+    会先撞上第二张，第二张就永远不算新的了。把「第几个同文」算进签名，两张就分得开。
+    首个（``dup_index=0``）的签名与旧算法一致，库里已有的游标不受影响。
 
     ★ **绝不能把 `sender` / `is_self` 算进来**（2026-08-13 真机血的教训）：
     `uia.py::read_current_chat` 只给**最后一条**消息补这两个字段（靠会话预览文案 +
@@ -125,7 +131,22 @@ def message_signature(raw: dict[str, Any]) -> str:
         # 语音气泡：转写出来之前 text 是空、出来之后是正文，同一条消息两种 text。
         # 只有「语音12"秒」这段前后不变，签它。
         return sha256(f"voice\x00{label}".encode()).hexdigest()[:32]
-    return sha256(str(raw.get("text") or "").encode()).hexdigest()[:32]
+    text = str(raw.get("text") or "")
+    if dup_index > 0:
+        return sha256(f"dup{dup_index}\x00{text}".encode()).hexdigest()[:32]
+    return sha256(text.encode()).hexdigest()[:32]
+
+
+def dup_indexes(raw_messages: Sequence[dict[str, Any]]) -> list[int]:
+    """每一行在这个窗口里是第几条同文（语音按标签算）。见 `message_signature`。"""
+    seen: dict[str, int] = {}
+    out: list[int] = []
+    for raw in raw_messages:
+        key = f"voice\x00{raw.get('voice_label')}" if raw.get("voice_label") else str(raw.get("text") or "")
+        index = seen.get(key, 0)
+        out.append(index)
+        seen[key] = index + 1
+    return out
 
 
 def legacy_message_signature(raw: dict[str, Any]) -> str:
@@ -135,7 +156,7 @@ def legacy_message_signature(raw: dict[str, Any]) -> str:
     return sha256(f"{sender}\x00{text}".encode()).hexdigest()[:32]
 
 
-def cursor_candidates(raw: dict[str, Any]) -> set[str]:
+def cursor_candidates(raw: dict[str, Any], dup_index: int = 0) -> set[str]:
     """这一行**可能**被记成游标的所有签名形态。
 
     老游标是在「它当过最后一条、被补了 `sender='我'` / `is_self=True`」的那一刻算的，
@@ -144,6 +165,8 @@ def cursor_candidates(raw: dict[str, Any]) -> set[str]:
     """
     text = str(raw.get("text") or "")
     return {
+        message_signature(raw, dup_index),
+        # 老游标不带同文序号（104 之前）；同文的后几条也认一次，代价只是多认到一个位置。
         message_signature(raw),
         legacy_message_signature(raw),
         sha256(f"self\x00{text}".encode()).hexdigest()[:32],
@@ -161,16 +184,23 @@ def split_new_messages(
     if not raw_messages:
         return [], last_signature
 
-    latest_signature = message_signature(raw_messages[-1])
+    dups = dup_indexes(raw_messages)
+    latest_signature = message_signature(raw_messages[-1], dups[-1])
     if last_signature is None:
         return first_seen_fresh(raw_messages), latest_signature
 
-    # 从后往前找游标最后一次出现的位置（老游标按旧算法也认一次，见 legacy_message_signature）。
+    # 从后往前找游标最后一次出现的位置。先按带同文序号的新签名精确找（104：连发两张
+    # 「图片」时停在正确的那一张），找不到再按老签名认（库里 104 之前记的游标）。
     cursor_index = -1
     for index in range(len(raw_messages) - 1, -1, -1):
-        if last_signature in cursor_candidates(raw_messages[index]):
+        if last_signature == message_signature(raw_messages[index], dups[index]):
             cursor_index = index
             break
+    if cursor_index < 0:
+        for index in range(len(raw_messages) - 1, -1, -1):
+            if last_signature in cursor_candidates(raw_messages[index], dups[index]):
+                cursor_index = index
+                break
 
     if cursor_index < 0:
         # 这条**不是**日常噪音：正常情况下游标就在刚读到的这批里。连着出现 =
@@ -236,6 +266,33 @@ def preview(raw: dict[str, Any]) -> str:
     return text[:PREVIEW_CHARS] + "…" if len(text) > PREVIEW_CHARS else text or "（空）"
 
 
+#: 表情 / 视频 / 拿不到的图片文件，喂给 AI 端的占位正文（104）。方括号写法与 AI 端
+#: `context.mjs` 的 `FILLER_RE` 同口径——表情那条要让它认出「这不是一句话」。
+EMOJI_TEXT = "[动画表情]"
+VIDEO_TEXT = "[对方发来一段视频，助手看不了视频]"
+IMAGE_UNSAVED_TEXT = "[对方发来一张图片，没能保存下来]"
+FILE_UNSAVED_TEXT = "[对方发来一个文件{name}，没能保存下来]"
+IMAGE_ATTACHED_TEXT = "[图片：{name}（已附上）]"
+FILE_ATTACHED_TEXT = "[文件：{name}（已附上）]"
+
+
+def attachment_text(raw: dict[str, Any], attachment: dict[str, Any] | None) -> str:
+    """图片 / 文件 / 表情 / 视频气泡在上下文里的正文。文字消息原样返回。"""
+    kind = str(raw.get("message_type") or "text")
+    if kind == "emoji":
+        return EMOJI_TEXT
+    if kind == "video":
+        return VIDEO_TEXT
+    if kind == "image":
+        return IMAGE_ATTACHED_TEXT.format(name=attachment["file_name"]) if attachment else IMAGE_UNSAVED_TEXT
+    if kind == "file":
+        if attachment:
+            return FILE_ATTACHED_TEXT.format(name=attachment["file_name"])
+        name = str(raw.get("file_name") or "").strip()
+        return FILE_UNSAVED_TEXT.format(name=f"「{name}」" if name else "")
+    return str(raw.get("text") or "")
+
+
 def to_inbound(
     account_id: str,
     peer_id: str,
@@ -243,17 +300,19 @@ def to_inbound(
     *,
     seq: int,
     at: datetime | None = None,
+    attachment: dict[str, Any] | None = None,
 ) -> InboundMessage:
     return InboundMessage(
         account_id=account_id,
         peer_id=peer_id,
         msg_id=f"{peer_id}#{seq}",
-        text=str(raw.get("text") or ""),
+        text=attachment_text(raw, attachment),
         at=at or datetime.now(timezone.utc),
         from_self=is_self_message(raw),
         peer_name=peer_id,
         at_text=str(raw.get("timestamp_text") or "").strip(),
         message_type=str(raw.get("message_type") or "text"),
+        attachments=(attachment,) if attachment else (),
     )
 
 
@@ -273,11 +332,14 @@ class QueueMessageSource:
         history_limit: int = 20,
         clock=None,
         on_unreachable=None,
+        attachment_fetcher=None,
     ) -> None:
         self._runtime = runtime
         self._store = store
         self._watchlist = watchlist or Watchlist()
         self._history_limit = history_limit
+        # 104：对方发来的图片/文件另存到本机的那一手。None = 不另存（只在正文里说「发了张图」）。
+        self._attachments = attachment_fetcher
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._rotation = 0
         # 092：连续 UNREACHABLE_STRIKES 轮读不到时喊一声。**只是「读不到」，不是「不是好友」**
@@ -473,11 +535,23 @@ class QueueMessageSource:
             )
 
         now = self._clock()
-        return [
-            to_inbound(account_id, peer_id, raw, seq=seq + offset + 1, at=now)
-            for offset, raw in enumerate(fresh)
-            if str(raw.get("text") or "").strip()
-        ]
+        inbound: list[InboundMessage] = []
+        for offset, raw in enumerate(fresh):
+            if not str(raw.get("text") or "").strip():
+                continue
+            attachment = None
+            # 104：对方发来的图片/文件先另存到本机，随这一轮送给 AI 端。只取对方发的——
+            # 专员自己发出去的合同、海报不用回头再读一遍。
+            if (
+                self._attachments is not None
+                and str(raw.get("message_type") or "") in SAVABLE_ATTACHMENT_TYPES
+                and not is_self_message(raw)
+            ):
+                attachment = await self._attachments.fetch(account_id, peer_id, raw)
+            inbound.append(
+                to_inbound(account_id, peer_id, raw, seq=seq + offset + 1, at=now, attachment=attachment)
+            )
+        return inbound
 
 
 class SendNotConfirmed(RuntimeError):

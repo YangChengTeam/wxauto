@@ -67,8 +67,12 @@ class InboundMessage:
     之后（不再依赖未读），读到的很可能是几分钟前甚至昨天的消息——把读取时刻当发送时刻
     喂给模型，它就会对着一条昨晚的消息说「你刚才说」。"""
     message_type: str = "text"
-    """``text`` / ``voice``。语音是微信自动转文字后读到的（``text`` 已是转写正文），
-    要让模型知道这是听写来的（可能有错字），上报后端时 ``messageType`` 也照实填。"""
+    """``text`` / ``voice`` / ``image`` / ``file`` / ``emoji`` / ``video``。语音是微信自动转文字后
+    读到的（``text`` 已是转写正文），要让模型知道这是听写来的（可能有错字），上报后端时
+    ``messageType`` 也照实填。图片/文件的 ``text`` 是网关写的占位句（见 `wechat_io.attachment_text`）。"""
+    attachments: tuple[dict, ...] = ()
+    """这条消息另存下来的附件（104）：``{"kind", "file_name", "path", "bytes"}``。
+    路径是**本机**的临时目录，只在起轮时读一次字节送 AI 端；过保鲜期整目录清掉。"""
 
     @property
     def key(self) -> PeerKey:
@@ -85,6 +89,7 @@ def message_to_row(message: InboundMessage) -> dict:
         "peer_name": message.peer_name,
         "at_text": message.at_text,
         "message_type": message.message_type,
+        "attachments": [dict(entry) for entry in message.attachments],
     }
 
 
@@ -104,6 +109,9 @@ def message_from_row(account_id: str, peer_id: str, row: dict) -> InboundMessage
         peer_name=str(row.get("peer_name") or peer_id),
         at_text=str(row.get("at_text") or ""),
         message_type=str(row.get("message_type") or "text"),
+        attachments=tuple(
+            dict(entry) for entry in (row.get("attachments") or []) if isinstance(entry, dict)
+        ),
     )
 
 

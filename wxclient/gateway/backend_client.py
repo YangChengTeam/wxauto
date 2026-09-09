@@ -117,7 +117,11 @@ class BackendEndpoint:
             return None
         self._not_ready = ""
         path = self._path_of(url)
-        headers = {"authorization": f"Bearer {token}", "content-type": "application/json"}
+        headers = {"authorization": f"Bearer {token}"}
+        # multipart（104 的证件/简历上传）由 httpx 自己定 boundary 和 content-type；
+        # 只有 JSON 请求才手写这一头。
+        if "files" not in kwargs:
+            headers["content-type"] = "application/json"
         # 请求发出去了、后端回了什么，两边各留一行。**只记 method/path/状态码**：
         # 请求体里有候选人姓名、手机号、会话名，那是真实 PII，日志文件不该有第二份。
         _log.info("请求业务接口", method=method, path=path)

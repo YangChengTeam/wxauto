@@ -31,6 +31,8 @@ class TaskType(str, Enum):
     GET_UNREAD_MESSAGES = "get_unread_messages"
     READ_CHAT_SESSIONS = "read_chat_sessions"
     READ_CHAT_HISTORY = "read_chat_history"
+    # 104：把一条图片/文件气泡另存到本地目录。只写本机磁盘，对方看不见，不算写类。
+    SAVE_MESSAGE_ATTACHMENT = "save_message_attachment"
     READ_VISIBLE_MESSAGES = "read_visible_messages"
     WATCH_CHATS = "watch_chats"
     POST_MOMENTS = "post_moments"

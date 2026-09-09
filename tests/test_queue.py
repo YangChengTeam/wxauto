@@ -55,6 +55,9 @@ class _FakeApi:
     def read_chat_history(self, friend: str, limit: int) -> dict[str, Any]:
         return {"action": "read_chat_history", "friend": friend, "limit": limit}
 
+    def save_message_attachment(self, friend: str, target_dir: str, **kwargs: Any) -> dict[str, Any]:
+        return {"action": "save_message_attachment", "friend": friend, "target_dir": target_dir, **kwargs}
+
     def scan_messages(
         self,
         friend: str,
@@ -529,6 +532,10 @@ class WorkerDispatchTests(unittest.TestCase):
             history = worker.dispatch(
                 Task.new(TaskType.READ_CHAT_HISTORY, {"friend": "大月", "limit": 20})
             )
+            saved = worker.dispatch(
+                Task.new(TaskType.SAVE_MESSAGE_ATTACHMENT,
+                         {"friend": "大月", "target_dir": tmp, "runtime_id": "r1", "order": 2, "text": "图片"})
+            )
             files = worker.dispatch(
                 Task.new(
                     TaskType.SEND_FILES,
@@ -540,6 +547,7 @@ class WorkerDispatchTests(unittest.TestCase):
         self.assertEqual(members["members"], ["甲", "乙"])
         self.assertEqual(unread["total_unread"], 2)
         self.assertEqual(history["limit"], 20)
+        self.assertEqual((saved["runtime_id"], saved["order"], saved["text"]), ("r1", 2, "图片"))
         self.assertTrue(files["dry_run"])
 
 

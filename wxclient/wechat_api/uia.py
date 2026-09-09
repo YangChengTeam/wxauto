@@ -2025,6 +2025,145 @@ class UiaWeChatDriver:
             "window_reused": reused_window,
         }
 
+    def save_message_attachment(
+        self,
+        friend: str,
+        target_dir: str,
+        runtime_id: str = "",
+        order: int = -1,
+        text: str = "",
+        timeout_seconds: float = 20.0,
+    ) -> dict[str, Any]:
+        """把当前会话里的一条图片/文件气泡另存到 ``target_dir``（104）。
+
+        走的是**右键 → 「另存为…」 → 系统保存对话框**这条最短的路：两次点击、一次回车。
+        vendor 的批量保存（聊天记录窗口多选 + 「保存」按钮）要多开一个窗口、多一轮翻页，
+        而我们一轮只取一两个附件，短路更省、也更不像机器。
+
+        保存对话框里**不改文件名**：先把目标目录贴进文件名框回车（对话框跳到该目录），
+        再回车一次按微信给的默认名保存——扩展名由微信定，我们不猜。
+
+        ⚠️ 未在真机验证前，这里每一步的控件判据都可能跟微信版本走
+        （memory `wechat-uia-window-state`）；失败一律抛 `WeChatApiError` 让网关如实放弃，
+        不重试、不猜路径。
+        """
+        normalized_friend = str(friend or "").strip()
+        if not normalized_friend:
+            raise ValueError("会话名称不能为空")
+        target = Path(str(target_dir or "")).expanduser()
+        if not str(target_dir or "").strip():
+            raise ValueError("保存目录不能为空")
+        target.mkdir(parents=True, exist_ok=True)
+        self._ensure_ready()
+        logger.info("chat.attachment.save.start", friend=normalized_friend, text=str(text or "")[:40])
+
+        window = self._open_main_dialog_window(normalized_friend, select=False)
+        chat_list = self._resolve_chat_list(window)
+        if chat_list is None:
+            raise WeChatApiError("未找到聊天消息列表")
+        item = _matching_list_item_for_message(
+            chat_list, {"runtime_id": runtime_id or "", "order": order, "text": text or ""}
+        )
+        if item is None:
+            raise WeChatApiError("这条消息不在当前窗口的可见区里，没法另存")
+
+        before = {entry.name for entry in target.iterdir()}
+        mouse = __import__("pywinauto", fromlist=["mouse"]).mouse
+        rect = item.rectangle()
+        click_at = (int(rect.mid_point().x), int(rect.mid_point().y))
+        mouse.right_click(coords=click_at)
+        time.sleep(random.uniform(0.4, 0.9))
+
+        Uielements = self._pyweixin_submodule("Uielements")
+        save_item = window.child_window(**Uielements.MenuItems.SaveMenuItem)
+        if not save_item.exists(timeout=2.0):
+            # 菜单没有「另存为」= 这不是可保存的气泡（表情、已过期的图、系统消息）。
+            # 把菜单点掉（vendor 同款：在原位再点一下），绝不按 ESC——那会关掉微信窗口。
+            with suppress(Exception):
+                mouse.click(coords=click_at)
+            raise WeChatApiError("右键菜单里没有「另存为」，这条内容不可保存（可能已过期或不是图片/文件）")
+        save_item.click_input()
+
+        dialog = self._await_native_save_dialog(timeout=8.0)
+        if dialog is None:
+            raise WeChatApiError("点了「另存为」但系统保存对话框没出现")
+        try:
+            self._drive_native_save_dialog(dialog, target)
+            saved = self._await_saved_file(target, before, timeout=timeout_seconds)
+        except Exception:
+            with suppress(Exception):
+                if dialog.exists(timeout=0.2):
+                    dialog.type_keys("{ESC}")   # 只关系统对话框；微信主窗口不在这个键的作用域里
+            raise
+        size = saved.stat().st_size
+        logger.info("chat.attachment.save.done", friend=normalized_friend, name=saved.name, bytes=size)
+        return {
+            "action": "save_message_attachment",
+            "friend": normalized_friend,
+            "path": str(saved),
+            "file_name": saved.name,
+            "bytes": size,
+        }
+
+    def _await_native_save_dialog(self, timeout: float) -> Any | None:
+        """等 Windows 的「另存为」对话框（Win32 `#32770`）弹出来。"""
+        Desktop = __import__("pywinauto", fromlist=["Desktop"]).Desktop
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                desktop = Desktop(backend="uia")
+                for candidate in desktop.windows():
+                    if _safe_call(candidate.class_name) != "#32770":
+                        continue
+                    title = str(_safe_call(candidate.window_text) or "")
+                    if any(mark in title for mark in ("另存为", "另存為", "Save As", "保存")):
+                        return candidate
+            except Exception:  # noqa: BLE001, S110 —— 枚举桌面窗口时任何一扇窗都可能正在消失，跳过继续等
+                pass
+            time.sleep(0.25)
+        return None
+
+    def _drive_native_save_dialog(self, dialog: Any, target: Path) -> None:
+        """文件名框里贴目标目录 → 回车（跳目录）→ 再回车（按默认名保存）。"""
+        edit = None
+        for kwargs in ({"class_name": "Edit", "found_index": 0}, {"control_type": "Edit", "found_index": 0}):
+            try:
+                candidate = dialog.child_window(**kwargs)
+                if candidate.exists(timeout=1.5):
+                    edit = candidate
+                    break
+            except Exception:  # noqa: BLE001, S112 —— 两种判据挨个试，这个不成就下一个
+                continue
+        if edit is None:
+            raise WeChatApiError("保存对话框里找不到文件名输入框")
+        edit.set_focus()
+        # 贴路径而不是逐字敲：路径里可能有中文，键盘事件对输入法不可控；剪贴板是 vendor 一直在用的路。
+        SystemSettings = self._pyweixin_class("SystemSettings")
+        SystemSettings.copy_text_to_clipboard(str(target))
+        edit.type_keys("^a^v", set_foreground=True)
+        time.sleep(0.2)
+        edit.type_keys("{ENTER}", set_foreground=True)
+        time.sleep(random.uniform(0.6, 1.1))
+        # 第二次回车：文件名框此时是微信给的默认名，直接保存。
+        edit.type_keys("{ENTER}", set_foreground=True)
+
+    @staticmethod
+    def _await_saved_file(target: Path, before: set[str], timeout: float) -> Path:
+        """等目录里多出一个文件且大小不再变化（微信是流式写盘的）。"""
+        deadline = time.monotonic() + timeout
+        last_size: dict[str, int] = {}
+        while time.monotonic() < deadline:
+            fresh = [entry for entry in target.iterdir() if entry.name not in before and entry.is_file()]
+            fresh = [entry for entry in fresh if not entry.name.lower().endswith((".tmp", ".crdownload", ".part"))]
+            if fresh:
+                entry = max(fresh, key=lambda e: e.stat().st_mtime)
+                size = entry.stat().st_size
+                if size > 0 and last_size.get(entry.name) == size:
+                    return entry
+                last_size[entry.name] = size
+            time.sleep(0.5)
+        raise WeChatApiError("另存为没有落下文件（等超时了）")
+
     def _collect_history_pages(
         self, window: Any, chat_name: str, safe_limit: int
     ) -> list[dict[str, Any]]:
@@ -2700,6 +2839,9 @@ class UiaWeChatDriver:
                 "order": order,
                 **metrics,
             }
+            attachment = _annotate_attachment_row(class_name, text)
+            if attachment is not None:
+                row.update(attachment)
             if voice is not None:
                 row.update(voice)
                 # 真机上语音气泡的名称到底长什么样，只有这条日志能告诉我们（SSH 会话里
@@ -3812,6 +3954,38 @@ def _is_self_activity_row(row: dict[str, Any]) -> bool:
 
 
 VOICE_ITEM_CLASS = "mmui::ChatVoiceItemView"
+
+#: 图片 / 文件 / 动画表情 / 视频气泡在 UIA 树里的名字（vendor `Special_Labels`：图片='图片'、文件='文件'、视频='视频'）。
+#: 中英繁都认；方括号是微信在会话预览里的写法，气泡名字上通常没有，但认上不吃亏。
+_IMAGE_LABELS = frozenset({"图片", "[图片]", "圖片", "[圖片]", "Image", "[Image]", "Photo", "[Photo]"})
+_EMOJI_LABELS = frozenset({"动画表情", "[动画表情]", "動畫表情", "[動畫表情]", "Sticker", "[Sticker]", "表情", "[表情]"})
+_VIDEO_LABELS = frozenset({"视频", "[视频]", "影片", "[影片]", "Video", "[Video]"})
+_FILE_PREFIXES = ("文件", "[文件]", "檔案", "[檔案]", "File", "[File]")
+#: 文件气泡名字里的文件名：`xxx.pdf` / `报名表.docx`（扩展名 1–8 位字母数字）。
+_FILE_NAME_RE = re.compile(r"([^\s\[\]:：/\\]+\.[A-Za-z0-9]{1,8})(?![A-Za-z0-9.])")
+
+
+def _annotate_attachment_row(class_name: Any, text: str) -> dict[str, Any] | None:
+    """图片 / 文件 / 动画表情 / 视频气泡 → 附加 ``message_type``（+ ``file_name``）；其余返回 None（104）。
+
+    只按 UIA 名字和类名判，**不碰控件**。文字气泡恰好只写了「图片」两个字的情况认不出来，
+    代价是把它当成一张图去另存一次然后失败——比把真图片当文字丢掉轻得多。
+    """
+    name = str(class_name or "")
+    body = str(text or "").strip()
+    if not body and not name:
+        return None
+    if "Emoticon" in name or "Sticker" in name or body in _EMOJI_LABELS:
+        return {"message_type": "emoji"}
+    if body in _VIDEO_LABELS or "Video" in name:
+        return {"message_type": "video"}
+    if body in _IMAGE_LABELS or "Image" in name:
+        return {"message_type": "image"}
+    if body.startswith(_FILE_PREFIXES) or "File" in name:
+        match = _FILE_NAME_RE.search(body)
+        return {"message_type": "file", "file_name": match.group(1) if match else ""}
+    return None
+
 
 #: 语音气泡的 UIA 名称：微信把「语音 + 时长」放前面，开了「聊天中的语音消息自动转成文字」后
 #: 转写正文跟在后面。vendor `pyweixin/utils.py` 的 ``Audio_pattern``（`(?<=语音)\d+"秒(.*)$`）
