@@ -1,29 +1,24 @@
-"""对方发来的图片 / 文件（104）：另存 → 随轮送 AI 端 → 卡上认领的证件/简历传业务后端。
+"""对方发来的图片 / 文件（104）：另存 → 随轮送 AI 端。
 
-**先证坏路被堵**：自己发的不另存、扩展名不在名单不送、另存失败只说不猜、候选人反查不到不上传、
-后端 404 不上抛；再证好路能通：气泡分类、同文游标、附件随轮、multipart 形状与契约一致。
+**先证坏路被堵**：自己发的不另存、扩展名不在名单不送、另存失败只说不猜；再证好路能通：气泡分类、
+同文游标、附件随轮。证件/简历的上报已改道 AI 端统一回执（agent_backend `docs/22`），客户端不再上传。
 """
 
 from __future__ import annotations
 
 import base64
-import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
-import httpx
 from structlog.testing import capture_logs
 
 from wxclient.gateway.attachments import (
     MAX_ATTACHMENTS_PER_TURN,
     AttachmentFetcher,
-    attachment_bytes,
     inline_attachments,
 )
-from wxclient.gateway.candidates import CandidateDirectory, CandidateUpdateError
 from wxclient.gateway.inbound import InboundMessage, message_from_row, message_to_row
 from wxclient.gateway.sessions import GatewayStore
 from wxclient.gateway.watchlist import Watchlist
@@ -220,136 +215,6 @@ class InlineTests(unittest.TestCase):
         out, skipped = inline_attachments([message])
         self.assertEqual((out, skipped), ([], 1))
 
-    def test_attachment_bytes_by_name(self) -> None:
-        message = self._message("id.jpg")
-        self.assertEqual(attachment_bytes([message], "id.jpg"), b"xxxx")
-        self.assertIsNone(attachment_bytes([message], "other.jpg"))
-
-
-def directory(handler, token: str = "tok") -> CandidateDirectory:
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return CandidateDirectory("https://api.example.com", lambda: token, client=client)
-
-
-class UploadMaterialTests(unittest.IsolatedAsyncioTestCase):
-    """契约 `docs/20` §3：multipart，字段按材料类型白名单，后端没实现（404）不上抛。"""
-
-    async def test_multipart_shape(self) -> None:
-        seen: dict[str, Any] = {}
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen["method"] = request.method
-            seen["url"] = str(request.url)
-            seen["content_type"] = request.headers.get("content-type", "")
-            seen["body"] = request.content
-            return httpx.Response(201, json={"materialId": "m-1"})
-
-        got = await directory(handler).upload_material(
-            "cand-1", material_type="id_card_front", file_name="正面.jpg", data=b"jpegbytes",
-            fields={"name": "王建国", "id_number": "4201**********1234", "phone": "138"},
-            consent_note="候选人在微信里主动发来",
-        )
-        self.assertEqual(got, {"uploaded": True, "material_id": "m-1"})
-        self.assertEqual(seen["method"], "POST")
-        self.assertTrue(seen["url"].endswith("/recruitment-agent/client/candidates/cand-1/onboarding-materials"))
-        self.assertTrue(seen["content_type"].startswith("multipart/form-data"))
-        body = seen["body"]
-        self.assertIn(b'name="material_type"', body)
-        self.assertIn(b"id_card_front", body)
-        self.assertIn(b'filename="' + "正面.jpg".encode() + b'"', body)
-        self.assertIn(b"jpegbytes", body)
-        fields = json.loads(body.split(b'name="fields"')[1].split(b"\r\n\r\n")[1].split(b"\r\n")[0])
-        self.assertEqual(fields, {"name": "王建国", "id_number": "4201**********1234"}, "phone 不在正面白名单里")
-        consent = json.loads(body.split(b'name="consent"')[1].split(b"\r\n\r\n")[1].split(b"\r\n")[0])
-        self.assertEqual(consent["source"], "wechat_chat")
-
-    async def test_backend_not_ready_404_is_reported_not_raised(self) -> None:
-        got = await directory(lambda _r: httpx.Response(404, json={})).upload_material(
-            "cand-1", material_type="resume", file_name="简历.pdf", data=b"%PDF",
-        )
-        self.assertEqual(got["uploaded"], False)
-        self.assertIn("后端", got["reason"])
-
-    async def test_bad_shape_is_rejected_locally(self) -> None:
-        called: list[str] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            called.append(str(request.url))
-            return httpx.Response(200)
-
-        with self.assertRaises(CandidateUpdateError):
-            await directory(handler).upload_material("cand-1", material_type="passport", file_name="a.jpg", data=b"x")
-        with self.assertRaises(CandidateUpdateError):
-            await directory(handler).upload_material("", material_type="resume", file_name="a.pdf", data=b"x")
-        self.assertEqual(called, [])
-
-
-class RunnerDocumentUploadTests(unittest.IsolatedAsyncioTestCase):
-    """卡上 `documents[]` → 本机反查候选人 → 上传；反查不到不上传，找不到附件跳过。"""
-
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.store = GatewayStore(Path(self._tmp.name) / "gw.db")
-        self.dir = Path(self._tmp.name)
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
-
-    def _runner(self, candidates):
-        from wxclient.gateway.runner import GatewayRunner
-
-        runner = GatewayRunner.__new__(GatewayRunner)
-        runner._store = self.store
-        runner._candidates = candidates
-        return runner
-
-    def _messages(self, name: str) -> list[InboundMessage]:
-        path = self.dir / name
-        path.write_bytes(b"jpeg")
-        return [InboundMessage(account_id="acc", peer_id="张三·普工", msg_id="m#1", text="t",
-                               at=datetime.now(timezone.utc), message_type="image",
-                               attachments=({"kind": "image", "file_name": name, "path": str(path), "bytes": 4},))]
-
-    def _card(self, documents) -> dict:
-        return {"type": "info", "body": {"kind": "wechat_reply", "reply_segments": ["收到"],
-                                         "intent": "consult", "funnel_stage": "qa", "documents": documents}}
-
-    def _seed(self, worker_id: str | None) -> None:
-        self.store.save_contacts("acc", [{
-            "number": "13800138000", "session_name": "张三·普工",
-            "contact_status": "accepted", "worker_id": worker_id, "updated_at": "2026-08-19T00:00:00Z",
-        }])
-
-    async def test_uploads_claimed_document(self) -> None:
-        seen: list[str] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen.append(str(request.url))
-            return httpx.Response(201, json={"materialId": "m-1"})
-
-        self._seed("w-77")
-        await self._runner(directory(handler))._upload_documents(
-            "acc", "张三·普工",
-            self._card([{"material_type": "id_card_front", "file_name": "正面.jpg", "fields": {"name": "张三"}}]),
-            self._messages("正面.jpg"),
-        )
-        self.assertEqual(len(seen), 1)
-        self.assertTrue(seen[0].endswith("/candidates/w-77/onboarding-materials"))
-
-    async def test_unknown_candidate_or_missing_file_uploads_nothing(self) -> None:
-        seen: list[str] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            seen.append(str(request.url))
-            return httpx.Response(201, json={})
-
-        runner = self._runner(directory(handler))
-        card = self._card([{"material_type": "resume", "file_name": "简历.pdf"}])
-        self._seed(None)
-        await runner._upload_documents("acc", "张三·普工", card, self._messages("简历.pdf"))
-        self._seed("w-77")
-        await runner._upload_documents("acc", "张三·普工", card, self._messages("别的.pdf"))
-        self.assertEqual(seen, [])
 
 
 if __name__ == "__main__":

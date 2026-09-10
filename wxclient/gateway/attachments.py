@@ -192,13 +192,3 @@ def inline_attachments(messages: Sequence[Any]) -> tuple[list[dict[str, Any]], i
             )
     return out, skipped
 
-
-def attachment_bytes(messages: Sequence[Any], file_name: str) -> bytes | None:
-    """按文件名找回这一批里某个附件的字节（卡片 ``documents[]`` 回指用）。"""
-    for message in messages:
-        for entry in getattr(message, "attachments", ()) or ():
-            if str(entry.get("file_name") or "") == file_name:
-                path = Path(str(entry.get("path") or ""))
-                if path.is_file():
-                    return path.read_bytes()
-    return None
