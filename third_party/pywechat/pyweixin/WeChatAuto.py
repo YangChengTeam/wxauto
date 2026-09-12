@@ -1195,7 +1195,7 @@ class Contacts():
             return recent_groups
     
     @staticmethod
-    def check_new_friends(verify:bool=False,limit:int=8,clear:bool=False,is_maximize:bool=None,close_weixin:bool=None,return_to_chat:bool=True)->list[str]:
+    def check_new_friends(verify:bool=False,limit:int=8,clear:bool=False,is_maximize:bool=None,close_weixin:bool=None,return_to_chat:bool=True,verified_out:list=None)->list[str]:
         '''
         该方法用来检查一遍通讯录中新的朋友的信息,可以通过验证被动添加好友
         Args:
@@ -1224,6 +1224,10 @@ class Contacts():
                 confirm_button=verifyFriend_window.child_window(**Buttons.ConfirmButton)
                 confirm_button.click_input()
                 current_item.click_input()
+                # 劳小智补：返回值里的 newfriends_detail 是「新的朋友」整个列表（含早就通过的老条目），
+                # 调用方分不出这一趟真点了谁的「通过」；这里把真通过的名字单独交出去。
+                if verified_out is not None:
+                    verified_out.append(current_item.window_text())
                 return True
             return False
 

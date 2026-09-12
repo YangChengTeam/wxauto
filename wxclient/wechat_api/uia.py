@@ -633,6 +633,9 @@ class UiaWeChatDriver:
             limit=limit,
         )
         Contacts = self._pyweixin_class("Contacts")
+        # 「新的朋友」列表里老条目（早就通过的）也在 `items` 里；这一趟**真点了「通过」**的名字
+        # 单独收在 `accepted`（vendor 的 `verified_out`），上层据此判「通过了谁」，不拿整个列表当通过。
+        accepted: list[str] = []
         try:
             items = Contacts.check_new_friends(
                 verify=verify,
@@ -641,6 +644,7 @@ class UiaWeChatDriver:
                 is_maximize=False,
                 close_weixin=False,
                 return_to_chat=True,
+                verified_out=accepted,
             )
         except Exception as exc:
             logger.info("friend.check.failed", error=str(exc)[:100])
@@ -652,6 +656,7 @@ class UiaWeChatDriver:
             logger.info(
                 "friend.check.found",
                 count=len(items),
+                accepted=len(accepted),
                 samples=names,
                 auto_accept=verify,
             )
@@ -660,6 +665,7 @@ class UiaWeChatDriver:
             "action": "check_new_friends",
             "verify": verify,
             "items": items,
+            "accepted": [str(name) for name in accepted],
         }
 
     def send_message(

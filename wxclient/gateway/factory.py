@@ -253,6 +253,8 @@ def build_gateway(
             commands=command_executor,
             enabled=gateway_settings.auto_add_friend,
         ),
+        # 2026-09-12：别人发来的申请默认自动通过（`auto_accept_friend`），走 `command_executor`——
+        # 能力闸、加好友配额、时间窗、幂等一道不绕；dry-run 机器只数不点。
         friend_watcher=FriendWatcher(
             accounts=resolved_accounts,
             runtime=runtime,
@@ -260,6 +262,8 @@ def build_gateway(
             active_hours=gateway_settings.active_hours,
             allow_real_actions=allow_real_actions,
             confirmation=REAL_ACTION_CONFIRMATION,
+            auto_accept=gateway_settings.auto_accept_friend,
+            commands=command_executor,
         ),
         # 093：已申请、还没通过的人，隔一阵复查一次是不是通过了。和 092 一正一反。
         friend_checker=PendingFriendWatcher(

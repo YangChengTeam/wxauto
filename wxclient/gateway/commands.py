@@ -337,6 +337,28 @@ class CommandResult:
         return data
 
 
+def accepted_names(result: dict[str, Any] | None) -> list[str]:
+    """`accept_new_friends` 这一趟**真通过了**谁。
+
+    驱动层 0.1.55 起单独给 `accepted`（vendor 只在真点了「通过」时记名字）；`items` 是「新的朋友」
+    整个列表，早就通过的老条目也在里面，拿它当「通过了」会把老朋友再报一遍。老驱动层没有
+    `accepted` 键时退回 `items`（保持原先的口径，别让旧包升不上来就全哑）。
+    """
+    payload = result or {}
+    raw = payload.get("accepted")
+    if raw is None:
+        raw = payload.get("items")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
+
+
+
 class CommandExecutor:
     """执行一条 AI 端推来的指令。**同一 command_id 只执行一次**。"""
 
@@ -690,7 +712,7 @@ class CommandExecutor:
             return ""
         if op == "add_friend":
             return "accepted" if result.get("already_friend") else "requested"
-        if op == "accept_new_friends" and result.get("items"):
+        if op == "accept_new_friends" and accepted_names(result):
             return "accepted"
         return ""
 

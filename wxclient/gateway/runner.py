@@ -36,6 +36,7 @@ from .commands import (
     TERMINAL_STATUSES,
     CommandExecutor,
     CommandResult,
+    accepted_names,
     parse_commands,
 )
 from .config import GatewaySettings
@@ -57,7 +58,7 @@ from .moments import MomentsWatcher
 from .outbound import DeliveryResult, MessageSink, OutboundSender
 from .pacing import MIN_READ_INTERVAL_SECONDS, PACING_EVENT, clamp_interval
 from .schedule import ScheduleLoop, parse_schedule_at
-from .sessions import CANDIDATE_MODES, GatewayStore
+from .sessions import CANDIDATE_MODES, STRANGER_ORIGIN_FRIEND_REQUEST, GatewayStore
 from .strangers import StrangerWatcher
 from .ticket import TicketProvider
 from .watchlist import PUSH_EVENT, Watchlist
@@ -326,6 +327,10 @@ class GatewayRunner:
         # 092 管「在名单里却不是好友」，093 管「是好友了却不在名单里」。
         if friend_checker is not None:
             friend_checker.on_accepted = self._on_friend_accepted
+        # 2026-09-12 自动通过别人发来的好友申请：通过之后先临时纳入监听（他发的第一句才读得到），
+        # 认得出号的照旧报给业务端。
+        if friend_watcher is not None:
+            friend_watcher.on_accepted = self._on_friend_requests_accepted
 
     def is_active(self, now: datetime) -> bool:
         """现在允不允许动微信。读消息、查好友、发送共用同一个「工作时间窗」。"""
@@ -827,16 +832,37 @@ class GatewayRunner:
     async def _report_accepted_by_name(self, result: CommandResult, command_id: str) -> None:
         """我方通过的那几位，凡是本机认得出号的都报一条 `accepted`。"""
         account_id = self._account()
-        items = (result.result or {}).get("items") or []
-        for item in items if isinstance(items, list) else []:
-            name = str(item or "").strip()
-            if not name:
-                continue
+        # 只报这一趟**真通过了**的（`accepted`；老驱动层没这个键时退回 `items`）。
+        for name in accepted_names(result.result):
             number = self._store.contact_number_for(account_id, name)
             if not number:
                 _backend.info("通过了好友申请但本机不认识这个名字，不上报")  # 名字不进日志
                 continue
             await self._report_accepted_now(account_id, number, name, command_id=command_id)
+
+    async def _on_friend_requests_accepted(
+        self, command: dict[str, Any], result: CommandResult | None, names: Sequence[str],
+    ) -> None:
+        """自动通过了几个人的好友申请（`friends.py`）→ 让他们**立刻**进监听，别等下一次扫会话列表。
+
+        候选人扫招聘老师的名片加进来的人，既不在候选人库里也不在监听名单里：通过之后他发的
+        第一句网关照样读不到（085 名单 fail-closed）。这里把他按「friend_request 来源」放进临时准入
+        （不过期、不占名额），第一轮带 `first_contact` + `friend_request_accepted` 交给 AI 端：
+        AI 端据此**先接一句**并建档，不再按「判不出求职就一条都不发」收紧——他是主动加过来的。
+        已经是候选人（会话名归位过）的名字不再当陌生人。认得出号的照旧报 `accepted` 给业务端。
+        """
+        await self._report_contact(command, result)
+        account_id = self._account()
+        known = self._store.known_session_names(account_id)
+        fresh = [str(n or "").strip() for n in names if str(n or "").strip() and str(n).strip() not in known]
+        if not fresh:
+            return
+        admitted = self._store.note_strangers(
+            account_id, fresh, now=self._clock(), origin=STRANGER_ORIGIN_FRIEND_REQUEST,
+        )
+        _log.info("已通过好友申请，先临时纳入监听（第一轮由 AI 端接话并建档）", account=account_id, 数量=len(fresh))
+        if admitted or fresh:
+            self._apply_derived_watchlist()
 
     async def _note_friend_accepted(self, account_id: str, peer_id: str) -> None:
         """和这个人有过一次成功的消息往来 = 他通过了我们的申请（api2 §4.1「检测到对方通过」）。
@@ -1279,9 +1305,13 @@ class GatewayRunner:
         )
         return format_history(rows)
 
-    def _is_stranger(self, peer_id: str) -> bool:
-        """这个会话现在还挂在「临时准入」里吗（090）。"""
-        return any(peer_id in set(self._store.stranger_names(account)) for account in self._accounts)
+    def _stranger_origin(self, peer_id: str) -> str | None:
+        """这个会话现在还挂在「临时准入」里吗（090）；在的话是哪种来源（scan / friend_request）。"""
+        for account in self._accounts:
+            origin = self._store.stranger_origin(account, peer_id)
+            if origin:
+                return origin
+        return None
 
     def _peer_refs(self, account_id: str, peer_id: str) -> list[dict[str, Any]]:
         """这一轮对面是哪个候选人（047 的 `@` 引用协议）。
@@ -1317,8 +1347,13 @@ class GatewayRunner:
         # ★ 必须由这一层说，不能让 AI 端拿「refs 是空的」去推：入站 refs 为空是常态
         #   （会话名还没归位到候选人，后端明说允许），拿它当判据会让名单里的正常联系人
         #   一起哑掉。
-        if self._is_stranger(peer_id):
+        origin = self._stranger_origin(peer_id)
+        if origin:
             meta["first_contact"] = True
+        if origin == STRANGER_ORIGIN_FRIEND_REQUEST:
+            # 2026-09-12：他是我们**通过了申请**才进来的（扫名片主动加的），AI 端第一轮要接一句，
+            # 不按「判不出求职就一条都不发」收紧。
+            meta["friend_request_accepted"] = True
         watching = self.watched_peers()
         if watching:
             meta["watching"] = watching

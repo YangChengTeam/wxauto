@@ -266,6 +266,10 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str)
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
+#: 临时准入的两种来源：会话列表里扫到的（090，有保鲜期）/ 我们自动通过了他的好友申请（2026-09-12，不过期）。
+STRANGER_ORIGIN_SCAN = "scan"
+STRANGER_ORIGIN_FRIEND_REQUEST = "friend_request"
+
 #: 候选人级接管/托管的两个词（业务端 v1.5 §4，本机原样沿用，不再翻译一遍）。
 HUMAN_TAKEOVER = "human_takeover"
 AI_MANAGED = "ai_managed"
@@ -318,6 +322,8 @@ class GatewayStore:
             # 093 改口径（2026-09-01）：复查台账从「进度」升级成「我们真发过申请」的权威，
             # 老库那两列不补就是 "no such column"。
             _ensure_column(conn, "gateway_friend_checks", "session_name", "TEXT NOT NULL DEFAULT ''")
+            # 2026-09-12 自动通过好友申请：通过的人也走临时准入，但**不过期**（他是真好友，不是路过的）。
+            _ensure_column(conn, "gateway_strangers", "origin", f"TEXT NOT NULL DEFAULT '{STRANGER_ORIGIN_SCAN}'")
             _ensure_column(conn, "gateway_friend_checks", "requested_at", "TEXT NOT NULL DEFAULT ''")
             # ★ 补列之后还要**回填**：老库里这两列是空的，而复查按 `session_name` 搜、
             #   按 `requested_at` 算期限——不回填，升级那一刻**所有在途的人当场消失**，
@@ -581,8 +587,13 @@ class GatewayStore:
         *,
         now: datetime | None = None,
         limit: int = 50,
+        origin: str = STRANGER_ORIGIN_SCAN,
     ) -> list[str]:
         """会话列表里出现了、但本机会话名映射里没有的名字 —— 记下来。返回**新**记下的那些。
+
+        ``origin=friend_request``：我们自动通过了他的申请。这种不受名额上限、也不过期
+        （`purge_strangers_before` 只清 scan 来的）——他已经是真好友，不是「路过问一句」的人；
+        同名已在（扫到的）就把来源升级成 friend_request。
 
         为什么要单独一张表：候选人主动加好友、主动发第一句话时，他既不在任何招聘计划里、
         也没有候选人档案，因此 `gateway_contacts` 里没有他 —— 而监听名单正是从那张表派生的
@@ -605,19 +616,25 @@ class GatewayStore:
                 if not name:
                     continue
                 if name in existing:
-                    conn.execute(
-                        "UPDATE gateway_strangers SET last_seen_at=? WHERE account_id=? AND session_name=?",
-                        (stamp, account_id, name),
-                    )
+                    if origin == STRANGER_ORIGIN_FRIEND_REQUEST:
+                        conn.execute(
+                            "UPDATE gateway_strangers SET last_seen_at=?, origin=? WHERE account_id=? AND session_name=?",
+                            (stamp, origin, account_id, name),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE gateway_strangers SET last_seen_at=? WHERE account_id=? AND session_name=?",
+                            (stamp, account_id, name),
+                        )
                     continue
-                if len(existing) >= limit:
+                if origin != STRANGER_ORIGIN_FRIEND_REQUEST and len(existing) >= limit:
                     break
                 existing.add(name)
                 added.append(name)
                 conn.execute(
-                    """INSERT INTO gateway_strangers (account_id, session_name, first_seen_at, last_seen_at)
-                       VALUES (?, ?, ?, ?)""",
-                    (account_id, name, stamp, stamp),
+                    """INSERT INTO gateway_strangers (account_id, session_name, first_seen_at, last_seen_at, origin)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (account_id, name, stamp, stamp, origin),
                 )
             conn.commit()
         return added
@@ -631,6 +648,15 @@ class GatewayStore:
                 (account_id,),
             ).fetchall()
         return [str(row[0]) for row in rows]
+
+    def stranger_origin(self, account_id: str, session_name: str) -> str | None:
+        """这个会话在不在临时准入里；在的话是哪种来源（scan / friend_request），不在回 None。"""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT origin FROM gateway_strangers WHERE account_id=? AND session_name=?",
+                (account_id, str(session_name or "").strip()),
+            ).fetchone()
+        return str(row[0] or STRANGER_ORIGIN_SCAN) if row else None
 
     def drop_strangers(self, account_id: str, names: Iterable[str]) -> int:
         """不再当陌生人（已经归位成候选人，或专员说了别理他）。"""
@@ -656,12 +682,12 @@ class GatewayStore:
         stamp = cutoff.isoformat()
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT session_name FROM gateway_strangers WHERE account_id=? AND last_seen_at < ?",
-                (account_id, stamp),
+                "SELECT session_name FROM gateway_strangers WHERE account_id=? AND last_seen_at < ? AND origin=?",
+                (account_id, stamp, STRANGER_ORIGIN_SCAN),
             ).fetchall()
             conn.execute(
-                "DELETE FROM gateway_strangers WHERE account_id=? AND last_seen_at < ?",
-                (account_id, stamp),
+                "DELETE FROM gateway_strangers WHERE account_id=? AND last_seen_at < ? AND origin=?",
+                (account_id, stamp, STRANGER_ORIGIN_SCAN),
             )
             conn.commit()
         return [str(row[0]) for row in rows]
