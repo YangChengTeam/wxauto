@@ -257,8 +257,11 @@ COMMANDS: dict[str, CommandSpec] = {
         lambda a: {"limit": _limit(a, 1, 5)},
         action=ACTION_FRIEND,
         # 一条指令 = 最多 limit 次「加好友」：按 limit 预留，按真实通过数结算。
+        # ★ 结算只数 `accepted`（真点了「通过」的），不数 `items`——`items` 是「新的朋友」整个列表，
+        #   早就通过的老条目全在里面。0.1.55 曾按 items 结算：列表里躺着 5 条老记录，自动通过每 15 分钟
+        #   跑一趟就把「加好友」一小时 5 次的配额整本烧光，一个人没通过，计划的 add_friend 也跟着被拒。
         reserve_count=lambda a: _limit(a, 1, 5),
-        counts=lambda _args, result: len(result.get("items") or []),
+        counts=lambda _args, result: len(accepted_names(result)),
     ),
     # ★ 配图同样只收描述符，`medias` 这个键**不再被 build 看见**（2026-08-18 审计 P0-5）：
     #   原来它是上游给的一串本机绝对路径，`_normalize_moments_media_paths` 只要文件存在

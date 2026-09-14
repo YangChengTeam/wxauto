@@ -144,13 +144,23 @@ class FriendWatcher:
         items = payload.get("items") or []
         accepted = [str(n or "").strip() for n in (payload.get("accepted") or []) if str(n or "").strip()]
         count = len(items) if isinstance(items, list) else 0
-        if accepted:
-            _log.info("已自动通过好友申请", account=account_id, 通过=len(accepted))
-            if self.on_accepted is not None:
-                try:
-                    await self.on_accepted(command, result, accepted)
-                except Exception as exc:  # noqa: BLE001 —— 后续处理失败不该拖垮循环
-                    _log.warning("通过之后的处理失败", account=account_id, error=str(exc))
+        if not accepted:
+            # 查到了条目却一个都没点「通过」：要么全是早就通过的老条目，要么这版微信的「前往验证」按钮
+            # 认不出来（vendor 判据跟微信版本走）。原来这一档一个字不记，看日志只见「轮询」不见「为什么没通过」。
+            # 只在数目变化时说话：每 15 分钟固定刷一条是纯噪音。
+            if count != self._pending.get(account_id):
+                self._pending[account_id] = count
+                if count:
+                    _log.info("「新的朋友」里有条目，但这一趟一个都没点「通过」（都是老条目，或认不出「前往验证」按钮）",
+                              account=account_id, count=count)
+            return count
+        self._pending[account_id] = count
+        _log.info("已自动通过好友申请", account=account_id, 通过=len(accepted))
+        if self.on_accepted is not None:
+            try:
+                await self.on_accepted(command, result, accepted)
+            except Exception as exc:  # noqa: BLE001 —— 后续处理失败不该拖垮循环
+                _log.warning("通过之后的处理失败", account=account_id, error=str(exc))
         return count
 
     async def run(self) -> None:

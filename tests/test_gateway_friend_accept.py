@@ -26,7 +26,7 @@ from wxclient.gateway import (
     GatewaySettings,
     LocalFileTicketProvider,
 )
-from wxclient.gateway.commands import CommandResult, accepted_names
+from wxclient.gateway.commands import COMMANDS, CommandResult, accepted_names
 from wxclient.gateway.sessions import (
     STRANGER_ORIGIN_FRIEND_REQUEST,
     STRANGER_ORIGIN_SCAN,
@@ -83,6 +83,19 @@ class AcceptedNamesTests(unittest.TestCase):
         self.assertEqual(accepted_names({"items": ["王建国", " ", "王建国"]}), ["王建国"])
         self.assertEqual(accepted_names(None), [])
         self.assertEqual(accepted_names({"items": "坏数据"}), [])
+
+
+class AcceptQuotaSettleTests(unittest.TestCase):
+    """配额结算只数真通过的：`items` 是「新的朋友」整个列表（含老条目），按它结算会把一小时 5 次整本烧光。"""
+
+    def test_x_按_accepted_结算_不按_items(self) -> None:
+        spec = COMMANDS["accept_new_friends"]
+        self.assertEqual(spec.reserve_count({"limit": 5}), 5)
+        self.assertEqual(spec.counts({}, {"items": ["老1", "老2", "老3", "老4", "老5", "王建国"], "accepted": ["王建国"]}), 1)
+        self.assertEqual(spec.counts({}, {"items": ["老1", "老2"], "accepted": []}), 0)
+
+    def test_老驱动层没有_accepted_键_退回按_items(self) -> None:
+        self.assertEqual(COMMANDS["accept_new_friends"].counts({}, {"items": ["王建国"]}), 1)
 
 
 class FriendWatcherAutoAcceptTests(unittest.IsolatedAsyncioTestCase):
