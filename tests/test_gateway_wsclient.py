@@ -38,6 +38,53 @@ WECHAT_CARD = {
 }
 
 
+class KeepaliveTests(unittest.IsolatedAsyncioTestCase):
+    """保活的门槛必须高过「一帧大文件慢慢传完」的时间（2026-09-15 三次 1011 断连）。
+
+    服务器出网只有十几 KB/s，AI 端发朋友圈配图是字节随指令帧推下来的：帧没传完 pong 就进不来，
+    库默认 20 秒一到连接就被自己判死，指令连「已收到」都来不及回。
+    """
+
+    async def test_underlying_keepalive_tolerates_a_slow_frame(self) -> None:
+        from wxclient.gateway import wsclient
+
+        seen: dict = {}
+
+        async def fake_connect(url, **kwargs):
+            seen.update(kwargs)
+            raise RuntimeError("到此为止")
+
+        original = wsclient.ws_connect
+        wsclient.ws_connect = fake_connect
+        try:
+            with self.assertRaises(RuntimeError):
+                await wsclient._connect_with_limits("ws://127.0.0.1:1/v1/ws")
+        finally:
+            wsclient.ws_connect = original
+        self.assertEqual(seen["max_size"], wsclient.MAX_FRAME_BYTES)
+        self.assertGreaterEqual(seen["ping_timeout"], 120.0, "20 秒的门槛就是事故本身")
+        self.assertLessEqual(seen["ping_interval"], 30.0, "反代 600 秒掐空闲，隔太久发不了")
+
+    async def test_app_ping_waits_longer_than_an_ordinary_op(self) -> None:
+        """pong 排在一帧大文件后面晚到——普通 op 的 30 秒早就把连接作废了，ping 要等得起。"""
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}, pong_delay_seconds=0.3) as server:
+            patient = AgentWsClient(server.url, op_timeout_seconds=0.1, ping_timeout_seconds=2.0)
+            await patient.connect("tkt-ok")
+            try:
+                await patient.ping()          # 0.3s > op_timeout，但 < ping_timeout：不许抛
+                self.assertTrue(patient.connected)
+            finally:
+                await patient.close()
+            # 对照：ping 的尺子真在起作用——把它调到 0.1s，同样的 0.3s 晚到就该超时。
+            hasty = AgentWsClient(server.url, op_timeout_seconds=5.0, ping_timeout_seconds=0.1)
+            await hasty.connect("tkt-ok")
+            try:
+                with self.assertRaises(AgentWsError):
+                    await hasty.ping()
+            finally:
+                await hasty.close()
+
+
 class ServerPushTests(unittest.IsolatedAsyncioTestCase):
     """AI 端主动推来的、不属于任何一轮的事件（监听列表就走这条）。"""
 

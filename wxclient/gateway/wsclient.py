@@ -25,9 +25,26 @@ _log = structlog.get_logger(__name__)
 #: （两张海报 ≈ 0.7MB base64，已经贴着默认值）。给到 16MB，超限会直接断连很难查。
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 
+#: 底层保活：`websockets` 自己每 ``PING_INTERVAL_SECONDS`` 发一次 ping，``PING_TIMEOUT_SECONDS`` 内
+#: 没等到 pong 就以 1011 关连接（日志里那句 ``keepalive ping timeout``）。
+#:
+#: ★ 为什么超时给到 120 秒而不是库默认的 20 秒（2026-09-15 事故）：服务器出网被业务后端占满，
+#:   实测到专员电脑只有 ≈14 KB/s；AI 端发朋友圈配图是**字节随指令帧一起推下来**的（067），一张
+#:   1.6 MB 的 PNG 转 base64 要传两分半——帧还没传完，pong 排在它后面进不来，20 秒一到连接就被
+#:   自己判死，指令连「已收到」都来不及回，朋友圈一次都没发成（当天三次 1011）。
+#:   AI 端那头已把图压到百 KB 级，这里再放宽：慢≠死，判死的门槛要高过一帧正常传完的时间。
+#:   代价是真断线要 120 秒才发现——读消息本来就是 180 秒一趟，等得起。
+PING_INTERVAL_SECONDS = 20.0
+PING_TIMEOUT_SECONDS = 120.0
+
 
 async def _connect_with_limits(url: str):
-    return await ws_connect(url, max_size=MAX_FRAME_BYTES)
+    return await ws_connect(
+        url,
+        max_size=MAX_FRAME_BYTES,
+        ping_interval=PING_INTERVAL_SECONDS,
+        ping_timeout=PING_TIMEOUT_SECONDS,
+    )
 
 # 一轮结束的两种信号：AI 端既可能发 ev=done，也可能发 status{state:done}。两者都要认。
 _TURN_DONE_EVENTS = frozenset({"done"})
@@ -116,12 +133,14 @@ class AgentWsClient:
         *,
         turn_timeout_seconds: float = 180.0,
         op_timeout_seconds: float = 30.0,
+        ping_timeout_seconds: float = PING_TIMEOUT_SECONDS,
         connect_factory: Callable[..., Any] | None = None,
         on_push: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._url = ws_url
         self._turn_timeout = turn_timeout_seconds
         self._op_timeout = op_timeout_seconds
+        self._ping_timeout = ping_timeout_seconds
         self._connect = connect_factory or _connect_with_limits
         self._on_push = on_push
 
@@ -273,8 +292,11 @@ class AgentWsClient:
         反代会掐空闲的 WS（线上 nginx 配的是 600s），不定期 ping 的话连接会静悄悄地死，
         等到真有候选人来消息时才发现——那时候要现重连，白等一次握手。ping 顺带充当探活：
         断了就能在下一拍重连，而不是攒到第一条真消息上。
+
+        ★ 超时与底层保活同一把尺（``PING_TIMEOUT_SECONDS``），不用普通 op 的 30 秒：AI 端正往下推
+        一帧大文件时 pong 排在它后面，30 秒等不到就把连接作废等于把那条指令连同连接一起扔了。
         """
-        await self._request("ping", {})
+        await self._request("ping", {}, timeout=self._ping_timeout)
 
     async def _send(self, op: str, data: dict[str, Any], *, ack: str | None = None) -> None:
         if self._ws is None:
@@ -296,15 +318,19 @@ class AgentWsClient:
         if op != "ping":
             _log.info("发往 AI 端", op=op, 字节=len(body.encode("utf-8")))
 
-    async def _request(self, op: str, data: dict[str, Any]) -> dict[str, Any]:
-        """发一个请求-响应型 op，按 ack 对号入座。"""
+    async def _request(
+        self, op: str, data: dict[str, Any], *, timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """发一个请求-响应型 op，按 ack 对号入座。``timeout`` 缺省用普通 op 的那把尺。"""
         ack = f"{op}-{next(self._ids)}"
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         self._pending[ack] = future
         try:
             await self._send(op, data, ack=ack)
-            return await asyncio.wait_for(future, timeout=self._op_timeout)
+            return await asyncio.wait_for(
+                future, timeout=self._op_timeout if timeout is None else timeout,
+            )
         except TimeoutError as exc:
             raise AgentWsError(f"{op} 超时") from exc
         finally:

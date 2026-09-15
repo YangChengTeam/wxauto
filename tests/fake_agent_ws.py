@@ -44,8 +44,11 @@ class FakeAgentServer:
         valid_tickets: set[str] | None = None,
         turn_script: TurnScript | Callable[[str, str], TurnScript] | None = None,
         push_on_auth: tuple[str, dict[str, Any]] | None = None,
+        pong_delay_seconds: float = 0.0,
     ) -> None:
         self._valid_tickets = valid_tickets
+        self._pong_delay = pong_delay_seconds
+        """pong 晚多久才回——模拟一帧大文件把 pong 排在后面的样子。"""
         self._push_on_auth = push_on_auth
         """鉴权成功后主动推一帧（不带 ack），用来模拟 AI 端下发监听列表。"""
         self._turn_script = turn_script or TurnScript(
@@ -114,6 +117,8 @@ class FakeAgentServer:
 
             if op == "ping":
                 # 与真 AI 端一致：ping → pong（网关拿它保活，反代会掐空闲连接）
+                if self._pong_delay:
+                    await asyncio.sleep(self._pong_delay)
                 await self._emit(websocket, ack, "pong", {})
                 continue
 
