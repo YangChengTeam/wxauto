@@ -18,7 +18,7 @@ from wxclient.uia_probe.constants import (
     DEFAULT_UIA_PROBE_MAX_NODES,
 )
 
-from .errors import WeChatApiError, WeChatApiUnavailableError
+from .errors import MomentsDockedLayoutError, WeChatApiError, WeChatApiUnavailableError
 
 logger = structlog.get_logger(__name__)
 
@@ -78,6 +78,70 @@ def _disable_esc_close_fallback() -> None:
     _ESC_CLOSE_FALLBACK_DISABLED = True
 
 
+def parse_wechat_version(text: Any) -> tuple[int, ...]:
+    """``"4.1.13.65"`` → ``(4, 1, 13, 65)``；读不出来就空元组（**不猜**）。"""
+    if not isinstance(text, str):
+        return ()
+    parts: list[int] = []
+    for piece in text.strip().split("."):
+        if not piece.isdigit():
+            break
+        parts.append(int(piece))
+    return tuple(parts)
+
+
+#: 朋友圈版式按微信版本分叉：(最低版本, 版式)，从高往低第一个够得着的算数。
+#:
+#: · ``docked``（4.1.13 起）——朋友圈**停靠进主窗口**（`mmui::SNSContentView`），
+#:   没有独立的 `mmui::SNSWindow`，也没有工具栏上的「发表」按钮；发表入口是相册
+#:   「今天」那一行里的**相机格**（`mmui::AlbumContentCell`「发表」），点一下直接弹
+#:   系统「选择文件」框，选完图才出编辑面板（`SnsPublishPanel`）。**没有纯文字入口**
+#:   （2026-09-15 真机 4.1.13.12：右键、长按、取消选文件三条路都试过，都没有）。
+#: · ``window``（更早）——独立朋友圈窗口，右键「发表」按钮选图片/纯文字模式。
+MOMENTS_LAYOUTS: tuple[tuple[tuple[int, ...], str], ...] = (
+    ((4, 1, 13), "docked"),
+    ((), "window"),
+)
+
+
+def moments_layout(version: Any) -> str:
+    """按微信进程版本挑朋友圈版式。版本读不到 → 按老版式走，跑到再靠现场认（见 `_open_moments_timeline`）。"""
+    parsed = parse_wechat_version(version)
+    if not parsed:
+        return "window"
+    for floor, layout in MOMENTS_LAYOUTS:
+        if parsed >= floor:
+            return layout
+    return "window"
+
+
+def find_gray_tile(
+    pixels: Any, width: int, height: int, *, step: int = 2, min_hits: int = 200,
+) -> tuple[int, int] | None:
+    """在「发表」那一格的截图里找相机格（一块中灰色的方块），返回它的中心（相对格子左上角）。
+
+    ★ 为什么截图找而不是写死偏移（2026-09-15 真机 4.1.13.12）：那一格 UIA 只暴露成一个
+      `AlbumContentCell`，相机方块**不是子控件**，点格子中心没反应；方块离左边多远随窗口宽度、
+      系统缩放走。而它的颜色很稳（(225,225,227) 常态、(213,213,215) 悬停），背景是 (250,250,250)
+      的近白——按颜色认，中心取中位数，抗零星噪点。
+
+    ``pixels`` 是 PIL 的 ``Image.load()``（按 ``pixels[x, y]`` 取色），任何同形状的都行。
+    """
+    xs: list[int] = []
+    ys: list[int] = []
+    for y in range(0, height, step):
+        for x in range(0, width, step):
+            r, g, b = pixels[x, y][:3]
+            if 198 <= r <= 238 and abs(r - g) < 4 and -2 <= b - r <= 6:
+                xs.append(x)
+                ys.append(y)
+    if len(xs) < min_hits:
+        return None
+    xs.sort()
+    ys.sort()
+    return xs[len(xs) // 2], ys[len(ys) // 2]
+
+
 class UiaWeChatDriver:
     driver_name = "uia"
 
@@ -90,6 +154,8 @@ class UiaWeChatDriver:
         self.project_root = project_root or Path(__file__).resolve().parents[2]
         self.dry_run = dry_run
         self.wechat_path = wechat_path
+        #: `_ensure_ready` 探测到的微信进程版本（如 ``4.1.13.65``），朋友圈按它挑版式。
+        self._wechat_version = ""
 
     def add_friend(
         self,
@@ -1408,6 +1474,9 @@ class UiaWeChatDriver:
         1. 桌面上已经有朋友圈窗口就直接用；没有就点主窗口工具栏头像 → 资料面板 → 「朋友圈」
         2. 进的不是主页（看不到发表按钮）就点返回
         """
+        if self._moments_layout() == "docked":
+            raise MomentsDockedLayoutError(self._docked_layout_message())
+
         from pywinauto import mouse
 
         moments_window = self._moments_window(desktop, Tools)
@@ -1418,6 +1487,9 @@ class UiaWeChatDriver:
             self._click_moments_entry(profile_pane, Buttons)
             moments_window = self._moments_window(desktop, Tools, timeout=12.0)
             if moments_window is None:
+                # 版本没读到、或版本表没跟上：窗口没出来但主窗口里长出了停靠面板，就是新版式。
+                if self._docked_moments_host(desktop) is not None:
+                    raise MomentsDockedLayoutError(self._docked_layout_message())
                 raise WeChatApiError("点了「朋友圈」但朋友圈窗口没出来")
 
         post_button = moments_window.child_window(**Buttons.PostButton)
@@ -1432,14 +1504,29 @@ class UiaWeChatDriver:
             raise WeChatApiError("无法找到朋友圈发表按钮")
         return moments_window, post_button
 
-    def _post_moments_impl(self, text: str, medias: list[str]) -> None:
-        """用 pyweixin 底层 UIA 操作发朋友圈。
+    def _moments_layout(self) -> str:
+        return moments_layout(self._wechat_version)
 
-        流程：
-        1–3. 打开朋友圈窗口并停在主页（`_open_moments_timeline`）
-        4. 右键发表按钮 → 有图片选图片模式，没图片选纯文字
-        5. 填入文字 → 点击发表
+    def _docked_layout_message(self) -> str:
+        shown = self._wechat_version or "未知版本"
+        return (
+            f"微信 {shown} 的朋友圈已停靠进主窗口（4.1.13 起的版式），"
+            "点赞/评论/巡看还没适配这个版式；要用请先退回微信 4.1.12"
+        )
+
+    def _post_moments_impl(self, text: str, medias: list[str]) -> dict[str, Any] | None:
+        """用 pyweixin 底层 UIA 操作发朋友圈。**按微信版本挑版式**（`moments_layout`）。
+
+        · 4.1.13 起 → `_post_moments_docked`（停靠面板 + 相机格）
+        · 更早 → 下面这条老路：独立朋友圈窗口
+          1–3. 打开朋友圈窗口并停在主页（`_open_moments_timeline`）
+          4. 右键发表按钮 → 有图片选图片模式，没图片选纯文字
+          5. 填入文字 → 点击发表
+        · 版本没读到、老路开出来的却是停靠面板 → 就地改走新路（面板已经开着，直接接手）
         """
+        if self._moments_layout() == "docked":
+            return self._post_moments_docked(text, medias)
+
         import pyautogui
         from pywinauto import Desktop
 
@@ -1456,9 +1543,13 @@ class UiaWeChatDriver:
         desktop = Desktop(backend="uia")
         valid_paths = self._normalize_moments_media_paths(medias) if medias else []
 
-        moments_window, post_button = self._open_moments_timeline(
-            desktop, Navigator, Tools, Main_window, Buttons,
-        )
+        try:
+            moments_window, post_button = self._open_moments_timeline(
+                desktop, Navigator, Tools, Main_window, Buttons,
+            )
+        except MomentsDockedLayoutError:
+            logger.info("moments.post.layout_sniffed_docked", version=self._wechat_version or None)
+            return self._post_moments_docked(text, medias, desktop=desktop)
 
         # 4. 右键发表按钮 → 选择模式
         post_button.right_click_input()
@@ -1498,6 +1589,213 @@ class UiaWeChatDriver:
             moments_window.close()
         except Exception:
             pass
+        return None
+
+    # ---- 4.1.13 起：停靠进主窗口的朋友圈 ----------------------------------------
+
+    #: 停靠式朋友圈的内容视图（挂在主窗口里，也可能被「恢复」按钮弹成独立窗口）。
+    MOMENTS_DOCKED_VIEW_CLASS = "mmui::SNSContentView"
+    #: 能装下停靠面板的顶层窗口 class：主窗口，或弹出去之后的 Chromium 宿主窗口。
+    MOMENTS_DOCKED_HOST_CLASSES = ("mmui::MainWindow", "Chrome_WidgetWin_0")
+    #: 相册列表 / 「发表」那一格 / 发表编辑面板。
+    MOMENTS_ALBUM_LIST_CLASS = "mmui::AlbumListView"
+    MOMENTS_POST_CELL_CLASS = "mmui::AlbumContentCell"
+    MOMENTS_PUBLISH_PANEL_ID = "SnsPublishPanel"
+    #: 相机格找不着时的退路：真机 4.1.13.12 上格子宽 358、相机中心在左起 128 ≈ 36%。
+    MOMENTS_CAMERA_TILE_FALLBACK_RATIO = 0.36
+    #: 点完「发表」等面板收起多久；图片要上传，给足。
+    MOMENTS_PUBLISH_SETTLE_SECONDS = 20.0
+
+    def _post_moments_docked(
+        self, text: str, medias: list[str], *, desktop: Any = None,
+    ) -> dict[str, Any]:
+        """4.1.13 起的发朋友圈（2026-09-15 真机 4.1.13.12 逐步 dump 出来的路）：
+
+        1. 主窗口里已有停靠面板就直接用；没有就点头像 → 资料面板 → 「朋友圈」，等面板长出来
+        2. 相册「今天」行的「发表」格（`AlbumContentCell`）→ 截图认出相机方块 → 点它
+        3. 系统「选择文件」框（Win32 `#32770`，UIA 顶层枚举看不见、win32 后端看得见）填路径 → 打开
+        4. `SnsPublishPanel` 出来 → 填文字（`mmui::XValidatorTextEdit`）→ 点「发表」
+        5. 等面板收起（图片要上传）→ 顺手把停靠面板关掉，桌面还给用户
+
+        ★ 没有纯文字入口：相机格右键没菜单、长按还是选文件、选文件框取消什么都不出。
+          所以没图就直接拒，别去点——点了只会给用户桌面上留一个选文件框。
+        """
+        if not medias:
+            raise WeChatApiError(
+                f"微信 {self._wechat_version or '4.1.13+'} 的朋友圈没有纯文字发表入口，"
+                "请带图片发，或把微信退回 4.1.12"
+            )
+        import pyautogui
+        from pywinauto import Desktop
+
+        valid_paths = self._normalize_moments_media_paths(medias)
+        Navigator = self._pyweixin_class("Navigator")
+        Uielements = self._pyweixin_submodule("Uielements")
+        Buttons = Uielements.Buttons
+        Edits = Uielements.Edits
+        Main_window = Uielements.Main_window
+        Windows = Uielements.Windows
+        desktop = desktop if desktop is not None else Desktop(backend="uia")
+
+        host = self._open_docked_moments(desktop, Navigator, Main_window, Buttons)
+        cell = self._docked_post_cell(host, Buttons)
+        self._click_camera_tile(host, cell, pyautogui)
+
+        native_window = self._wait_native_file_dialog_any(desktop, Windows)
+        self._choose_native_files(native_window, valid_paths, pyautogui)
+
+        panel = host.child_window(auto_id=self.MOMENTS_PUBLISH_PANEL_ID)
+        if not panel.exists(timeout=15):
+            raise WeChatApiError("选完图片但朋友圈发表面板没出来")
+        if text:
+            text_input = panel.child_window(**Edits.SnsEdit)
+            text_input.click_input()
+            text_input.set_text(text)
+            time.sleep(0.3)
+        final_button = panel.child_window(**Buttons.PostButton)
+        if not final_button.exists(timeout=3):
+            raise WeChatApiError("朋友圈发表面板里找不到「发表」按钮")
+        final_button.click_input()
+        closed = self._wait_publish_panel_gone(panel)
+        logger.info("moments.post.docked.published", panel_closed=closed)
+        self._close_docked_moments(host)
+        return {"layout": "docked", "publish_panel_closed": closed}
+
+    def _docked_moments_host(self, desktop: Any) -> Any | None:
+        """此刻装着停靠式朋友圈的那个顶层窗口（spec），没有就 None。只枚举顶层，再往里看一层判据。"""
+        try:
+            windows = list(desktop.windows())
+        except Exception:  # noqa: BLE001 —— 桌面枚举都失败就当没有
+            return None
+        # 弹出去的宿主窗口 class 是 Chromium 通用的，别的程序也叫这个名；只认微信自己进程里的。
+        wechat_pids: set[Any] = set()
+        for window in windows:
+            with suppress(Exception):
+                if window.element_info.class_name == self.MOMENTS_DOCKED_HOST_CLASSES[0]:
+                    wechat_pids.add(window.element_info.process_id)
+        for window in windows:
+            try:
+                info = window.element_info
+                if info.class_name not in self.MOMENTS_DOCKED_HOST_CLASSES:
+                    continue
+                if info.class_name != self.MOMENTS_DOCKED_HOST_CLASSES[0] and info.process_id not in wechat_pids:
+                    continue
+                spec = desktop.window(handle=info.handle)
+                if spec.child_window(class_name=self.MOMENTS_DOCKED_VIEW_CLASS).exists(timeout=0.5):
+                    return spec
+            except Exception:  # noqa: BLE001, S112 —— 单个窗口读不到就看下一个
+                continue
+        return None
+
+    def _open_docked_moments(self, desktop: Any, Navigator: Any, Main_window: Any, Buttons: Any) -> Any:
+        from pywinauto import mouse
+
+        host = self._docked_moments_host(desktop)
+        if host is not None:
+            return host
+        main_window = Navigator.open_weixin(is_maximize=False)
+        toolbar = main_window.child_window(**Main_window.Toolbar)
+        profile_pane = self._open_profile_pane(desktop, toolbar, mouse)
+        self._click_moments_entry(profile_pane, Buttons)
+        deadline = time.monotonic() + 12.0
+        while True:
+            host = self._docked_moments_host(desktop)
+            if host is not None:
+                return host
+            if time.monotonic() >= deadline:
+                raise WeChatApiError("点了「朋友圈」但停靠式朋友圈面板没出来")
+            time.sleep(0.5)
+
+    def _docked_post_cell(self, host: Any, Buttons: Any) -> Any:
+        """相册里「发表」那一格。名字跟客户端语言走（和工具栏「发表」按钮同一个词）。不在视野里就先回顶。"""
+        title = dict(Buttons.PostButton).get("title", "发表")
+        cell = host.child_window(
+            control_type="ListItem", class_name=self.MOMENTS_POST_CELL_CLASS, title=title,
+        )
+        if cell.exists(timeout=2):
+            return cell
+        album = host.child_window(class_name=self.MOMENTS_ALBUM_LIST_CLASS)
+        if album.exists(timeout=2):
+            with suppress(Exception):
+                album.type_keys("{HOME}")
+                time.sleep(0.6)
+        if cell.exists(timeout=3):
+            return cell
+        raise WeChatApiError("停靠式朋友圈里找不到「发表」那一格")
+
+    def _click_camera_tile(self, host: Any, cell: Any, pyautogui: Any) -> None:
+        """点「发表」格里的相机方块。先把微信提到前台再截图，不然截到的是盖在上面的别的窗口。"""
+        with suppress(Exception):
+            host.set_focus()
+            time.sleep(0.4)
+        rect = cell.rectangle()
+        width, height = rect.width(), rect.height()
+        tile: tuple[int, int] | None = None
+        try:
+            shot = pyautogui.screenshot(region=(rect.left, rect.top, width, height)).convert("RGB")
+            tile = find_gray_tile(shot.load(), *shot.size)
+        except Exception as exc:  # noqa: BLE001 —— 截不到就按比例点，别在这儿断
+            logger.info("moments.post.docked.screenshot_failed", error=str(exc)[:120])
+        if tile is None:
+            tile = (int(width * self.MOMENTS_CAMERA_TILE_FALLBACK_RATIO), height // 2)
+            logger.info("moments.post.docked.tile_fallback", x=tile[0], y=tile[1])
+        cell.click_input(coords=tile)
+        time.sleep(1.5)
+
+    #: 系统选文件框的标题（跟系统语言走）。
+    NATIVE_FILE_DIALOG_TITLES = ("选择文件", "打开", "Open", "選擇檔案", "開啟")
+
+    def _wait_native_file_dialog_any(self, desktop: Any, Windows: Any, *, timeout: float = 8.0) -> Any:
+        """等系统「选择文件」框。**先 win32 后 UIA**（2026-09-15 真机：这个框 UIA 顶层枚举、
+        `top_level_only=False` 的判据都找不到，win32 后端一枚举就有）。"""
+        from pywinauto import Desktop
+
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                for window in Desktop(backend="win32").windows():
+                    try:
+                        if (window.is_visible() and window.class_name() == "#32770"
+                                and window.window_text() in self.NATIVE_FILE_DIALOG_TITLES):
+                            return window
+                    except Exception:  # noqa: BLE001, S112 —— 单个窗口读不到就看下一个
+                        continue
+            except Exception:  # noqa: BLE001, S110 —— 这一轮枚举失败，下一轮再来
+                pass
+            time.sleep(0.5)
+        return self._wait_native_file_dialog(desktop, Windows)
+
+    def _wait_publish_panel_gone(self, panel: Any, *, timeout: float | None = None) -> bool:
+        """点完「发表」等面板收起。收不起**不当失败报**——发表已经点下去了，报失败上层会重发，
+        重复一条朋友圈比晚知道更糟；只如实带回 ``publish_panel_closed=False``。"""
+        deadline = time.monotonic() + (self.MOMENTS_PUBLISH_SETTLE_SECONDS if timeout is None else timeout)
+        while True:
+            try:
+                if not panel.exists(timeout=0.5):
+                    return True
+            except Exception:  # noqa: BLE001 —— 面板都查不到了，就是收起了
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
+
+    def _close_docked_moments(self, host: Any) -> None:
+        """把停靠面板关掉（面板顶栏的「关闭」，在朋友圈那一列里）。纯善后，失败不影响结果。"""
+        try:
+            view = host.child_window(class_name=self.MOMENTS_DOCKED_VIEW_CLASS)
+            if not view.exists(timeout=1):
+                return
+            left_edge = view.rectangle().left - 10
+            for button in host.descendants(control_type="Button"):
+                try:
+                    if ((button.window_text() or "").strip() in ("关闭", "Close", "關閉")
+                            and button.rectangle().left >= left_edge):
+                        button.click_input()
+                        return
+                except Exception:  # noqa: BLE001, S112 —— 单个按钮读不到就看下一个
+                    continue
+        except Exception as exc:  # noqa: BLE001
+            logger.info("moments.post.docked.close_failed", error=str(exc)[:120])
 
     #: 朋友圈窗口的 class。
     MOMENTS_WINDOW_CLASS = "mmui::SNSWindow"
@@ -1788,8 +2086,40 @@ class UiaWeChatDriver:
                 continue
         raise WeChatApiError("Native file dialog did not appear")
 
+    @staticmethod
+    def _is_win32_wrapper(control: Any) -> bool:
+        return getattr(getattr(control, "backend", None), "name", "") == "win32"
+
+    def _choose_native_files_win32(self, dialog: Any, dialog_value: str, pyautogui: Any) -> None:
+        """win32 后端拿到的「选择文件」框：底部文件名 `Edit` 直接填，再点「打开(&O)」。"""
+        edits = [child for child in dialog.children() if _safe_call(child.class_name) == "Edit"]
+        if not edits:
+            raise WeChatApiError("Native file name edit was not found")
+        edit = edits[0]
+        with suppress(Exception):
+            dialog.set_focus()
+        with suppress(Exception):
+            edit.set_focus()
+        edit.set_edit_text(dialog_value)
+        if _safe_call(edit.window_text) != dialog_value:
+            with suppress(Exception):
+                SystemSettings = self._pyweixin_class("SystemSettings")
+                SystemSettings.copy_text_to_clipboard(dialog_value)
+                pyautogui.hotkey("ctrl", "a", _pause=False)
+                pyautogui.hotkey("ctrl", "v", _pause=False)
+        time.sleep(0.3)
+        for child in dialog.children():
+            text = str(_safe_call(child.window_text) or "").replace("&", "").lower()
+            if _safe_call(child.class_name) == "Button" and text in {"打开(o)", "打开", "open", "開啟(o)", "開啟"}:
+                child.click()
+                return
+        pyautogui.hotkey("alt", "o", _pause=False)
+
     def _choose_native_files(self, native_window: Any, paths: list[str], pyautogui: Any) -> None:
         dialog_value = self._build_native_file_dialog_value(paths)
+        if self._is_win32_wrapper(native_window):
+            self._choose_native_files_win32(native_window, dialog_value, pyautogui)
+            return
         edit = self._find_native_file_name_edit(native_window)
         try:
             native_window.set_focus()
@@ -2393,7 +2723,10 @@ class UiaWeChatDriver:
             raise WeChatApiUnavailableError(
                 f"微信 UIA 不可用：{probe.get('reason') or '未知原因'}"
             )
-        self._restore_if_minimized(probe.get("selected_window"))
+        selected = probe.get("selected_window")
+        if isinstance(selected, dict):
+            self._wechat_version = str(selected.get("process_version") or "")
+        self._restore_if_minimized(selected)
 
     @classmethod
     def _restore_if_minimized(cls, window_info: Any, *, force: bool = False) -> bool:

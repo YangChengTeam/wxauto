@@ -412,6 +412,17 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         return f"朋友圈发布失败：{payload.get('error') or '-'}"
     if event == "moments.post.media.missing":
         return f"朋友圈媒体文件不存在：{_json(payload.get('paths'))}"
+    if event == "moments.post.layout_sniffed_docked":
+        return f"朋友圈开出来的是停靠进主窗口的新版式（微信版本 {payload.get('version') or '未读到'}），改走新版流程"
+    if event == "moments.post.docked.published":
+        closed = "已收起" if payload.get("panel_closed") else "20 秒内没收起，是否发出去请到朋友圈核对"
+        return f"新版朋友圈已点「发表」，编辑面板{closed}"
+    if event == "moments.post.docked.screenshot_failed":
+        return f"截「发表」格失败，改按比例点相机格：{payload.get('error') or '-'}"
+    if event == "moments.post.docked.tile_fallback":
+        return f"截图里没认出相机格，按比例点 ({payload.get('x')}, {payload.get('y')})"
+    if event == "moments.post.docked.close_failed":
+        return f"发完关朋友圈面板没成（不影响结果）：{payload.get('error') or '-'}"
     if event == "moments.like.start":
         return f"开始给朋友圈点赞：只点今天的，最多 {payload.get('limit', 0)} 条"
     if event == "moments.like.done":
