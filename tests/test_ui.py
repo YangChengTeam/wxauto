@@ -1056,6 +1056,7 @@ class SettingsDefaultsTests(unittest.TestCase):
                 int(gateway.friend_recheck_deadline_hours),
             "WXCLIENT_GATEWAY_ACTIVE_HOURS": gateway.active_hours,
             "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": gateway.max_sends_per_hour,
+            "WXCLIENT_GATEWAY_MAX_MESSAGES_PER_HOUR": gateway.max_messages_per_hour,
             "WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR": gateway.max_friend_actions_per_hour,
             "WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS": int(gateway.friend_interval_seconds),
             "WXCLIENT_GATEWAY_MAX_MOMENTS_PER_DAY": gateway.max_moments_per_day,
