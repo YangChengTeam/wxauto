@@ -563,6 +563,15 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"微信输入框还没准备好（刚切过去，还不能打字），等一下重来一次：这次要做的是"
             f"{'发文件' if payload.get('op') == 'send_files' else '发消息'}"
         )
+    if event == "wechat.edit_missing":
+        # 「非正常好友,无法发送消息」的第一现场：切过去 0.1 秒内没找到输入框，好友其实是真的。
+        return (
+            f"微信没找到「{payload.get('friend') or '-'}」的聊天输入框（微信报「非正常好友」，"
+            f"多半是聊天被弹成独立窗口或界面还没切好），等一下重来一次：这次要做的是"
+            f"{'发文件' if payload.get('op') == 'send_files' else '发消息'}"
+        )
+    if event == "wechat.separate_window_closed_before_retry":
+        return f"重来前先把「{payload.get('friend') or '-'}」被弹出去的独立聊天窗口关掉"
     if event == "wechat.edit_retry":
         waited = "输入框已经可用了" if payload.get("等到可用") else "没等到它变可用，仍然再试一次"
         return f"重来一次：{waited}"
