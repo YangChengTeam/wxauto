@@ -43,6 +43,17 @@ def _is_element_not_enabled(exc: BaseException) -> bool:
     return type(exc).__name__ == "ElementNotEnabled"
 
 
+def _is_not_friend_error(exc: BaseException) -> bool:
+    """这个异常是不是 pyweixin 的 ``NotFriendError``（「非正常好友,无法发送消息」）。
+
+    名字听着像「对方不是好友」，实际判据只是：点开会话后 **0.1 秒内没找到输入框**
+    （`WeChatAuto.send_messages_to_friend` / `send_files_to_friend` 的 `edit_area.exists(timeout=0.1)`）。
+    2026-09-17 真机：好友是真的，前一条、后一条都发成了，唯独刚读完他的消息立刻回的那一条
+    撞上这句——微信那一刻的界面状态而已。同样按类名认，理由见 `_is_element_not_enabled`。
+    """
+    return type(exc).__name__ == "NotFriendError"
+
+
 
 def _disable_esc_close_fallback() -> None:
     """让 pywinauto 的 ``close()`` 关不掉时**什么都不做**，而不是回退去按 ESC。
@@ -967,17 +978,47 @@ class UiaWeChatDriver:
 
         ★ 哪天改成一次传多条消息，上面这个论证就不成立了——先把它重新想清楚再动，
           别顺手加进来。重复骚扰候选人比慢一轮严重得多。
+
+        **第二种也重来：``NotFriendError``（「非正常好友,无法发送消息」）**（2026-09-17 用户实报）。
+        它和上面那种是同一道闸的两副面孔：`edit_area.exists(timeout=0.1)` 说「不在」就抛这句，
+        `set_text('')` 说「不能用」就抛那句——都在**一个字都还没粘进去之前**，所以重来同样不会多发。
+        真机上好友是真的：通过后第一条发成了、半小时后的跟进也发成了，只有刚读完他的回复
+        立刻回的那一条撞上它。多半是那一刻主窗口里没有这个会话的输入框——最常见的一种是
+        这个会话被弹成了独立小窗口（读聊天记录退回弹窗那条路就会弹，读完关不掉就留着），
+        微信 4.x 里被弹出去的会话在主窗口里没有输入框，而发消息只认主窗口。
+        所以重来之前先把这个人的独立窗口关掉（有就关、没有就过），再等输入框回来。
+        对方真不是好友时（删了 / 拉黑 / 还没通过）重来那次照样抛，只多等最长 3 秒。
         """
         try:
             return call()
         except Exception as exc:
-            # 只挑这一种重来；别的错原样上抛——见上面「为什么重来一次不会多发」那段
-            if not _is_element_not_enabled(exc):
+            # 只挑这两种重来；别的错原样上抛——见上面「为什么重来一次不会多发」那段
+            if _is_not_friend_error(exc):
+                logger.warning("wechat.edit_missing", friend=friend, op=op)
+                self._close_separate_dialog_window(friend)
+            elif _is_element_not_enabled(exc):
+                logger.warning("wechat.edit_not_enabled", friend=friend, op=op)
+            else:
                 raise
-        logger.warning("wechat.edit_not_enabled", friend=friend, op=op)
         ready = self._wait_chat_input_enabled(friend)
         logger.info("wechat.edit_retry", friend=friend, op=op, 等到可用=ready)
         return call()
+
+    def _close_separate_dialog_window(self, friend: str) -> bool:
+        """这个人的会话要是被弹成了独立窗口，关掉它，让会话回到主窗口里。返回关没关。
+
+        关不掉也不抛：这只是重来前的收拾现场，真正的结论由重来那一次给。
+        """
+        try:
+            window = self._find_separate_dialog_window(friend)
+        except Exception:  # noqa: BLE001 —— 找窗口本身失败就当没有
+            window = None
+        if window is None:
+            return False
+        logger.info("wechat.separate_window_closed_before_retry", friend=friend)
+        self._try_close_window(window)
+        time.sleep(0.5)   # 关窗之后主窗口要重排一下右侧才有输入框
+        return True
 
     def _wait_chat_input_enabled(self, friend: str) -> bool:
         """等输入框变成可操作。返回「等到了没有」——等不到也照样重来一次。

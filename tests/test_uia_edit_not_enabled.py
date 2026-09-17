@@ -8,7 +8,11 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from wxclient.wechat_api.uia import UiaWeChatDriver, _is_element_not_enabled
+from wxclient.wechat_api.uia import (
+    UiaWeChatDriver,
+    _is_element_not_enabled,
+    _is_not_friend_error,
+)
 
 
 class ElementNotEnabled(Exception):
@@ -70,6 +74,67 @@ class 重来一次(unittest.TestCase):
             raise ElementNotEnabled("一直不能用")
 
         with mock.patch("wxclient.wechat_api.uia.logger"), self.assertRaises(ElementNotEnabled):
+            self.driver._with_edit_retry("张三", "send_message", always)
+
+
+class NotFriendError(Exception):
+    """冒充 pyweixin 的那个异常（「非正常好友,无法发送消息」）。同样按类名认。"""
+
+
+class 非正常好友也重来一次(unittest.TestCase):
+    """2026-09-17 用户实报：好友是真的，前后两条都发成了，刚读完他的回复立刻回的那条报
+    「非正常好友,无法发送消息」。它和「还没 enabled」是同一道闸、同样在一个字都没粘进去前抛。"""
+
+    def setUp(self) -> None:
+        self.driver = UiaWeChatDriver.__new__(UiaWeChatDriver)
+        self.waited: list[str] = []
+        self.driver._wait_chat_input_enabled = lambda friend: (self.waited.append(friend), True)[1]
+        self.closed: list[object] = []
+        self.separate_window: object | None = None
+        self.driver._find_separate_dialog_window = lambda friend: self.separate_window
+        self.driver._try_close_window = lambda window: self.closed.append(window)
+
+    def test_判据只认类名(self) -> None:
+        self.assertTrue(_is_not_friend_error(NotFriendError("非正常好友,无法发送消息")))
+        self.assertFalse(_is_not_friend_error(RuntimeError("非正常好友,无法发送消息")))
+
+    def test_撞上就等输入框回来再试一次(self) -> None:
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise NotFriendError("非正常好友,无法发送消息")
+            return "发出去了"
+
+        with mock.patch("wxclient.wechat_api.uia.logger"), mock.patch("wxclient.wechat_api.uia.time"):
+            result = self.driver._with_edit_retry("Hope Of The Whole Village", "send_message", flaky)
+        self.assertEqual(result, "发出去了")
+        self.assertEqual(len(calls), 2, "★ 只重来一次")
+        self.assertEqual(self.waited, ["Hope Of The Whole Village"])
+        self.assertEqual(self.closed, [], "没有独立窗口就什么都别关")
+
+    def test_会话被弹成独立窗口时先关掉再试(self) -> None:
+        self.separate_window = object()
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise NotFriendError("非正常好友,无法发送消息")
+            return "发出去了"
+
+        with mock.patch("wxclient.wechat_api.uia.logger"), mock.patch("wxclient.wechat_api.uia.time"):
+            self.driver._with_edit_retry("Hope Of The Whole Village", "send_message", flaky)
+        self.assertEqual(self.closed, [self.separate_window], "★ 重来之前要把独立窗口关掉")
+        self.assertEqual(len(calls), 2)
+
+    def test_真不是好友时重来那次照样抛(self) -> None:
+        def always():
+            raise NotFriendError("非正常好友,无法发送消息")
+
+        with mock.patch("wxclient.wechat_api.uia.logger"), mock.patch("wxclient.wechat_api.uia.time"), \
+                self.assertRaises(NotFriendError):
             self.driver._with_edit_retry("张三", "send_message", always)
 
 
