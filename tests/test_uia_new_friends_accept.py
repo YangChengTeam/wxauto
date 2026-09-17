@@ -304,6 +304,25 @@ class VerifyConfirmFormTests(_Harness):
         self.assertEqual(result["accepted"], ["小张"])
         self.assertNotIn("confirm", self._clicks())
 
+    def test_verify_button_is_clicked_again_once_when_nothing_appears(self) -> None:
+        """第一下可能没点上：等到一半确认框没出现、按钮还在，就再点一次；第二下之后窗口出现照常确认。"""
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[])
+        window = self.confirm_window(title="通过朋友验证", class_name="mmui::VerifyFriendWindow")
+        verify = self.detail._lookup[_key({"title": "前往验证", "control_type": "Button"})]
+
+        def click_verify() -> None:
+            self.log.append(("verify", "click"))
+            if self._clicks().count("verify") == 2:
+                self.windows.append(window)
+
+        verify.click_input = click_verify  # type: ignore[method-assign]
+        with capture_logs() as logs:
+            result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+        self.assertEqual(self._clicks().count("verify"), 2)
+        self.assertEqual(self._clicks().count("confirm"), 1)
+        self.assertEqual(len([e for e in logs if e.get("event") == "friend.check.verify_reclicked"]), 1)
+
     def test_no_confirm_anywhere_stops_and_leaves_evidence(self) -> None:
         driver = self._driver(cells=self._pending(), verify_title="前往验证",
                               windows=[_Node("main", self.log, text="微信", class_name="mmui::MainWindow")])
@@ -311,6 +330,7 @@ class VerifyConfirmFormTests(_Harness):
             driver.check_new_friends(verify=True, limit=1)
         self.assertIn("前往验证", str(ctx.exception))
         self.assertNotIn("confirm", self._clicks())
+        self.assertEqual(self._clicks().count("verify"), 2, "只补点一次，不会一直点")
         missing = [entry for entry in logs if entry.get("event") == "friend.check.confirm_missing"]
         self.assertEqual(len(missing), 1)
         self.assertEqual(missing[0].get("button"), "前往验证")

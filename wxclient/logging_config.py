@@ -408,6 +408,8 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"这条申请右侧没认出「通过」按钮，跳过：{payload.get('entry') or '-'}"
             f"（面板上的按钮：{payload.get('buttons') or '-'}）"
         )
+    if event == "friend.check.verify_reclicked":
+        return f"点了「通过」等了 {payload.get('waited') or '-'} 秒什么都没出现、按钮还在，再点一次"
     if event == "friend.check.confirm_missing":
         return (
             f"点了「{payload.get('button') or '通过'}」但没等到确认框，这一趟停手：{payload.get('entry') or '-'}，"

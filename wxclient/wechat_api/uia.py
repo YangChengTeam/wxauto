@@ -798,7 +798,7 @@ class UiaWeChatDriver:
                 button_title = str(_safe_call(getattr(button, "window_text", None)) or "").strip()[:20]
                 button.click_input()
                 try:
-                    via = self._confirm_friend_verification(main_window, detail, Uielements)
+                    via = self._confirm_friend_verification(main_window, detail, Uielements, button=button)
                 except Exception as exc:
                     # 「通过」已经点下去、确认框却没等到：这一下是不是生效了说不准，别再往下点别人。
                     # 留证：点的是哪颗按钮、桌面上此刻有哪些顶层窗口、详情面板上还剩哪些按钮——
@@ -851,7 +851,7 @@ class UiaWeChatDriver:
         return None
 
     def _confirm_friend_verification(
-        self, main_window: Any, detail: Any, Uielements: Any, *, timeout: float = 8.0,
+        self, main_window: Any, detail: Any, Uielements: Any, *, button: Any = None, timeout: float = 8.0,
     ) -> str:
         """点了「通过」之后把「通过朋友验证」那一步走完，返回是怎么确认的（中文，直接进日志）。
 
@@ -862,8 +862,14 @@ class UiaWeChatDriver:
         ② 停靠在主窗口里：主窗口里出现「通过朋友验证」这行字或 `VerifyFriend` 类控件；
         ③ 根本没有确认这一步：详情面板上「通过」按钮没了、换成了「发消息」，说明一点就通过了。
         找到 ①/② 就点里面的「确定」（各语言写法都认）。三种都没等到才抛，让上层留证停手。
+        ★ 等到一半（``timeout`` 的一半）什么都没出现、「通过」按钮还原样在面板上，就**再点一次**（只补一次）：
+        同一套判据 4.1.13.12 真机点得通，4.1.13.65 现场却没等到，「第一下没点上」是最便宜也最常见的解释
+        （[[wxauto-win-realmachine]]：焦点不在微信上时 click_input 会落到别的窗口）。
         """
-        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        deadline = started + timeout
+        reclick_at = started + timeout / 2
+        reclicked = False
         while True:
             host, via = self._find_verify_confirm_host(main_window)
             if host is not None:
@@ -875,7 +881,15 @@ class UiaWeChatDriver:
                     return via
             elif self._find_verify_button(detail) is None and _has_button(detail, _ACCEPTED_BUTTON_TITLES):
                 return "无需确认（一点即通过）"
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if button is not None and not reclicked and now >= reclick_at and now < deadline:
+                still_there = self._find_verify_button(detail)
+                if still_there is not None:
+                    logger.info("friend.check.verify_reclicked", waited=round(now - started, 1))
+                    still_there.click_input()
+                    reclicked = True
+                    continue
+            if now >= deadline:
                 raise WeChatApiError(f"{timeout:.0f} 秒内没见到「通过朋友验证」确认框（顶层窗口、主窗口内都没有），详情面板也没变成已通过")
             time.sleep(0.5)
 
