@@ -396,8 +396,19 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "friend.check.empty":
         return "好友申请检查完成：没有新的申请"
     if event == "friend.check.found":
-        mode = "，已执行同意" if payload.get("auto_accept") else ""
-        return f"好友申请检查完成：发现 {payload.get('count', 0)} 条{mode}"
+        mode = f"，这一趟通过了 {payload.get('accepted', 0)} 个" if payload.get("auto_accept") else ""
+        return f"好友申请检查完成：「新的朋友」里有 {payload.get('count', 0)} 条{mode}"
+    if event == "friend.check.no_section":
+        return "好友申请检查：通讯录里没找到「新的朋友」分区（微信版式变了？）"
+    if event == "friend.check.accepted":
+        return f"已通过好友申请：{payload.get('name') or '-'}"
+    if event == "friend.check.verify_button_missing":
+        return (
+            f"这条申请右侧没认出「通过」按钮，跳过：{payload.get('entry') or '-'}"
+            f"（面板上的按钮：{payload.get('buttons') or '-'}）"
+        )
+    if event == "friend.check.confirm_missing":
+        return f"点了「通过」但没等到确认框，这一趟停手：{payload.get('entry') or '-'}，原因：{payload.get('error') or '-'}"
     if event == "friend.check.failed":
         return f"好友申请检查失败：{payload.get('error') or '-'}"
 

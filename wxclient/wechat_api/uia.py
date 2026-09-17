@@ -702,20 +702,19 @@ class UiaWeChatDriver:
             verify=verify,
             limit=limit,
         )
-        Contacts = self._pyweixin_class("Contacts")
         # 「新的朋友」列表里老条目（早就通过的）也在 `items` 里；这一趟**真点了「通过」**的名字
-        # 单独收在 `accepted`（vendor 的 `verified_out`），上层据此判「通过了谁」，不拿整个列表当通过。
-        accepted: list[str] = []
+        # 单独收在 `accepted`，上层据此判「通过了谁」，不拿整个列表当通过。
+        #
+        # ★ 不再交给 vendor 的 `Contacts.check_new_friends`（2026-09-17 真机 4.1.13.12 坐实）：它按
+        #   `class_name == 'mmui::XTableCell'` 挑申请条目，而 4.1.13 的条目是 `mmui::ContactsCellNewFriendView`
+        #   ——整趟拿到空列表、一个都不点、一个字不记，候选人加了好友就一直挂着。自己走一遍，
+        #   判据全用正向证据（条目 class 表 + 按钮标题），和加好友那条路（`_await_contact_profile`）同思路。
         try:
-            items = Contacts.check_new_friends(
-                verify=verify,
-                limit=limit,
-                clear=False,
-                is_maximize=False,
-                close_weixin=False,
-                return_to_chat=True,
-                verified_out=accepted,
+            items, accepted = self._check_new_friends_reading_list(
+                verify=verify, limit=max(1, min(int(limit), _NEW_FRIENDS_LIMIT_MAX)),
             )
+        except WeChatApiError:
+            raise
         except Exception as exc:
             logger.info("friend.check.failed", error=str(exc)[:100])
             raise WeChatApiError(f"好友检测失败：{exc}") from exc
@@ -737,6 +736,110 @@ class UiaWeChatDriver:
             "items": items,
             "accepted": [str(name) for name in accepted],
         }
+
+    def _check_new_friends_reading_list(
+        self, *, verify: bool, limit: int
+    ) -> tuple[list[str], list[str]]:
+        """通讯录 → 「新的朋友」→ 逐条看右侧详情，有「通过」按钮就点。返回 ``(整个列表的文字, 真通过的名字)``。
+
+        ★ 条目怎么认：`_NEW_FRIEND_CELL_CLASSES`（4.1.13 是 `ContactsCellNewFriendView`，更早是 `XTableCell`）。
+          vendor 只认后者，4.1.13 上整趟为空——这就是「候选人加了好友没人通过」的真因（2026-09-17 真机 dump）。
+        ★ 「通过」怎么认：右侧详情面板（`FMessageDetailView`）上标题在 `_VERIFY_BUTTON_TITLES` 里的按钮。
+          不拿包着它的面板 class 当判据（vendor 那张 `ContactDetailCustom` 表按版本分叉，4.1.13 落到 `found_index`）。
+          我方发出去还没被通过的条目，同一个位置是「等待对方验证」——标题对不上就不点，别把它当「通过」。
+        ★ 已处理过的条目（列表文字末尾带「已添加 / 已过期 / …」）不点进去：右侧没有按钮，白翻一次。
+        ★ 通过者的名字从详情面板顶上的昵称（`TextViewCanCopy`）读，**在点「通过」之前读**；列表那一行是
+          「昵称 + 验证语 + 状态」拼在一起的（`周彪我: 我是Kk已添加`），拿它当会话名去读消息会「查无此人」。
+        ★ 收尾点回左侧「微信」，不按 ESC（[[wechat-uia-window-state]]：ESC = 关窗）。
+        """
+        Navigator = self._pyweixin_class("Navigator")
+        Tools = self._pyweixin_class("Tools")
+        Uielements = self._pyweixin_submodule("Uielements")
+        contact_list, main_window = Navigator.open_contacts(is_maximize=False)
+        items: list[str] = []
+        accepted: list[str] = []
+        try:
+            _safe_call(lambda: Tools.collapse_contacts(main_window, contact_list))
+            section = main_window.child_window(**Uielements.ListItems.NewFriendListItem)
+            if not _truthy_safe_call(lambda: section.exists(timeout=1)):
+                logger.info("friend.check.no_section", seen=_pane_inventory(contact_list))
+                return items, accepted
+            entries = self._expand_new_friend_entries(section, contact_list)
+            items = [text for _cell, text in entries]
+            if not verify:
+                return items, accepted
+            detail = self._new_friend_detail_root(main_window)
+            for cell, text in entries:
+                if len(accepted) >= limit:
+                    break
+                if text.endswith(_NEW_FRIEND_SETTLED_SUFFIXES):
+                    continue
+                cell.click_input()
+                time.sleep(1.0)
+                name = self._new_friend_display_name(detail) or _strip_new_friend_status(text)
+                button = self._find_verify_button(detail)
+                if button is None:
+                    # 留证：这一条右侧到底有哪些按钮。下次再遇到「有申请却没通过」，日志自己说得清
+                    # 是按钮换了标题、还是这条本来就不是别人加我们（比如「等待对方验证」）。
+                    logger.info("friend.check.verify_button_missing", entry=text[:20],
+                                buttons=_button_titles(detail))
+                    continue
+                button.click_input()
+                try:
+                    verify_window = Tools.move_window_to_center(Window=Uielements.Windows.VerifyFriendWindow2)
+                    time.sleep(0.5)
+                    verify_window.child_window(**Uielements.Buttons.ConfirmButton).click_input()
+                except Exception as exc:
+                    # 「通过」已经点下去、确认框却没等到：这一下是不是生效了说不准，别再往下点别人。
+                    logger.info("friend.check.confirm_missing", entry=text[:20], error=str(exc)[:100])
+                    raise WeChatApiError(f"点了「通过」但没等到确认框：{exc}") from exc
+                time.sleep(1.0)
+                accepted.append(name)
+                logger.info("friend.check.accepted", name=name[:20])
+        finally:
+            _safe_call(lambda: contact_list.type_keys("{HOME}"))
+            _safe_call(lambda: Tools.collapse_contacts(main_window, contact_list))
+            _safe_call(lambda: main_window.child_window(**Uielements.SideBar.Weixin).click_input())
+        return items, accepted
+
+    @staticmethod
+    def _expand_new_friend_entries(section: Any, contact_list: Any) -> list[tuple[Any, str]]:
+        """点开「新的朋友」分区，把展开的申请条目 ``(控件, 文字)`` 收回来。
+
+        分区是开关式的：`collapse_contacts` 把它收起后点一下是展开；万一它本来就是展开的，
+        这一下反而收起——读不到条目就再点一次。
+        """
+        section.click_input()
+        time.sleep(1.0)
+        entries = _new_friend_entries(contact_list)
+        if not entries:
+            section.click_input()
+            time.sleep(1.0)
+            entries = _new_friend_entries(contact_list)
+        return entries
+
+    @staticmethod
+    def _new_friend_detail_root(main_window: Any) -> Any:
+        """右侧申请详情面板；认不出就拿整个主窗口兜底（按钮标题判据在整窗口里也不会撞车）。"""
+        detail = _safe_call(lambda: main_window.child_window(**_NEW_FRIEND_DETAIL_ROOT))
+        if detail is not None and _truthy_safe_call(lambda: detail.exists(timeout=0.5)):
+            return detail
+        return main_window
+
+    @staticmethod
+    def _find_verify_button(detail: Any) -> Any | None:
+        for title in _VERIFY_BUTTON_TITLES:
+            button = _safe_call(lambda t=title: detail.child_window(title=t, control_type="Button"))
+            if button is not None and _truthy_safe_call(lambda b=button: b.exists(timeout=0.3)):
+                return button
+        return None
+
+    @staticmethod
+    def _new_friend_display_name(detail: Any) -> str:
+        text = _safe_call(lambda: detail.child_window(**_NEW_FRIEND_NAME_TEXT))
+        if text is None or not _truthy_safe_call(lambda: text.exists(timeout=0.3)):
+            return ""
+        return str(_safe_call(getattr(text, "window_text", None)) or "").strip()
 
     def send_message(
         self,
@@ -3594,6 +3697,55 @@ def _pick_profile_name(lines: list[str], number: str) -> str | None:
         if fallback is None:
             fallback = line
     return fallback
+
+
+#: 「新的朋友」分区展开后每条申请的 ListItem class。4.1.13 起是 `ContactsCellNewFriendView`（2026-09-17 真机 dump），
+#: 更早版本是 `XTableCell`——vendor 只认后者，4.1.13 上整趟拿到空列表。新版本再换名字就往这张表里加。
+_NEW_FRIEND_CELL_CLASSES = ("mmui::ContactsCellNewFriendView", "mmui::XTableCell")
+#: 申请详情面板上「通过」那颗按钮的标题。vendor 表里是「前往验证」（老版本）；4.1.13 待处理条目的标题
+#: 还没在真机上见过（dump 那天没有待处理申请），几种可能的写法都认。**只认标题**：我方发出去的申请
+#: 同一个位置是「等待对方验证」，靠 class 认会把它也点了。
+_VERIFY_BUTTON_TITLES = ("前往验证", "通过验证", "接受", "同意", "Verify Now", "Accept", "前往驗證")
+#: 已处理过的条目在列表文字末尾带的状态；这些条目右侧没有「通过」按钮，不点进去。
+_NEW_FRIEND_SETTLED_SUFFIXES = ("已添加", "已过期", "已通过", "已拒绝", "已拉黑")
+#: 右侧申请详情面板 / 面板顶上的昵称（4.1.13 dump：`mmui::DetailView` auto_id=FMessageDetailView，昵称是 `TextViewCanCopy`）。
+_NEW_FRIEND_DETAIL_ROOT = {"control_type": "Group", "auto_id": "FMessageDetailView"}
+_NEW_FRIEND_NAME_TEXT = {"control_type": "Text", "auto_id": "TextViewCanCopy"}
+#: 一趟最多通过几个（vendor 的口径：单次 ≤8）。
+_NEW_FRIENDS_LIMIT_MAX = 8
+
+
+def _new_friend_entries(contact_list: Any) -> list[tuple[Any, str]]:
+    """通讯录列表里现在露出来的申请条目。列表是虚拟化的（`RecyclerListView`），只有露出来的才在树上。"""
+    entries: list[tuple[Any, str]] = []
+    for cell in _safe_call(lambda: contact_list.children()) or []:
+        class_name = str(_safe_call(getattr(cell, "class_name", None)) or "")
+        if class_name not in _NEW_FRIEND_CELL_CLASSES:
+            continue
+        text = str(_safe_call(getattr(cell, "window_text", None)) or "").strip()
+        entries.append((cell, text))
+    return entries
+
+
+def _strip_new_friend_status(text: str) -> str:
+    """列表那一行拼的是「昵称 + 验证语 + 状态」；读不到详情面板的昵称时，尽量剥出前面那段。"""
+    cleaned = str(text or "").strip()
+    for suffix in _NEW_FRIEND_SETTLED_SUFFIXES:
+        cleaned = cleaned.removesuffix(suffix)
+    head, sep, _tail = cleaned.partition("我: ")
+    if sep:
+        cleaned = head
+    return cleaned.strip()[:30]
+
+
+def _button_titles(pane: Any, limit: int = 12) -> str:
+    """面板上有哪些按钮（标题）。「通过」按钮没认出来时留这一行，下次一眼看出是不是标题换了。"""
+    titles: list[str] = []
+    for control in (_safe_call(lambda: pane.descendants(control_type="Button")) or [])[:limit]:
+        title = str(_safe_call(getattr(control, "window_text", None)) or "").strip()[:20]
+        if title:
+            titles.append(title)
+    return "; ".join(titles) or "(没有带标题的按钮)"
 
 
 def _pane_inventory(pane: Any, limit: int = 25) -> str:
