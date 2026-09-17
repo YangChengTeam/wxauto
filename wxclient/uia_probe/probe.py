@@ -5,6 +5,8 @@ from typing import Any
 
 import structlog
 
+from wxclient.heavy_import import import_wechat_driver
+
 from .constants import MIN_UIA_EXPOSED_DESCENDANTS, UIA_LOGIN_CLASSES, UIA_MAIN_CLASSES
 from .windows import find_wechat_windows
 
@@ -34,6 +36,10 @@ def probe_wechat_uia(max_depth: int = 10, max_nodes: int = 5000) -> dict[str, An
             "reason": "UIA 探测仅支持 Windows",
         }
 
+    # ★ 先在闸里把 pywinauto / comtypes / pywin32 / psutil 这套 C 扩展加载完（heavy_import.py）：
+    # 下面 find_wechat_windows 里那几个函数内惰性 import 才是真正 LoadLibrary 的地方，
+    # 不排队就会和主线程 / 网关线程的首次 import 撞加载器锁。
+    import_wechat_driver()
     try:
         windows = find_wechat_windows(max_depth=max_depth, max_nodes=max_nodes)
     except Exception as exc:

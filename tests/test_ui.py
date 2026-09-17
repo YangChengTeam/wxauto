@@ -595,6 +595,74 @@ class HeavyImportSerializationTests(unittest.TestCase):
             )
 
 
+    # ★ 2026-09-17 第二次发作：启动动画停在「正在准备界面…」不动，一定概率。上面那把闸围住的
+    # 只是一句纯 Python import，真正 LoadLibrary 的 psutil / win32api / pywinauto 在
+    # `probe_wechat_uia()` 里是函数内惰性 import，从来没排过队；这回撞上的是主线程
+    # （MainWindow 一建完就起探测线程，主线程还在 import pystray / 登录页）。
+    # 下面四条钉的是两条修法：首次加载集中进 `import_wechat_driver()`、探测线程等 mainloop。
+
+    def test_driver_import_happens_inside_the_lock_and_only_once(self) -> None:
+        from wxclient import heavy_import
+
+        seen: list[tuple[str, bool]] = []
+
+        def fake_import(name: str) -> None:
+            seen.append((name, heavy_import.HEAVY_IMPORT_LOCK.locked()))
+
+        before = heavy_import._driver_imported
+        with mock.patch.object(heavy_import.platform, "system", return_value="Windows"), \
+                mock.patch.object(heavy_import.importlib, "import_module", side_effect=fake_import):
+            heavy_import._driver_imported = False
+            try:
+                heavy_import.import_wechat_driver()
+                heavy_import.import_wechat_driver()  # 第二次只查布尔，不再碰加载器
+            finally:
+                heavy_import._driver_imported = before
+
+        names = [name for name, _ in seen]
+        self.assertEqual(len(names), len(set(names)), f"同一个模块被 import 了两遍：{names}")
+        self.assertTrue({"pywinauto", "comtypes", "win32api", "psutil"} <= set(names),
+                        f"微信驱动链上会 LoadLibrary 的模块都得在这一批里：{names}")
+        self.assertTrue(all(locked for _, locked in seen),
+                        "每一次首次 import 都必须发生在 HEAVY_IMPORT_LOCK 里")
+
+    def test_driver_import_is_a_noop_off_windows(self) -> None:
+        from wxclient import heavy_import
+
+        before = heavy_import._driver_imported
+        with mock.patch.object(heavy_import.platform, "system", return_value="Linux"), \
+                mock.patch.object(heavy_import.importlib, "import_module") as import_module:
+            heavy_import._driver_imported = False
+            try:
+                heavy_import.import_wechat_driver()
+            finally:
+                heavy_import._driver_imported = before
+        import_module.assert_not_called()
+
+    def test_every_lazy_pywinauto_user_warms_up_through_the_shared_import(self) -> None:
+        """探测入口和驱动构造都要先喊 `import_wechat_driver()`，而且要在惰性 import 之前。"""
+        root = Path(__file__).resolve().parent.parent / "wxclient"
+        probe = (root / "uia_probe/probe.py").read_text(encoding="utf-8")
+        self.assertIn("from wxclient.heavy_import import import_wechat_driver", probe)
+        self.assertLess(probe.index("import_wechat_driver()"),
+                        probe.index("find_wechat_windows(max_depth"),
+                        "probe_wechat_uia 必须先排队加载 C 扩展，再去枚举窗口")
+        driver = (root / "wechat_api/uia.py").read_text(encoding="utf-8")
+        self.assertIn("from wxclient.heavy_import import import_wechat_driver", driver)
+        init = driver[driver.index("class UiaWeChatDriver"):driver.index("    def add_friend(")]
+        self.assertIn("import_wechat_driver()", init,
+                      "UiaWeChatDriver.__init__ 必须先排队加载 C 扩展，别让第一个动作去撞加载器锁")
+
+    def test_first_wechat_probe_waits_for_the_mainloop(self) -> None:
+        """探测线程不能在 MainWindow.__init__ 里直接起：主线程那会儿还在 import pystray / 登录页。"""
+        root = Path(__file__).resolve().parent.parent / "wxclient"
+        source = (root / "ui/window.py").read_text(encoding="utf-8")
+        self.assertIn("self._later(0, self._schedule_wechat_probe)", source,
+                      "首次探测必须经 after(0) 排到 mainloop 之后")
+        self.assertNotIn("self._schedule_wechat_probe()", source,
+                         "不许在 tk 线程上同步起探测线程（那正是「正在准备界面…」卡住的死锁）")
+
+
 class AppIconTests(unittest.TestCase):
     """exe / 快捷方式 / 任务栏 / 托盘用同一份品牌图标（用户 2026-08-13 要求）。"""
 

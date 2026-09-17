@@ -256,7 +256,11 @@ class MainWindow:
         # 而且它一边跑一边触发 GC，GC 落在**非主线程**上回收 tk 对象时 Tcl 会直接 abort
         # 整个进程（`Tcl_AsyncDelete`，真机上实测过）。测试传 probe_wechat=False 关掉。
         if probe_wechat:
-            self._schedule_wechat_probe()
+            # ★ 不在这里直接起线程，排到 mainloop 之后（2026-09-17，heavy_import.py）：主线程从
+            # 这儿到 mainloop 之间还要 import pystray、登录页；探测线程一起来就首次 import
+            # pywinauto，两边同时 LoadLibrary 就是那个「正在准备界面…」不动的死锁。
+            # after(0) 只在 mainloop 里才跑，那时主线程的启动 import 已经全部结束。
+            self._later(0, self._schedule_wechat_probe)
         # 参数页提前建好：建控件是「很多次小 Tcl 调用」，正是主线程抢不到 GIL 时最吃亏的活。
         # 真机实测空闲时也要 9ms，网关忙着读聊天记录时点下去就是肉眼可见的一顿。
         # 排在启动之后的空闲档期建，用户点的时候只剩 pack/unpack。
@@ -1606,8 +1610,9 @@ class MainWindow:
         if not self._probe_lock.acquire(blocking=False):
             return  # 上一次还没探完，跳过这轮，别堆线程
         try:
-            # 首次 import 会拉起 pywinauto 那套 C 扩展；必须和网关装配串行，否则两个线程
-            # 同时 LoadLibrary 会卡死在 Windows 加载器锁上（见 heavy_import.py）。
+            # 这一句 import 本身是纯 Python 的；真正拉起 pywinauto 那套 C 扩展的是
+            # probe_wechat_uia() 进门那次 import_wechat_driver()，它自己会在闸里做（见 heavy_import.py）。
+            # 这儿的闸留着，是不让「探测线程首次 import」这条路上出现任何不排队的加载。
             with HEAVY_IMPORT_LOCK:
                 from wxclient.uia_probe import probe_wechat_uia
 

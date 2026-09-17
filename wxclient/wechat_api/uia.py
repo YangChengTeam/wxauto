@@ -12,6 +12,7 @@ from typing import Any, ClassVar
 
 import structlog
 
+from wxclient.heavy_import import import_wechat_driver
 from wxclient.uia_probe import probe_wechat_uia
 from wxclient.uia_probe.constants import (
     DEFAULT_UIA_PROBE_MAX_DEPTH,
@@ -154,6 +155,9 @@ class UiaWeChatDriver:
         self.project_root = project_root or Path(__file__).resolve().parents[2]
         self.dry_run = dry_run
         self.wechat_path = wechat_path
+        # 下面各动作里 `from pywinauto import ...` 全是惰性的：首次加载排进闸里做（heavy_import.py），
+        # 别让网关线程的第一个动作去和探测线程撞加载器锁。
+        import_wechat_driver()
         #: `_ensure_ready` 探测到的微信进程版本（如 ``4.1.13.65``），朋友圈按它挑版式。
         self._wechat_version = ""
 
