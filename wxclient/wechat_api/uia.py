@@ -796,19 +796,27 @@ class UiaWeChatDriver:
                                 buttons=_button_titles(detail))
                     continue
                 button_title = str(_safe_call(getattr(button, "window_text", None)) or "").strip()[:20]
+                windows_before = _window_handles(self._desktop_windows())
                 button.click_input()
                 try:
-                    via = self._confirm_friend_verification(main_window, detail, Uielements, button=button)
+                    via = self._confirm_friend_verification(
+                        main_window, detail, Uielements, button=button, windows_before=windows_before,
+                    )
                 except Exception as exc:
                     # 「通过」已经点下去、确认框却没等到：这一下是不是生效了说不准，别再往下点别人。
                     # 留证：点的是哪颗按钮、桌面上此刻有哪些顶层窗口、详情面板上还剩哪些按钮——
                     # 4.1.13.65 现场（2026-09-17）就是这一步停手，而日志里只有 vendor 那串判据，看不出窗口去哪了。
+                    # ★ 证据要进异常文本本身：用户机上我们看不到本地日志，能到 AI 端 / 用户眼前的只有这句报错。
+                    windows = _window_inventory(self._desktop_windows())
+                    buttons = _button_titles(detail)
                     logger.info(
                         "friend.check.confirm_missing", entry=text[:20], button=button_title,
-                        error=str(exc)[:100], windows=_window_inventory(self._desktop_windows()),
-                        buttons=_button_titles(detail),
+                        error=str(exc)[:160], windows=windows, buttons=buttons,
                     )
-                    raise WeChatApiError(f"点了「{button_title or '通过'}」但没等到确认框：{exc}") from exc
+                    raise WeChatApiError(
+                        f"点了「{button_title or '通过'}」但没等到确认框：{exc}"
+                        f"｜此刻顶层窗口：{windows}｜详情面板按钮：{buttons}"
+                    ) from exc
                 time.sleep(1.0)
                 accepted.append(name)
                 logger.info("friend.check.accepted", name=name[:20], via=via)
@@ -852,6 +860,7 @@ class UiaWeChatDriver:
 
     def _confirm_friend_verification(
         self, main_window: Any, detail: Any, Uielements: Any, *, button: Any = None, timeout: float = 8.0,
+        windows_before: set[Any] | None = None,
     ) -> str:
         """点了「通过」之后把「通过朋友验证」那一步走完，返回是怎么确认的（中文，直接进日志）。
 
@@ -870,53 +879,90 @@ class UiaWeChatDriver:
         deadline = started + timeout
         reclick_at = started + timeout / 2
         reclicked = False
+        seen_host: tuple[str, str] | None = None   # (形态, 里面的按钮标题) —— 找到过确认框却认不出按钮时的证据
         while True:
-            host, via = self._find_verify_confirm_host(main_window)
+            host, via = self._find_verify_confirm_host(main_window, windows_before)
             if host is not None:
                 _safe_call(getattr(host, "set_focus", None))
                 time.sleep(0.5)
-                confirm = self._find_confirm_button(host, Uielements)
+                confirm = self._find_confirm_button(host, Uielements, standalone=host is not main_window)
                 if confirm is not None:
                     confirm.click_input()
                     return via
+                seen_host = (via, _button_titles(host))
             elif self._find_verify_button(detail) is None and _has_button(detail, _ACCEPTED_BUTTON_TITLES):
                 return "无需确认（一点即通过）"
             now = time.monotonic()
-            if button is not None and not reclicked and now >= reclick_at and now < deadline:
+            if button is not None and not reclicked and now >= reclick_at and now < deadline and seen_host is None:
                 still_there = self._find_verify_button(detail)
                 if still_there is not None:
                     logger.info("friend.check.verify_reclicked", waited=round(now - started, 1))
-                    still_there.click_input()
+                    # 第二下走 UIA 的 Invoke（不靠坐标、不靠焦点）；没有这个模式再退回坐标点击。
+                    if _safe_call(getattr(still_there, "invoke", None)) is None:
+                        still_there.click_input()
                     reclicked = True
                     continue
             if now >= deadline:
+                if seen_host is not None:
+                    raise WeChatApiError(
+                        f"{timeout:.0f} 秒内见到了确认框（{seen_host[0]}）但认不出里面的确认按钮，它上面的按钮是：{seen_host[1]}"
+                    )
                 raise WeChatApiError(f"{timeout:.0f} 秒内没见到「通过朋友验证」确认框（顶层窗口、主窗口内都没有），详情面板也没变成已通过")
             time.sleep(0.5)
 
-    def _find_verify_confirm_host(self, main_window: Any) -> tuple[Any | None, str]:
-        """「通过朋友验证」确认框现在在哪：``(宿主控件, 形态说明)``，没有就 ``(None, "")``。"""
-        for window in self._desktop_windows():
+    def _find_verify_confirm_host(
+        self, main_window: Any, windows_before: set[Any] | None = None,
+    ) -> tuple[Any | None, str]:
+        """「通过朋友验证」确认框现在在哪：``(宿主控件, 形态说明)``，没有就 ``(None, "")``。
+
+        判据从具体到泛：① 顶层窗口 class 带 VerifyFriend / FriendVerify 或标题命中；② 点击之后**新冒出来**的微信顶层窗口
+        （`mmui::` 打头、不在点击前的句柄集合里）——名字全没猜中也认得出「它刚弹出来」，是否点它由里面有没有确认按钮决定；
+        ③ 停靠在主窗口里：标题文字（不限控件类型）或 Verify 类控件。
+        """
+        windows = self._desktop_windows()
+        for window in windows:
             class_name = str(_safe_call(getattr(window, "class_name", None)) or "")
             title = str(_safe_call(getattr(window, "window_text", None)) or "").strip()
-            if "verifyfriend" in class_name.lower() or title in _VERIFY_CONFIRM_TITLES:
+            lowered = class_name.lower()
+            if "verifyfriend" in lowered or "friendverify" in lowered or title in _VERIFY_CONFIRM_TITLES:
                 return window, "独立确认框"
+        if windows_before is not None:
+            for window in windows:
+                handle = _window_handle(window)
+                class_name = str(_safe_call(getattr(window, "class_name", None)) or "")
+                if handle is None or handle in windows_before or not class_name.startswith("mmui::"):
+                    continue
+                if class_name in _NOT_A_CONFIRM_WINDOW:
+                    continue
+                return window, f"点击后新出现的窗口（{class_name}）"
         for title in _VERIFY_CONFIRM_TITLES:
-            node = _safe_call(lambda t=title: main_window.child_window(title=t, control_type="Text"))
+            node = _safe_call(lambda t=title: main_window.child_window(title=t))
             if node is not None and _truthy_safe_call(lambda n=node: n.exists(timeout=0.2)):
                 return main_window, "主窗口内确认框"
-        node = _safe_call(lambda: main_window.child_window(class_name_re=".*VerifyFriend.*"))
+        node = _safe_call(lambda: main_window.child_window(class_name_re=".*(VerifyFriend|FriendVerify).*"))
         if node is not None and _truthy_safe_call(lambda n=node: n.exists(timeout=0.2)):
             return node, "主窗口内确认框"
         return None, ""
 
     @staticmethod
-    def _find_confirm_button(host: Any, Uielements: Any) -> Any | None:
+    def _find_confirm_button(host: Any, Uielements: Any, *, standalone: bool = False) -> Any | None:
+        """确认框里那颗「确定」。三层：① 标题 + Button；② 标题不限控件类型（4.1.13.65 用户机上「确定」肉眼看得见、
+        按 Button 却找不到——文字可能挂在按钮的子 Text 上，点它的坐标同样落在按钮上）；③ 独立确认框里一颗标题都对不上时，
+        点最后一颗按钮（对话框的主操作按惯例在最后；点错了最多把框关掉，条目还在，下一趟再来），并把点了谁写进日志。
+        """
         criteria: list[dict[str, Any]] = [dict(Uielements.Buttons.ConfirmButton)]
         criteria.extend({"title": title, "control_type": "Button"} for title in _CONFIRM_BUTTON_TITLES)
+        criteria.extend({"title": title} for title in _CONFIRM_BUTTON_TITLES)
         for crit in criteria:
             button = _safe_call(lambda c=crit: host.child_window(**c))
             if button is not None and _truthy_safe_call(lambda b=button: b.exists(timeout=0.3)):
                 return button
+        if standalone:
+            buttons = _safe_call(lambda: host.descendants(control_type="Button")) or []
+            if buttons:
+                logger.info("friend.check.confirm_fallback_button", buttons=_button_titles(host),
+                            picked=str(_safe_call(getattr(buttons[-1], "window_text", None)) or "")[:20])
+                return buttons[-1]
         return None
 
     @staticmethod
@@ -3839,7 +3885,9 @@ _NEW_FRIEND_NAME_TEXT = {"control_type": "Text", "auto_id": "TextViewCanCopy"}
 #: 两条判据任一命中就是它——vendor 要求标题和 class 同时对上，4.1.13.65 上 5 秒没等到（2026-09-17 现场）。
 _VERIFY_CONFIRM_TITLES = ("通过朋友验证", "通过好友验证", "通過朋友驗證", "Confirm Friend Request", "朋友验证")
 #: 确认框里那颗按钮的标题（vendor 的 ConfirmButton 先试，再试这些）。
-_CONFIRM_BUTTON_TITLES = ("确定", "完成", "发送", "確定", "OK", "Done")
+_CONFIRM_BUTTON_TITLES = ("确定", "完成", "通过", "确认", "添加", "发送", "確定", "確認", "通過", "OK", "Done", "Confirm")
+#: 点击之后可能同时冒出来、但绝不是确认框的微信顶层窗口（气泡提示、主窗口本身）。
+_NOT_A_CONFIRM_WINDOW = frozenset({"mmui::MainWindow", "mmui::XTooltip", "mmui::XPopover", "mmui::ToastWindow"})
 #: 详情面板上「已经是好友」的正向证据：「通过」按钮没了、换成这些，说明这一下一点就通过了、没有确认框。
 _ACCEPTED_BUTTON_TITLES = ("发消息", "Send Message", "發消息", "發訊息")
 #: 一趟最多通过几个（vendor 的口径：单次 ≤8）。
@@ -3885,6 +3933,16 @@ def _has_button(pane: Any, titles: tuple[str, ...]) -> bool:
         if button is not None and _truthy_safe_call(lambda b=button: b.exists(timeout=0.3)):
             return True
     return False
+
+
+def _window_handle(window: Any) -> Any:
+    """pywinauto 包装器上 ``handle`` 是属性不是方法，读它本身就可能抛（窗口已经没了）。"""
+    handle = _safe_call(lambda: window.handle)
+    return handle if isinstance(handle, int) else None
+
+
+def _window_handles(windows: list[Any]) -> set[Any]:
+    return {handle for handle in (_window_handle(window) for window in windows) if handle is not None}
 
 
 def _window_inventory(windows: list[Any], limit: int = 12) -> str:

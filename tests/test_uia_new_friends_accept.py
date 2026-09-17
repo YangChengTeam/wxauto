@@ -39,6 +39,7 @@ class _Node:
     ) -> None:
         self._name, self._log = name, log
         self._class_name, self._text, self._exists = class_name, text, exists
+        self.handle = id(self)
         self._children = children or []
         self._lookup = lookup or {}
 
@@ -279,7 +280,7 @@ class VerifyConfirmFormTests(_Harness):
 
     def test_confirm_form_docked_inside_main_window(self) -> None:
         driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[])
-        self.main_window._lookup[_key({"title": "通过朋友验证", "control_type": "Text"})] = _Node("docked_title", self.log)
+        self.main_window._lookup[_key({"title": "通过朋友验证"})] = _Node("docked_title", self.log)
         self.main_window._lookup[_key(_Elements.Buttons.ConfirmButton)] = self.confirm
         with capture_logs() as logs:
             result = driver.check_new_friends(verify=True, limit=1)
@@ -323,6 +324,75 @@ class VerifyConfirmFormTests(_Harness):
         self.assertEqual(self._clicks().count("confirm"), 1)
         self.assertEqual(len([e for e in logs if e.get("event") == "friend.check.verify_reclicked"]), 1)
 
+    def test_new_mmui_window_after_click_is_taken_as_the_confirm_box(self) -> None:
+        """名字全没猜中（标题、class 都陌生）也认得出「点完刚冒出来的微信窗口」，里面有「确定」就点。"""
+        main = _Node("main_top", self.log, text="微信", class_name="mmui::MainWindow")
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[main])
+        popup = self.confirm_window(title="早芳", class_name="mmui::XDialogWindow")
+        verify = self.detail._lookup[_key({"title": "前往验证", "control_type": "Button"})]
+
+        def click_verify() -> None:
+            self.log.append(("verify", "click"))
+            self.windows.append(popup)
+
+        verify.click_input = click_verify  # type: ignore[method-assign]
+        with capture_logs() as logs:
+            result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+        self.assertEqual(self._clicks().count("confirm"), 1)
+        accepted = [e for e in logs if e.get("event") == "friend.check.accepted"]
+        self.assertIn("mmui::XDialogWindow", accepted[0].get("via"))
+
+    def test_a_tooltip_that_pops_after_the_click_is_not_the_confirm_box(self) -> None:
+        main = _Node("main_top", self.log, text="微信", class_name="mmui::MainWindow")
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[main])
+        verify = self.detail._lookup[_key({"title": "前往验证", "control_type": "Button"})]
+
+        def click_verify() -> None:
+            self.log.append(("verify", "click"))
+            self.windows.append(_Node("tip", self.log, text="", class_name="mmui::XTooltip",
+                                      lookup={_key(_Elements.Buttons.ConfirmButton): self.confirm}))
+
+        verify.click_input = click_verify  # type: ignore[method-assign]
+        with self.assertRaises(uia.WeChatApiError):
+            driver.check_new_friends(verify=True, limit=1)
+        self.assertNotIn("confirm", self._clicks())
+
+    def test_confirm_text_without_button_type_is_clicked(self) -> None:
+        """4.1.13.65 用户机：「确定」肉眼看得见、按 Button 找不到——按文字不限控件类型也要点到。"""
+        text_confirm = _Node("confirm_text", self.log, text="确定")
+        window = _Node("verify_window", self.log, text="通过朋友验证", class_name="mmui::VerifyFriendWindow",
+                       lookup={_key({"title": "确定"}): text_confirm})
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[window])
+        result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+        self.assertIn("confirm_text", self._clicks())
+
+    def test_standalone_box_with_unknown_button_titles_clicks_the_last_button(self) -> None:
+        close = _button("close", self.log, "关闭")
+        primary = _button("primary", self.log, "好的")
+        window = _Node("verify_window", self.log, text="通过朋友验证", class_name="mmui::VerifyFriendWindow",
+                       lookup={"a": close, "b": primary})
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[window])
+        with capture_logs() as logs:
+            result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+        self.assertIn("primary", self._clicks())
+        self.assertNotIn("close", self._clicks())
+        fallback = [e for e in logs if e.get("event") == "friend.check.confirm_fallback_button"]
+        self.assertEqual(fallback[0].get("picked"), "好的")
+
+    def test_docked_host_with_unknown_buttons_says_it_saw_the_box(self) -> None:
+        """主窗口当宿主时不许乱点最后一颗按钮；报错要说明「见到了确认框但认不出按钮」并列出按钮。"""
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[])
+        self.main_window._lookup[_key({"title": "通过朋友验证"})] = _Node("docked_title", self.log)
+        with self.assertRaises(uia.WeChatApiError) as ctx:
+            driver.check_new_friends(verify=True, limit=1)
+        self.assertIn("见到了确认框", str(ctx.exception))
+        self.assertIn("主窗口内确认框", str(ctx.exception))
+        self.assertNotIn("confirm", self._clicks())
+        self.assertEqual(self._clicks().count("verify"), 1, "见到过确认框就不再补点「通过」")
+
     def test_no_confirm_anywhere_stops_and_leaves_evidence(self) -> None:
         driver = self._driver(cells=self._pending(), verify_title="前往验证",
                               windows=[_Node("main", self.log, text="微信", class_name="mmui::MainWindow")])
@@ -336,6 +406,7 @@ class VerifyConfirmFormTests(_Harness):
         self.assertEqual(missing[0].get("button"), "前往验证")
         self.assertIn("mmui::MainWindow|微信", missing[0].get("windows", ""))
         self.assertIn("前往验证", missing[0].get("buttons", ""))
+        self.assertIn("mmui::MainWindow|微信", str(ctx.exception), "证据要进异常文本，用户机上只有这句能传出来")
 
 
 if __name__ == "__main__":
