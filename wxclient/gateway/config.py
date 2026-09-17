@@ -108,9 +108,11 @@ class GatewaySettings(BaseSettings):
     没有这条复查，我们主动加的人一旦通过，系统里没有任何一处会发现（见 ``friendcheck.py``）。
 
     只读、不发申请，但仍在动微信搜索，所以走的是和「查好友申请」**同一档共享节拍**
-    （``guard.READ_FRIENDS_ACTION``，≥300s，整台机器共用），一轮最多查一个人。
+    （``guard.READ_FRIENDS_ACTION``，整台机器共用），一轮最多查一个人。
     另外它还要给**主动加好友**让路：刚加过（``guard.FRIEND_WRITE_ACTION`` 那本账，只看不占）
     就跳过这轮——连着两次搜人正是 2026-08-27 弹出安全验证的形状。
+    这两道闸的秒数都是下面的 ``friend_interval_seconds``（「加好友最小间隔」），
+    被挡下的那一趟只睡闸还差的秒数。所以本项填得比它小也没用：真正搜的节拍由它定。
     """
 
     friend_recheck_deadline_hours: float = 72.0
@@ -178,6 +180,7 @@ class GatewaySettings(BaseSettings):
 
     friend_interval_seconds: float = MIN_FRIEND_INTERVAL_SECONDS
     """两次**主动加好友**之间至少隔多久（秒）。配额之外的第二道闸：配额管总量、它管节奏。
+    也是「查好友通过」复查给加好友让路、以及复查自己占搜人闸的秒数（2026-09-17）。
 
     ★ 为什么要有它：2026-08-27 真机弹了微信安全验证，那天加好友一共才两次——
     15:22:36 和 15:23:57，隔 81 秒，两次都是「没搜到这个号」。只有配额的话，

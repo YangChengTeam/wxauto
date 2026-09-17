@@ -390,3 +390,102 @@ class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestConfiguredFriendInterval(_Base):
+    """★ 2026-09-17：两道闸都读配置中心的「加好友最小间隔」，不再写死 300。
+
+    现场：客户端填了 180，候选人 10:21 秒通过，第一句 10:28 才发出——复查让路和占闸
+    都按 300 算，180 秒周期撞上 300 秒闸，实际每 6 分钟才真搜一次。
+    """
+
+    async def test_让路按配置的加好友间隔(self) -> None:
+        self.requested()
+        from wxclient.gateway.guard import FRIEND_WRITE_ACTION
+
+        self.store.try_touch_read(ACCOUNT, FRIEND_WRITE_ACTION, self.now, 180.0)
+        runtime = _Runtime({"exact_count": 1})
+        watcher = self.watcher(runtime, friend_interval_seconds=180.0)
+        self.now += timedelta(seconds=181)
+        self.assertEqual(await watcher.tick(), [NAME])  # 300 那版这里还在让路
+
+    async def test_占闸按配置的加好友间隔(self) -> None:
+        self.requested()
+        from wxclient.gateway.guard import READ_FRIENDS_ACTION
+
+        self.store.try_touch_read(ACCOUNT, READ_FRIENDS_ACTION, self.now, 180.0)
+        runtime = _Runtime({"exact_count": 1})
+        watcher = self.watcher(runtime, friend_interval_seconds=180.0)
+        self.now += timedelta(seconds=181)
+        self.assertEqual(await watcher.tick(), [NAME])
+
+    async def test_不传就还是原来的下限(self) -> None:
+        """默认值仍是 300：没配置的老库行为一个字不变。"""
+        self.requested()
+        from wxclient.gateway.guard import FRIEND_WRITE_ACTION
+
+        self.store.try_touch_read(ACCOUNT, FRIEND_WRITE_ACTION, self.now, 300.0)
+        runtime = _Runtime({"exact_count": 1})
+        self.now += timedelta(seconds=181)
+        self.assertEqual(await self.watcher(runtime).tick(), [])
+        self.assertEqual(runtime.calls, [])
+
+
+class TestSleepOnlyRemaining(_Base):
+    """★ 被闸挡下的那一趟只睡闸还差的秒数，不整睡一个复查周期。"""
+
+    async def test_没被挡就睡带抖动的周期(self) -> None:
+        self.requested()
+        watcher = self.watcher(_Runtime(), interval_seconds=180.0)
+        await watcher.tick()
+        self.assertEqual(watcher.pending_wait_seconds, 0.0)
+        for _ in range(20):
+            self.assertTrue(126.0 <= watcher.next_sleep_seconds() <= 234.0)
+
+    async def test_被让路挡下就只睡剩余秒数(self) -> None:
+        self.requested()
+        from wxclient.gateway.guard import FRIEND_WRITE_ACTION
+
+        self.store.try_touch_read(ACCOUNT, FRIEND_WRITE_ACTION, self.now, 180.0)
+        runtime = _Runtime({"exact_count": 1})
+        watcher = self.watcher(runtime, interval_seconds=180.0, friend_interval_seconds=180.0)
+        self.now += timedelta(seconds=100)
+        self.assertEqual(await watcher.tick(), [])
+        self.assertAlmostEqual(watcher.pending_wait_seconds, 80.0, places=1)
+        for _ in range(20):
+            self.assertAlmostEqual(watcher.next_sleep_seconds(), 80.0, places=1)
+        # 睡完再查：闸到了就真搜
+        self.now += timedelta(seconds=81)
+        self.assertEqual(await watcher.tick(), [NAME])
+        self.assertEqual(watcher.pending_wait_seconds, 0.0)
+
+    async def test_被搜人闸挡下就只睡剩余秒数(self) -> None:
+        self.requested()
+        from wxclient.gateway.guard import READ_FRIENDS_ACTION
+
+        self.store.try_touch_read(ACCOUNT, READ_FRIENDS_ACTION, self.now, 180.0)
+        watcher = self.watcher(_Runtime(), interval_seconds=900.0, friend_interval_seconds=180.0)
+        self.now += timedelta(seconds=30)
+        await watcher.tick()
+        self.assertAlmostEqual(watcher.pending_wait_seconds, 150.0, places=1)
+        self.assertAlmostEqual(watcher.next_sleep_seconds(), 150.0, places=1)
+
+    async def test_剩余秒数不小于一秒也不长于周期(self) -> None:
+        watcher = self.watcher(_Runtime(), interval_seconds=180.0)
+        watcher.pending_wait_seconds = 0.1
+        self.assertEqual(watcher.next_sleep_seconds(), 1.0)
+        watcher.pending_wait_seconds = 10_000.0
+        self.assertTrue(watcher.next_sleep_seconds() <= 234.0)
+
+    async def test_没人要查时不留剩余秒数(self) -> None:
+        """名单空了、窗外、关掉复查：都不该拿上一趟的剩余秒数去睡。"""
+        from wxclient.gateway.guard import FRIEND_WRITE_ACTION
+
+        self.requested()
+        self.store.try_touch_read(ACCOUNT, FRIEND_WRITE_ACTION, self.now, 300.0)
+        watcher = self.watcher(_Runtime(), interval_seconds=180.0)
+        await watcher.tick()
+        self.assertGreater(watcher.pending_wait_seconds, 0)
+        self.store.drop_friend_request(ACCOUNT, NUMBER)
+        await watcher.tick()
+        self.assertEqual(watcher.pending_wait_seconds, 0.0)

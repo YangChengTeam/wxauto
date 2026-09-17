@@ -272,6 +272,8 @@ def build_gateway(
             store=store,
             interval_seconds=gateway_settings.friend_recheck_interval_seconds,
             deadline_hours=gateway_settings.friend_recheck_deadline_hours,
+            # 让路和占闸都按「加好友最小间隔」来，和加好友自己守的是同一个数。
+            friend_interval_seconds=gateway_settings.friend_interval_seconds,
             active_hours=gateway_settings.active_hours,
         ),
         # 090：陌生人主动发起。**默认关**（`stranger_intake`）——放开 fail-closed 名单
