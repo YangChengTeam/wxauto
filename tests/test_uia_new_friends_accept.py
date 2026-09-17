@@ -152,13 +152,13 @@ class NewFriendsAcceptTests(unittest.TestCase):
         cells = [
             _Node("old1", self.log, text="奥利给我: 你好已过期"),
             _Node("old2", self.log, text="周彪我: 我是Kk已添加"),
-            _Node("pending", self.log, text="小张你好，我想找工作"),
+            _Node("pending", self.log, text="小张我是小张等待验证"),   # 4.1.13 真机：待处理条目末尾是「等待验证」
         ]
         driver = self._driver(cells=cells, verify_title="前往验证")
 
         result = driver.check_new_friends(verify=True, limit=5)
 
-        self.assertEqual(result["items"], ["奥利给我: 你好已过期", "周彪我: 我是Kk已添加", "小张你好，我想找工作"])
+        self.assertEqual(result["items"], ["奥利给我: 你好已过期", "周彪我: 我是Kk已添加", "小张我是小张等待验证"])
         self.assertEqual(result["accepted"], ["小张"], "名字来自详情面板的昵称，不是列表那一行")
         clicks = self._clicks()
         self.assertNotIn("old1", clicks)
