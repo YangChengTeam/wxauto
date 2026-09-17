@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import itertools
 import unittest
 from typing import Any, ClassVar
 from unittest import mock
@@ -98,12 +99,18 @@ def _button(name: str, log: list, title: str) -> _Node:
     return node
 
 
-class NewFriendsAcceptTests(unittest.TestCase):
+class _Harness(unittest.TestCase):
     def setUp(self) -> None:
         self.log: list[tuple[str, str]] = []
         self.sleep_patch = mock.patch.object(uia.time, "sleep", lambda *_: None)
         self.sleep_patch.start()
         self.addCleanup(self.sleep_patch.stop)
+        # 确认框等待用 monotonic 定 8 秒期限：假时钟每问一次走 1 秒，等不到时几轮就到期，测试不用真等。
+        clock = itertools.count(0.0, 1.0)
+        self.clock_patch = mock.patch.object(uia.time, "monotonic", lambda: next(clock))
+        self.clock_patch.start()
+        self.addCleanup(self.clock_patch.stop)
+        self.confirm = _Node("confirm", self.log)
 
     def _driver(
         self,
@@ -112,6 +119,7 @@ class NewFriendsAcceptTests(unittest.TestCase):
         verify_title: str | None,
         nickname: str = "小张",
         cell_class: str = "mmui::ContactsCellNewFriendView",
+        windows: list[_Node] | None = None,
     ) -> uia.UiaWeChatDriver:
         log = self.log
         for cell in cells:
@@ -130,24 +138,32 @@ class NewFriendsAcceptTests(unittest.TestCase):
             _key({"control_type": "Group", "auto_id": "FMessageDetailView"}): detail,
             _key(_Elements.SideBar.Weixin): weixin_button,
         })
-        self.confirm = _Node("confirm", log)
-        verify_window = _Node("verify_window", log, lookup={_key(_Elements.Buttons.ConfirmButton): self.confirm})
+        self.detail, self.main_window = detail, main_window
+        if windows is None:
+            windows = [self.confirm_window(title="通过朋友验证", class_name="mmui::VerifyFriendWindow")]
+        self.windows = windows
 
         navigator = mock.Mock()
         navigator.open_contacts.return_value = (contact_list, main_window)
         tools = mock.Mock()
-        tools.move_window_to_center.return_value = verify_window
 
         driver = uia.UiaWeChatDriver(dry_run=False)
         driver._ensure_ready = lambda: None  # type: ignore[method-assign]
         driver._pyweixin_class = lambda name: navigator if name == "Navigator" else tools  # type: ignore[method-assign]
         driver._pyweixin_submodule = lambda name: _Elements  # type: ignore[method-assign]
+        driver._desktop_windows = lambda: list(self.windows)  # type: ignore[method-assign]
         self.tools = tools
         return driver
+
+    def confirm_window(self, *, title: str, class_name: str) -> _Node:
+        return _Node("verify_window", self.log, text=title, class_name=class_name,
+                     lookup={_key(_Elements.Buttons.ConfirmButton): self.confirm})
 
     def _clicks(self) -> list[str]:
         return [name for name, action in self.log if action == "click"]
 
+
+class NewFriendsAcceptTests(_Harness):
     def test_4113_entries_are_recognized_and_pending_one_gets_accepted(self) -> None:
         cells = [
             _Node("old1", self.log, text="奥利给我: 你好已过期"),
@@ -166,7 +182,7 @@ class NewFriendsAcceptTests(unittest.TestCase):
         self.assertEqual(clicks[-4:], ["pending", "verify", "confirm", "weixin_tab"],
                          "点条目 → 点「通过」→ 确认框「确定」→ 收尾回「微信」页")
         self.assertNotIn(("contact_list", "type_keys:{ESC}"), self.log)
-        self.tools.move_window_to_center.assert_called_once_with(Window=_Elements.Windows.VerifyFriendWindow2)
+        self.tools.move_window_to_center.assert_not_called()
 
     def test_alternative_button_title_is_also_accepted(self) -> None:
         driver = self._driver(cells=[_Node("pending", self.log, text="小张想找活")], verify_title="通过验证")
@@ -222,8 +238,7 @@ class NewFriendsAcceptTests(unittest.TestCase):
 
     def test_confirm_window_missing_raises_instead_of_moving_on(self) -> None:
         driver = self._driver(cells=[_Node("p1", self.log, text="甲"), _Node("p2", self.log, text="乙")],
-                              verify_title="前往验证")
-        self.tools.move_window_to_center.side_effect = RuntimeError("no window")
+                              verify_title="前往验证", windows=[])
         with self.assertRaises(uia.WeChatApiError):
             driver.check_new_friends(verify=True, limit=5)
         self.assertNotIn("p2", self._clicks(), "第一条的确认框没等到就停手，不再往下点别人")
@@ -235,6 +250,72 @@ class StripStatusTests(unittest.TestCase):
         self.assertEqual(uia._strip_new_friend_status("周彪我: 我是Kk已添加"), "周彪")
         self.assertEqual(uia._strip_new_friend_status("奥利给我: 你好已过期"), "奥利给")
         self.assertEqual(uia._strip_new_friend_status("小张"), "小张")
+
+
+class VerifyConfirmFormTests(_Harness):
+    """点了「通过」之后的「通过朋友验证」确认框（2026-09-17 微信 4.1.13.65 现场：vendor 判据 5 秒没等到，整趟停手）。
+
+    vendor 要求顶层窗口的标题「通过朋友验证」**和** class `mmui::VerifyFriendWindow` 同时对上；这里任一命中都算，
+    还认停靠在主窗口里的形态，以及「一点就通过、根本没有确认框」的形态。三种都没等到才停手，且必须留证。
+    """
+
+    def _pending(self) -> list[_Node]:
+        return [_Node("pending", self.log, text="早芳我是早芳等待验证")]
+
+    def test_confirm_window_found_by_class_when_title_changed(self) -> None:
+        driver = self._driver(cells=self._pending(), verify_title="前往验证",
+                              windows=[self.confirm_window(title="添加朋友", class_name="mmui::VerifyFriendWindow")])
+        result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+        self.assertIn("confirm", self._clicks())
+
+    def test_confirm_window_found_by_title_when_class_changed(self) -> None:
+        driver = self._driver(cells=self._pending(), verify_title="前往验证",
+                              windows=[_Node("other", self.log, text="微信", class_name="mmui::MainWindow"),
+                                       self.confirm_window(title="通过朋友验证", class_name="mmui::XDialog")])
+        result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+        self.assertEqual(self._clicks().count("confirm"), 1)
+
+    def test_confirm_form_docked_inside_main_window(self) -> None:
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[])
+        self.main_window._lookup[_key({"title": "通过朋友验证", "control_type": "Text"})] = _Node("docked_title", self.log)
+        self.main_window._lookup[_key(_Elements.Buttons.ConfirmButton)] = self.confirm
+        with capture_logs() as logs:
+            result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+        self.assertIn("confirm", self._clicks())
+        accepted = [entry for entry in logs if entry.get("event") == "friend.check.accepted"]
+        self.assertEqual(accepted[0].get("via"), "主窗口内确认框")
+
+    def test_accept_without_any_confirm_form_counts_when_panel_shows_send_message(self) -> None:
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[])
+        detail = self.detail
+        verify = detail._lookup[_key({"title": "前往验证", "control_type": "Button"})]
+        send_message = _button("send_message", self.log, "发消息")
+
+        def click_verify() -> None:
+            self.log.append(("verify", "click"))
+            verify._exists = False
+            detail._lookup[_key({"title": "发消息", "control_type": "Button"})] = send_message
+
+        verify.click_input = click_verify  # type: ignore[method-assign]
+        result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+        self.assertNotIn("confirm", self._clicks())
+
+    def test_no_confirm_anywhere_stops_and_leaves_evidence(self) -> None:
+        driver = self._driver(cells=self._pending(), verify_title="前往验证",
+                              windows=[_Node("main", self.log, text="微信", class_name="mmui::MainWindow")])
+        with capture_logs() as logs, self.assertRaises(uia.WeChatApiError) as ctx:
+            driver.check_new_friends(verify=True, limit=1)
+        self.assertIn("前往验证", str(ctx.exception))
+        self.assertNotIn("confirm", self._clicks())
+        missing = [entry for entry in logs if entry.get("event") == "friend.check.confirm_missing"]
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0].get("button"), "前往验证")
+        self.assertIn("mmui::MainWindow|微信", missing[0].get("windows", ""))
+        self.assertIn("前往验证", missing[0].get("buttons", ""))
 
 
 if __name__ == "__main__":
