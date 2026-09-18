@@ -356,6 +356,13 @@ class SettingsPage(tk.Frame):
 
     def _save(self, *, restart: bool) -> None:
         values = self._collect()
+        problems = settings_store.validate(values)
+        if problems:
+            # 网关地板以下的数：以前悄悄抬回去只打日志，界面上还显示你填的——「改了没反应」。
+            # 现在不存、说清楚哪格为什么（用户 2026-09-18）。
+            dialog.tell(self, "有几个数不能这么填",
+                        "\n".join(problems.values()) + "\n\n改好再保存。", tone="error")
+            return
         try:
             path = settings_store.save(self.data_dir, values)
         except OSError as exc:

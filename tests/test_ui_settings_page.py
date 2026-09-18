@@ -198,6 +198,21 @@ class ConfigLookTests(unittest.TestCase):
         self.root.update()
         self.assertIn("所有更改均已保存", self._labels(self.bar))
 
+    def test_a_number_below_the_gateway_floor_is_refused_and_not_saved(self) -> None:
+        """读消息间隔填 10：不写文件、弹一句带地板的话（用户 2026-09-18 「配置改了没反应」）。"""
+        from unittest import mock
+
+        from wxclient.ui import dialog
+
+        self.page._vars["WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS"].set("10")
+        with mock.patch.object(dialog, "tell") as tell:
+            self.page._save(restart=False)
+        self.assertFalse(settings_store.settings_path(self.dir).exists(), "拒了就不该落盘")
+        title, message = tell.call_args.args[1], tell.call_args.args[2]
+        self.assertIn("不能这么填", title)
+        self.assertIn("最低 30", message)
+        self.assertEqual(tell.call_args.kwargs.get("tone"), "error")
+
     def test_a_placeholder_never_becomes_a_value(self) -> None:
         """★ 占位文字要是塞进变量，那一格就会被存成提示语本身。
 

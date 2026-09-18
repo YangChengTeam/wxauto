@@ -34,6 +34,8 @@ class Field:
     unit: str = ""          # 输入框右边贴着的单位（设计稿上「秒」是框内的一格）
     placeholder: str = ""   # 空着时框里的灰字。**只是提示，永远不会被当成值**
     default: str = ""       # 没配过时**真正生效**的值（和 placeholder 不是一回事）
+    minimum: float | None = None  # 网关那边的硬地板；填得比它低保存时当场拒绝，见 `validate`
+    zero_means_off: bool = False  # 0 是「关掉」不是「0 秒」，不跟地板比
 
 
 @dataclass(frozen=True)
@@ -84,11 +86,16 @@ FIELDS: tuple[Field, ...] = (
           default=DEFAULT_BUSINESS_API_URL),
     Field("WXCLIENT_GATEWAY_AI_WS_URL", "AI 端地址", "默认已填好正式地址",
           default=DEFAULT_AI_WS_URL),
+    # ★ `minimum` 抄自 `gateway/pacing.py` 的 MIN_READ / MIN_FRIEND 两个常量，**不在这里 import**
+    #   （同 default 的理由：`wxclient.gateway` 包一进来就是 structlog + pydantic）。
+    #   抄错了由 `tests/test_settings_validation.py` 判死。用户 2026-09-18：原来填低了网关
+    #   悄悄抬回地板、只打一条日志，界面上还显示你填的数——「配置改了没反应」。现在保存时就拒。
     Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔",
-          "空闲时多久看一次未读", section="sched", unit="秒",
-          default="180"),
+          "空闲时多久看一次未读；最低 30", section="sched", unit="秒",
+          default="180", minimum=30),
     Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔",
-          "0=不查", section="sched", unit="秒", default="900"),
+          "0=不查；最低 300", section="sched", unit="秒", default="900",
+          minimum=300, zero_means_off=True),
     # 用户 2026-09-07：说明太长把输入框挤坏了（调度配置一行两组），全部精简成半句。
     # 原来写在说明里的两条限定挪到这里：① 通过检测实际仍受「查好友」那档 ≥300 秒的
     # 整机节拍约束，填更小也不会更快；② 期限到了只是别让他占住名额，不代表判定对方
@@ -165,6 +172,37 @@ def fields_of(section: str) -> tuple[Field, ...]:
     return tuple(field for field in FIELDS if field.section == section)
 
 _TRUE = {"1", "true", "yes", "on", "是"}
+
+
+def validate(values: dict[str, str]) -> dict[str, str]:
+    """保存前的检查：返回 ``{键: 一句人话}``，空字典 = 都能存。
+
+    只管**带 `minimum` 的格子**：填得比网关地板低，网关启动时会 `clamp_interval` 抬回去并只打一条
+    日志，界面上仍显示你填的数——人看到的是「改了没反应」。与其事后悄悄改，不如保存时就说清楚。
+    空着 = 用默认值，不算错；`zero_means_off` 的格子填 0 是「关掉」，也不算错。
+    不是数字的按「填错」报，别让它带着一个字符串进 env 再在网关启动那一刻炸。
+    """
+    errors: dict[str, str] = {}
+    for field in FIELDS:
+        if field.minimum is None:
+            continue
+        raw = str(values.get(field.key, "")).strip()
+        if raw == "":
+            continue
+        try:
+            number = float(raw)
+        except ValueError:
+            errors[field.key] = f"「{field.label}」要填数字，现在是「{raw}」"
+            continue
+        if number == 0 and field.zero_means_off:
+            continue
+        if number < field.minimum:
+            floor = f"{field.minimum:g}"
+            errors[field.key] = (
+                f"「{field.label}」最低 {floor} {field.unit}，你填的是 {raw}"
+                + ("（0 表示关掉）" if field.zero_means_off else "")
+            )
+    return errors
 
 
 def settings_path(data_dir: Path) -> Path:
