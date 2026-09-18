@@ -81,6 +81,25 @@ class _Node:
         return _Node(f"{self._name}/{key}", self._log, exists=False)
 
 
+class _Wrapper(_Node):
+    """长得像 pywinauto 的 UIAWrapper（`Desktop().windows()` 给的那种顶层窗口）：**没有** `child_window`，只能
+    `descendants(**判据)`。0.1.63–0.1.66 的假窗口都带 child_window，真机上的「确定」找不到就这样漏过了测试。"""
+
+    child_window = None  # type: ignore[assignment]
+
+    def descendants(self, **kwargs: Any) -> list[Any]:
+        out = []
+        for node in self._lookup.values():
+            if not isinstance(node, _Node):
+                continue
+            if kwargs.get("control_type") == "Button" and not node._is_button:
+                continue
+            if "title" in kwargs and node._text != kwargs["title"]:
+                continue
+            out.append(node)
+        return out
+
+
 def _key(kwargs: dict[str, Any]) -> str:
     return "|".join(f"{k}={kwargs[k]}" for k in sorted(kwargs))
 
@@ -116,7 +135,7 @@ class _Harness(unittest.TestCase):
         self.clock_patch = mock.patch.object(uia.time, "monotonic", lambda: next(clock))
         self.clock_patch.start()
         self.addCleanup(self.clock_patch.stop)
-        self.confirm = _Node("confirm", self.log)
+        self.confirm = _button("confirm", self.log, "确定")
 
     def _driver(
         self,
@@ -165,8 +184,8 @@ class _Harness(unittest.TestCase):
         return driver
 
     def confirm_window(self, *, title: str, class_name: str) -> _Node:
-        return _Node("verify_window", self.log, text=title, class_name=class_name,
-                     lookup={_key(_Elements.Buttons.ConfirmButton): self.confirm})
+        return _Wrapper("verify_window", self.log, text=title, class_name=class_name,
+                        lookup={_key(_Elements.Buttons.ConfirmButton): self.confirm})
 
     def _clicks(self) -> list[str]:
         return [name for name, action in self.log if action == "click"]
@@ -369,26 +388,53 @@ class VerifyConfirmFormTests(_Harness):
     def test_confirm_text_without_button_type_is_clicked(self) -> None:
         """4.1.13.65 用户机：「确定」肉眼看得见、按 Button 找不到——按文字不限控件类型也要点到。"""
         text_confirm = _Node("confirm_text", self.log, text="确定")
-        window = _Node("verify_window", self.log, text="通过朋友验证", class_name="mmui::VerifyFriendWindow",
-                       lookup={_key({"title": "确定"}): text_confirm})
+        window = _Wrapper("verify_window", self.log, text="通过朋友验证", class_name="mmui::VerifyFriendWindow",
+                          lookup={_key({"title": "确定"}): text_confirm})
         driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[window])
         result = driver.check_new_friends(verify=True, limit=1)
         self.assertEqual(result["accepted"], ["小张"])
         self.assertIn("confirm_text", self._clicks())
 
-    def test_standalone_box_with_unknown_button_titles_clicks_the_last_button(self) -> None:
-        close = _button("close", self.log, "关闭")
+    def test_standalone_box_with_unknown_button_titles_clicks_the_last_non_cancel_button(self) -> None:
         primary = _button("primary", self.log, "好的")
-        window = _Node("verify_window", self.log, text="通过朋友验证", class_name="mmui::VerifyFriendWindow",
-                       lookup={"a": close, "b": primary})
+        cancel = _button("cancel", self.log, "取消")
+        window = _Wrapper("verify_window", self.log, text="通过朋友验证", class_name="mmui::VerifyFriendWindow",
+                          lookup={"a": _button("tags", self.log, "修改标签"), "b": primary, "c": cancel})
         driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[window])
         with capture_logs() as logs:
             result = driver.check_new_friends(verify=True, limit=1)
         self.assertEqual(result["accepted"], ["小张"])
         self.assertIn("primary", self._clicks())
-        self.assertNotIn("close", self._clicks())
+        self.assertNotIn("cancel", self._clicks(), "「取消」排在最后也不许点：框关了申请还在，却记成 accepted")
+        self.assertNotIn("tags", self._clicks())
         fallback = [e for e in logs if e.get("event") == "friend.check.confirm_fallback_button"]
         self.assertEqual(fallback[0].get("picked"), "好的")
+        self.assertIn("不是「取消」", uia_logging_sentence("friend.check.confirm_fallback_button", fallback[0]))
+
+    def test_standalone_box_with_only_cancel_buttons_raises_instead_of_clicking_cancel(self) -> None:
+        window = _Wrapper("verify_window", self.log, text="通过朋友验证", class_name="mmui::VerifyFriendWindow",
+                          lookup={"a": _button("tags", self.log, "修改标签"), "b": _button("cancel", self.log, "取消")})
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[window])
+        with self.assertRaises(uia.WeChatApiError) as ctx:
+            driver.check_new_friends(verify=True, limit=1)
+        self.assertIn("认不出里面的确认按钮", str(ctx.exception))
+        self.assertIn("取消", str(ctx.exception))
+        self.assertNotIn("cancel", self._clicks())
+
+    def test_real_4113_verify_window_shape_clicks_ok_not_cancel(self) -> None:
+        """2026-09-18 真机（4.1.13.12 / 0.1.66）原样：顶层 mmui::VerifyFriendWindow 是 UIAWrapper（没有 child_window），
+        按钮依次「修改标签」「确定」「取消」——之前每种找法都吞掉 AttributeError，兜底点了最后一颗「取消」。"""
+        ok = _button("ok", self.log, "确定")
+        window = _Wrapper("verify_window", self.log, text="通过朋友验证", class_name="mmui::VerifyFriendWindow",
+                          lookup={"a": _button("tags", self.log, "修改标签"), "b": ok, "c": _button("cancel", self.log, "取消")})
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[window])
+        with capture_logs() as logs:
+            result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+        self.assertIn("ok", self._clicks())
+        self.assertNotIn("cancel", self._clicks())
+        self.assertFalse([e for e in logs if e.get("event") == "friend.check.confirm_fallback_button"],
+                         "「确定」明明在，不该走兜底")
 
     def test_docked_host_with_unknown_buttons_says_it_saw_the_box(self) -> None:
         """主窗口当宿主时不许乱点最后一颗按钮；报错要说明「见到了确认框但认不出按钮」并列出按钮。"""

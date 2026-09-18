@@ -91,7 +91,7 @@ def _disable_esc_close_fallback() -> None:
 
 
 def parse_wechat_version(text: Any) -> tuple[int, ...]:
-    """``"4.1.13.65"`` → ``(4, 1, 13, 65)``；读不出来就空元组（**不猜**）。"""
+    """``"4.1.12.26"`` → ``(4, 1, 13, 65)``；读不出来就空元组（**不猜**）。"""
     if not isinstance(text, str):
         return ()
     parts: list[int] = []
@@ -169,7 +169,7 @@ class UiaWeChatDriver:
         # 下面各动作里 `from pywinauto import ...` 全是惰性的：首次加载排进闸里做（heavy_import.py），
         # 别让网关线程的第一个动作去和探测线程撞加载器锁。
         import_wechat_driver()
-        #: `_ensure_ready` 探测到的微信进程版本（如 ``4.1.13.65``），朋友圈按它挑版式。
+        #: `_ensure_ready` 探测到的微信进程版本（如 ``4.1.12.26``），朋友圈按它挑版式。
         self._wechat_version = ""
 
     def add_friend(
@@ -805,7 +805,7 @@ class UiaWeChatDriver:
                 except Exception as exc:
                     # 「通过」已经点下去、确认框却没等到：这一下是不是生效了说不准，别再往下点别人。
                     # 留证：点的是哪颗按钮、桌面上此刻有哪些顶层窗口、详情面板上还剩哪些按钮——
-                    # 4.1.13.65 现场（2026-09-17）就是这一步停手，而日志里只有 vendor 那串判据，看不出窗口去哪了。
+                    # 4.1.12.26 现场（2026-09-17）就是这一步停手，而日志里只有 vendor 那串判据，看不出窗口去哪了。
                     # ★ 证据要进异常文本本身：用户机上我们看不到本地日志，能到 AI 端 / 用户眼前的只有这句报错。
                     windows = _window_inventory(self._desktop_windows())
                     hidden = _window_inventory(
@@ -857,8 +857,8 @@ class UiaWeChatDriver:
     @staticmethod
     def _find_verify_button(detail: Any) -> Any | None:
         for title in _VERIFY_BUTTON_TITLES:
-            button = _safe_call(lambda t=title: detail.child_window(title=t, control_type="Button"))
-            if button is not None and _truthy_safe_call(lambda b=button: b.exists(timeout=0.3)):
+            button = _find_child(detail, {"title": title, "control_type": "Button"})
+            if button is not None:
                 return button
         return None
 
@@ -869,14 +869,14 @@ class UiaWeChatDriver:
         """点了「通过」之后把「通过朋友验证」那一步走完，返回是怎么确认的（中文，直接进日志）。
 
         vendor 只认一种形态：顶层窗口、标题「通过朋友验证」、class `mmui::VerifyFriendWindow`，5 秒内没出现就
-        `ElementNotFoundError`——2026-09-17 微信 4.1.13.65 现场正是这样停手的（[[wechat-auto-accept-friend-110]]）。
+        `ElementNotFoundError`——2026-09-17 微信 4.1.12.26 现场正是这样停手的（[[wechat-auto-accept-friend-110]]）。
         4.1.13 把朋友圈都停靠进主窗口了，这个确认框长什么样还没在真机上见过，所以这里按正向证据找三种形态：
         ① 顶层窗口：class 里带 `VerifyFriend` **或** 标题是「通过朋友验证」一类——两条判据任一命中，不要求同时；
         ② 停靠在主窗口里：主窗口里出现「通过朋友验证」这行字或 `VerifyFriend` 类控件；
         ③ 根本没有确认这一步：详情面板上「通过」按钮没了、换成了「发消息」，说明一点就通过了。
         找到 ①/② 就点里面的「确定」（各语言写法都认）。三种都没等到才抛，让上层留证停手。
         ★ 等到一半（``timeout`` 的一半）什么都没出现、「通过」按钮还原样在面板上，就**再点一次**（只补一次）：
-        同一套判据 4.1.13.12 真机点得通，4.1.13.65 现场却没等到，「第一下没点上」是最便宜也最常见的解释
+        同一套判据 4.1.13.12 真机点得通，4.1.12.26 现场却没等到，「第一下没点上」是最便宜也最常见的解释
         （[[wxauto-win-realmachine]]：焦点不在微信上时 click_input 会落到别的窗口）。
         """
         started = time.monotonic()
@@ -943,7 +943,7 @@ class UiaWeChatDriver:
         node = _safe_call(lambda: main_window.child_window(class_name_re=".*(VerifyFriend|FriendVerify).*"))
         if node is not None and _truthy_safe_call(lambda n=node: n.exists(timeout=0.2)):
             return node, "主窗口内确认框"
-        # 用户机 4.1.13.65（2026-09-18 截图）：确认框明明在屏幕上，「可见的顶层窗口」里却没有它——
+        # 用户机 4.1.12.26（2026-09-18 截图）：确认框明明在屏幕上，「可见的顶层窗口」里却没有它——
         # 再按「不限可见性」枚举一遍，标题 / class 对得上就当它是。
         for window in self._desktop_windows(visible_only=False):
             if _looks_like_verify_confirm_window(window):
@@ -952,23 +952,29 @@ class UiaWeChatDriver:
 
     @staticmethod
     def _find_confirm_button(host: Any, Uielements: Any, *, standalone: bool = False) -> Any | None:
-        """确认框里那颗「确定」。三层：① 标题 + Button；② 标题不限控件类型（4.1.13.65 用户机上「确定」肉眼看得见、
-        按 Button 却找不到——文字可能挂在按钮的子 Text 上，点它的坐标同样落在按钮上）；③ 独立确认框里一颗标题都对不上时，
-        点最后一颗按钮（对话框的主操作按惯例在最后；点错了最多把框关掉，条目还在，下一趟再来），并把点了谁写进日志。
+        """确认框里那颗「确定」。三层：① 标题 + Button；② 标题不限控件类型（文字可能挂在按钮的子 Text 上，点它的坐标
+        同样落在按钮上）；③ 独立确认框里一颗标题都对不上时，点最后一颗**不是「取消」一类**的按钮，并把点了谁写进日志。
+        ★ 宿主可能是 `Desktop().windows()` 给的 UIAWrapper——它没有 child_window，只能 descendants；找法统一走
+        `_find_child`（2026-09-18 真机：0.1.63–0.1.66 对它 child_window 一直报 AttributeError 被吞掉，「确定」一次都没
+        找到，兜底点了最后一颗按钮=「取消」，框关了、申请原样留着，还记成了 accepted）。
         """
         criteria: list[dict[str, Any]] = [dict(Uielements.Buttons.ConfirmButton)]
         criteria.extend({"title": title, "control_type": "Button"} for title in _CONFIRM_BUTTON_TITLES)
         criteria.extend({"title": title} for title in _CONFIRM_BUTTON_TITLES)
         for crit in criteria:
-            button = _safe_call(lambda c=crit: host.child_window(**c))
-            if button is not None and _truthy_safe_call(lambda b=button: b.exists(timeout=0.3)):
+            button = _find_child(host, crit)
+            if button is not None:
                 return button
         if standalone:
             buttons = _safe_call(lambda: host.descendants(control_type="Button")) or []
-            if buttons:
+            candidates = [
+                b for b in buttons
+                if (title := str(_safe_call(getattr(b, "window_text", None)) or "").strip()) and title not in _CANCEL_BUTTON_TITLES
+            ]
+            if candidates:
                 logger.info("friend.check.confirm_fallback_button", buttons=_button_titles(host),
-                            picked=str(_safe_call(getattr(buttons[-1], "window_text", None)) or "")[:20])
-                return buttons[-1]
+                            picked=str(_safe_call(getattr(candidates[-1], "window_text", None)) or "")[:20])
+                return candidates[-1]
         return None
 
     @staticmethod
@@ -3888,13 +3894,15 @@ _NEW_FRIEND_SETTLED_SUFFIXES = ("已添加", "已过期", "已通过", "已拒�
 _NEW_FRIEND_DETAIL_ROOT = {"control_type": "Group", "auto_id": "FMessageDetailView"}
 _NEW_FRIEND_NAME_TEXT = {"control_type": "Text", "auto_id": "TextViewCanCopy"}
 #: 点了「通过」之后弹出的「通过朋友验证」确认框的标题（vendor 三种语言 + 可能的改名）。class 带 `VerifyFriend` 也算，
-#: 两条判据任一命中就是它——vendor 要求标题和 class 同时对上，4.1.13.65 上 5 秒没等到（2026-09-17 现场）。
+#: 两条判据任一命中就是它——vendor 要求标题和 class 同时对上，4.1.12.26 上 5 秒没等到（2026-09-17 现场）。
 _VERIFY_CONFIRM_TITLES = ("通过朋友验证", "通过好友验证", "通過朋友驗證", "Confirm Friend Request", "朋友验证")
 #: 确认框里那颗按钮的标题（vendor 的 ConfirmButton 先试，再试这些）。
 _CONFIRM_BUTTON_TITLES = ("确定", "完成", "通过", "确认", "添加", "发送", "確定", "確認", "通過", "OK", "Done", "Confirm")
 #: 点击之后可能同时冒出来、但绝不是确认框的微信顶层窗口（气泡提示、主窗口本身）。
 #: （XPopover 不排除：确认框是不是它没人说得准，反正只在里面找得到「确定」才会点。）
 _NOT_A_CONFIRM_WINDOW = frozenset({"mmui::MainWindow", "mmui::XTooltip", "mmui::ToastWindow"})
+#: 独立确认框里兜底选按钮时**绝不**点的标题——点「取消」会把框关掉、申请原样留着，却被记成 accepted（2026-09-18 真机）。
+_CANCEL_BUTTON_TITLES = frozenset({"取消", "关闭", "關閉", "Cancel", "Close", "修改标签", "修改標籤", "Edit Tags"})
 #: 详情面板上「已经是好友」的正向证据：「通过」按钮没了、换成这些，说明这一下一点就通过了、没有确认框。
 _ACCEPTED_BUTTON_TITLES = ("发消息", "Send Message", "發消息", "發訊息")
 #: 一趟最多通过几个（vendor 的口径：单次 ≤8）。
@@ -3935,11 +3943,22 @@ def _button_titles(pane: Any, limit: int = 12) -> str:
 
 
 def _has_button(pane: Any, titles: tuple[str, ...]) -> bool:
-    for title in titles:
-        button = _safe_call(lambda t=title: pane.child_window(title=t, control_type="Button"))
-        if button is not None and _truthy_safe_call(lambda b=button: b.exists(timeout=0.3)):
-            return True
-    return False
+    return any(_find_child(pane, {"title": title, "control_type": "Button"}) is not None for title in titles)
+
+
+def _find_child(pane: Any, criteria: dict[str, Any], timeout: float = 0.3) -> Any | None:
+    """在 ``pane`` 里按判据找一个控件；``pane`` 是 WindowSpecification（有 ``child_window``）还是 UIAWrapper
+    （``Desktop().windows()`` 给的那种，**只有** ``descendants``）都行。找不到给 ``None``，不抛。
+    ★ 两种形状必须都认：wrapper 上调 ``child_window`` 是 AttributeError，被 ``_safe_call`` 吞掉后看起来就像「没找到」
+    （2026-09-18 真机，[[wechat-auto-accept-friend-110]]）。
+    """
+    if callable(getattr(pane, "child_window", None)):
+        spec = _safe_call(lambda: pane.child_window(**criteria))
+        if spec is not None and _truthy_safe_call(lambda: spec.exists(timeout=timeout)):
+            return spec
+        return None
+    found = _safe_call(lambda: pane.descendants(**criteria)) or []
+    return found[0] if found else None
 
 
 def _looks_like_verify_confirm_window(window: Any) -> bool:
