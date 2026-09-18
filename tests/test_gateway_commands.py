@@ -28,7 +28,7 @@ from wxclient.gateway.capabilities import (
     probe_capabilities,
 )
 from wxclient.gateway.download import DownloadError, FileFetcher, FileRef
-from wxclient.gateway.guard import ACTION_MOMENTS
+from wxclient.gateway.guard import ACTION_GROUP, ACTION_MOMENTS, RateLimit
 from wxclient.gateway.schedule import MAX_LATE_HOURS, ScheduleLoop, parse_schedule_at
 from wxclient.queue import TaskType
 
@@ -86,6 +86,7 @@ class CommandTestCase(unittest.IsolatedAsyncioTestCase):
                 max_sends_per_hour=kwargs.pop("max_sends_per_hour", 20),
                 active_hours=kwargs.pop("active_hours", "09:00-21:00"),
                 write_intervals=kwargs.pop("write_intervals", None),
+                action_limits=kwargs.pop("action_limits", None),
             ),
             account_id=ACCOUNT,
             clock=lambda: self.now,
@@ -309,10 +310,16 @@ class GroupLaneTests(CommandTestCase):
 
     本机只在**收到过**群消息时才知道某个名字是群（`wechat_io` 里 `mark_peer_kind`）。
     计划驱动的主动触达（081）是往 `wechatGroupIds` 里的群发第一条——那时本机一无所知，
-    于是整批群发都被算进宽松的私聊档（20/时），群那档 6/时 形同虚设。
+    于是整批群发都被算进私聊档，群那档形同虚设。
+
+    出厂默认群消息已不限（用户 2026-09-18），这里显式配 6/时，测的是「分到哪一档」。
     """
 
     GROUP = "劳务派遣交流群"
+
+    def _executor(self, runtime: FakeRuntime, **kwargs: Any) -> CommandExecutor:
+        kwargs.setdefault("action_limits", {ACTION_GROUP: RateLimit(6, 3600.0)})
+        return super()._executor(runtime, **kwargs)
 
     async def _send(self, executor, i: int, **args: Any):
         return await executor.execute({

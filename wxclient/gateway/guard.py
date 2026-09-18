@@ -118,10 +118,18 @@ ACTION_LABELS = {
 
 @dataclass(frozen=True)
 class RateLimit:
-    """一档配额：``window_seconds`` 内最多 ``max_count`` 次。``max_count <= 0`` = 禁止这类动作。"""
+    """一档配额：``window_seconds`` 内最多 ``max_count`` 次。``max_count <= 0`` = **不限**这一档。
+
+    ★ 0 曾经表示「禁止这类动作」；2026-09-18 用户裁决改成「不限」，跟 ``friend_interval_seconds``
+      等间隔闸的 ``0 = 关掉`` 同一个口径——一个数、一种读法，专员不用记两套。
+      要禁某类动作走能力探测（`capability_of`）或不下发那个 op，不再拿配额当开关。
+    """
 
     max_count: int
     window_seconds: float
+
+    def unlimited(self) -> bool:
+        return self.max_count <= 0
 
     def since(self, now: datetime) -> datetime:
         return now - timedelta(seconds=self.window_seconds)
@@ -133,7 +141,9 @@ DAY = 86400.0
 #: 出厂默认。都比「人手动能做到的量」低一档——宁可挡住也不要把号跑没了。
 DEFAULT_ACTION_LIMITS: dict[str, RateLimit] = {
     ACTION_MESSAGE: RateLimit(20, HOUR),
-    ACTION_GROUP: RateLimit(6, HOUR),
+    # 群消息不限（用户 2026-09-18：「这个发消息不需要限制」）。原来 6/时是实现时拍的保守值，
+    # 没有事故依据；总闸 `max_sends_per_hour` 仍然罩着它。
+    ACTION_GROUP: RateLimit(0, HOUR),
     # 加好友是最招风控的一类：一小时 5 个已经不算保守。
     ACTION_FRIEND: RateLimit(5, HOUR),
     # 朋友圈按天算——一小时发 3 条和一天发 3 条完全是两回事。
@@ -239,9 +249,9 @@ class Reservation:
     granted: int = 0
     reason: str = ""
     temporary: bool = False
-    """这次拒绝会不会自己过去。时间窗、配额用完 = 会（等一等就行）；黑名单、本机没开放
-    这类动作 = 不会。上层据此决定**这批消息是留着重投还是就此销账**——留错了会在额度
-    恢复的那一刻把攒了一天的话一次性喷出去，正是风控要看的东西（审计 P0-4）。"""
+    """这次拒绝会不会自己过去。时间窗、配额用完 = 会（等一等就行）；黑名单 = 不会。
+    上层据此决定**这批消息是留着重投还是就此销账**——留错了会在额度恢复的那一刻
+    把攒了一天的话一次性喷出去，正是风控要看的东西（审计 P0-4）。"""
     _store: object | None = None
     _rowids: list[int] = field(default_factory=list)
 
@@ -319,12 +329,10 @@ class OutboundGuard:
         if not within_active_hours(now, self._active_hours):
             return GuardDecision.deny(f"不在允许发送的时间窗 {self._active_hours}")
 
-        # 分档：加好友额度用完了不该因为「今天没怎么发消息」就放行。
+        # 分档：加好友额度用完了不该因为「今天没怎么发消息」就放行。配成 0 的档不查。
         limit = self._action_limits.get(action)
-        if limit is not None:
+        if limit is not None and not limit.unlimited():
             label = ACTION_LABELS.get(action, action)
-            if limit.max_count <= 0:
-                return GuardDecision.deny(f"本机没有开放「{label}」这类动作")
             used = self._store.sends_since(account_id, limit.since(now), action=action)
             if used >= limit.max_count:
                 span = "24 小时" if limit.window_seconds >= DAY else "一小时"
@@ -332,10 +340,11 @@ class OutboundGuard:
                     f"「{label}」在过去{span}内已做 {used} 次，达到上限 {limit.max_count}"
                 )
 
-        # 总闸：分档各自没超，加起来也不能没边。
-        sent = self._store.sends_in_last_hour(account_id, now)
-        if sent >= self._max_per_hour:
-            return GuardDecision.deny(f"该账号一小时内已发送 {sent} 条，达到上限")
+        # 总闸：分档各自没超，加起来也不能没边。0 = 不设总闸。
+        if self._max_per_hour > 0:
+            sent = self._store.sends_in_last_hour(account_id, now)
+            if sent >= self._max_per_hour:
+                return GuardDecision.deny(f"该账号一小时内已发送 {sent} 条，达到上限")
         return GuardDecision.allow()
 
     def reserve(
@@ -367,16 +376,16 @@ class OutboundGuard:
         if not within_active_hours(now, self._active_hours):
             return Reservation(reason=f"不在允许发送的时间窗 {self._active_hours}", temporary=True)
 
+        # 配成 0 的档（分档或总闸）不进 checks：没有上限就没有「占不到」这回事，
+        # 但这次发送照样记进 `gateway_send_log`——别的档还要数它。
         limit = self._action_limits.get(action)
         label = ACTION_LABELS.get(action, action)
-        if limit is not None and limit.max_count <= 0:
-            return Reservation(reason=f"本机没有开放「{label}」这类动作")
-
         checks: list[tuple[str, str | None, datetime, int]] = []
-        if limit is not None:
+        if limit is not None and not limit.unlimited():
             span = "24 小时" if limit.window_seconds >= DAY else "一小时"
             checks.append((f"「{label}」在过去{span}内", action, limit.since(now), limit.max_count))
-        checks.append(("该账号一小时内", None, now - timedelta(hours=1), self._max_per_hour))
+        if self._max_per_hour > 0:
+            checks.append(("该账号一小时内", None, now - timedelta(hours=1), self._max_per_hour))
 
         rowids, granted, binding = self._store.reserve_sends(
             account_id, peer_id, now, action, count, checks, clamp=clamp,

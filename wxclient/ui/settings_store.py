@@ -105,15 +105,15 @@ FIELDS: tuple[Field, ...] = (
     # 标题却叫「每小时发送上限」——专员把它调高，私聊照样被 20 那档拦住，而两边都
     # 「没配错」。总闸改名「发送总上限」，私聊档单独一格，两个数各管各的：
     # 总闸管所有写动作合计，私聊档只管私聊；两道都要过。
-    Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "发送总上限", "所有动作合计，每小时",
+    Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "发送总上限", "所有动作合计，每小时；0=不限",
           section="sched", default="30"),
-    Field("WXCLIENT_GATEWAY_MAX_MESSAGES_PER_HOUR", "私聊上限", "每小时最多发几条私聊",
+    Field("WXCLIENT_GATEWAY_MAX_MESSAGES_PER_HOUR", "私聊上限", "每小时最多发几条私聊；0=不限",
           section="sched", default="20"),
     # 用户 2026-08-28：加好友的上限和间隔都要能在界面上改（不同账号的承受力不一样）。
     # 两个数管两件事：上限管**一小时总共几个**，间隔管**两次之间隔多久**。
     # 只有上限的话，5 个全挤进一分钟也照样放行——2026-08-27 弹安全验证就是这么来的。
     Field("WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR", "加好友上限",
-          "每小时最多加几个", section="sched", default="5"),
+          "每小时最多加几个；0=不限", section="sched", default="5"),
     Field("WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS", "加好友最小间隔",
           "两次之间至少隔多久", section="sched", unit="秒",
           default="300"),

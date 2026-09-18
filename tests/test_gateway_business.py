@@ -333,15 +333,32 @@ class ActionRateLimitTests(StoreTestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("上限", decision.reason)
 
-    async def test_zero_budget_forbids_the_action_outright(self) -> None:
-        """配额配成 0 = 本机不开放这类动作，而不是「无限」。"""
+    async def test_zero_budget_means_unlimited(self) -> None:
+        """配额配成 0 = 这一档不限（用户 2026-09-18 裁决；原来 0 表示「禁止」）。
+
+        分档为 0 时随便发；总闸为 0 时也不数总量；两边都 0 就只剩黑名单/时间窗/接管三道纯判断。
+        """
         guard = OutboundGuard(
-            self.store, active_hours="00:00-23:59",
-            action_limits={ACTION_MOMENTS: RateLimit(0, 86400.0)},
+            self.store, active_hours="00:00-23:59", max_sends_per_hour=0,
+            action_limits={ACTION_GROUP: RateLimit(0, 3600.0)},
         )
-        decision = guard.check("a", "", now=T0, action=ACTION_MOMENTS)
+        for _ in range(50):
+            self.store.record_send("a", "g", T0, action=ACTION_GROUP)
+        self.assertTrue(guard.check("a", "g", now=T0, action=ACTION_GROUP).allowed)
+        reservation = guard.reserve("a", "g", now=T0, action=ACTION_GROUP, count=3)
+        self.assertEqual(reservation.granted, 3)
+        reservation.settle(3)
+        # 不限的档照样记账——别的档（比如总闸开着时）还要数它
+        self.assertEqual(self.store.sends_since("a", T0 - timedelta(hours=1), action=ACTION_GROUP), 53)
+
+    async def test_group_messages_unlimited_by_default(self) -> None:
+        """出厂默认群消息不限，但总闸仍然罩着它。"""
+        guard = OutboundGuard(self.store, active_hours="00:00-23:59", max_sends_per_hour=2)
+        for _ in range(10):
+            self.store.record_send("a", "g", T0, action=ACTION_GROUP)
+        decision = guard.check("a", "g", now=T0, action=ACTION_GROUP)
         self.assertFalse(decision.allowed)
-        self.assertIn("朋友圈", decision.reason)
+        self.assertIn("该账号一小时内", decision.reason)
 
     async def test_legacy_rows_count_as_private_messages(self) -> None:
         """老库补列后，历史那些没有 action 的行按「私聊」算——不能凭空清零谁的额度。"""
