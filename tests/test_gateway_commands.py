@@ -359,7 +359,7 @@ class GroupLaneTests(CommandTestCase):
         self.assertEqual((await self._send(executor, 6, to_group=False)).status, "rejected")
 
     async def test_private_chat_is_untouched(self) -> None:
-        """没有提示、也没收过群消息的，仍是私聊那一档（20/时），别误伤。"""
+        """没有提示、也没收过群消息的，仍是私聊那一档，别误伤（群档配了 6/时也拦不到它）。"""
         runtime = FakeRuntime()
         executor = self._executor(runtime)
         for i in range(7):

@@ -138,9 +138,10 @@ class RateLimit:
 HOUR = 3600.0
 DAY = 86400.0
 
-#: 出厂默认。都比「人手动能做到的量」低一档——宁可挡住也不要把号跑没了。
+#: 出厂默认。有事故依据的档（加好友）比「人手动能做到的量」低一档——宁可挡住也不要把号跑没了；
+#: 没有事故依据的档（私聊、群消息、总闸）2026-09-18 起默认不限（用户裁决），专员要收紧自己填数。
 DEFAULT_ACTION_LIMITS: dict[str, RateLimit] = {
-    ACTION_MESSAGE: RateLimit(20, HOUR),
+    ACTION_MESSAGE: RateLimit(0, HOUR),
     # 群消息不限（用户 2026-09-18：「这个发消息不需要限制」）。原来 6/时是实现时拍的保守值，
     # 没有事故依据；总闸 `max_sends_per_hour` 仍然罩着它。
     ACTION_GROUP: RateLimit(0, HOUR),
@@ -295,7 +296,7 @@ class OutboundGuard:
         self,
         store,  # GatewayStore —— 避免循环导入，用鸭子类型
         *,
-        max_sends_per_hour: int = 30,
+        max_sends_per_hour: int = 0,
         active_hours: str = "09:00-21:00",
         action_limits: dict[str, RateLimit] | None = None,
         write_intervals: dict[str, float] | None = None,
