@@ -20,7 +20,12 @@ from unittest import mock
 
 from structlog.testing import capture_logs
 
+from wxclient import logging_config
 from wxclient.wechat_api import uia
+
+
+def uia_logging_sentence(event: str, payload: dict[str, Any]) -> str:
+    return logging_config._render_event(event, payload)
 
 
 class _Node:
@@ -152,7 +157,10 @@ class _Harness(unittest.TestCase):
         driver._ensure_ready = lambda: None  # type: ignore[method-assign]
         driver._pyweixin_class = lambda name: navigator if name == "Navigator" else tools  # type: ignore[method-assign]
         driver._pyweixin_submodule = lambda name: _Elements  # type: ignore[method-assign]
-        driver._desktop_windows = lambda: list(self.windows)  # type: ignore[method-assign]
+        self.hidden_windows: list[_Node] = []
+        driver._desktop_windows = (  # type: ignore[method-assign]
+            lambda visible_only=True: list(self.windows) if visible_only else list(self.windows) + list(self.hidden_windows)
+        )
         self.tools = tools
         return driver
 
@@ -393,6 +401,30 @@ class VerifyConfirmFormTests(_Harness):
         self.assertNotIn("confirm", self._clicks())
         self.assertEqual(self._clicks().count("verify"), 1, "见到过确认框就不再补点「通过」")
 
+    def test_confirm_window_that_uia_marks_invisible_is_still_used(self) -> None:
+        """用户机截图里确认框明明在屏幕上，可见窗口列表里却没有：按不限可见性再找一遍。"""
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[])
+        self.hidden_windows.append(self.confirm_window(title="通过朋友验证", class_name="mmui::VerifyFriendWindow"))
+        with capture_logs() as logs:
+            result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+        self.assertIn("confirm", self._clicks())
+        accepted = [e for e in logs if e.get("event") == "friend.check.accepted"]
+        self.assertIn("不可见", accepted[0].get("via"))
+
+    def test_a_popover_that_pops_after_the_click_counts_when_it_has_the_button(self) -> None:
+        main = _Node("main_top", self.log, text="微信", class_name="mmui::MainWindow")
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[main])
+        verify = self.detail._lookup[_key({"title": "前往验证", "control_type": "Button"})]
+
+        def click_verify() -> None:
+            self.log.append(("verify", "click"))
+            self.windows.append(self.confirm_window(title="", class_name="mmui::XPopover"))
+
+        verify.click_input = click_verify  # type: ignore[method-assign]
+        result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+
     def test_no_confirm_anywhere_stops_and_leaves_evidence(self) -> None:
         driver = self._driver(cells=self._pending(), verify_title="前往验证",
                               windows=[_Node("main", self.log, text="微信", class_name="mmui::MainWindow")])
@@ -407,6 +439,9 @@ class VerifyConfirmFormTests(_Harness):
         self.assertIn("mmui::MainWindow|微信", missing[0].get("windows", ""))
         self.assertIn("前往验证", missing[0].get("buttons", ""))
         self.assertIn("mmui::MainWindow|微信", str(ctx.exception), "证据要进异常文本，用户机上只有这句能传出来")
+        self.assertIn("含不可见的微信窗口", str(ctx.exception))
+        self.assertIn("v0.1.", uia_logging_sentence("friend.check.confirm_missing", missing[0]),
+                      "失败句子要带客户端版本号，贴回来就知道装的是哪版")
 
 
 if __name__ == "__main__":

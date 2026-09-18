@@ -808,14 +808,18 @@ class UiaWeChatDriver:
                     # 4.1.13.65 现场（2026-09-17）就是这一步停手，而日志里只有 vendor 那串判据，看不出窗口去哪了。
                     # ★ 证据要进异常文本本身：用户机上我们看不到本地日志，能到 AI 端 / 用户眼前的只有这句报错。
                     windows = _window_inventory(self._desktop_windows())
+                    hidden = _window_inventory(
+                        [w for w in self._desktop_windows(visible_only=False)
+                         if str(_safe_call(getattr(w, "class_name", None)) or "").startswith("mmui::")], limit=8,
+                    )
                     buttons = _button_titles(detail)
                     logger.info(
                         "friend.check.confirm_missing", entry=text[:20], button=button_title,
-                        error=str(exc)[:160], windows=windows, buttons=buttons,
+                        error=str(exc)[:160], windows=windows, hidden=hidden, buttons=buttons,
                     )
                     raise WeChatApiError(
                         f"点了「{button_title or '通过'}」但没等到确认框：{exc}"
-                        f"｜此刻顶层窗口：{windows}｜详情面板按钮：{buttons}"
+                        f"｜此刻顶层窗口：{windows}｜含不可见的微信窗口：{hidden}｜详情面板按钮：{buttons}"
                     ) from exc
                 time.sleep(1.0)
                 accepted.append(name)
@@ -921,10 +925,7 @@ class UiaWeChatDriver:
         """
         windows = self._desktop_windows()
         for window in windows:
-            class_name = str(_safe_call(getattr(window, "class_name", None)) or "")
-            title = str(_safe_call(getattr(window, "window_text", None)) or "").strip()
-            lowered = class_name.lower()
-            if "verifyfriend" in lowered or "friendverify" in lowered or title in _VERIFY_CONFIRM_TITLES:
+            if _looks_like_verify_confirm_window(window):
                 return window, "独立确认框"
         if windows_before is not None:
             for window in windows:
@@ -942,6 +943,11 @@ class UiaWeChatDriver:
         node = _safe_call(lambda: main_window.child_window(class_name_re=".*(VerifyFriend|FriendVerify).*"))
         if node is not None and _truthy_safe_call(lambda n=node: n.exists(timeout=0.2)):
             return node, "主窗口内确认框"
+        # 用户机 4.1.13.65（2026-09-18 截图）：确认框明明在屏幕上，「可见的顶层窗口」里却没有它——
+        # 再按「不限可见性」枚举一遍，标题 / class 对得上就当它是。
+        for window in self._desktop_windows(visible_only=False):
+            if _looks_like_verify_confirm_window(window):
+                return window, "独立确认框（UIA 标记为不可见）"
         return None, ""
 
     @staticmethod
@@ -966,12 +972,12 @@ class UiaWeChatDriver:
         return None
 
     @staticmethod
-    def _desktop_windows() -> list[Any]:
+    def _desktop_windows(*, visible_only: bool = True) -> list[Any]:
         """桌面上此刻的顶层窗口；pywinauto 不在（Linux 跑测试）或枚举失败就空列表，测试里直接替换这个方法。"""
         windows: list[Any] = []
         with suppress(Exception):
             Desktop = __import__("pywinauto", fromlist=["Desktop"]).Desktop
-            windows = list(Desktop(backend="uia").windows())
+            windows = list(Desktop(backend="uia").windows(visible_only=visible_only))
         return windows
 
     @staticmethod
@@ -3887,7 +3893,8 @@ _VERIFY_CONFIRM_TITLES = ("通过朋友验证", "通过好友验证", "通過朋
 #: 确认框里那颗按钮的标题（vendor 的 ConfirmButton 先试，再试这些）。
 _CONFIRM_BUTTON_TITLES = ("确定", "完成", "通过", "确认", "添加", "发送", "確定", "確認", "通過", "OK", "Done", "Confirm")
 #: 点击之后可能同时冒出来、但绝不是确认框的微信顶层窗口（气泡提示、主窗口本身）。
-_NOT_A_CONFIRM_WINDOW = frozenset({"mmui::MainWindow", "mmui::XTooltip", "mmui::XPopover", "mmui::ToastWindow"})
+#: （XPopover 不排除：确认框是不是它没人说得准，反正只在里面找得到「确定」才会点。）
+_NOT_A_CONFIRM_WINDOW = frozenset({"mmui::MainWindow", "mmui::XTooltip", "mmui::ToastWindow"})
 #: 详情面板上「已经是好友」的正向证据：「通过」按钮没了、换成这些，说明这一下一点就通过了、没有确认框。
 _ACCEPTED_BUTTON_TITLES = ("发消息", "Send Message", "發消息", "發訊息")
 #: 一趟最多通过几个（vendor 的口径：单次 ≤8）。
@@ -3933,6 +3940,13 @@ def _has_button(pane: Any, titles: tuple[str, ...]) -> bool:
         if button is not None and _truthy_safe_call(lambda b=button: b.exists(timeout=0.3)):
             return True
     return False
+
+
+def _looks_like_verify_confirm_window(window: Any) -> bool:
+    class_name = str(_safe_call(getattr(window, "class_name", None)) or "")
+    title = str(_safe_call(getattr(window, "window_text", None)) or "").strip()
+    lowered = class_name.lower()
+    return "verifyfriend" in lowered or "friendverify" in lowered or title in _VERIFY_CONFIRM_TITLES
 
 
 def _window_handle(window: Any) -> Any:

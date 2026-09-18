@@ -11,6 +11,12 @@ import structlog
 
 from . import logrole
 
+
+def _client_version() -> str:
+    from . import __version__
+
+    return __version__
+
 _LEVEL_LABELS = {
     "debug": "调试",
     "info": "信息",
@@ -346,7 +352,8 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "task.blocked":
         return f"微信任务被阻止：{task_type} #{task_id}，原因：{payload.get('error') or '-'}"
     if event == "task.failed":
-        return f"微信任务执行失败：{task_type} #{task_id}，原因：{payload.get('error') or '-'}"
+        # 版本号印在句子里：用户贴回来的就是这一行，「装的是不是最新版」不用再问（2026-09-18）。
+        return f"微信任务执行失败：{task_type} #{task_id}，原因：{payload.get('error') or '-'}（客户端 v{_client_version()}）"
     if event == "task.duplicate_skipped":
         return f"跳过重复待执行任务：{task_type}，已有任务 #{task_id}"
 
@@ -417,9 +424,10 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         return f"点了「通过」等了 {payload.get('waited') or '-'} 秒什么都没出现、按钮还在，再点一次"
     if event == "friend.check.confirm_missing":
         return (
-            f"点了「{payload.get('button') or '通过'}」但没等到确认框，这一趟停手：{payload.get('entry') or '-'}，"
+            f"[v{_client_version()}] 点了「{payload.get('button') or '通过'}」但没等到确认框，这一趟停手：{payload.get('entry') or '-'}，"
             f"原因：{payload.get('error') or '-'}"
-            f"（此刻桌面顶层窗口：{payload.get('windows') or '-'}；详情面板按钮：{payload.get('buttons') or '-'}）"
+            f"（此刻桌面顶层窗口：{payload.get('windows') or '-'}；含不可见的微信窗口：{payload.get('hidden') or '-'}；"
+            f"详情面板按钮：{payload.get('buttons') or '-'}）"
         )
     if event == "friend.check.failed":
         return f"好友申请检查失败：{payload.get('error') or '-'}"
