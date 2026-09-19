@@ -12,11 +12,10 @@ AI 端每一轮只收得到「这一趟去抖攒下的那几条」，而它要�
 
 from __future__ import annotations
 
-import unittest
-from datetime import datetime, timedelta
-
 import json
 import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,9 +30,18 @@ from test_gateway_e2e import (
     wechat_card,
 )
 
-from wxclient.gateway import GatewayRunner, GatewaySettings, InboundMessage, LocalFileTicketProvider
+from wxclient.gateway import (
+    GatewayRunner,
+    GatewaySettings,
+    InboundMessage,
+    LocalFileTicketProvider,
+)
+from wxclient.gateway import inbound as _inbound_mod
 from wxclient.gateway.inbound import format_history, format_transcript
 from wxclient.gateway.sessions import GatewayStore
+
+# 夹具 T0 是 UTC，行首时分的断言按 UTC 写；生产按本机时区打（见 inbound.local_clock_text）。
+_inbound_mod.LOCAL_TZ = timezone.utc
 
 
 def _row(msg_id: str, text: str, *, at: datetime, from_self: bool = False, at_text: str = "") -> dict:
@@ -232,3 +240,25 @@ class HistoryReachesTheAgentTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LocalClockTests(unittest.TestCase):
+    """行首时分按**本机时区**打，不是 UTC（2026-09-19 线上：表情行显示 03:37，实际 11:37 发的）。"""
+
+    def test_transcript_and_history_render_read_time_in_local_zone(self):
+        from datetime import timedelta as _td
+
+        message = InboundMessage(account_id=ACCOUNT, peer_id=PEER, msg_id="m1", text="[动画表情]", at=T0)
+        row = _row("m1", "[动画表情]", at=T0)
+        saved = _inbound_mod.LOCAL_TZ
+        try:
+            _inbound_mod.LOCAL_TZ = timezone(_td(hours=8))
+            self.assertEqual(format_transcript([message]), "[对方 · 22:00] [动画表情]")
+            self.assertEqual(format_history([row]), format_transcript([message]))
+            _inbound_mod.LOCAL_TZ = timezone.utc
+            self.assertEqual(format_transcript([message]), "[对方 · 14:00] [动画表情]")
+        finally:
+            _inbound_mod.LOCAL_TZ = saved
+
+    def test_history_row_with_unparseable_time_falls_back_to_slice(self):
+        self.assertEqual(format_history([{"msg_id": "x", "at": "2026-08-10 14:00", "text": "在吗"}]), "[对方 · 14:00] 在吗")

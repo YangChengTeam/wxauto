@@ -155,9 +155,27 @@ def format_transcript(messages: Iterable[InboundMessage]) -> str:
     lines = []
     for message in messages:
         who = "专员本人" if message.from_self else "对方"
-        when = message.at_text or f"{message.at:%H:%M}"
+        when = message.at_text or local_clock_text(message.at)
         lines.append(f"[{who} · {when}] {voice_marked(message.message_type, message.text)}")
     return "\n".join(lines)
+
+
+def local_clock_text(at: datetime) -> str:
+    """没有微信自带时间文本时，用读到这条的时刻——**必须换成本机时区再取时分**。
+
+    ``at`` 一律是 UTC（`wechat_io.to_inbound` 用 ``datetime.now(timezone.utc)``），直接
+    ``%H:%M`` 打出来的是 UTC 小时。2026-09-19 线上历史里 ``[对方 · 03:37] [动画表情]`` 其实是
+    11:37 发的：带微信时间文本的行是北京时间、表情这类没有时间文本的行是 UTC，同一段对话两个
+    时间基准；AI 端顶部的时钟是本机时间，模型就把刚发的表情当成八小时前的旧消息。
+    naive 的 datetime 当本机时间原样打（只有测试会造）。
+    """
+    moment = at.astimezone(LOCAL_TZ) if at.tzinfo is not None else at
+    return f"{moment:%H:%M}"
+
+
+#: 打时分用的时区。``None`` = 本机时区（`datetime.astimezone(None)` 的语义）；只有测试改它——
+#: 夹具的时刻是 UTC，断言里的时分按 UTC 写，测试机跑在哪个时区都得过。
+LOCAL_TZ: timezone | None = None
 
 
 def voice_marked(message_type: str, text: str) -> str:
@@ -179,7 +197,12 @@ def format_history(rows: Iterable[dict]) -> str:
         when = str(row.get("at_text") or "")
         if not when:
             at = str(row.get("at") or "")
-            when = at[11:16] if len(at) >= 16 else at
+            try:
+                # 落盘的是 UTC ISO 串（`message_to_row`），要和 `format_transcript` 一样换成本机时区；
+                # 直接切 `at[11:16]` 切出来的是 UTC 小时。
+                when = local_clock_text(datetime.fromisoformat(at))
+            except ValueError:
+                when = at[11:16] if len(at) >= 16 else at
         text = str(row.get("text") or "").strip()
         if not text:
             continue

@@ -10,6 +10,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
+from wxclient.gateway import inbound as _inbound_mod
 from wxclient.gateway.inbound import (
     InboundMessage,
     format_history,
@@ -26,6 +27,9 @@ from wxclient.gateway.wechat_io import (
     to_inbound,
 )
 from wxclient.wechat_api.uia import VOICE_ITEM_CLASS, _annotate_voice_row
+
+# 夹具时刻是 UTC，行首时分的断言按 UTC 写；生产按本机时区打（见 inbound.local_clock_text）。
+_inbound_mod.LOCAL_TZ = timezone.utc
 
 
 class AnnotateVoiceRowTests(unittest.TestCase):

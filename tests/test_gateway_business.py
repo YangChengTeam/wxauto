@@ -30,6 +30,7 @@ from wxclient.gateway import (
     looks_like_rejection,
     within_active_hours,
 )
+from wxclient.gateway import inbound as _inbound_mod
 from wxclient.gateway.guard import (
     ACTION_FRIEND,
     ACTION_GROUP,
@@ -46,6 +47,9 @@ from wxclient.gateway.wechat_io import (
     split_new_messages,
 )
 from wxclient.queue import TaskType
+
+# 夹具 T0 是 UTC，行首时分的断言按 UTC 写；生产按本机时区打（见 inbound.local_clock_text）。
+_inbound_mod.LOCAL_TZ = timezone.utc
 
 T0 = datetime(2026, 8, 10, 14, 0, 0, tzinfo=timezone.utc)
 

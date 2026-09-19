@@ -33,6 +33,10 @@ from wxclient.gateway import (
     split_new_messages,
     to_inbound,
 )
+from wxclient.gateway import inbound as _inbound_mod
+
+# 夹具 T0 是 UTC，行首时分的断言按 UTC 写；生产按本机时区打（见 inbound.local_clock_text）。
+_inbound_mod.LOCAL_TZ = timezone.utc
 
 T0 = datetime(2026, 8, 10, 14, 0, 0, tzinfo=timezone.utc)
 ACCOUNT = "wxid_zhangsan_work"
