@@ -58,6 +58,11 @@ class InboundMessage:
     from_self: bool = False
     """True = 这条是**招聘专员本人手打发出去的**（人工接管）。必须一起喂给 AI，
     否则它会重复问专员已经问过的问题（``CLAUDE.md`` §5.2）。"""
+    from_gateway: bool = False
+    """True = 这条是**网关替分身发出去、又被读回来的回声**（`wechat_io._claim_own_echoes` 按出站
+    台账认亲）。它同时也是 ``from_self``，但喂给 AI 端要标成「分身」而不是「专员本人」：
+    2026-09-19 线上，候选人一回话、同一趟轮询把我们那句一起读进批次，AI 端就把它当成
+    招聘老师插话（清掉待 HR 记号、提示里说「老师本人已经说过话」）。"""
     peer_name: str = ""
     at_text: str = ""
     """微信自己标的时间（「18:28」「昨天 20:11」），来自聊天记录里的时间分隔行。
@@ -85,6 +90,7 @@ def message_to_row(message: InboundMessage) -> dict:
         "text": message.text,
         "at": message.at.isoformat(),
         "from_self": message.from_self,
+        "from_gateway": message.from_gateway,
         "peer_name": message.peer_name,
         "at_text": message.at_text,
         "message_type": message.message_type,
@@ -105,6 +111,7 @@ def message_from_row(account_id: str, peer_id: str, row: dict) -> InboundMessage
         text=str(row.get("text") or ""),
         at=at,
         from_self=bool(row.get("from_self")),
+        from_gateway=bool(row.get("from_gateway")),
         peer_name=str(row.get("peer_name") or peer_id),
         at_text=str(row.get("at_text") or ""),
         message_type=str(row.get("message_type") or "text"),
@@ -147,14 +154,22 @@ TurnHandler = Callable[[str, str, str, Sequence[InboundMessage]], Awaitable[Any]
 """(account_id, peer_id, transcript, messages) -> 结果对象（可带 `follow_up`）或 None"""
 
 
-def format_transcript(messages: Iterable[InboundMessage]) -> str:
-    """拼成 AI 端约定的入站上下文格式（064 design §2）。
+def speaker_label(*, from_self: bool, from_gateway: bool) -> str:
+    """说话人三类（064 design §2）：分身自己的回声 / 专员手打的 / 对方。**不暴露 wxid**。
 
-    说话人只有两类，且**不暴露 wxid**——AI 端不需要知道对方的微信标识。
+    「分身」必须排在「专员本人」前面判：回声同时也是 ``from_self``。AI 端只认这三个字面，
+    改一个字它就当「对方」说的。
     """
+    if from_gateway:
+        return "分身"
+    return "专员本人" if from_self else "对方"
+
+
+def format_transcript(messages: Iterable[InboundMessage]) -> str:
+    """拼成 AI 端约定的入站上下文格式（064 design §2）。"""
     lines = []
     for message in messages:
-        who = "专员本人" if message.from_self else "对方"
+        who = speaker_label(from_self=message.from_self, from_gateway=message.from_gateway)
         when = message.at_text or local_clock_text(message.at)
         lines.append(f"[{who} · {when}] {voice_marked(message.message_type, message.text)}")
     return "\n".join(lines)
@@ -193,7 +208,7 @@ def format_history(rows: Iterable[dict]) -> str:
     """
     lines = []
     for row in rows:
-        who = "专员本人" if row.get("from_self") else "对方"
+        who = speaker_label(from_self=bool(row.get("from_self")), from_gateway=bool(row.get("from_gateway")))
         when = str(row.get("at_text") or "")
         if not when:
             at = str(row.get("at") or "")

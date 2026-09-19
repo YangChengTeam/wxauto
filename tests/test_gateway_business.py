@@ -1285,6 +1285,9 @@ class OwnEchoTests(StoreTestCase):
             messages = await source.fetch("acct-1")
         self.assertEqual([(m.text, m.from_self) for m in messages], [("在的，岗位还在招", True)])
         self.assertTrue(any("自己刚发出去" in entry["event"] for entry in logs), logs)
+        # 台账认出来的回声要标成「分身」而不是「专员本人」（2026-09-19：AI 端否则当成老师插话）。
+        self.assertEqual([m.from_gateway for m in messages], [True])
+        self.assertTrue(format_transcript(messages).startswith("[分身 · "), format_transcript(messages))
 
     async def test_echo_with_no_is_self_field_at_all(self) -> None:
         """真机上多数行压根没有 is_self / sender 字段——这时更只能靠原文认。"""

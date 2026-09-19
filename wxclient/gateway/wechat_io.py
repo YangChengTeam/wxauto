@@ -309,6 +309,7 @@ def to_inbound(
         text=attachment_text(raw, attachment),
         at=at or datetime.now(timezone.utc),
         from_self=is_self_message(raw),
+        from_gateway=bool(raw.get("gateway_echo")),
         peer_name=peer_id,
         at_text=str(raw.get("timestamp_text") or "").strip(),
         message_type=str(raw.get("message_type") or "text"),
@@ -451,7 +452,9 @@ class QueueMessageSource:
                     会话=peer_id,
                     内容=preview(raw),
                 )
-            out.append(dict(raw, is_self=True, sender=SELF_SENDER))
+            # `gateway_echo`：这是**网关替分身发出去**的那句（台账认亲），不是专员手打的——
+            # AI 端按这个标成「分身」，否则会当成招聘老师插话（2026-09-19）。
+            out.append(dict(raw, is_self=True, sender=SELF_SENDER, gateway_echo=True))
         return out
 
     async def _fetch_peer(self, account_id: str, peer_id: str) -> list[InboundMessage]:

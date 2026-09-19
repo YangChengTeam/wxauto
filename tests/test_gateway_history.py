@@ -37,7 +37,12 @@ from wxclient.gateway import (
     LocalFileTicketProvider,
 )
 from wxclient.gateway import inbound as _inbound_mod
-from wxclient.gateway.inbound import format_history, format_transcript
+from wxclient.gateway.inbound import (
+    format_history,
+    format_transcript,
+    message_from_row,
+    message_to_row,
+)
 from wxclient.gateway.sessions import GatewayStore
 
 # 夹具 T0 是 UTC，行首时分的断言按 UTC 写；生产按本机时区打（见 inbound.local_clock_text）。
@@ -262,3 +267,29 @@ class LocalClockTests(unittest.TestCase):
 
     def test_history_row_with_unparseable_time_falls_back_to_slice(self):
         self.assertEqual(format_history([{"msg_id": "x", "at": "2026-08-10 14:00", "text": "在吗"}]), "[对方 · 14:00] 在吗")
+
+
+class GatewayEchoLabelTests(unittest.TestCase):
+    """分身自己的回声标「分身」，专员手打的才是「专员本人」（2026-09-19：AI 端把回声当成老师插话）。"""
+
+    def test_transcript_history_and_store_round_trip_keep_the_gateway_label(self):
+        echo = InboundMessage(
+            account_id=ACCOUNT, peer_id=PEER, msg_id="m1", text="好的，有需要随时喊我哈",
+            at=T0, from_self=True, from_gateway=True, at_text="11:38",
+        )
+        typed = InboundMessage(
+            account_id=ACCOUNT, peer_id=PEER, msg_id="m2", text="我是张老师", at=T0, from_self=True, at_text="11:39"
+        )
+        peer = InboundMessage(account_id=ACCOUNT, peer_id=PEER, msg_id="m3", text="[悠闲]", at=T0, at_text="11:40")
+        expected = "[分身 · 11:38] 好的，有需要随时喊我哈\n[专员本人 · 11:39] 我是张老师\n[对方 · 11:40] [悠闲]"
+        self.assertEqual(format_transcript([echo, typed, peer]), expected)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GatewayStore(Path(tmp) / "g.sqlite")
+            store.record_messages(ACCOUNT, PEER, [message_to_row(m) for m in (echo, typed, peer)])
+            rows = store.recent_messages(ACCOUNT, PEER)
+            self.assertEqual(format_history(rows), expected)
+            self.assertEqual([message_from_row(ACCOUNT, PEER, r).from_gateway for r in rows], [True, False, False])
+
+    def test_old_rows_without_the_column_default_to_operator(self):
+        self.assertEqual(format_history([_row("m1", "在的", at=T0, from_self=True, at_text="09:00")]), "[专员本人 · 09:00] 在的")

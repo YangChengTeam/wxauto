@@ -227,6 +227,7 @@ CREATE TABLE IF NOT EXISTS gateway_messages (
   at         TEXT NOT NULL,
   at_text    TEXT NOT NULL DEFAULT '',
   from_self  INTEGER NOT NULL DEFAULT 0,
+  from_gateway INTEGER NOT NULL DEFAULT 0,
   text       TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (account_id, peer_id, msg_id)
 );
@@ -325,6 +326,8 @@ class GatewayStore:
             # 2026-09-12 自动通过好友申请：通过的人也走临时准入，但**不过期**（他是真好友，不是路过的）。
             _ensure_column(conn, "gateway_strangers", "origin", f"TEXT NOT NULL DEFAULT '{STRANGER_ORIGIN_SCAN}'")
             _ensure_column(conn, "gateway_friend_checks", "requested_at", "TEXT NOT NULL DEFAULT ''")
+            # 2026-09-19：历史里分身自己的回声要标「分身」而不是「专员本人」（AI 端否则当成老师插话）。
+            _ensure_column(conn, "gateway_messages", "from_gateway", "INTEGER NOT NULL DEFAULT 0")
             # ★ 补列之后还要**回填**：老库里这两列是空的，而复查按 `session_name` 搜、
             #   按 `requested_at` 算期限——不回填，升级那一刻**所有在途的人当场消失**，
             #   一个都不会再被查（正是这次要治的病，不能靠升级又制造一遍）。
@@ -1634,6 +1637,7 @@ class GatewayStore:
                 str(row.get("at") or ""),
                 str(row.get("at_text") or ""),
                 1 if row.get("from_self") else 0,
+                1 if row.get("from_gateway") else 0,
                 str(row.get("text") or ""),
             )
             for row in rows
@@ -1645,8 +1649,8 @@ class GatewayStore:
             before = conn.total_changes
             conn.executemany(
                 """INSERT OR IGNORE INTO gateway_messages
-                       (account_id, peer_id, msg_id, at, at_text, from_self, text)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                       (account_id, peer_id, msg_id, at, at_text, from_self, from_gateway, text)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 values,
             )
             conn.commit()
@@ -1668,7 +1672,7 @@ class GatewayStore:
         skip = {str(x) for x in exclude}
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                """SELECT msg_id, at, at_text, from_self, text FROM gateway_messages
+                """SELECT msg_id, at, at_text, from_self, from_gateway, text FROM gateway_messages
                    WHERE account_id=? AND peer_id=?
                    ORDER BY at DESC, rowid DESC LIMIT ?""",
                 (account_id, peer_id, max(1, limit) + len(skip)),
@@ -1679,7 +1683,8 @@ class GatewayStore:
                 "at": row[1],
                 "at_text": row[2],
                 "from_self": bool(row[3]),
-                "text": row[4],
+                "from_gateway": bool(row[4]),
+                "text": row[5],
             }
             for row in rows
             if row[0] not in skip

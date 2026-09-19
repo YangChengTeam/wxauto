@@ -50,7 +50,7 @@ wxclient/gateway/
 
 - [x] B1. `sessions.py`：`GatewayStore`（会话映射 / 去重游标 / 黑名单 / 发送计数），与队列分库避免抢锁
 - [x] B2. `inbound.py`：轮询循环 + `msg_id` 去重（持久化游标，RPA 重推不触发第二轮）
-- [x] B3. `inbound.py`：`Debouncer` 去抖聚合 + `format_transcript` 生成 `[对方/专员本人 · 时间]` 上下文（不泄露 wxid）
+- [x] B3. `inbound.py`：`Debouncer` 去抖聚合 + `format_transcript` 生成 `[对方/专员本人/分身 · 时间]` 上下文（不泄露 wxid；「分身」= 网关自己发出又读回的回声，2026-09-19 加，此前标「专员本人」被 AI 端当成老师插话）
 - [x] B4. `inbound.py`：同联系人严格串行（在途轮未收口 → 新批次放回缓冲继续攒；不同联系人并发不受影响）
 - [x] B5. `guard.py`：~~拒绝关键词表（**确定性第一道闸**，命中即拉黑且**一条都不发**）~~（2026-09-19 已拆，见下）+ 频次计数器 + 工作时间窗（支持跨午夜）
 - [x] B6. `outbound.py`：`extract_reply` 只认契约形状（畸形卡当不回复，绝不猜）+ 逐段投递 + 拉黑提案即使不回复也立即生效
