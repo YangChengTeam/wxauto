@@ -20,7 +20,6 @@ from typing import Any, Protocol
 import structlog
 
 from .. import logrole
-from .guard import looks_like_rejection
 from .pacing import jittered
 
 _log = structlog.get_logger(__name__)
@@ -369,7 +368,7 @@ class InboundLoop:
         # ★ 看到的都记下来（双方的话都记）。AI 端每一轮只收得到「这一趟攒下的那几条」，
         # 而它要判的是「这一步走完没有」——对方上周答应过来看看、专员前天已经问过工种，
         # 都在更早的轮次里。记在这里，下一轮当历史一并送上去（见 `GatewayRunner._history_for`）。
-        # 放在拒绝闸**之前**：那条「别再联系我了」本身也是这段对话的一部分，记下来才对得上。
+        # 那条「别再联系我了」本身也是这段对话的一部分，记下来才对得上。
         self._store.record_messages(account_id, peer_id, [message_to_row(m) for m in fresh])
 
         # 对方真说话了 = 这个会话正热着 → 接下来几分钟读得勤一点（见 `_interval_for`）。
@@ -377,18 +376,13 @@ class InboundLoop:
             self._last_activity = now
 
         # ★ 对方真开口了 → 交给旁听者上报（业务后端据此取消待跟进）。
-        #   **必须排在拒绝闸之前**：「别再联系我了」也是一次回复，而那正是最不该再追一条的
-        #   时刻——放在 `return` 后面，这条事件永远发不出去，后端照旧四小时后追过去。
+        #   「别再联系我了」也是一次回复，而那正是最不该再追一条的时刻。
         self._note_peer_messages(account_id, peer_id, [m for m in fresh if not m.from_self])
 
-        # ★ 确定性拒绝闸（第一道，不依赖模型）：对方说了「别联系我」类的话 →
-        #   立即拉黑，且**不派发任何一轮**。连告别语都不发——对方要的是别再被联系，
-        #   再回一句同样是一次联系（需求文档 §7 的字面要求）。
-        for message in fresh:
-            if not message.from_self and looks_like_rejection(message.text):
-                self._store.blacklist(account_id, peer_id, reason="入站消息命中拒绝表达")
-                _local.info("命中拒绝表达，已拉黑并停止自动化", account=account_id)
-                return
+        # ★ 这里曾经有一道确定性拒绝闸（命中「别联系我」类词表 → 本地拉黑、一轮都不派发）。
+        #   用户 2026-09-19 裁决拆除：候选人发来的每条新消息都要派给 AI 端回一句，闲聊也回。
+        #   拒绝与否由 AI 端看过原话再判；它提案 `blacklist` 时网关才拉黑（`outbound`）。
+        #   黑名单本身还在（上面 `is_blacklisted`），只是不再由网关凭一个关键词自己写。
 
         # ★ 落盘再入缓冲（070）：游标在读到消息那一刻就推进了，从这里到「AI 端跑完一轮」
         # 之间断掉任何一环，这批消息就同时满足「游标翻过去了」和「谁也没处理」。

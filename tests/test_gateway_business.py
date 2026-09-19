@@ -583,8 +583,12 @@ class InboundLoopTests(StoreTestCase):
         await loop.drain()
         self.assertEqual(len(calls), 1)
 
-    async def test_rejection_blacklists_and_dispatches_nothing(self) -> None:
-        """确定性拒绝闸：命中即拉黑，连告别语都不发（§7 的字面要求）。"""
+    async def test_rejection_wording_is_dispatched_not_blacklisted_locally(self) -> None:
+        """★ 网关不再凭关键词自己拉黑（用户 2026-09-19 裁决：候选人每条新消息都要回）。
+
+        「别再联系我了」照样派给 AI 端一轮；是不是拒绝由它看过原话再判，
+        它提案 `blacklist` 时网关才拉黑（`outbound._apply_blacklist_actions`）。
+        """
         calls: list[str] = []
 
         async def handler(_a: str, _p: str, transcript: str, _m) -> None:
@@ -597,8 +601,9 @@ class InboundLoopTests(StoreTestCase):
         await loop.tick()
         await loop.drain()
 
-        self.assertEqual(calls, [])
-        self.assertTrue(self.store.is_blacklisted("acct-1", "peer-1"))
+        self.assertEqual(len(calls), 1)
+        self.assertIn("别再联系我了", calls[0])
+        self.assertFalse(self.store.is_blacklisted("acct-1", "peer-1"))
 
     async def test_blacklisted_peer_is_never_processed(self) -> None:
         calls: list[str] = []

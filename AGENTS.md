@@ -183,18 +183,22 @@ This long-lived polling loop is **settled architecture**. It is not the "schedul
 
 ### 5.2 Business
 
-- **Refusal stops everything, with two independent guards**: when the peer expresses "don't contact me / don't
-  add me / I'll report you", every automated action must stop. **The gateway runs a deterministic keyword gate
-  first**; the model's judgement is only supplementary. This one cannot rest on the AI service alone.
-- **Two grades of refusal, never conflated.** A hard refusal ("don't contact me") is caught by the gateway
-  gate, blacklisted, and nothing is sent. A soft close ("I already found a job", "not interested right now")
-  **does not enter the gateway gate**: it is dispatched to the AI service as usual, which closes politely,
-  marks the funnel `closed`, and **proposes no blacklisting** — we will want to reach these people again, and
-  a permanent blacklist is disproportionate.
+- **Every new candidate message is dispatched and answered** (user ruling 2026-09-19: "每次客户端轮询消息，
+  有新消息是候选人发的我们就需要回复；闲聊也是可以的；去掉闸"). The gateway runs **no keyword gate of its
+  own on inbound text** any more — the deterministic "don't contact me / I'll report you → blacklist locally,
+  dispatch nothing" gate that used to sit in `InboundLoop._ingest` was removed that day. Whether the peer is
+  refusing is judged by the AI service after it has read the actual words; small talk gets a reply too.
+- **Blacklisting still exists, but only on the AI service's proposal.** A hard refusal is detected there
+  (rules ∪ model), answered with one closing line, and comes back as a `blacklist` action which the gateway
+  applies (`outbound._apply_blacklist_actions`); a blacklisted peer is then never read again. A soft close
+  ("I already found a job", "not interested right now") closes politely, marks the funnel `closed`, and
+  **proposes no blacklisting** — we will want to reach these people again, and a permanent blacklist is
+  disproportionate. `guard.looks_like_rejection` remains as a pure helper, no longer wired into the read loop.
 - **Rate limits are enforced on the gateway side**: friend requests, broadcasts and direct messages are
   guarded by the gateway's deterministic counters, never by the AI service's good behaviour.
-- **Not replying is allowed**: when the AI service says "no reply needed", send nothing. Not every message
-  must be answered.
+- **Silence is the AI service's call, not the gateway's**: when a card carries no `reply_segments`, send
+  nothing and log the reason. The AI service itself only stays silent on a recruiter-set hold or an unrecognised
+  stranger (spec 090); everything else gets at least one line.
 - **Human takeover wins**: if the recruiter replied in WeChat themselves, that message must also be fed into
   the session context (marked as said by us), otherwise the AI repeats the question on its next turn. After a
   human interjects, the AI stays silent for a while.

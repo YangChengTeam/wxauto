@@ -314,8 +314,12 @@ class InboundReportingTests(StoreTestCase):
         await loop.tick()   # 同一条再读到一次（去重表兜住）
         self.assertEqual(len(seen), 1)
 
-    async def test_rejection_is_still_reported_before_the_blacklist_return(self) -> None:
-        """★ 「别再联系我了」也是一次回复，而那正是最不该再追一条的时刻。"""
+    async def test_rejection_is_still_reported(self) -> None:
+        """★ 「别再联系我了」也是一次回复，而那正是最不该再追一条的时刻。
+
+        网关关键词拉黑闸 2026-09-19 已拆（候选人每条新消息都要回）；上报这条不受影响，
+        而且这个人**不再**由网关自己拉黑。
+        """
         seen: list[str] = []
         loop = self._loop(
             [[msg("别再联系我了", msg_id="m1")]],
@@ -323,7 +327,7 @@ class InboundReportingTests(StoreTestCase):
         )
         await loop.tick()
         self.assertEqual(seen, ["别再联系我了"])
-        self.assertTrue(self.store.is_blacklisted(ACCOUNT, PEER))
+        self.assertFalse(self.store.is_blacklisted(ACCOUNT, PEER))
 
     async def test_listener_failure_never_stops_the_read_loop(self) -> None:
         def boom(*_args: Any) -> None:

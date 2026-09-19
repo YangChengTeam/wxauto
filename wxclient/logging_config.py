@@ -256,8 +256,6 @@ def _render_gateway_line(event: str, payload: dict[str, Any]) -> str | None:
         )
     if event == "上一轮还没跑完，这几条先等着":
         return f"「{peer}」上一轮还没跑完，这 {payload.get('条数', 0)} 条先等着，等收口后并进下一轮"
-    if event == "命中拒绝表达，已拉黑并停止自动化":
-        return "对方说了拒绝联系的话，已拉黑并停止自动化：这一轮一个字都不发，也不再派轮"
 
     # ── 和 AI 端的连接：断没断、什么时候换的票 ──────────────────
     if event == "已连接 AI 端":

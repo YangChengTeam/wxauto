@@ -249,8 +249,12 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.stop()
 
-    async def test_inbound_rejection_stops_everything_before_any_ai_call(self) -> None:
-        """确定性拒绝闸在最前面：不建连、不发轮、不回消息，直接拉黑。"""
+    async def test_inbound_rejection_wording_still_reaches_the_ai(self) -> None:
+        """★ 网关关键词拉黑闸已拆（用户 2026-09-19：候选人每条新消息都要回，闲聊也回）。
+
+        「别再联系我了」和别的消息一样派给 AI 端一轮；网关自己不拉黑。
+        拒绝与否由 AI 端判，它提案 `blacklist` 才拉黑（见下一条用例）。
+        """
         async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
             sink = RecordingSink()
             runner = self._runner(
@@ -260,9 +264,9 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 await runner.tick()
                 await self._advance_and_tick(runner, 10)
 
-                self.assertEqual(sink.sent, [])
-                self.assertTrue(self.store.is_blacklisted(ACCOUNT, PEER))
-                self.assertEqual(server.received, [], "拒绝的人不该触发任何 AI 调用")
+                self.assertFalse(self.store.is_blacklisted(ACCOUNT, PEER))
+                sends = [f for f in server.received if f.get("op") == "message.send"]
+                self.assertEqual(len(sends), 1, "这条消息该照常派给 AI 端一轮")
             finally:
                 await runner.stop()
 
