@@ -540,21 +540,24 @@ class DesktopEnumFallbackTests(unittest.TestCase):
     def setUp(self) -> None:
         uia._take_enum_error()  # 清掉上一条用例可能留下的错
 
-    def test_win32_returns_empty_without_pywin32(self) -> None:
-        # Linux / 没装 pywin32 或 pywinauto：既不抛也不记错，返回空列表
-        windows, err = uia._win32_top_windows()
+    def test_win32_returns_empty_when_modules_missing(self) -> None:
+        # 拿不到 win32gui / pywinauto 模块（Linux 测试，或强制降级）：既不抛也不记错，返回空列表
+        with mock.patch.object(uia, "_win32_modules", return_value=None):
+            windows, err = uia._win32_top_windows()
         self.assertEqual(windows, [])
         self.assertIsNone(err)
 
     def test_desktop_windows_falls_back_when_primary_empty(self) -> None:
         sentinel = [_Node("win", [], class_name="mmui::MainWindow")]
-        with mock.patch.object(uia, "_win32_top_windows", return_value=(sentinel, None)):
-            # pywinauto 不在 → 主路 suppress 成空 → 落到兜底
+        # 主路（带缓存 Desktop().windows()）返回空 → 落到 Win32 兜底；真机有桌面时也强制走这条
+        with mock.patch.object(uia, "_pywinauto_top_windows", return_value=[]), \
+                mock.patch.object(uia, "_win32_top_windows", return_value=(sentinel, None)):
             self.assertEqual(uia.UiaWeChatDriver._desktop_windows(), sentinel)
 
     def test_desktop_windows_records_enum_error(self) -> None:
-        with mock.patch.object(uia, "_win32_top_windows",
-                               return_value=([], "COMError: -2147220991 事件无法调用任何订户")):
+        with mock.patch.object(uia, "_pywinauto_top_windows", return_value=[]), \
+                mock.patch.object(uia, "_win32_top_windows",
+                                  return_value=([], "COMError: -2147220991 事件无法调用任何订户")):
             self.assertEqual(uia.UiaWeChatDriver._desktop_windows(), [])
         taken = uia._take_enum_error()
         self.assertIn("COMError", taken)

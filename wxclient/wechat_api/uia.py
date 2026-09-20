@@ -998,10 +998,7 @@ class UiaWeChatDriver:
           详情面板按钮）。所以拿不到窗口时，改走 Win32 `EnumWindows`（纯 ctypes、不经 comtypes，冻结与否一致）拿
           顶层句柄，再用元素级 UIA 逐个包装，得到同形状的窗口列表（[[wechat-auto-accept-friend-110]]）。
         """
-        windows: list[Any] = []
-        with suppress(Exception):
-            Desktop = __import__("pywinauto", fromlist=["Desktop"]).Desktop
-            windows = list(Desktop(backend="uia").windows(visible_only=visible_only))
+        windows = _pywinauto_top_windows(visible_only=visible_only)
         if windows:
             return windows
         alt, err = _win32_top_windows(visible_only=visible_only)
@@ -4007,6 +4004,27 @@ def _take_enum_error() -> str:
     return f"｜枚举异常：{err}" if err else ""
 
 
+def _win32_modules() -> tuple[Any, Any, Any] | None:
+    """``(win32gui, UIAElementInfo 模块, UIAWrapper 模块)`` 或 ``None``（非 Windows / 没装 pywin32 或 pywinauto）。
+    单独抽出来是为了测试能强制走「拿不到模块」的降级分支——真机上装了才走真路。"""
+    try:
+        import win32gui  # 惰性：Linux 测试没有 pywin32
+        info_mod = __import__("pywinauto.uia_element_info", fromlist=["UIAElementInfo"])
+        wrap_mod = __import__("pywinauto.controls.uiawrapper", fromlist=["UIAWrapper"])
+    except Exception:  # noqa: BLE001 - 非 Windows / 没装 pywin32 或 pywinauto
+        return None
+    return win32gui, info_mod, wrap_mod
+
+
+def _pywinauto_top_windows(visible_only: bool = True) -> list[Any]:
+    """pywinauto 带缓存的整桌面根枚举 `Desktop().windows()`；没装 / 抛错返回 ``[]``。
+    抽出来是为了测试能强制它返回空、逼出 Win32 兜底路（真机有桌面时它本来就返回真窗口）。"""
+    with suppress(Exception):
+        Desktop = __import__("pywinauto", fromlist=["Desktop"]).Desktop
+        return list(Desktop(backend="uia").windows(visible_only=visible_only))
+    return []
+
+
 def _win32_top_windows(visible_only: bool = True) -> tuple[list[Any], str | None]:
     """用 Win32 ``EnumWindows`` 枚举顶层窗口句柄，再用**元素级** UIA（ElementFromHandle）逐个包成 pywinauto 包装器。
 
@@ -4020,12 +4038,10 @@ def _win32_top_windows(visible_only: bool = True) -> tuple[list[Any], str | None
     元素级 UIA（`UIAElementInfo(hwnd)` → `UIAWrapper`，客户端里能用的那条路）就能得到和 `Desktop().windows()` 同形状的
     包装器。pywin32 / pywinauto 不在（Linux 测试）→ ``([], None)``。[[wechat-auto-accept-friend-110]]
     """
-    try:
-        import win32gui  # 惰性：Linux 测试没有 pywin32
-        info_mod = __import__("pywinauto.uia_element_info", fromlist=["UIAElementInfo"])
-        wrap_mod = __import__("pywinauto.controls.uiawrapper", fromlist=["UIAWrapper"])
-    except Exception:  # noqa: BLE001 - 非 Windows / 没装 pywin32 或 pywinauto
+    mods = _win32_modules()
+    if mods is None:  # 非 Windows / 没装 pywin32 或 pywinauto（Linux 测试）
         return [], None
+    win32gui, info_mod, wrap_mod = mods
     handles: list[int] = []
     try:
         def _collect(hwnd: int, _: Any) -> bool:
