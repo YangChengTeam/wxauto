@@ -808,9 +808,11 @@ class UiaWeChatDriver:
                     # 4.1.12.26 现场（2026-09-17）就是这一步停手，而日志里只有 vendor 那串判据，看不出窗口去哪了。
                     # ★ 证据要进异常文本本身：用户机上我们看不到本地日志，能到 AI 端 / 用户眼前的只有这句报错。
                     windows = _window_inventory(self._desktop_windows())
+                    wechat_pid = _window_pid(main_window)
                     hidden = _window_inventory(
                         [w for w in self._desktop_windows(visible_only=False)
-                         if str(_safe_call(getattr(w, "class_name", None)) or "").startswith("mmui::")], limit=8,
+                         if str(_safe_call(getattr(w, "class_name", None)) or "").startswith("mmui::")
+                         or (wechat_pid is not None and _window_pid(w) == wechat_pid)], limit=8,
                     )
                     buttons = _button_titles(detail)
                     enum_error = _take_enum_error()   # pywinauto 带缓存枚举吞掉的真实 COMError（若有）
@@ -921,8 +923,9 @@ class UiaWeChatDriver:
     ) -> tuple[Any | None, str]:
         """「通过朋友验证」确认框现在在哪：``(宿主控件, 形态说明)``，没有就 ``(None, "")``。
 
-        判据从具体到泛：① 顶层窗口 class 带 VerifyFriend / FriendVerify 或标题命中；② 点击之后**新冒出来**的微信顶层窗口
-        （`mmui::` 打头、不在点击前的句柄集合里）——名字全没猜中也认得出「它刚弹出来」，是否点它由里面有没有确认按钮决定；
+        判据从具体到泛：① 顶层窗口 class 带 VerifyFriend / FriendVerify 或标题命中；② 点击之后**新冒出来的微信自家窗口**
+        （同属微信进程、或 class `mmui::` 打头，且不在点击前的句柄集合里）——名字全没猜中也认得出「它刚弹出来」，
+        是否点它由里面有没有确认按钮决定（Qt 构建 4.1.12.26 的确认框 class 不是 `mmui::`、标题还可能空，只能靠进程认）；
         ③ 停靠在主窗口里：标题文字（不限控件类型）或 Verify 类控件。
         """
         windows = self._desktop_windows()
@@ -930,14 +933,19 @@ class UiaWeChatDriver:
             if _looks_like_verify_confirm_window(window):
                 return window, "独立确认框"
         if windows_before is not None:
+            wechat_pid = _window_pid(main_window)
             for window in windows:
                 handle = _window_handle(window)
-                class_name = str(_safe_call(getattr(window, "class_name", None)) or "")
-                if handle is None or handle in windows_before or not class_name.startswith("mmui::"):
+                if handle is None or handle in windows_before:
                     continue
+                class_name = str(_safe_call(getattr(window, "class_name", None)) or "")
                 if class_name in _NOT_A_CONFIRM_WINDOW:
                     continue
-                return window, f"点击后新出现的窗口（{class_name}）"
+                is_mm = class_name.startswith("mmui::")
+                same_proc = wechat_pid is not None and _window_pid(window) == wechat_pid
+                if not (is_mm or same_proc):
+                    continue
+                return window, f"点击后新出现的窗口（{class_name or '无 class'}）"
         for title in _VERIFY_CONFIRM_TITLES:
             node = _safe_call(lambda t=title: main_window.child_window(title=t))
             if node is not None and _truthy_safe_call(lambda n=node: n.exists(timeout=0.2)):
@@ -983,12 +991,12 @@ class UiaWeChatDriver:
     def _desktop_windows(*, visible_only: bool = True) -> list[Any]:
         """桌面上此刻的顶层窗口；pywinauto 不在（Linux 跑测试）或枚举失败就空列表，测试里直接替换这个方法。
 
-        ★ 2026-09-20 用户机 4.1.12.26（1024×768 虚拟屏云主机）现场：`Desktop(backend="uia").windows()`
-          **一个顶层窗口都不返回**，连微信主窗口都枚举不到——可系统自带的 UIAutomation（.NET）在同一桌面
-          会话里 `RootElement.FindAll(Children, TrueCondition)` 能看到 10 个窗口。差别在 pywinauto 这条路走的是
-          **带缓存**（`cache_enable=True`）的 `FindAll`；带缓存的枚举在这台机上抛 COMError，被 pywinauto 静默
-          吞成空列表（错误只进它自己的 ActionLogger、不进我们的日志）。而 `child_window` 这些非缓存路都正常。
-          所以拿不到窗口时，改用**非缓存**的根枚举再试一遍，并把真实异常留给上层记进日志（[[wechat-auto-accept-friend-110]]）。
+        ★ 2026-09-20 用户机现场坐实：**冻结（PyInstaller 打包）客户端**里 `Desktop(backend="uia").windows()`
+          **一个顶层窗口都不返回**，连微信主窗口都枚举不到；同一台机、同一个桌面会话，标准 Python 里同一句
+          却返回 10 个窗口。STA/MTA、带不带缓存都试过，都不是主因——根因是 comtypes 打进 exe 后跑 UIAutomation
+          **根枚举**的行为问题；而 `child_window` 这类**元素级** UIA 在客户端里照常能用（点完「前往验证」能读到
+          详情面板按钮）。所以拿不到窗口时，改走 Win32 `EnumWindows`（纯 ctypes、不经 comtypes，冻结与否一致）拿
+          顶层句柄，再用元素级 UIA 逐个包装，得到同形状的窗口列表（[[wechat-auto-accept-friend-110]]）。
         """
         windows: list[Any] = []
         with suppress(Exception):
@@ -996,7 +1004,7 @@ class UiaWeChatDriver:
             windows = list(Desktop(backend="uia").windows(visible_only=visible_only))
         if windows:
             return windows
-        alt, err = _uncached_top_windows()
+        alt, err = _win32_top_windows(visible_only=visible_only)
         if err:
             _record_enum_error(err)
         return alt
@@ -3999,27 +4007,38 @@ def _take_enum_error() -> str:
     return f"｜枚举异常：{err}" if err else ""
 
 
-def _uncached_top_windows() -> tuple[list[Any], str | None]:
-    """不走 pywinauto 带缓存的 `Desktop().windows()`，直接用**非缓存**的 UIA 根枚举拿顶层窗口。
+def _win32_top_windows(visible_only: bool = True) -> tuple[list[Any], str | None]:
+    """用 Win32 ``EnumWindows`` 枚举顶层窗口句柄，再用**元素级** UIA（ElementFromHandle）逐个包成 pywinauto 包装器。
 
-    返回 ``(窗口列表, 异常文字或 None)``。带缓存的 `FindAll` 在个别机器上抛 COMError、被 pywinauto 静默吞成空
-    列表（[[wechat-auto-accept-friend-110]]）；非缓存的 `children(cache_enable=False)` 与 `child_window` 同路，
-    正常机器上照样能枚举，出问题时这里能把真实异常抛出来记进日志。pywinauto 不在（Linux 测试）返回 ``([], None)``。
+    返回 ``(窗口列表, 异常文字或 None)``。
+
+    为什么这样：**打包后的冻结客户端**里，pywinauto 的整桌面根枚举 `Desktop().windows()` 会返回空
+    （2026-09-20 实机坐实：同一台机、同一个桌面会话，标准 Python 里 `Desktop(uia).windows()` 返回 10 个顶层窗口，
+    冻结客户端却返回 0；而 `child_window` 这种**元素级** UIA 在客户端里照常能用——所以客户端点完「前往验证」能读到详情
+    面板按钮，却「一个顶层窗口都没枚举到」）。跟机器、线程、STA/MTA 套间都无关，是 comtypes 打进 exe 后跑 UIAutomation
+    **根枚举**的行为问题。Win32 `EnumWindows` 是纯 ctypes、不经 comtypes/UIA typelib，冻结与否表现一致；拿到 HWND 再走
+    元素级 UIA（`UIAElementInfo(hwnd)` → `UIAWrapper`，客户端里能用的那条路）就能得到和 `Desktop().windows()` 同形状的
+    包装器。pywin32 / pywinauto 不在（Linux 测试）→ ``([], None)``。[[wechat-auto-accept-friend-110]]
     """
     try:
+        import win32gui  # 惰性：Linux 测试没有 pywin32
         info_mod = __import__("pywinauto.uia_element_info", fromlist=["UIAElementInfo"])
         wrap_mod = __import__("pywinauto.controls.uiawrapper", fromlist=["UIAWrapper"])
-    except Exception:  # noqa: BLE001 - 非 Windows / 没装 pywinauto
+    except Exception:  # noqa: BLE001 - 非 Windows / 没装 pywin32 或 pywinauto
         return [], None
+    handles: list[int] = []
     try:
-        root = info_mod.UIAElementInfo()
-        children = root.children(cache_enable=False)
-    except Exception as exc:  # noqa: BLE001 - 这正是要抓的：带缓存路吞掉的那个错
-        return [], f"{type(exc).__name__}: {str(exc)[:160]}"
+        def _collect(hwnd: int, _: Any) -> bool:
+            if not visible_only or win32gui.IsWindowVisible(hwnd):
+                handles.append(hwnd)
+            return True
+        win32gui.EnumWindows(_collect, None)
+    except Exception as exc:  # noqa: BLE001 - EnumWindows 本身几乎不会失败，真失败要留证
+        return [], f"EnumWindows {type(exc).__name__}: {str(exc)[:160]}"
     windows: list[Any] = []
-    for info in children:
-        # 单个窗口包装失败（COM 调 control_type 偶发抛）不该拖垮整张列表——逐个来，坏的跳过。
-        wrapped = _safe_call(lambda i=info: wrap_mod.UIAWrapper(i))
+    for hwnd in handles:
+        # 逐个 ElementFromHandle + 包装；单个失败（窗口刚消失 / COM 偶发）跳过，不拖垮整张列表。
+        wrapped = _safe_call(lambda h=hwnd: wrap_mod.UIAWrapper(info_mod.UIAElementInfo(h)))
         if wrapped is not None:
             windows.append(wrapped)
     return windows, None
@@ -4033,6 +4052,24 @@ def _window_handle(window: Any) -> Any:
 
 def _window_handles(windows: list[Any]) -> set[Any]:
     return {handle for handle in (_window_handle(window) for window in windows) if handle is not None}
+
+
+def _window_pid(window: Any) -> int | None:
+    """窗口所属进程 PID；拿不到（非 Windows / 窗口已消失 / 没装 pywin32）返回 ``None``。
+
+    确认框判据里用它认「这是不是微信自己弹的窗口」——比认 class 前缀稳：4.1.13 的原生确认框 class 带 `mmui::`，
+    4.1.12.26 是 Qt 构建、确认框 class 是 `Qt….QWindowIcon` 一类、窗口标题还可能是空的，只有「同属微信进程」这条
+    判据两种构建都成立（[[wechat-auto-accept-friend-110]]）。
+    """
+    handle = _window_handle(window)
+    if handle is None:
+        return None
+    try:
+        win32process = __import__("win32process")
+    except Exception:  # noqa: BLE001 - Linux 测试 / 没装 pywin32
+        return None
+    pid = _safe_call(lambda: win32process.GetWindowThreadProcessId(handle)[1])
+    return pid if isinstance(pid, int) else None
 
 
 def _window_inventory(windows: list[Any], limit: int = 12) -> str:

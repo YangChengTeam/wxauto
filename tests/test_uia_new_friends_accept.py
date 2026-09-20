@@ -370,6 +370,46 @@ class VerifyConfirmFormTests(_Harness):
         accepted = [e for e in logs if e.get("event") == "friend.check.accepted"]
         self.assertIn("mmui::XDialogWindow", accepted[0].get("via"))
 
+    def test_new_qt_window_after_click_is_matched_by_wechat_process(self) -> None:
+        """Qt 构建 4.1.12.26：确认框 class 不是 `mmui::`、标题还可能空，靠「同属微信进程」认出「点完刚冒出来的窗口」。"""
+        main = _Node("main_top", self.log, text="微信", class_name="mmui::MainWindow")
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[main])
+        popup = self.confirm_window(title="", class_name="Qt51514QWindowIcon")
+        verify = self.detail._lookup[_key({"title": "前往验证", "control_type": "Button"})]
+
+        def click_verify() -> None:
+            self.log.append(("verify", "click"))
+            self.windows.append(popup)
+
+        verify.click_input = click_verify  # type: ignore[method-assign]
+        # 只有主窗口和确认框属于同一个「微信进程」；其它窗口 pid 不同 → 只能靠进程判据认出 Qt 确认框
+        def fake_pid(window: object) -> int | None:
+            return 4242 if window is popup or window is self.main_window else 1
+        with mock.patch.object(uia, "_window_pid", side_effect=fake_pid), capture_logs() as logs:
+            result = driver.check_new_friends(verify=True, limit=1)
+        self.assertEqual(result["accepted"], ["小张"])
+        self.assertEqual(self._clicks().count("confirm"), 1)
+        accepted = [e for e in logs if e.get("event") == "friend.check.accepted"]
+        self.assertIn("Qt51514QWindowIcon", accepted[0].get("via"))
+
+    def test_new_qt_window_of_another_process_is_not_the_confirm_box(self) -> None:
+        """点完冒出来的若是别的进程的 Qt 窗口（银行工具之类），不是微信自家窗口，不当确认框。"""
+        main = _Node("main_top", self.log, text="微信", class_name="mmui::MainWindow")
+        driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[main])
+        popup = self.confirm_window(title="", class_name="Qt51514QWindowIcon")
+        verify = self.detail._lookup[_key({"title": "前往验证", "control_type": "Button"})]
+
+        def click_verify() -> None:
+            self.log.append(("verify", "click"))
+            self.windows.append(popup)
+
+        verify.click_input = click_verify  # type: ignore[method-assign]
+        def fake_pid(window: object) -> int | None:
+            return 4242 if window is self.main_window else 999
+        with mock.patch.object(uia, "_window_pid", side_effect=fake_pid), self.assertRaises(uia.WeChatApiError):
+            driver.check_new_friends(verify=True, limit=1)
+        self.assertNotIn("confirm", self._clicks())
+
     def test_a_tooltip_that_pops_after_the_click_is_not_the_confirm_box(self) -> None:
         main = _Node("main_top", self.log, text="微信", class_name="mmui::MainWindow")
         driver = self._driver(cells=self._pending(), verify_title="前往验证", windows=[main])
@@ -491,29 +531,29 @@ class VerifyConfirmFormTests(_Harness):
 
 
 class DesktopEnumFallbackTests(unittest.TestCase):
-    """`Desktop().windows()` 返回空时的非缓存兜底枚举 + 枚举异常留证。
+    """`Desktop().windows()` 返回空时的 Win32 兜底枚举 + 枚举异常留证。
 
-    2026-09-20 用户机 4.1.12.26 现场：带缓存的 `FindAll` 抛 COMError 被 pywinauto 静默吞成空列表，
-    连微信主窗口都枚举不到；非缓存路要能补上，真实异常要能记进失败信息。
+    2026-09-20 用户机现场：冻结客户端里 `Desktop().windows()` 一个顶层窗口都不返回（同机标准 Python 返回 10 个），
+    根枚举在打包后哑掉；Win32 `EnumWindows` 兜底路要能补上，真实异常要能记进失败信息。
     """
 
     def setUp(self) -> None:
         uia._take_enum_error()  # 清掉上一条用例可能留下的错
 
-    def test_uncached_returns_empty_without_pywinauto(self) -> None:
-        # Linux / 没装 pywinauto：既不抛也不记错，返回空列表
-        windows, err = uia._uncached_top_windows()
+    def test_win32_returns_empty_without_pywin32(self) -> None:
+        # Linux / 没装 pywin32 或 pywinauto：既不抛也不记错，返回空列表
+        windows, err = uia._win32_top_windows()
         self.assertEqual(windows, [])
         self.assertIsNone(err)
 
     def test_desktop_windows_falls_back_when_primary_empty(self) -> None:
         sentinel = [_Node("win", [], class_name="mmui::MainWindow")]
-        with mock.patch.object(uia, "_uncached_top_windows", return_value=(sentinel, None)):
+        with mock.patch.object(uia, "_win32_top_windows", return_value=(sentinel, None)):
             # pywinauto 不在 → 主路 suppress 成空 → 落到兜底
             self.assertEqual(uia.UiaWeChatDriver._desktop_windows(), sentinel)
 
     def test_desktop_windows_records_enum_error(self) -> None:
-        with mock.patch.object(uia, "_uncached_top_windows",
+        with mock.patch.object(uia, "_win32_top_windows",
                                return_value=([], "COMError: -2147220991 事件无法调用任何订户")):
             self.assertEqual(uia.UiaWeChatDriver._desktop_windows(), [])
         taken = uia._take_enum_error()
