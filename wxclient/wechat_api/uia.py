@@ -813,13 +813,15 @@ class UiaWeChatDriver:
                          if str(_safe_call(getattr(w, "class_name", None)) or "").startswith("mmui::")], limit=8,
                     )
                     buttons = _button_titles(detail)
+                    enum_error = _take_enum_error()   # pywinauto 带缓存枚举吞掉的真实 COMError（若有）
                     logger.info(
                         "friend.check.confirm_missing", entry=text[:20], button=button_title,
                         error=str(exc)[:160], windows=windows, hidden=hidden, buttons=buttons,
+                        enum_error=enum_error or None,
                     )
                     raise WeChatApiError(
                         f"点了「{button_title or '通过'}」但没等到确认框：{exc}"
-                        f"｜此刻顶层窗口：{windows}｜含不可见的微信窗口：{hidden}｜详情面板按钮：{buttons}"
+                        f"｜此刻顶层窗口：{windows}｜含不可见的微信窗口：{hidden}｜详情面板按钮：{buttons}{enum_error}"
                     ) from exc
                 time.sleep(1.0)
                 accepted.append(name)
@@ -979,12 +981,25 @@ class UiaWeChatDriver:
 
     @staticmethod
     def _desktop_windows(*, visible_only: bool = True) -> list[Any]:
-        """桌面上此刻的顶层窗口；pywinauto 不在（Linux 跑测试）或枚举失败就空列表，测试里直接替换这个方法。"""
+        """桌面上此刻的顶层窗口；pywinauto 不在（Linux 跑测试）或枚举失败就空列表，测试里直接替换这个方法。
+
+        ★ 2026-09-20 用户机 4.1.12.26（1024×768 虚拟屏云主机）现场：`Desktop(backend="uia").windows()`
+          **一个顶层窗口都不返回**，连微信主窗口都枚举不到——可系统自带的 UIAutomation（.NET）在同一桌面
+          会话里 `RootElement.FindAll(Children, TrueCondition)` 能看到 10 个窗口。差别在 pywinauto 这条路走的是
+          **带缓存**（`cache_enable=True`）的 `FindAll`；带缓存的枚举在这台机上抛 COMError，被 pywinauto 静默
+          吞成空列表（错误只进它自己的 ActionLogger、不进我们的日志）。而 `child_window` 这些非缓存路都正常。
+          所以拿不到窗口时，改用**非缓存**的根枚举再试一遍，并把真实异常留给上层记进日志（[[wechat-auto-accept-friend-110]]）。
+        """
         windows: list[Any] = []
         with suppress(Exception):
             Desktop = __import__("pywinauto", fromlist=["Desktop"]).Desktop
             windows = list(Desktop(backend="uia").windows(visible_only=visible_only))
-        return windows
+        if windows:
+            return windows
+        alt, err = _uncached_top_windows()
+        if err:
+            _record_enum_error(err)
+        return alt
 
     @staticmethod
     def _new_friend_display_name(detail: Any) -> str:
@@ -3966,6 +3981,48 @@ def _looks_like_verify_confirm_window(window: Any) -> bool:
     title = str(_safe_call(getattr(window, "window_text", None)) or "").strip()
     lowered = class_name.lower()
     return "verifyfriend" in lowered or "friendverify" in lowered or title in _VERIFY_CONFIRM_TITLES
+
+
+# 最近一次「非缓存兜底枚举」的真实异常（pywinauto 带缓存那条路把它吞了）。放弃时随失败信息一起记进日志。
+_LAST_ENUM_ERROR: str | None = None
+
+
+def _record_enum_error(err: str) -> None:
+    global _LAST_ENUM_ERROR
+    _LAST_ENUM_ERROR = err
+
+
+def _take_enum_error() -> str:
+    """取出并清掉最近一次枚举异常，只在真的记了错时返回一段文字。"""
+    global _LAST_ENUM_ERROR
+    err, _LAST_ENUM_ERROR = _LAST_ENUM_ERROR, None
+    return f"｜枚举异常：{err}" if err else ""
+
+
+def _uncached_top_windows() -> tuple[list[Any], str | None]:
+    """不走 pywinauto 带缓存的 `Desktop().windows()`，直接用**非缓存**的 UIA 根枚举拿顶层窗口。
+
+    返回 ``(窗口列表, 异常文字或 None)``。带缓存的 `FindAll` 在个别机器上抛 COMError、被 pywinauto 静默吞成空
+    列表（[[wechat-auto-accept-friend-110]]）；非缓存的 `children(cache_enable=False)` 与 `child_window` 同路，
+    正常机器上照样能枚举，出问题时这里能把真实异常抛出来记进日志。pywinauto 不在（Linux 测试）返回 ``([], None)``。
+    """
+    try:
+        info_mod = __import__("pywinauto.uia_element_info", fromlist=["UIAElementInfo"])
+        wrap_mod = __import__("pywinauto.controls.uiawrapper", fromlist=["UIAWrapper"])
+    except Exception:  # noqa: BLE001 - 非 Windows / 没装 pywinauto
+        return [], None
+    try:
+        root = info_mod.UIAElementInfo()
+        children = root.children(cache_enable=False)
+    except Exception as exc:  # noqa: BLE001 - 这正是要抓的：带缓存路吞掉的那个错
+        return [], f"{type(exc).__name__}: {str(exc)[:160]}"
+    windows: list[Any] = []
+    for info in children:
+        # 单个窗口包装失败（COM 调 control_type 偶发抛）不该拖垮整张列表——逐个来，坏的跳过。
+        wrapped = _safe_call(lambda i=info: wrap_mod.UIAWrapper(i))
+        if wrapped is not None:
+            windows.append(wrapped)
+    return windows, None
 
 
 def _window_handle(window: Any) -> Any:

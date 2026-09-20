@@ -490,5 +490,37 @@ class VerifyConfirmFormTests(_Harness):
                       "失败句子要带客户端版本号，贴回来就知道装的是哪版")
 
 
+class DesktopEnumFallbackTests(unittest.TestCase):
+    """`Desktop().windows()` 返回空时的非缓存兜底枚举 + 枚举异常留证。
+
+    2026-09-20 用户机 4.1.12.26 现场：带缓存的 `FindAll` 抛 COMError 被 pywinauto 静默吞成空列表，
+    连微信主窗口都枚举不到；非缓存路要能补上，真实异常要能记进失败信息。
+    """
+
+    def setUp(self) -> None:
+        uia._take_enum_error()  # 清掉上一条用例可能留下的错
+
+    def test_uncached_returns_empty_without_pywinauto(self) -> None:
+        # Linux / 没装 pywinauto：既不抛也不记错，返回空列表
+        windows, err = uia._uncached_top_windows()
+        self.assertEqual(windows, [])
+        self.assertIsNone(err)
+
+    def test_desktop_windows_falls_back_when_primary_empty(self) -> None:
+        sentinel = [_Node("win", [], class_name="mmui::MainWindow")]
+        with mock.patch.object(uia, "_uncached_top_windows", return_value=(sentinel, None)):
+            # pywinauto 不在 → 主路 suppress 成空 → 落到兜底
+            self.assertEqual(uia.UiaWeChatDriver._desktop_windows(), sentinel)
+
+    def test_desktop_windows_records_enum_error(self) -> None:
+        with mock.patch.object(uia, "_uncached_top_windows",
+                               return_value=([], "COMError: -2147220991 事件无法调用任何订户")):
+            self.assertEqual(uia.UiaWeChatDriver._desktop_windows(), [])
+        taken = uia._take_enum_error()
+        self.assertIn("COMError", taken)
+        self.assertIn("枚举异常", taken)
+        self.assertEqual(uia._take_enum_error(), "", "取过一次就清掉，不会漏进下一条失败信息")
+
+
 if __name__ == "__main__":
     unittest.main()
