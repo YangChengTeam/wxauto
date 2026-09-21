@@ -5,11 +5,12 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from sqlite3 import connect
 from typing import Any
+from unittest import mock
 
 from wxclient.queue import OperationWorker, Task, TaskStatus, TaskStore, TaskType
 from wxclient.wechat_api import WeChatApiError
@@ -403,6 +404,69 @@ class TaskStoreTests(unittest.TestCase):
         self.assertEqual(completed.status, TaskStatus.SUCCEEDED)  # type: ignore[union-attr]
         self.assertEqual(completed.result["message_count"], 1)  # type: ignore[union-attr,index]
 
+
+class _HeartbeatWatchingStore(TaskStore):
+    """记下每次写终态时租约心跳线程是否还活着。"""
+
+    def __init__(self, database_path: Path) -> None:
+        super().__init__(database_path)
+        self.heartbeat_alive_at_settle: list[bool] = []
+
+    def _note(self) -> None:
+        alive = any(t.name == "wx-lease-heartbeat" and t.is_alive() for t in threading.enumerate())
+        self.heartbeat_alive_at_settle.append(alive)
+
+    def complete(self, task_id: str, result: dict[str, Any] | None = None, owner_id: str | None = None) -> bool:
+        self._note()
+        return super().complete(task_id, result, owner_id)
+
+    def fail(self, task_id: str, error: str, retry: bool = False, owner_id: str | None = None,
+             result: dict[str, Any] | None = None, retry_delay_seconds: float = 0.0) -> bool:
+        self._note()
+        return super().fail(task_id, error, retry, owner_id, result, retry_delay_seconds)
+
+
+class WorkerLeaseHeartbeatTests(unittest.TestCase):
+    """★ 2026-09-21 假警报：终态先写、心跳后停，心跳撞进窗口就记「任务租约丢」。"""
+
+    def test_heartbeat_is_stopped_before_the_terminal_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _HeartbeatWatchingStore(Path(tmp) / "tasks.db")
+            worker = OperationWorker(store, _FakeApi())  # type: ignore[arg-type]
+            task = store.create_task(TaskType.SEARCH_CONTACTS, {"query": "a"}, "default")
+
+            self.assertTrue(worker.run_once())
+
+            self.assertEqual(store.heartbeat_alive_at_settle, [False])
+            self.assertEqual(store.get(task.id).status, TaskStatus.SUCCEEDED)  # type: ignore[union-attr]
+
+    def test_heartbeat_is_stopped_before_a_failure_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _HeartbeatWatchingStore(Path(tmp) / "tasks.db")
+            worker = OperationWorker(store, _FailingApi())  # type: ignore[arg-type]
+            task = store.create_task(TaskType.SEARCH_CONTACTS, {"query": "a"}, "default")
+
+            self.assertTrue(worker.run_once())
+
+            self.assertEqual(store.heartbeat_alive_at_settle, [False])
+            self.assertEqual(store.get(task.id).status, TaskStatus.PENDING)  # type: ignore[union-attr]
+
+    def test_a_tick_that_lands_after_stop_does_not_cry_lease_lost(self) -> None:
+        """join 超时的兜底：续租失败但 stop 已置位（终态可能刚写下去）就不记 lease_lost。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "tasks.db")
+            worker = OperationWorker(store, _FakeApi(), lease_seconds=1.0)  # type: ignore[arg-type]
+            stop = threading.Event()
+
+            def renew_task(task_id: str, owner_id: str, lease_seconds: float) -> bool:
+                stop.set()  # 续租进行中，主线程写完终态并叫停了心跳
+                return False
+
+            with mock.patch.object(store, "renew_task", side_effect=renew_task), \
+                    mock.patch("wxclient.queue.worker.logger") as fake_logger:
+                worker._renew_leases("task-1", stop)
+
+            fake_logger.error.assert_not_called()
 
 class WorkerDispatchTests(unittest.TestCase):
     def test_one_worker_instance_cannot_dispatch_concurrently(self) -> None:

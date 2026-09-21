@@ -116,34 +116,51 @@ class OperationWorker:
             daemon=True,
         )
         heartbeat.start()
+        outcome: dict[str, Any] | TaskContinuation | Exception
         try:
-            result = self.dispatch(task)
-        except WeChatApiUnavailableError as exc:
-            self.store.block(task.id, str(exc), owner_id=self.worker_id)
-            task_logger.warning("task.blocked", error=str(exc))
-        except WeChatApiError as exc:
-            self._record_execution_failure(task, exc)
-            task_logger.warning("task.failed", error=str(exc))
-        except Exception as exc:
-            self._record_execution_failure(task, exc)
-            task_logger.exception("task.failed", error=str(exc))
-        else:
-            if isinstance(result, TaskContinuation):
-                self.store.yield_task(
-                    task.id,
-                    self.worker_id,
-                    result.payload,
-                    result.delay_seconds,
-                )
-                task_logger.info("task.yielded")
-            else:
-                self.store.complete(task.id, result, owner_id=self.worker_id)
-                task_logger.info("task.succeeded", action=result.get("action"))
+            outcome = self.dispatch(task)
+        except Exception as exc:  # noqa: BLE001 —— 任何异常都要落成终态，分类在 _settle 里做
+            outcome = exc
         finally:
+            # ★ 先叫停心跳、等它退出，**再**写终态。终态一写，任务的 status 就不再是
+            # RUNNING、lease_owner 也清空了，这时心跳若还在续租必然失败，会记一条
+            # 「任务租约丢」的假警报（2026-09-21 复现：worker_lease=True、task_lease=False，
+            # 任务其实已 succeeded）。窗口宽度 = 终态那次 SQLite 写入的耗时，真机磁盘慢或
+            # 写锁排队时能到几十毫秒，watch_chats 每 5 秒收尾一次，一天撞上几回很正常。
             heartbeat_stop.set()
             heartbeat.join(timeout=1.0)
+        try:
+            self._settle(task, task_logger, outcome)
+        finally:
             self._busy = False
         return True
+
+    def _settle(
+        self,
+        task: Task,
+        task_logger: Any,
+        outcome: dict[str, Any] | TaskContinuation | Exception,
+    ) -> None:
+        if isinstance(outcome, WeChatApiUnavailableError):
+            self.store.block(task.id, str(outcome), owner_id=self.worker_id)
+            task_logger.warning("task.blocked", error=str(outcome))
+        elif isinstance(outcome, WeChatApiError):
+            self._record_execution_failure(task, outcome)
+            task_logger.warning("task.failed", error=str(outcome))
+        elif isinstance(outcome, Exception):
+            self._record_execution_failure(task, outcome)
+            task_logger.error("task.failed", error=str(outcome), exc_info=outcome)
+        elif isinstance(outcome, TaskContinuation):
+            self.store.yield_task(
+                task.id,
+                self.worker_id,
+                outcome.payload,
+                outcome.delay_seconds,
+            )
+            task_logger.info("task.yielded")
+        else:
+            self.store.complete(task.id, outcome, owner_id=self.worker_id)
+            task_logger.info("task.succeeded", action=outcome.get("action"))
 
     def _record_execution_failure(self, task: Task, exc: Exception) -> None:
         if is_real_write(task):
@@ -176,6 +193,9 @@ class OperationWorker:
         while not stop.wait(interval):
             worker_ok = self.store.renew_worker(self.worker_id, self.lease_seconds)
             task_ok = self.store.renew_task(task_id, self.worker_id, self.lease_seconds)
+            if stop.is_set():
+                # 收尾时刻已经过了：这次续租结果不作数（终态可能刚写下去）。
+                return
             if not worker_ok or not task_ok:
                 logger.error(
                     "worker.lease_lost",
@@ -318,7 +338,7 @@ class OperationWorker:
         scan_payload.pop("_wxclient_watch_state", None)
         try:
             slice_result = self._scan_messages(scan_payload)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 —— 一个好友出错不该拖垮整轮巡看，记下继续
             error_count += 1
             results.append({"friend": friend, "error": str(exc)})
             index += 1

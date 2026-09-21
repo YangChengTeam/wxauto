@@ -625,9 +625,10 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "task.yielded":
         return f"微信任务让出这一轮，稍后接着做：{task_type} #{task_id}"
     if event == "worker.lease_lost":
-        # 租约丢了 = 这条任务可能已经被另一个执行器接走，**再往下写就是两个人同时操作微信**。
+        # 租约续不上 = 这条任务可能已经被另一个执行器接走。执行器**不会**中途停手
+        # （微信操作做到一半没法安全打断），但做完后的结果会因为归属校验写不进库。
         return (
-            f"执行器租约丢失，已停手：任务 #{_short_id(payload.get('task_id'))}"
+            f"任务续租失败，做完后结果可能记不上：任务 #{_short_id(payload.get('task_id'))}"
             f"（执行器租约 {'在' if payload.get('worker_lease') else '丢'}、"
             f"任务租约 {'在' if payload.get('task_lease') else '丢'}）"
         )

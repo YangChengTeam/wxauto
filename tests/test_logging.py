@@ -189,7 +189,9 @@ class NoEnglishLeaksTests(ChineseLogRendererTests):
         output = self.render("worker.lease_lost", worker_id="w-1", task_id="12345678-abcd",
                              worker_lease=False, task_lease=True)
 
-        self.assertIn("租约丢失，已停手", output)
+        self.assertIn("续租失败", output)
+        self.assertIn("结果可能记不上", output)
+        self.assertNotIn("已停手", output)
         self.assertIn("#12345678", output)
         self.assertIn("执行器租约 丢", output)
         self.assertIn("任务租约 在", output)
