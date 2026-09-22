@@ -66,6 +66,9 @@ MATERIAL_TYPE_TEXT = {
     "id_card_front": "身份证正面",
     "id_card_back": "身份证背面",
     "bank_card": "银行卡",
+    "certificate": "证书",
+    "health_certificate": "健康证",
+    "physical_exam_report": "体检报告",
 }
 
 
