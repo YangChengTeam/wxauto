@@ -443,7 +443,13 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             return f"名片读到了但加不了：{payload.get('number')}（既没有「添加到通讯录」也没有「发消息」）"
         return f"等不到这个号的名片：{payload.get('number')}（可能号码不对，也可能微信版式变了）"
     if event == "friend.add.fallback":
-        return f"添加好友改走备用流程：{payload.get('number')}（这次读不到对方昵称）"
+        # reason 必须打出来：2026-09-22 客户机上加好友连号都没输进去，日志里却只有
+        # 一句「改走备用流程」，到底卡在「面板打不开」还是「搜索框用不了」全靠猜。
+        reason = payload.get("reason")
+        tail = f"，原因：{reason}" if reason else ""
+        return f"添加好友改走备用流程：{payload.get('number')}（这次读不到对方昵称）{tail}"
+    if event == "friend.panel.entry_missing":
+        return f"快捷操作菜单里没有「{payload.get('label')}」：{payload.get('seen') or '-'}"
     if event == "friend.add.failed":
         return f"添加好友失败：{payload.get('number')}，原因：{payload.get('error') or '-'}"
     if event == "friend.check.start":

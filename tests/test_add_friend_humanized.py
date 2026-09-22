@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import unittest
-from typing import Any
+from typing import Any, ClassVar
 from unittest import mock
 
 from wxclient.wechat_api import uia
@@ -117,13 +117,28 @@ class _Node:
     def window_text(self) -> str:
         return ""
 
+    def exists(self, **_: Any) -> bool:
+        return True
+
 
 class _Elements:
     class Windows:
-        VerifyFriendWindow = {"role": "verify"}
+        VerifyFriendWindow: ClassVar[dict] = {"role": "verify"}
+        # 面板窗口的 title 同时也是快捷操作菜单里那一项的文案——`_open_add_friend_panel`
+        # 靠这一句**按名字**点，不数第几项（2026-09-22 客户机事故）。
+        AddFriendWindow: ClassVar[dict] = {"title": "添加朋友", "class_name": "mmui::AddFriendWindow",
+                           "control_type": "Window"}
 
     class Buttons:
-        ConfirmButton = {"role": "confirm"}
+        ConfirmButton: ClassVar[dict] = {"role": "confirm"}
+        QuickActionsButton: ClassVar[dict] = {"role": "quick_actions"}
+
+    class Lists:
+        QuickActionsList: ClassVar[dict] = {"role": "quick_actions_list"}
+
+    class SideBar:
+        # 「快捷操作」只挂在会话页上，所以开面板前要先点亮它。
+        Weixin: ClassVar[dict] = {"role": "chat_tab"}
 
 
 class AddFriendFlowTests(unittest.TestCase):
@@ -143,10 +158,27 @@ class AddFriendFlowTests(unittest.TestCase):
         pane.child_window = lambda **_: self.search_edit  # type: ignore[method-assign]
         self.pane = pane
 
+        # 主窗 → 「快捷操作」按钮 → 菜单列表 → 「添加朋友」那一项，每一层都记账，
+        # 这样「是按名字点的还是敲键盘蒙的」在断言里看得见。
+        self.entry = _Node("add_friend_entry", self.log)
+        menu = _Node("quick_actions_list", self.log)
+        menu.child_window = lambda **kw: (  # type: ignore[method-assign]
+            self.entry if kw.get("title") == "添加朋友" else _Node("其他项", self.log)
+        )
+        self.quick_actions_button = _Node("quick_actions_button", self.log)
+        main = _Node("main", self.log, {
+            "quick_actions": self.quick_actions_button,
+            "quick_actions_list": menu,
+        })
+
         navigator = mock.Mock()
-        navigator.open_add_friend_panel.return_value = (pane, _Node("main", self.log))
+        navigator.open_weixin.return_value = main
         tools = mock.Mock()
-        tools.move_window_to_center.return_value = _Node("verify", self.log)
+        # 面板和验证窗都走 move_window_to_center，按 criteria 分派，别让两者串味。
+        tools.move_window_to_center.side_effect = lambda Window: (
+            pane if Window.get("class_name") == "mmui::AddFriendWindow"
+            else _Node("verify", self.log)
+        )
 
         self.driver = uia.UiaWeChatDriver(dry_run=False)
         self.driver._ensure_ready = lambda: None  # type: ignore[method-assign]
@@ -169,6 +201,20 @@ class AddFriendFlowTests(unittest.TestCase):
         self.assertEqual(len(self.slept), len(uia._PAUSES),
                          f"该停 {len(uia._PAUSES)} 次，实际停了 {len(self.slept)} 次")
         self.assertGreater(sum(self.slept), 5, "加起来还不到 5 秒，等于没停")
+
+    def test_the_panel_is_opened_by_clicking_the_entry_by_name(self) -> None:
+        """★ 2026-09-22 客户机事故：面板是**按名字点**开的，不是敲 {UP} 数第几项。
+
+        vendor 的 `open_add_friend_panel` 赌菜单项顺序（`{UP}`×2 + `{ENTER}`），
+        微信 4.1.12.26 上那个菜单是「发起群聊 / 添加朋友 / 写笔记」三项，两下 UP 落在别处，
+        面板压根没开 —— 号码于是**永远没机会输进去**，用户看到的就是「添加框出来了但没查询」。
+        """
+        self._run()
+        self.assertIn(("quick_actions_button", "click"), self.log)
+        self.assertIn(("add_friend_entry", "click"), self.log)
+        self.assertNotIn("add_friend_entry", [n for n, _ in self.log if _.startswith("type_keys")])
+        self.assertFalse([a for _, a in self.log if "{UP}" in a],
+                         "又在靠敲方向键数第几项了——项序跟微信版本走，名字才跟语言走")
 
     def test_the_number_is_typed_key_by_key_not_pasted(self) -> None:
         self._run()

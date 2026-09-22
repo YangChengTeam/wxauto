@@ -252,7 +252,7 @@ class UiaWeChatDriver:
         Tools = self._pyweixin_class("Tools")
         Uielements = self._pyweixin_submodule("Uielements")
         try:
-            add_friend_pane, _main_window = Navigator.open_add_friend_panel(is_maximize=False)
+            add_friend_pane = self._open_add_friend_panel(Navigator, Tools, Uielements)
         except Exception as exc:
             raise _AddFriendNotStarted(f"打不开添加朋友面板：{exc}") from exc
 
@@ -302,6 +302,45 @@ class UiaWeChatDriver:
                     "profile_name": nickname or display_name, "already_friend": False}
         finally:
             _safe_call(getattr(add_friend_pane, "close", None))
+
+    def _open_add_friend_panel(self, Navigator: Any, Tools: Any, Uielements: Any) -> Any:
+        """打开「添加朋友」面板并返回那个窗口。
+
+        ★ **按名字点菜单项，不数第几项**（2026-09-22 线上事故）：vendor 的
+          `WeChatTools.open_add_friend_panel` 是点开「快捷操作」后盲敲 ``{UP}``×2 + ``{ENTER}``
+          ——它赌的是菜单项的**顺序**。微信 4.1.12.26 上那个菜单只有三项
+          「发起群聊 / 添加朋友 / 写笔记」，两下 UP 落在别处，回车下去面板压根没开，
+          随后找 `mmui::AddFriendWindow` 顶层窗自然找不到。现场表现就是用户说的
+          **「添加框出来了，但没有输入手机号去查询」**——出来的是快捷操作菜单，不是添加面板；
+          报上来的「原因」还是 pywinauto 那个 criteria 字典（异常的 str 就长这样），
+          客户机上一天失败 6 次没一次能看出卡在哪。
+          项的**名字**跟语言走（vendor 的表里已经有：简中「添加朋友」/繁中「新增朋友」/
+          英文「Add Contacts」），顺序却跟版本走——按名字点是这里唯一稳的判据。
+
+        点不开时抛原异常，由 `_add_friend_reading_profile` 统一转成 `_AddFriendNotStarted`。
+        """
+        main_window = Navigator.open_weixin(is_maximize=False)
+        window_criteria = dict(Uielements.Windows.AddFriendWindow)
+        # 面板窗口的标题和菜单项的文案是同一句（「添加朋友」/「新增朋友」/「Add Contacts」），
+        # 所以语言分支只认这一处，不再另抄一张表。
+        label = window_criteria.get("title")
+
+        # 「快捷操作」只挂在会话页上，停在通讯录/收藏页时这个按钮根本不存在——
+        # vendor 原来也是先点亮会话页再点它的，这一步省不得。
+        main_window.child_window(**Uielements.SideBar.Weixin).click_input()
+        main_window.child_window(**Uielements.Buttons.QuickActionsButton).click_input()
+        _human_pause("menu_open")
+        quick_actions = main_window.child_window(**Uielements.Lists.QuickActionsList)
+        entry = quick_actions.child_window(title=label, control_type="ListItem")
+        if not _truthy_safe_call(lambda: entry.exists(timeout=2)):
+            # 菜单开着但没有这一项：别再盲敲键盘碰运气（那正是这次事故的由来），
+            # 把看到的都记下来，让下一次「版式又变了」一眼看得出来。
+            logger.info("friend.panel.entry_missing", label=label,
+                        seen=_pane_inventory(quick_actions))
+            raise WeChatApiError(f"快捷操作菜单里没有「{label}」这一项（微信版式可能变了）")
+        entry.click_input()
+        _human_pause("panel_open")
+        return Tools.move_window_to_center(Window=window_criteria)
 
     def _await_contact_profile(
         self, pane: Any, Uielements: Any, number: str
@@ -3676,6 +3715,8 @@ _SEARCH_RESULT_SECTIONS = {
 #:
 #: 停顿一律取随机区间，不写死。固定 2.0 秒和固定 0.0 秒一样是机器特征，只是慢一点。
 _PAUSES: dict[str, tuple[float, float]] = {
+    "menu_open": (0.5, 1.4),       # 「快捷操作」点开了，扫一眼菜单再挑那一项
+    "panel_open": (0.8, 2.0),      # 「添加朋友」点下去，等面板渲染出来
     "before_enter": (0.6, 1.6),    # 号码打完，按回车之前
     "after_enter": (1.5, 3.5),     # 回车之后等搜索结果（原来是写死的 sleep(1)）
     "read_profile": (1.2, 3.0),    # 名片出来了，看一眼再点「添加到通讯录」

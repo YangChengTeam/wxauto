@@ -168,8 +168,16 @@ class _FakeUielements:
     Groups = type("G", (), {"ContactProfileViewGroup": {"_key": "profile"}})()
     Buttons = type("B", (), {"AddToContactsButton": {"_key": "add"},
                              "SendMessageButton": {"_key": "send"},
-                             "ConfirmButton": {"_key": "confirm"}})()
-    Windows = type("W", (), {"VerifyFriendWindow": {"_key": "verify"}})()
+                             "ConfirmButton": {"_key": "confirm"},
+                             "QuickActionsButton": {"_key": "quick_actions"}})()
+    # AddFriendWindow 的 title 同时也是快捷操作菜单里那一项的文案——`_open_add_friend_panel`
+    # 按这个名字点菜单项，不数第几项（2026-09-22 客户机事故）。
+    Windows = type("W", (), {"VerifyFriendWindow": {"_key": "verify"},
+                             "AddFriendWindow": {"_key": "add_friend_window",
+                                                 "title": "添加朋友",
+                                                 "class_name": "mmui::AddFriendWindow"}})()
+    Lists = type("L", (), {"QuickActionsList": {"_key": "quick_actions_list"}})()
+    SideBar = type("S", (), {"Weixin": {"_key": "chat_tab"}})()
 
 
 class AddFriendReturnsTheNameTests(unittest.TestCase):
@@ -223,15 +231,28 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
         )
         vendor_calls: list[dict] = []
 
+        # 主窗 → 会话页 → 「快捷操作」→ 菜单里按名字点「添加朋友」，
+        # 就是 `_open_add_friend_panel` 真实走的那几步（不再有 open_add_friend_panel 这个桩）。
+        main_window = _FakeControl("主窗口", children={
+            "chat_tab": _FakeControl("会话页", log=log),
+            "quick_actions": _FakeControl("快捷操作", log=log),
+            "quick_actions_list": _FakeControl("快捷操作菜单", children={
+                "ListItem": _FakeControl("添加朋友", log=log),
+            }, log=log),
+        }, log=log)
+
         class _Navigator:
             @staticmethod
-            def open_add_friend_panel(**_: object):
-                return pane, _FakeControl("主窗口", log=log)
+            def open_weixin(**_: object):
+                return main_window
 
         class _Tools:
             @staticmethod
-            def move_window_to_center(**_: object):
-                return verify
+            def move_window_to_center(**kwargs: object):
+                # 面板和验证窗共用这一个入口，按 criteria 分派，别让两者串味。
+                window = kwargs.get("Window") or {}
+                key = window.get("_key") if isinstance(window, dict) else None
+                return pane if key == "add_friend_window" else verify
 
         class _FriendSettings:
             @staticmethod
