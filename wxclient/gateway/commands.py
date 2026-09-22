@@ -457,6 +457,12 @@ class CommandExecutor:
         if refs and self._fetcher is None:
             _ai.warning("收到发文件指令但没配下载通道", op=op)
             return CommandResult(command_id, "rejected", "本机没有配取文件通道，发不了 AI 端产出的文件")
+        # ★ 指令点名了它是发给哪个微信账号的（面试天气提醒那条契约：换号之后旧提醒不许自动
+        #   转投新号）。本机登录的不是那个号就拒——动都不动微信。没点名的指令照旧。
+        pinned_account = str(args.get("wechat_account_id") or "").strip()
+        if pinned_account and pinned_account != self._account:
+            _local.info("指令指向的微信账号不是本机这个号，不执行", op=op)
+            return CommandResult(command_id, "rejected", "这条指令指向的微信账号不是本机登录的这个号，没有执行")
 
         # ★ 074：先问「能不能做」，再问「让不让做」。两者原因不同，给用户的话完全两样：
         #   做不了 = 去修环境（微信没登、只走流程不真发、没配取文件通道）；
@@ -602,6 +608,9 @@ class CommandExecutor:
             state = self._friend_state(op, result, raw)
             if state:
                 result = {**result, "friend_state": state}
+            receipt = self._delivery_receipt(command_id, op, raw)
+            if receipt:
+                result = {**result, **receipt}
             return CommandResult(command_id, "done", result=result)
 
     def _drop_commented(
@@ -695,6 +704,26 @@ class CommandExecutor:
             content=str(args.get("text") or ""),
             source="command",
         )
+
+    def _delivery_receipt(self, command_id: str, op: str, raw: dict[str, Any] | None) -> dict[str, str]:
+        """真发出去一条微信 → 回执里带上**发送凭据**：`message_id` + `delivery_status`。
+
+        面试天气提醒那条契约只认「`result.delivery_status=sent` 且非空 `result.message_id`」当发成
+        的证据——`done` 本身不算（done 只说明这条指令跑完了）。`message_id` 就是 `_note_message_sent`
+        上报消息事件用的那个本机稳定 ID（同一账号 + 同一指令派生，重推得同一个值），后端账本里
+        按它能对上那条 outbound 事件。
+
+        只在**真动了微信且队列确认 succeeded** 时给：dry-run 一个字没发，不能给凭据；
+        不是发消息的 op（加好友、朋友圈、读类）也没有「一条消息」可指。不编 ID 顶上。
+        """
+        if not self._allow_real or op not in MESSAGE_EVENT_OPS:
+            return {}
+        if str((raw or {}).get("status") or "") != "succeeded":
+            return {}
+        return {
+            "message_id": local_message_id(self._account, command_id),
+            "delivery_status": "sent",
+        }
 
     def _friend_state(
         self, op: str, result: dict[str, Any], raw: dict[str, Any] | None = None

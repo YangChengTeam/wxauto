@@ -18,6 +18,7 @@ from structlog.testing import capture_logs
 
 from wxclient.gateway import CommandExecutor, GatewayStore, OutboundGuard
 from wxclient.gateway.capabilities import (
+    CAP_DELIVERY_RECEIPT,
     CAP_GROUP_MESSAGE,
     CAP_MOMENTS,
     CAP_PRIVATE_MESSAGE,
@@ -247,6 +248,69 @@ class SentEchoRecordTests(CommandTestCase):
             "args": {"to": "张三", "text": "在吗"},
         })
         self.assertFalse(self.store.claim_sent_echo(ACCOUNT, "张三", "在吗"))
+
+
+class DeliveryReceiptTests(CommandTestCase):
+    """真发出去一条微信 → 回执带**发送凭据**（面试天气提醒契约：`done` 不算发成，
+    只认 `result.delivery_status=sent` + 非空 `result.message_id`）。凭据只在真动了微信且
+    队列确认 succeeded 时给；dry-run / 失败 / 不是发消息的 op 一律没有——不编 ID 顶上。"""
+
+    async def test_real_send_carries_a_stable_message_id(self) -> None:
+        result = await self._executor(FakeRuntime()).execute({
+            "command_id": "weather:r1", "op": "send_message", "args": {"to": "张三", "text": "预报有雨，记得带伞"},
+        })
+        self.assertEqual(result.status, "done")
+        self.assertEqual((result.result or {}).get("delivery_status"), "sent")
+        message_id = (result.result or {}).get("message_id")
+        self.assertTrue(message_id and message_id.startswith("wxlocal_"), result.result)
+        # 同一账号 + 同一指令 → 同一个 ID（重推幂等层已经挡住；万一漏过去，后端按它去重）。
+        from wxclient.gateway.message_events import local_message_id
+        self.assertEqual(message_id, local_message_id(ACCOUNT, "weather:r1"))
+
+    async def test_failed_send_has_no_receipt(self) -> None:
+        result = await self._executor(FakeRuntime(status="failed")).execute({
+            "command_id": "c1", "op": "send_message", "args": {"to": "张三", "text": "在吗"},
+        })
+        self.assertEqual(result.status, "failed")
+        self.assertNotIn("message_id", result.result or {})
+
+    async def test_dry_run_has_no_receipt(self) -> None:
+        """只走流程不真发：私聊本来就被能力表拦成 rejected；就算放过去也不能给凭据。"""
+        executor = self._executor(FakeRuntime(), allow_real_actions=False)
+        self.assertEqual(executor._delivery_receipt("c1", "send_message", {"status": "succeeded"}), {})
+
+    async def test_add_friend_has_no_receipt(self) -> None:
+        result = await self._executor(FakeRuntime(result={"requested": True})).execute({
+            "command_id": "c1", "op": "add_friend", "args": {"number": "13800000000"},
+        })
+        self.assertEqual(result.status, "done")
+        self.assertNotIn("message_id", result.result or {})
+        self.assertNotIn("delivery_status", result.result or {})
+
+
+class PinnedAccountTests(CommandTestCase):
+    """指令点名了微信账号（`args.wechat_account_id`）：本机登录的不是那个号就拒，微信一下不动。
+    换号之后旧的面试天气提醒不许自动转投新号（契约 §3.5）。"""
+
+    async def test_other_account_is_rejected_before_touching_wechat(self) -> None:
+        runtime = FakeRuntime()
+        result = await self._executor(runtime).execute({
+            "command_id": "weather:r1", "op": "send_message",
+            "args": {"to": "张三", "text": "预报有雨", "wechat_account_id": "someone_else"},
+        })
+        self.assertEqual(result.status, "rejected")
+        self.assertIn("不是本机登录的这个号", result.reason)
+        self.assertEqual(runtime.calls, [])
+
+    async def test_matching_account_goes_through_and_is_not_forwarded_to_wechat(self) -> None:
+        runtime = FakeRuntime()
+        result = await self._executor(runtime).execute({
+            "command_id": "weather:r1", "op": "send_message",
+            "args": {"to": "张三", "text": "预报有雨", "wechat_account_id": ACCOUNT},
+        })
+        self.assertEqual(result.status, "done")
+        _task, payload, _conf = runtime.calls[-1]
+        self.assertNotIn("wechat_account_id", payload)
 
 
 class WhitelistTests(CommandTestCase):
@@ -888,6 +952,11 @@ class CapabilityProbeTests(unittest.TestCase):
     def test_everything_works_when_wechat_is_live(self) -> None:
         caps = self._caps()
         self.assertTrue(all(c.available for c in caps.values()), caps)
+        self.assertIn(CAP_DELIVERY_RECEIPT, caps)   # AI 端投面试天气提醒前看这一项
+
+    def test_dry_run_cannot_promise_a_delivery_receipt(self) -> None:
+        caps = self._caps(allow_real_actions=False)
+        self.assertFalse(caps[CAP_DELIVERY_RECEIPT].available)
 
     def test_login_screen_blocks_everything_with_a_human_reason(self) -> None:
         caps = self._caps(uia={"logged_in": False, "login_window": True})
