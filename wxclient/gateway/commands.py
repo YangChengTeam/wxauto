@@ -251,6 +251,9 @@ COMMANDS: dict[str, CommandSpec] = {
                    "remark": a.get("remark")},
         lambda a: _req(a, "number"),
         action=ACTION_FRIEND,
+        # ★ 配额只数**真发出去的申请**（用户 2026-09-22：「没有加上好友不算用掉配额」）。
+        #   这个号早就是好友（`already_friend`）时微信一下没动，不占「加好友」一小时 5 次的名额。
+        counts=lambda _args, result: 0 if result.get("already_friend") else 1,
     ),
     "accept_new_friends": CommandSpec(
         TaskType.ACCEPT_NEW_FRIENDS, True,
@@ -561,10 +564,19 @@ class CommandExecutor:
             if status != "succeeded":
                 why = str((raw or {}).get("last_error") or "").strip()
                 if (raw or {}).get("timed_out"):
-                    # 没结论：微信那边**可能已经动过**了，额度绝不能还回去（还回去 =
-                    # 下一条指令拿它再做一次同样的动作）。只把「不知道」如实报上去。
-                    reservation.settle(reservation.granted)
                     message = why or "等超时了，没等到微信任务的结论"
+                    if action == ACTION_FRIEND:
+                        # ★ 加好友这一档：**没确认加上就不算用掉配额**（用户 2026-09-22 裁决）。
+                        #   自动通过每 15 分钟一趟、每趟预留 5 个，原来超时按预留数全额扣——
+                        #   一趟没等到结论就把整小时的「加好友」额度烧光，一个人都没加，
+                        #   计划里真正的 add_friend 跟着被拒（2026-09-22 真机：当天第一次加好友
+                        #   就撞上「过去一小时内已做 5 次」）。超时的 result 里只有驱动层已经
+                        #   确认的那部分（`accepted` 名单 / 申请是否发出），按它结算，没有就全还。
+                        reservation.settle(spec.counts(args, result) if result else 0)
+                    else:
+                        # 没结论：微信那边**可能已经动过**了，额度绝不能还回去（还回去 =
+                        # 下一条指令拿它再做一次同样的动作）。只把「不知道」如实报上去。
+                        reservation.settle(reservation.granted)
                 else:
                     reservation.release()   # 有明确终态且不是成功 —— 一件没做成，全额还回去
                     message = why or f"微信任务{status or 'unknown'}"

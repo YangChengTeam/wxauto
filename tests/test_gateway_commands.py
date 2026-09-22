@@ -12,7 +12,7 @@ import unittest
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from structlog.testing import capture_logs
 
@@ -28,7 +28,13 @@ from wxclient.gateway.capabilities import (
     probe_capabilities,
 )
 from wxclient.gateway.download import DownloadError, FileFetcher, FileRef
-from wxclient.gateway.guard import ACTION_GROUP, ACTION_MOMENTS, RateLimit
+from wxclient.gateway.guard import (
+    ACTION_FRIEND,
+    ACTION_GROUP,
+    ACTION_MOMENTS,
+    FRIEND_WRITE_ACTION,
+    RateLimit,
+)
 from wxclient.gateway.schedule import MAX_LATE_HOURS, ScheduleLoop, parse_schedule_at
 from wxclient.queue import TaskType
 
@@ -157,6 +163,72 @@ class TaskFailureTests(CommandTestCase):
             "args": {"to": "李四", "text": "在吗"},
         })
         self.assertEqual(again.status, "rejected", "名额没还，这条该被配额挡住")
+
+    async def test_加好友这档_超时没确认加上就不算用掉配额(self) -> None:
+        """★ 用户 2026-09-22：「没有加上好友不算用掉配额」。自动通过每 15 分钟一趟、每趟预留 5，
+        原来超时按预留数全额扣——一趟没等到结论就把整小时「加好友」额度烧光，一个人没加，
+        计划里当天第一次 add_friend 就撞上「过去一小时内已做 5 次」。"""
+        class _Rt(FakeRuntime):
+            async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
+                await super().submit(task_type, payload, confirmation=confirmation)
+                return {"status": "running", "timed_out": True}
+
+        limits = {ACTION_FRIEND: RateLimit(5, 3600)}
+        first = await self._executor(_Rt(), action_limits=limits).execute({
+            "command_id": "c1", "op": "accept_new_friends", "args": {"limit": 5},
+        })
+        self.assertEqual(first.status, "failed")
+        self.assertEqual(self.store.sends_since(ACCOUNT, self.now - timedelta(hours=1), action=ACTION_FRIEND), 0)
+
+        again = await self._executor(FakeRuntime(), action_limits=limits,
+                                     write_intervals={FRIEND_WRITE_ACTION: 0}).execute({
+            "command_id": "c2", "op": "add_friend", "args": {"number": "13800000001"},
+        })
+        self.assertEqual(again.status, "done", again.reason)
+
+    async def test_加好友超时但驱动层已确认通过的那几个照记(self) -> None:
+        """超时不等于一个没做：result 里驱动层已经记下的 `accepted` 是确认过的，按它结算。"""
+        class _Rt(FakeRuntime):
+            async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
+                await super().submit(task_type, payload, confirmation=confirmation)
+                return {"status": "running", "timed_out": True,
+                        "result": {"items": ["张三", "李四", "王五"], "accepted": ["张三", "李四"]}}
+
+        limits = {ACTION_FRIEND: RateLimit(5, 3600)}
+        result = await self._executor(_Rt(), action_limits=limits).execute({
+            "command_id": "c1", "op": "accept_new_friends", "args": {"limit": 5},
+        })
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(self.store.sends_since(ACCOUNT, self.now - timedelta(hours=1), action=ACTION_FRIEND), 2)
+
+    async def test_早就是好友的号不占加好友配额(self) -> None:
+        """`already_friend` = 微信一下没动、没有申请发出去，不算用掉「加好友」名额。"""
+        limits = {ACTION_FRIEND: RateLimit(1, 3600)}
+        first = await self._executor(FakeRuntime(result={"already_friend": True, "profile_name": "张三"}),
+                                     action_limits=limits, write_intervals={FRIEND_WRITE_ACTION: 0}).execute({
+            "command_id": "c1", "op": "add_friend", "args": {"number": "13800000001"},
+        })
+        self.assertEqual(first.status, "done", first.reason)
+        self.assertEqual(self.store.sends_since(ACCOUNT, self.now - timedelta(hours=1), action=ACTION_FRIEND), 0)
+
+        again = await self._executor(FakeRuntime(result={"already_friend": False}),
+                                     action_limits=limits, write_intervals={FRIEND_WRITE_ACTION: 0}).execute({
+            "command_id": "c2", "op": "add_friend", "args": {"number": "13800000002"},
+        })
+        self.assertEqual(again.status, "done", again.reason)
+        self.assertEqual(self.store.sends_since(ACCOUNT, self.now - timedelta(hours=1), action=ACTION_FRIEND), 1)
+
+    async def test_私聊超时仍不还额度_口径只改加好友这档(self) -> None:
+        """发消息那档维持原样：超时可能已经发出去，还了名额就是重复发。"""
+        class _Rt(FakeRuntime):
+            async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
+                await super().submit(task_type, payload, confirmation=confirmation)
+                return {"status": "running", "timed_out": True}
+
+        await self._executor(_Rt(), max_sends_per_hour=1).execute({
+            "command_id": "c1", "op": "send_message", "args": {"to": "张三", "text": "在吗"},
+        })
+        self.assertEqual(self.store.sends_in_last_hour(ACCOUNT, self.now), 1)
 
 
 class SentEchoRecordTests(CommandTestCase):
@@ -806,7 +878,7 @@ class CapabilityProbeTests(unittest.TestCase):
     而且要**执行到一半**才发现（需求文档 §12.2 要逐能力上报 + 执行前校验）。
     """
 
-    LIVE = {"logged_in": True, "uia_exposed": True}
+    LIVE: ClassVar[dict[str, bool]] = {"logged_in": True, "uia_exposed": True}
 
     def _caps(self, **kw):
         base = {"uia": self.LIVE, "allow_real_actions": True, "has_file_channel": True}
