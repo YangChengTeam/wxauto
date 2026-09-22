@@ -281,9 +281,10 @@ def main(argv: list[str] | None = None) -> int:
 
     splash.stage("正在读取配置…")
     wechat_settings = load_settings(args.config)
-    # 先把参数灌进环境变量再读配置——真实环境变量优先。
+    # 先把参数灌进环境变量再读配置——**配置中心那份优先**（文件里有的键盖过进程环境变量，
+    # 见 `settings_store.load_into_environ`：自动更新链会把旧版环境变量传给新版）。
     # 只有一份参数：这台机器在「配置中心」里填的那份（客户端接口不下发配置）。
-    settings_store.apply_to_environ(settings_store.effective(wechat_settings.data_dir))
+    settings_store.load_into_environ(wechat_settings.data_dir)
     settings = UiSettings()
 
     # ★ 单实例：两个进程同时驱动同一个微信 = 同一条消息读两遍、回两遍，两边还各按各的
@@ -338,9 +339,7 @@ def main(argv: list[str] | None = None) -> int:
         # 但停机要等网关线程收口（最长 15s），**绝不能在 tk 主线程上等**——
         # 那 15 秒里窗口一次都不重绘，用户看到的就是「点了保存，程序死了」。
         def before_start() -> None:
-            settings_store.apply_to_environ(
-                settings_store.effective(wechat_settings.data_dir), force=True
-            )
+            settings_store.load_into_environ(wechat_settings.data_dir)
 
         def done() -> None:
             # 回调在后台线程上，动界面必须先回 tk 线程

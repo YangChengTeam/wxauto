@@ -296,6 +296,22 @@ def apply_to_environ(
             target[key] = value
 
 
+def load_into_environ(data_dir: Path, environ: dict[str, str] | None = None) -> dict[str, str]:
+    """启动 / 重启前把**配置中心那份**灌进环境变量，文件里有的键**盖过**进程里已有的值。
+
+    ★ 为什么必须 force（2026-09-22 真机：「发送总上限」填 0 存了，跑起来还是老默认 30）：
+    自动更新是「旧版起安装程序 → 安装程序拉起新版」一条进程链，新版**继承了旧版的环境变量**，
+    而旧版启动时早把它那一版的默认值（≤0.1.66 是 30/时）写进了 `os.environ`。原来这里
+    「真实环境变量优先」，于是文件里明明是 0，网关读到的永远是链上游留下的 30——界面显示 0、
+    日志按 30 拦，两边都「没配错」。文件缺的键仍回落环境变量再回落默认（`effective`），
+    命令行 `set` 出来的值只在**文件没写这个键**时才算数：配置中心保存过就以配置中心为准。
+    返回实际灌进去的那份，便于日志/测试核对。
+    """
+    values = effective(data_dir, environ)
+    apply_to_environ(values, environ, force=True)
+    return values
+
+
 def as_bool(value: str, default: bool = False) -> bool:
     text = str(value).strip().lower()
     if not text:

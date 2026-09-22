@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from wxclient.ui import settings_store
 from wxclient.ui.settings_store import FIELDS, validate
@@ -73,3 +75,46 @@ class ValidateTests(unittest.TestCase):
     def test_fields_without_a_floor_are_never_judged(self) -> None:
         """加好友最小间隔填 10 也放行——那格的取舍写在 config.py 里，不归这里管。"""
         self.assertEqual(validate({"WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS": "10"}), {})
+
+
+class LoadIntoEnvironTests(unittest.TestCase):
+    """★ 2026-09-22 真机：「发送总上限」填 0 存了，网关还是按老默认 30 跑。
+    自动更新链把旧版环境变量传给了新版，而启动时「真实环境变量优先」——文件从来盖不过它。
+    现在：文件里有的键盖过环境变量；文件没有的才回落环境变量、再回落默认。"""
+
+    KEY = "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_file_value_overrides_a_stale_inherited_environ(self) -> None:
+        settings_store.save(self.data_dir, {self.KEY: "0"})
+        env = {self.KEY: "30"}
+        settings_store.load_into_environ(self.data_dir, env)
+        self.assertEqual(env[self.KEY], "0")
+
+    def test_environ_still_counts_when_the_file_has_no_such_key(self) -> None:
+        settings_store.save(self.data_dir, {})
+        env = {self.KEY: "12"}
+        settings_store.load_into_environ(self.data_dir, env)
+        self.assertEqual(env[self.KEY], "12")
+
+    def test_default_fills_in_when_neither_file_nor_environ_has_it(self) -> None:
+        env: dict[str, str] = {}
+        settings_store.load_into_environ(self.data_dir, env)
+        default = next(f.default for f in FIELDS if f.key == self.KEY)
+        self.assertEqual(env[self.KEY], default)
+        self.assertEqual(default, "0", "总闸出厂默认 0 = 不限（用户 2026-09-18）")
+
+    def test_every_field_saved_in_the_file_reaches_the_environ(self) -> None:
+        """「保证所有的配置修改都能生效」（用户 2026-09-22）：不只总上限，每一格都一样。"""
+        saved = {f.key: ("1" if f.kind == "bool" else "7") for f in FIELDS if not f.secret}
+        settings_store.save(self.data_dir, saved)
+        env = {f.key: "stale" for f in FIELDS}
+        settings_store.load_into_environ(self.data_dir, env)
+        for key, value in saved.items():
+            self.assertEqual(env[key], value, key)

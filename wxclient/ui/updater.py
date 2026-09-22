@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -144,6 +145,21 @@ def _open_url(url: str, timeout: float) -> BinaryIO:
     return urllib.request.urlopen(request, timeout=timeout)  # 只认 https，见 parse_manifest
 
 
+#: 本进程自己灌进 `os.environ` 的配置键都以此开头（`settings_store.apply_to_environ`）。
+_OWN_ENV_PREFIX = "WXCLIENT_"
+
+
+def installer_environ(environ: dict[str, str] | None = None) -> dict[str, str]:
+    """给安装程序（以及它拉起的新版）的环境变量：**去掉本进程自己灌进去的配置键**。
+
+    ★ 2026-09-22 真机：自动更新是「旧版 → 安装程序 → 新版」一条继承链，旧版启动时把当时那版的
+    默认值（如「发送总上限」30/时）写进了 `os.environ`，新版原样继承——配置中心改成 0 也压不住
+    上游留下的 30。配置只有一份权威（`gateway.env`），新版自己会从文件读，链上不该再传一份快照。
+    """
+    source = os.environ if environ is None else environ
+    return {k: v for k, v in source.items() if not k.startswith(_OWN_ENV_PREFIX)}
+
+
 def _spawn_installer(command: list[str], cwd: Path) -> None:
     flags = 0
     if sys.platform == "win32":
@@ -151,7 +167,9 @@ def _spawn_installer(command: list[str], cwd: Path) -> None:
     # ★ close_fds=True 不是默认值的复述：单实例锁是一个打开着的文件句柄（`single_instance`），
     #   要是被安装程序继承过去，装完新版起来时会发现「已经在运行」——而那个「在运行」的
     #   是安装程序手里那份句柄。
+    # ★ env=installer_environ()：同理，本进程灌进去的 WXCLIENT_* 配置也不继承给新版（见其 docstring）。
     subprocess.Popen(command, cwd=str(cwd), close_fds=True, creationflags=flags,
+                     env=installer_environ(),
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
 

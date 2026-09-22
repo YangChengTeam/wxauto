@@ -270,3 +270,19 @@ class DescribeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstallerEnvironTests(unittest.TestCase):
+    """安装程序（及其拉起的新版）不继承本进程灌进去的 WXCLIENT_* 配置：
+    配置只有一份权威（gateway.env），新版自己从文件读（2026-09-22 真机：老默认 30 沿链活了三个版本）。"""
+
+    def test_own_config_keys_are_dropped_and_the_rest_kept(self) -> None:
+        env = {
+            "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": "30",
+            "WXCLIENT_UI_AUTOSTART": "1",
+            "PATH": "C:\\Windows",
+            "LOCALAPPDATA": "C:\\Users\\x\\AppData\\Local",
+        }
+        cleaned = updater.installer_environ(env)
+        self.assertEqual(set(cleaned), {"PATH", "LOCALAPPDATA"})
+        self.assertEqual(env["WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR"], "30", "不改调用方的那份")
