@@ -11,15 +11,19 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import ClassVar
 
 from structlog.testing import capture_logs
 
 from wxclient.gateway.attachments import (
+    LEFT_BEHIND_TEXT,
     MAX_ATTACHMENTS_PER_TURN,
+    MAX_TOTAL_BYTES,
     AttachmentFetcher,
     inline_attachments,
 )
 from wxclient.gateway.inbound import InboundMessage, message_from_row, message_to_row
+from wxclient.gateway.runner import GatewayRunner
 from wxclient.gateway.sessions import GatewayStore
 from wxclient.gateway.watchlist import Watchlist
 from wxclient.gateway.wechat_io import (
@@ -189,9 +193,10 @@ class InlineTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def _message(self, *names: str, size: int = 4) -> InboundMessage:
+    def _message(self, *names: str | tuple[str, int], size: int = 4) -> InboundMessage:
         entries = []
-        for name in names:
+        for spec in names:
+            name, size = spec if isinstance(spec, tuple) else (spec, size)
             path = self.dir / name
             path.write_bytes(b"x" * size)
             entries.append({"kind": "image", "file_name": name, "path": str(path), "bytes": size})
@@ -199,22 +204,76 @@ class InlineTests(unittest.TestCase):
                               at=datetime.now(timezone.utc), attachments=tuple(entries))
 
     def test_base64_shape(self) -> None:
-        out, skipped = inline_attachments([self._message("a.jpg")])
-        self.assertEqual(skipped, 0)
+        out, left_behind = inline_attachments([self._message("a.jpg")])
+        self.assertEqual(left_behind, [])
         self.assertEqual(out[0]["file_name"], "a.jpg")
         self.assertEqual(out[0]["content_type"], "image/jpeg")
         self.assertEqual(base64.b64decode(out[0]["data_base64"]), b"xxxx")
 
     def test_caps_count_and_missing_files(self) -> None:
         names = [f"{i}.jpg" for i in range(MAX_ATTACHMENTS_PER_TURN + 2)]
-        out, skipped = inline_attachments([self._message(*names)])
+        out, left_behind = inline_attachments([self._message(*names)])
         self.assertEqual(len(out), MAX_ATTACHMENTS_PER_TURN)
-        self.assertEqual(skipped, 2)
+        # 没带上的要说得出是哪一份、为什么——日志页上「有 2 份没带上」对方追问时答不上来。
+        self.assertEqual(
+            left_behind,
+            [{"file_name": names[-2], "reason": "too_many"}, {"file_name": names[-1], "reason": "too_many"}],
+        )
         message = self._message("gone.jpg")
         (self.dir / "gone.jpg").unlink()
-        out, skipped = inline_attachments([message])
-        self.assertEqual((out, skipped), ([], 1))
+        out, left_behind = inline_attachments([message])
+        self.assertEqual((out, left_behind), ([], [{"file_name": "gone.jpg", "reason": "missing"}]))
+        self.assertTrue(all(reason in LEFT_BEHIND_TEXT for reason in ("missing", "too_many", "over_budget")))
 
+    def test_total_budget_is_reported_as_its_own_reason(self) -> None:
+        big = MAX_TOTAL_BYTES // 2 + 1
+        out, left_behind = inline_attachments([self._message(("x.jpg", big), ("y.jpg", big))])
+        self.assertEqual([o["file_name"] for o in out], ["x.jpg"])
+        self.assertEqual(left_behind, [{"file_name": "y.jpg", "reason": "over_budget"}])
+
+
+
+class ClaimedDocumentsLogTests(unittest.TestCase):
+    """104/106：送过去的附件 AI 端认没认成材料、会不会上传，日志里得说清楚——
+    上传在 AI 端做，这台电脑看不到结果，但从卡上 `documents[]` 就能判「会不会传」。"""
+
+    SENT: ClassVar[list[dict]] = [{"file_name": "身份证.jpg", "kind": "image", "data_base64": "AAAA"},
+                                  {"file_name": "简历.pdf", "kind": "file", "data_base64": "AAAA"}]
+
+    def _card(self, documents: object) -> dict:
+        return {"body": {"kind": "wechat_reply", "documents": documents}}
+
+    def test_claimed_with_and_without_consent(self) -> None:
+        card = self._card([
+            {"material_type": "id_card_front", "file_name": "身份证.jpg",
+             "fields": {"name": "王建国", "id_number": "110101199001011234"}, "consent_note": "身份证发你了"},
+            {"material_type": "resume", "file_name": "简历.pdf"},
+        ])
+        with capture_logs() as logs:
+            GatewayRunner._log_claimed_documents("候选人-王建国", self.SENT, card)
+        entry = next(e for e in logs if e["event"] == "AI 端认领了材料")
+        self.assertEqual(entry["清单"], [
+            {"文件": "身份证.jpg", "类型": "身份证正面", "有授权原话": True, "字段数": 2},
+            {"文件": "简历.pdf", "类型": "简历", "有授权原话": False, "字段数": 0},
+        ])
+        self.assertEqual(entry["未认领"], [])
+        # 字段值是证件号一类的 PII：只记个数，日志里一个数字都不能出现。
+        self.assertNotIn("110101199001011234", repr(logs))
+        self.assertNotIn("王建国", repr(entry["清单"]))
+
+    def test_unclaimed_files_are_named(self) -> None:
+        card = self._card([{"material_type": "resume", "file_name": "简历.pdf", "consent_note": "简历给你"}])
+        with capture_logs() as logs:
+            GatewayRunner._log_claimed_documents("p", self.SENT, card)
+        self.assertEqual(logs[0]["未认领"], ["身份证.jpg"])
+
+    def test_nothing_claimed_says_so(self) -> None:
+        with capture_logs() as logs:
+            GatewayRunner._log_claimed_documents("p", self.SENT, self._card(None))
+            GatewayRunner._log_claimed_documents("p", self.SENT, None)
+            GatewayRunner._log_claimed_documents("p", [], self._card(None))
+        self.assertEqual([e["event"] for e in logs], ["AI 端没认领这一轮的附件"] * 2)
+        self.assertEqual(logs[0]["送去"], ["身份证.jpg", "简历.pdf"])
 
 
 if __name__ == "__main__":

@@ -305,6 +305,37 @@ class TurnProgressLineTests(ChineseLogRendererTests):
         self.assertIn("还不知道对面是哪个候选人", again)
         self.assertIn("第 2 次尝试", again)
 
+    def test_fed_line_lists_the_attachments_that_went_along(self) -> None:
+        """104：送了哪几份附件、多大，得在「喂给 AI 端」这一行就看见，不用翻另存那几行去对。"""
+        output = self.render("喂给 AI 端", 会话="张三", 本轮=1, 历史行=0, 认得这个人=True, 第几次=1,
+                             附件=2, 附件清单=[{"文件": "身份证.jpg", "类型": "image", "字节": 350 * 1024},
+                                             {"文件": "简历.pdf", "类型": "file", "字节": 2 * 1024 * 1024}])
+        self.assertIn("随行附件 2 份：身份证.jpg（图片，350 KB）、简历.pdf（文件，2.0 MB）", output)
+        self.assertNotIn("随行附件", self.render("喂给 AI 端", 会话="张三", 本轮=1, 历史行=0,
+                                                认得这个人=True, 第几次=1, 附件=0, 附件清单=[]))
+
+    def test_left_behind_names_each_file_and_why(self) -> None:
+        output = self.render("这一轮有附件没能带上", 会话="张三", 个数=2,
+                             清单=[{"文件": "7.jpg", "原因": "超出一轮最多 6 份的上限"},
+                                  {"文件": "旧图.jpg", "原因": "文件已不在本机（过了保鲜期或被清掉）"}])
+        self.assertIn("「张三」这一轮有 2 份附件没能带上：7.jpg（超出一轮最多 6 份的上限）、"
+                      "旧图.jpg（文件已不在本机（过了保鲜期或被清掉））", output)
+        self.assertIn("不会上传", output)
+
+    def test_claimed_materials_say_whether_they_will_be_uploaded(self) -> None:
+        """上传在 AI 端做、这台电脑看不到结果，但「会不会传」从卡上就能判：有授权原话的才会。"""
+        output = self.render("AI 端认领了材料", 会话="张三",
+                             清单=[{"文件": "身份证.jpg", "类型": "身份证正面", "有授权原话": True, "字段数": 3},
+                                  {"文件": "简历.pdf", "类型": "简历", "有授权原话": False, "字段数": 0}],
+                             未认领=["合影.jpg"])
+        self.assertIn("身份证.jpg → 身份证正面（有授权原话，会上传到后端，识别到 3 个字段）", output)
+        self.assertIn("简历.pdf → 简历（没有授权原话，不会上传，要传得专员自己传）", output)
+        self.assertIn("未认领：合影.jpg（这些不会上传）", output)
+
+    def test_unclaimed_attachments_say_nothing_will_be_uploaded(self) -> None:
+        output = self.render("AI 端没认领这一轮的附件", 会话="张三", 送去=["a.jpg", "b.pdf"])
+        self.assertIn("AI 端没认领「张三」这一轮的附件（a.jpg、b.pdf）：不会上传到后端", output)
+
     def test_a_stage_reads_like_a_status_line(self) -> None:
         """AI 端本来就在流里发阶段（055），网关此前整个丢掉。"""
         self.assertIn("AI 端：正在读取资料",

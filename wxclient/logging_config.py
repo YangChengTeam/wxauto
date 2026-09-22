@@ -181,6 +181,21 @@ class ChineseLogRenderer:
         return f"{prefix} {message}"
 
 
+#: 附件类型码（客户端 `SAVABLE_TYPES` 的口径）→ 日志页上的叫法。
+_ATTACHMENT_KIND_TEXT = {"image": "图片", "file": "文件"}
+
+
+def _kb(value: object) -> str:
+    """字节数 → 「123 KB」/「1.5 MB」，看一眼就知道大不大。"""
+    try:
+        n = int(value or 0)
+    except (TypeError, ValueError):
+        return "-"
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    return f"{max(n + 1023, 1024) // 1024} KB"
+
+
 def _attempt_tail(payload: dict[str, Any]) -> str:
     """一轮失败时的共同尾巴：第几次、什么原因、等了多久、接下来会怎样。
 
@@ -280,9 +295,25 @@ def _render_gateway_line(event: str, payload: dict[str, Any]) -> str | None:
     if event == "喂给 AI 端":
         known = "对面已归位到候选人" if payload.get("认得这个人") else "还不知道对面是哪个候选人"
         again = f"，第 {payload.get('第几次')} 次尝试" if int(payload.get("第几次") or 1) > 1 else ""
+        files = [
+            f"{item.get('文件') or '-'}（{_ATTACHMENT_KIND_TEXT.get(item.get('类型'), '文件')}，{_kb(item.get('字节'))}）"
+            for item in (payload.get("附件清单") or [])
+            if isinstance(item, dict)
+        ]
+        with_files = f"，随行附件 {len(files)} 份：{'、'.join(files)}" if files else ""
         return (
             f"喂给 AI 端：「{peer}」，本轮 {payload.get('本轮', 0)} 条 + "
-            f"历史 {payload.get('历史行', 0)} 行，{known}{again}"
+            f"历史 {payload.get('历史行', 0)} 行，{known}{again}{with_files}"
+        )
+    if event == "这一轮有附件没能带上":
+        items = [
+            f"{item.get('文件') or '-'}（{item.get('原因') or '-'}）"
+            for item in (payload.get("清单") or [])
+            if isinstance(item, dict)
+        ]
+        return (
+            f"「{peer}」这一轮有 {payload.get('个数', len(items))} 份附件没能带上："
+            f"{'、'.join(items) or '-'}（正文里已如实告诉 AI 端，不会上传）"
         )
     if event == "AI 端阶段":
         return f"AI 端：{payload.get('阶段') or '-'}"
@@ -294,6 +325,26 @@ def _render_gateway_line(event: str, payload: dict[str, Any]) -> str | None:
     if event == "AI 端这一轮跑完了":
         got = "拿到卡片" if payload.get("有卡片") else "但没有卡片（出站那步会说明为什么不回）"
         return f"AI 端这一轮跑完了：「{peer}」，用时 {payload.get('已用秒', 0)} 秒，{got}"
+    if event == "AI 端认领了材料":
+        items = []
+        for item in payload.get("清单") or []:
+            if not isinstance(item, dict):
+                continue
+            upload = (
+                f"有授权原话，会上传到后端，识别到 {item.get('字段数', 0)} 个字段"
+                if item.get("有授权原话")
+                else "没有授权原话，不会上传，要传得专员自己传"
+            )
+            items.append(f"{item.get('文件') or '-'} → {item.get('类型') or '-'}（{upload}）")
+        missed = payload.get("未认领") or []
+        tail = f"；未认领：{'、'.join(str(n) for n in missed)}（这些不会上传）" if missed else ""
+        return f"AI 端认领了「{peer}」发来的材料：{'、'.join(items) or '-'}{tail}"
+    if event == "AI 端没认领这一轮的附件":
+        sent = "、".join(str(n) for n in (payload.get("送去") or [])) or "-"
+        return (
+            f"AI 端没认领「{peer}」这一轮的附件（{sent}）：不会上传到后端"
+            f"（多半是没认出是简历 / 身份证 / 银行卡，或图太糊；要传得专员自己传）"
+        )
     if event == "AI 端返回错误":
         return (
             f"AI 端返回错误：「{peer}」，错误码 {payload.get('code') or '-'}，"

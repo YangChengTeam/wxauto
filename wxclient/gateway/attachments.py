@@ -53,6 +53,21 @@ RETENTION_HOURS = 24
 #: 会被拿去另存的气泡类型。表情 / 视频不在内：表情不是内容，视频 AI 端也不看。
 SAVABLE_TYPES = frozenset({"image", "file"})
 
+#: 「没能带上」的原因码 → 给日志页看的话。原因码随 ``inline_attachments`` 返回，话在这里配，
+#: 日志渲染器只管照抄——同一个原因码两处各写一句话，迟早写岔。
+LEFT_BEHIND_TEXT = {
+    "missing": "文件已不在本机（过了保鲜期或被清掉）",
+    "too_many": f"超出一轮最多 {MAX_ATTACHMENTS_PER_TURN} 份的上限",
+    "over_budget": f"超出一轮 {MAX_TOTAL_BYTES // (1024 * 1024)}MB 的总量上限",
+}
+#: AI 端认领材料时的类型码（与 AI 端 `wechat_reply_card.json` 的 `documents[].material_type` 同口径）→ 给日志页看的话。
+MATERIAL_TYPE_TEXT = {
+    "resume": "简历",
+    "id_card_front": "身份证正面",
+    "id_card_back": "身份证背面",
+    "bank_card": "银行卡",
+}
+
 
 def guess_content_type(file_name: str) -> str:
     guessed, _ = mimetypes.guess_type(file_name)
@@ -161,27 +176,32 @@ class _suppress_oserror:
         return exc_type is not None and issubclass(exc_type, OSError)
 
 
-def inline_attachments(messages: Sequence[Any]) -> tuple[list[dict[str, Any]], int]:
+def inline_attachments(messages: Sequence[Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """把这一批消息带的附件读成 AI 端 ``message.send.attachments`` 的形状。
 
-    返回 (随行附件, 没能带上的个数)。超出个数或总量上限的**不送**，交给调用方在
-    正文里如实说；文件已经不在了（过保鲜期 / 被清）也算没带上。
+    返回 (随行附件, 没能带上的清单)。清单每条 ``{"file_name", "reason"}``，``reason`` 是
+    ``LEFT_BEHIND_TEXT`` 的键——超出个数或总量上限的**不送**，交给调用方在正文里如实说；
+    文件已经不在了（过保鲜期 / 被清）也算没带上。原来只回一个数，日志页上只见「有 2 份没带上」
+    却说不出是哪两份、为什么；对方追问「我发的身份证你收到没」时这台电脑答不上来。
     """
     out: list[dict[str, Any]] = []
-    skipped = 0
+    left_behind: list[dict[str, str]] = []
     total = 0
     for message in messages:
         for entry in getattr(message, "attachments", ()) or ():
             path = Path(str(entry.get("path") or ""))
+            file_name = str(entry.get("file_name") or path.name)
             if not path.is_file():
-                skipped += 1
+                left_behind.append({"file_name": file_name, "reason": "missing"})
                 continue
             data = path.read_bytes()
-            if len(out) >= MAX_ATTACHMENTS_PER_TURN or total + len(data) > MAX_TOTAL_BYTES:
-                skipped += 1
+            if len(out) >= MAX_ATTACHMENTS_PER_TURN:
+                left_behind.append({"file_name": file_name, "reason": "too_many"})
+                continue
+            if total + len(data) > MAX_TOTAL_BYTES:
+                left_behind.append({"file_name": file_name, "reason": "over_budget"})
                 continue
             total += len(data)
-            file_name = str(entry.get("file_name") or path.name)
             out.append(
                 {
                     "file_name": file_name,
@@ -190,5 +210,5 @@ def inline_attachments(messages: Sequence[Any]) -> tuple[list[dict[str, Any]], i
                     "data_base64": base64.b64encode(data).decode("ascii"),
                 }
             )
-    return out, skipped
+    return out, left_behind
 

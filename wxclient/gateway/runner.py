@@ -22,7 +22,7 @@ from typing import Any
 import structlog
 
 from .. import logrole
-from .attachments import inline_attachments
+from .attachments import LEFT_BEHIND_TEXT, MATERIAL_TYPE_TEXT, inline_attachments
 from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
 from .candidates import CandidateDirectory
@@ -1074,7 +1074,15 @@ class GatewayRunner:
         # 104：这一批消息另存下来的图片/文件，随轮送过去（AI 端落到会话 inbox）。
         attachments, left_behind = inline_attachments(messages)
         if left_behind:
-            _ai.info("这一轮有附件没能带上（超出个数/体积上限或已过期）", 会话=peer_id, 个数=left_behind)
+            _ai.warning(
+                "这一轮有附件没能带上",
+                会话=peer_id,
+                个数=len(left_behind),
+                清单=[
+                    {"文件": e["file_name"], "原因": LEFT_BEHIND_TEXT.get(e["reason"], e["reason"])}
+                    for e in left_behind
+                ],
+            )
         extra_turn: dict[str, Any] = {}
         if attachments:
             extra_turn["attachments"] = attachments
@@ -1087,6 +1095,11 @@ class GatewayRunner:
                 历史行=history.count("\n") + 1 if history else 0,
                 认得这个人=bool(refs),
                 附件=len(attachments),
+                # 只记名 / 类型 / 大小，不记内容（另存那步的口径一样）。base64 长度 ×3/4 ≈ 原字节数，够看。
+                附件清单=[
+                    {"文件": a["file_name"], "类型": a["kind"], "字节": len(a["data_base64"]) * 3 // 4}
+                    for a in attachments
+                ],
                 第几次=attempt,
             )
             heartbeat = asyncio.create_task(self._turn_heartbeat(peer_id, started))
@@ -1149,8 +1162,42 @@ class GatewayRunner:
                 已用秒=self._elapsed(started),
                 有卡片=result.card is not None,
             )
+            self._log_claimed_documents(peer_id, attachments, result.card)
             return result.card
         return None
+
+    @staticmethod
+    def _log_claimed_documents(peer_id: str, attachments: Sequence[dict[str, Any]], card: Any) -> None:
+        """这一轮送过去的附件，AI 端认没认成材料（104 `documents[]`）——只打日志，一处判定都不动。
+
+        上传到后端那一步在 AI 端做（106 统一回执），这台电脑看不到结果；但**会不会上传**在卡上
+        就能看出来：认领了、且带「授权原话」的那份才会上报，其余的都不会。原来这里一个字都没有，
+        专员只能对着后端问「他发的身份证怎么没进档」。字段值是证件号一类的 PII，只记个数。
+        """
+        if not attachments:
+            return
+        sent = [str(a.get("file_name") or "") for a in attachments]
+        body = card.get("body") if isinstance(card, dict) else None
+        documents = body.get("documents") if isinstance(body, dict) else None
+        claimed = [d for d in (documents or []) if isinstance(d, dict)]
+        if not claimed:
+            _ai.info("AI 端没认领这一轮的附件", 会话=peer_id, 送去=sent)
+            return
+        names = {str(d.get("file_name") or "") for d in claimed}
+        _ai.info(
+            "AI 端认领了材料",
+            会话=peer_id,
+            清单=[
+                {
+                    "文件": str(d.get("file_name") or ""),
+                    "类型": MATERIAL_TYPE_TEXT.get(str(d.get("material_type") or ""), str(d.get("material_type") or "-")),
+                    "有授权原话": bool(str(d.get("consent_note") or "").strip()),
+                    "字段数": len(d.get("fields") or {}) if isinstance(d.get("fields"), dict) else 0,
+                }
+                for d in claimed
+            ],
+            未认领=[n for n in sent if n not in names],
+        )
 
     async def _ensure_session(
         self, client: AgentWsClient, account_id: str, peer_id: str, task_type: str | None = None
