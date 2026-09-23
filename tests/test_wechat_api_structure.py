@@ -172,6 +172,7 @@ class _FakeUielements:
                              "QuickActionsButton": {"_key": "quick_actions"}})()
     # AddFriendWindow 的 title 同时也是快捷操作菜单里那一项的文案——`_open_add_friend_panel`
     # 按这个名字点菜单项，不数第几项（2026-09-22 客户机事故）。
+    Edits = type("E", (), {"ChangeRemarkEdit": {"_key": "remark_edit"}})()
     Windows = type("W", (), {"VerifyFriendWindow": {"_key": "verify"},
                              "AddFriendWindow": {"_key": "add_friend_window",
                                                  "title": "添加朋友",
@@ -184,7 +185,7 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
     """★ 加好友要把「后续拿什么名字回消息」带回来（用户 2026-08-15）。
 
     三个名字别混：`name` 是对方昵称（给人看），`remark` 是我们设的备注，
-    `session_name` = 备注优先、没有才退回昵称 —— 那才是 send_message(to=...) 该用的。
+    `session_name` = 备注真填上了就用备注、没有才退回昵称 —— 那才是 send_message(to=...) 该用的。
     """
 
     def setUp(self) -> None:
@@ -198,7 +199,7 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
 
     def _driver(self, profile_exists: bool = True, add_button_exists: bool = True,
                 send_button_exists: bool = False, profile_text: str | None = None,
-                group_matches: bool = True):
+                group_matches: bool = True, remark_edit_exists: bool = True):
         from unittest import mock
 
         from wxclient.wechat_api.uia import UiaWeChatDriver
@@ -206,7 +207,9 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
         log: list[str] = []
         verify = _FakeControl("申请窗", children={
             "Edit0": _FakeControl("招呼语", log=log),
-            "Edit1": _FakeControl("备注", log=log),
+            # 序号 1 那格不是备注栏（2026-09-23 用户实报：候选人名字被填进了昵称那格）。
+            "Edit1": _FakeControl("昵称", log=log),
+            "remark_edit": _FakeControl("修改备注", exists_=remark_edit_exists, log=log),
             "confirm": _FakeControl("确定", log=log),
         }, log=log)
         profile = _FakeControl(
@@ -273,19 +276,48 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
         patched["_pyweixin_submodule"].side_effect = lambda name: _FakeUielements
         return driver, log, vendor_calls, verify
 
-    def test_the_nickname_comes_back_and_the_remark_wins_as_session_name(self) -> None:
+    def test_the_remark_goes_into_the_remark_box_not_the_nickname_box(self) -> None:
+        """★ 用户 2026-09-23：「备注要填，只是不要填到昵称上去」——按名字找「修改备注」栏。"""
         driver, log, vendor_calls, verify = self._driver()
 
         result = driver.add_friend("13800138000", "你好", remark="张三-仓库工")
 
         self.assertEqual(result["name"], "张三", "对方昵称要读回来")
         self.assertEqual(result["remark"], "张三-仓库工")
-        self.assertEqual(result["session_name"], "张三-仓库工", "★ 有备注就用备注")
+        self.assertEqual(result["session_name"], "张三-仓库工", "★ 备注填上了就用备注")
         self.assertIn("click:添加到通讯录", log)
         self.assertIn("click:确定", log)
+        self.assertEqual(verify.child_window(_key="remark_edit").set_texts,
+                         ["张三-仓库工"], "★ 备注要真的填进备注栏")
         self.assertEqual(verify.child_window(control_type="Edit", found_index=1).set_texts,
-                         ["张三-仓库工"], "备注要真的填进去")
+                         [], "★ 序号 1 那格（昵称）一个字都不许填")
+        self.assertEqual(verify.child_window(control_type="Edit", found_index=0).set_texts,
+                         ["你好"], "验证语照填")
         self.assertEqual(vendor_calls, [], "自己走通了就不该再调 vendor")
+
+    def test_no_remark_box_means_no_remark_and_the_nickname_is_the_session_name(self) -> None:
+        """找不到备注栏就不填，绝不退回按序号猜；会话名如实退回昵称。"""
+        driver, log, _vendor, verify = self._driver(remark_edit_exists=False)
+
+        result = driver.add_friend("13800138000", "你好", remark="张三-仓库工")
+
+        self.assertIn("click:确定", log, "申请照发")
+        self.assertEqual(verify.child_window(control_type="Edit", found_index=1).set_texts, [])
+        self.assertEqual(result["session_name"], "张三", "★ 备注没填上，会话名不能是 remark")
+
+    def test_the_vendor_fallback_does_not_set_a_remark_either(self) -> None:
+        from wxclient.wechat_api.uia import _AddFriendNotStarted
+
+        driver, _log, vendor_calls, _verify = self._driver()
+
+        def not_started(*_a: object, **_k: object):
+            raise _AddFriendNotStarted("面板没开")
+
+        driver._add_friend_reading_profile = not_started  # type: ignore[assignment]
+        driver.add_friend("13800138000", "你好", remark="张三-仓库工")
+
+        self.assertEqual(len(vendor_calls), 1)
+        self.assertIsNone(vendor_calls[0]["remark"], "★ vendor 按序号填，会填进昵称那格——退化路不设备注")
 
     def test_without_a_remark_the_session_name_falls_back_to_the_nickname(self) -> None:
         driver, _log, _vendor, _verify = self._driver()

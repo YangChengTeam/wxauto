@@ -185,8 +185,8 @@ class UiaWeChatDriver:
           · ``name``         —— 申请时对方名片上的**昵称**。会变、会重名、可能带 emoji，
                                 只适合给人看，**不要拿它当回复的锚**。
           · ``remark``       —— 我们自己设的备注。对方通过后，会话列表里显示的就是它。
-          · ``session_name`` —— 后续 ``send_message(to=...)`` 该用的名字 = 备注优先，
-                                没设备注才退回昵称。这是唯一该被记下来的那个。
+          · ``session_name`` —— 后续 ``send_message(to=...)`` 该用的名字 = 备注真填上了就是备注，
+                                没填上才退回昵称。这是唯一该被记下来的那个。
           · ``profile_name`` —— 确定是**昵称**的那个值，只在拿得准时才有（见下）。
           · ``already_friend`` —— 这个号早就是好友了。
 
@@ -194,6 +194,10 @@ class UiaWeChatDriver:
           名字也已经读到手，抛掉等于白搜一次陌生号（节拍红线：查好友 ≥300s 一次）而且
           这个人在计划里永远停在原地。改成如实回一条「他已经是好友了」，昵称跟着回来，
           由上层报回业务端。
+
+        ★ 备注按**名字**找「修改备注」那一栏填（用户 2026-09-23：「备注要填，只是不要填到昵称上去」）。
+          原来盲填申请窗里的「第 2 个输入框」（vendor 也这么写），那一格不是备注栏，
+          候选人名字被填进了昵称那一格。找不到备注栏就**不填**，绝不退回按序号猜。
 
         ⚠️ 加好友是**异步**的：``already_friend`` 为假时，返回成功只代表申请发出去了，
         对方没通过就没有会话、也发不了消息。真正"可以回了"的信号是
@@ -227,8 +231,12 @@ class UiaWeChatDriver:
             # 拿我们提议的 remark 当会话名会给出一个微信里根本不存在的名字，
             # 逐字寻址随即找不到窗口（[[wechat-uia-window-state]] 同一类坑）。
             session_name = read.get("display_name") or remark
+        elif read.get("remark_set"):
+            session_name = remark
         else:
-            session_name = remark or name
+            # 备注没填上：会话名就是名片上的昵称；挑不出昵称时退到名片顶上那行，别退回 remark
+            # ——那是个微信里不存在的名字。
+            session_name = name or read.get("display_name")
         logger.info("friend.add.done", number=number, name=name,
                     session_name=session_name, already_friend=already_friend)
         return {
@@ -289,17 +297,25 @@ class UiaWeChatDriver:
             verify_window = Tools.move_window_to_center(Window=Uielements.Windows.VerifyFriendWindow)
             _human_pause("verify_open")
             request_edit = verify_window.child_window(control_type="Edit", found_index=0)
-            remark_edit = verify_window.child_window(control_type="Edit", found_index=1)
             if greetings:
                 request_edit.set_text(greetings)
                 _human_pause("between_fields")
+            remark_set = False
             if remark:
-                remark_edit.set_text(remark)
+                # 按名字找「修改备注」栏（vendor 表里的 `Edits.ChangeRemarkEdit`），不按序号——
+                # 序号 1 那格不是备注栏（见 `add_friend` 文档）。
+                remark_edit = verify_window.child_window(**Uielements.Edits.ChangeRemarkEdit)
+                if _truthy_safe_call(lambda: remark_edit.exists(timeout=1)):
+                    remark_edit.set_text(remark)
+                    remark_set = True
+                else:
+                    logger.info("friend.add.remark_edit_missing", number=number)
             _human_pause("before_confirm")
             verify_window.child_window(**Uielements.Buttons.ConfirmButton).click_input()
             # 陌生人名片上没有备注可言，顶上那行就是昵称——这条路上 `profile_name` 拿得准。
             return {"name": name, "display_name": display_name,
-                    "profile_name": nickname or display_name, "already_friend": False}
+                    "profile_name": nickname or display_name, "already_friend": False,
+                    "remark_set": remark_set}
         finally:
             _safe_call(getattr(add_friend_pane, "close", None))
 
@@ -423,7 +439,8 @@ class UiaWeChatDriver:
                 # 空串按 None 传：vendor 的签名就是 `greetings:str=None`，
                 # None 才是「你别管这句话」，空串未必被它当成同一回事（092）。
                 greetings=greetings or None,
-                remark=remark,
+                # vendor 按序号填第 2 个输入框，那格不是备注栏——退化路宁可不设备注。
+                remark=None,
                 chat_only=False,
                 is_maximize=False,
                 close_weixin=False,

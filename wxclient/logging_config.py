@@ -442,6 +442,8 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         if payload.get("rendered"):
             return f"名片读到了但加不了：{payload.get('number')}（既没有「添加到通讯录」也没有「发消息」）"
         return f"等不到这个号的名片：{payload.get('number')}（可能号码不对，也可能微信版式变了）"
+    if event == "friend.add.remark_edit_missing":
+        return f"申请窗里找不到「修改备注」栏，这次不设备注：{payload.get('number')}"
     if event == "friend.add.fallback":
         # reason 必须打出来：2026-09-22 客户机上加好友连号都没输进去，日志里却只有
         # 一句「改走备用流程」，到底卡在「面板打不开」还是「搜索框用不了」全靠猜。

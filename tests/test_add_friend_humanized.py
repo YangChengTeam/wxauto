@@ -129,6 +129,9 @@ class _Elements:
         AddFriendWindow: ClassVar[dict] = {"title": "添加朋友", "class_name": "mmui::AddFriendWindow",
                            "control_type": "Window"}
 
+    class Edits:
+        ChangeRemarkEdit: ClassVar[dict] = {"role": "remark_edit"}
+
     class Buttons:
         ConfirmButton: ClassVar[dict] = {"role": "confirm"}
         QuickActionsButton: ClassVar[dict] = {"role": "quick_actions"}
