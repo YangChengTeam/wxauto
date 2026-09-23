@@ -38,14 +38,26 @@ from __future__ import annotations
 
 import importlib
 import platform
+import sys
 import threading
 
 #: 进程内唯一。谁要在后台线程上首次 import 重型模块（网关装配 / 微信驱动），先拿它。
 HEAVY_IMPORT_LOCK = threading.Lock()
 
-#: 微信驱动链上会 LoadLibrary 的模块：comtypes（COM）、pywin32、psutil，最后 pywinauto
-#: 把它们连带拉齐。谁真正用它们时 import 已命中 `sys.modules`，不再碰加载器。
-WECHAT_DRIVER_MODULES = ("comtypes", "win32api", "win32gui", "psutil", "pywinauto")
+#: 微信驱动链上会 LoadLibrary 的模块。谁真正用它们时 import 已命中 `sys.modules`，不再碰加载器。
+#:
+#: ★ **pywinauto 必须排第一**（2026-09-23 加好友事故）：0.1.60 起这里是 comtypes 打头，
+#: 而 comtypes 一 import 就按 `sys.coinit_flags`（没设 = STA）初始化当前线程的 COM；
+#: 轮到 pywinauto 时 MTA 探测失败，它「Revert to STA COM threading mode」，UIA 对象就钉在
+#: 这条不泵消息的 STA 后台线程上。从别的线程（网关队列）做**根枚举**
+#: `Desktop(uia).windows()` / `Desktop(uia).window(...)` 全部返回空——添加朋友面板明明弹出来了，
+#: 客户端却报「打不开添加朋友面板：{... mmui::AddFriendWindow ...}」，号码永远没机会输进去。
+#: 0.1.59 及以前是 pywinauto 先 import（MTA），同一台客户机 09-17 加好友还成功过。
+#: 客户机实测：pywinauto 先 → 另一线程枚举到 9 个顶层窗；comtypes 先 → 0 个。
+WECHAT_DRIVER_MODULES = ("pywinauto", "comtypes", "win32api", "win32gui", "psutil")
+
+#: pywinauto 要的 COM 套间：MTA（COINIT_MULTITHREADED）。comtypes 和 pywinauto 都读 `sys.coinit_flags`。
+COM_MULTITHREADED = 0
 
 _driver_imported = False
 
@@ -64,6 +76,9 @@ def import_wechat_driver() -> None:
     with HEAVY_IMPORT_LOCK:
         if _driver_imported:
             return
+        # 在任何模块碰 COM 之前先把套间定成 MTA：光靠上面的顺序，只要别处先 import 了 comtypes 就又回到 STA。
+        if not hasattr(sys, "coinit_flags"):
+            sys.coinit_flags = COM_MULTITHREADED
         for name in WECHAT_DRIVER_MODULES:
             try:
                 importlib.import_module(name)
