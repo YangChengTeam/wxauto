@@ -249,7 +249,8 @@ def _render_gateway_line(event: str, payload: dict[str, Any]) -> str | None:
     if event == "名单较长，本轮只读其中一段":
         return (
             f"监听名单共 {payload.get('名单', 0)} 个会话，本轮只读其中 {payload.get('本轮', 0)} 个"
-            f"（轮着来，免得一次开太多聊天窗口）"
+            f"（正聊着的 {payload.get('正聊着', 0)} 个先读 {payload.get('热读', 0)} 个，"
+            f"其余轮着来，免得一次开太多聊天窗口）"
         )
     if event == "名单里的这个会话读不到，先跳过":
         return (

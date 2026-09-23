@@ -1103,6 +1103,111 @@ class InboundScopeTests(StoreTestCase):
         # 20 个名字、一轮最多 8 个 → 三轮之内每个都该轮到（轮转不往前走的话会卡在头 8 个）。
         self.assertEqual(seen, set(names), "轮转没走完一圈，有人永远读不到")
 
+    async def test_hot_peer_is_read_every_round_while_cold_peers_still_rotate(self) -> None:
+        """名单超长时**正聊着的人每轮都读**，其余的照旧轮着来、谁都不会永远读不到。
+
+        原来是机械轮转：对方刚回了一句，网关却先去翻另外十几个没人说话的窗口，
+        正在聊的人也得等两三轮。有限的窗口先给有来往的会话。
+        """
+        names = [f"候选人-{i:02d}" for i in range(20)]
+        hot = "候选人-13"
+        now = datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)
+        runtime = FakeRuntime(unread=[], history={n: [{"text": "你好", "is_self": False}] for n in names})
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=names),
+            clock=lambda: now, hot_window_seconds=900,
+        )
+        # 对方 3 分钟前说过话（记在聊天记录里）→ 正热着
+        self.store.record_messages("acct-1", hot, [{
+            "msg_id": f"{hot}#1", "text": "还招人吗", "from_self": False,
+            "at": (now - timedelta(minutes=3)).isoformat(),
+        }])
+        seen: set[str] = set()
+        for _ in range(3):
+            runtime.calls.clear()
+            await source.fetch("acct-1")
+            opened = runtime.opened()
+            self.assertLessEqual(len(opened), MAX_PEERS_PER_POLL, "一轮开的窗口数超了上限")
+            self.assertIn(hot, opened, "正聊着的人这一轮没读到")
+            self.assertEqual(opened[0], hot, "正聊着的人该排在最前面")
+            seen.update(opened)
+        self.assertEqual(seen, set(names), "轮转没走完一圈，有人永远读不到")
+
+    async def test_our_own_unread_back_reply_keeps_the_peer_hot(self) -> None:
+        """我们刚发出去、还没从微信读回来的那句也算来往——正等对方回，这会儿最该盯着。"""
+        names = [f"候选人-{i:02d}" for i in range(20)]
+        hot = "候选人-17"
+        now = datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)
+        runtime = FakeRuntime(unread=[], history={n: [] for n in names})
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=names),
+            clock=lambda: now, hot_window_seconds=900,
+        )
+        self.store.remember_sent_text("acct-1", hot, "明天上午方便来看看吗", at=now - timedelta(minutes=1))
+        await source.fetch("acct-1")
+        self.assertEqual(runtime.opened()[0], hot)
+
+    async def test_stale_activity_falls_back_to_rotation(self) -> None:
+        """热窗之外的来往不算热：昨天聊过的人跟没聊过的一样排队。"""
+        names = [f"候选人-{i:02d}" for i in range(20)]
+        stale = "候选人-13"
+        now = datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)
+        runtime = FakeRuntime(unread=[], history={n: [] for n in names})
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=names),
+            clock=lambda: now, hot_window_seconds=900,
+        )
+        self.store.record_messages("acct-1", stale, [{
+            "msg_id": f"{stale}#1", "text": "还招人吗", "from_self": False,
+            "at": (now - timedelta(hours=20)).isoformat(),
+        }])
+        await source.fetch("acct-1")
+        self.assertEqual(runtime.opened(), names[:MAX_PEERS_PER_POLL], "没人热着时该按名单顺序从头读")
+
+    async def test_hot_peers_leave_one_slot_for_cold_rotation(self) -> None:
+        """热的人把槛位占满时也要留一个给冷档往前走，否则第九个人的消息永远看不见。"""
+        names = [f"候选人-{i:02d}" for i in range(20)]
+        hots = names[:10]
+        now = datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)
+        runtime = FakeRuntime(unread=[], history={n: [] for n in names})
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=names),
+            clock=lambda: now, hot_window_seconds=900,
+        )
+        for name in hots:
+            self.store.record_messages("acct-1", name, [{
+                "msg_id": f"{name}#1", "text": "在吗", "from_self": False,
+                "at": (now - timedelta(minutes=2)).isoformat(),
+            }])
+        cold_seen: list[str] = []
+        hot_seen: set[str] = set()
+        for _ in range(12):
+            runtime.calls.clear()
+            await source.fetch("acct-1")
+            opened = runtime.opened()
+            self.assertEqual(len(opened), MAX_PEERS_PER_POLL)
+            cold_in_round = [p for p in opened if p not in hots]
+            self.assertEqual(len(cold_in_round), 1, "每轮该正好留一个位子给冷档")
+            cold_seen.extend(cold_in_round)
+            hot_seen.update(p for p in opened if p in hots)
+        self.assertEqual(set(cold_seen), set(names[10:]), "冷档没轮完一圈")
+        self.assertEqual(hot_seen, set(hots), "热档里有人一直排在门外")
+
+    def test_recent_peer_activity_takes_the_latest_of_both_ledgers(self) -> None:
+        """来往时刻取聊天记录和出站台账里最近的那一笔，太早的一律不出现。"""
+        now = datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)
+        self.store.record_messages("acct-1", "甲", [{
+            "msg_id": "甲#1", "text": "在吗", "from_self": False, "at": (now - timedelta(minutes=8)).isoformat(),
+        }])
+        self.store.remember_sent_text("acct-1", "甲", "在的", at=now - timedelta(minutes=2))
+        self.store.remember_sent_text("acct-1", "乙", "您好", at=now - timedelta(hours=3))
+        self.store.record_messages("acct-2", "丙", [{
+            "msg_id": "丙#1", "text": "在吗", "from_self": False, "at": now.isoformat(),
+        }])
+        activity = self.store.recent_peer_activity("acct-1", since=now - timedelta(minutes=15))
+        self.assertEqual(set(activity), {"甲"}, "别的账号、太早的来往都不该出现")
+        self.assertEqual(activity["甲"], now - timedelta(minutes=2))
+
     async def test_transcript_uses_wechat_own_timestamp(self) -> None:
         """时间点用微信自己标的那个。
 

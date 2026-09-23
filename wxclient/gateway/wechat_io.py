@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from typing import Any
 
@@ -387,6 +387,7 @@ class QueueMessageSource:
         clock=None,
         on_unreachable=None,
         attachment_fetcher=None,
+        hot_window_seconds: float = 600.0,
     ) -> None:
         self._runtime = runtime
         self._store = store
@@ -395,7 +396,10 @@ class QueueMessageSource:
         # 104：对方发来的图片/文件另存到本机的那一手。None = 不另存（只在正文里说「发了张图」）。
         self._attachments = attachment_fetcher
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._rotation = 0
+        # 名单超长时的排序依据（见 `_due_peers`）：多久之内有来往算「正聊着」，
+        # 以及每个会话上一次被我们读是什么时候（只在内存里，重启后大家重新排队）。
+        self._hot_window = max(0.0, float(hot_window_seconds))
+        self._last_read: dict[str, datetime] = {}
         # 092：连续 UNREACHABLE_STRIKES 轮读不到时喊一声。**只是「读不到」，不是「不是好友」**
         # ——判定留给回调那边（`autofriend.py`），这里一行都不管策略。
         self._on_unreachable = on_unreachable
@@ -425,9 +429,15 @@ class QueueMessageSource:
             return []
 
         collected: list[InboundMessage] = []
-        for peer_id in self._due_peers(watched):
+        now = self._clock()
+        for peer_id in self._due_peers(account_id, watched, now):
+            self._last_read[peer_id] = now
             collected.extend(await self._fetch_peer(account_id, peer_id))
         return collected
+
+    def set_hot_window(self, seconds: float) -> None:
+        """跟 `InboundLoop` 用同一个热窗（AI 端下发节拍时一起改）。"""
+        self._hot_window = max(0.0, float(seconds))
 
     def _drop_handed_off(self, account_id: str, watched: Sequence[str]) -> list[str]:
         """人工接管中的候选人，这一轮连读都不读（用户裁决 2026-08-28）。
@@ -461,20 +471,47 @@ class QueueMessageSource:
         self._paused_peers = set(paused)
         return kept
 
-    def _due_peers(self, watched: Sequence[str]) -> list[str]:
-        """这一轮读哪几个。名单长了就轮着来，一轮最多 ``MAX_PEERS_PER_POLL`` 个。
+    def _due_peers(self, account_id: str, watched: Sequence[str], now: datetime) -> list[str]:
+        """这一轮读哪几个。名单长了一轮最多 ``MAX_PEERS_PER_POLL`` 个，**正聊着的人先读**。
 
-        读一个会话 = 打开一次聊天窗口。名单有五十个人时，每轮把五十个窗口挨个点一遍
-        既慢又正是风控最不喜欢的形状（2026-08-12 自动退登事故）。轮转的代价只是
-        「名单很长时，某个人的消息最多晚几轮被看到」——比被封号强得多。
+        读一个会话 = 打开一次聊天窗口（真机约 9 秒）。名单有五十个人时，每轮把五十个窗口
+        挨个点一遍既慢又正是风控最不喜欢的形状（2026-08-12 自动退登事故），所以每轮只读几个。
+
+        原来是机械轮转：谁排到谁读，正在聊的人和三天没动静的人一样，都得等两三轮才轮到
+        自己——对方刚回了一句，网关却先去翻另外十几个没人说话的窗口。现在分两档：
+
+        - **热**：``hot_window`` 之内有过来往的（对方刚说过话，或我们刚回过正等他回，
+          见 `GatewayStore.recent_peer_activity`），每轮都读。热的人比槛位多时，先读最久没被
+          我们读过的那几个——谁都不会一直排在门外。
+        - **冷**：其余的，按「上次被我们读是什么时候」从最久远的开始，轮着补满剩下的槛位。
+
+        只要还有冷的人，热档最多占 ``MAX_PEERS_PER_POLL - 1`` 个位子：至少留一个给冷档往前走，
+        否则八个人同时聊着的那半小时里，第九个人来的消息一条也看不见。
+        名单不超过上限时一律全读，跟原来一样。
         """
         if len(watched) <= MAX_PEERS_PER_POLL:
             return list(watched)
-        start = self._rotation % len(watched)
-        self._rotation = start + MAX_PEERS_PER_POLL
-        doubled = list(watched) + list(watched)
-        due = doubled[start:start + MAX_PEERS_PER_POLL]
-        _log.info("名单较长，本轮只读其中一段", 名单=len(watched), 本轮=len(due))
+
+        since = now - timedelta(seconds=self._hot_window)
+        activity = self._store.recent_peer_activity(account_id, since=since) if self._hot_window > 0 else {}
+        order = {peer_id: index for index, peer_id in enumerate(watched)}
+        never = datetime.min.replace(tzinfo=timezone.utc)
+
+        def least_recently_read(peer_id: str) -> tuple[datetime, int]:
+            return (self._last_read.get(peer_id, never), order[peer_id])
+
+        hot = sorted((p for p in watched if p in activity), key=least_recently_read)
+        cold = sorted((p for p in watched if p not in activity), key=least_recently_read)
+        hot_slots = MAX_PEERS_PER_POLL - (1 if cold else 0)
+        due = hot[:hot_slots]
+        due.extend(cold[: MAX_PEERS_PER_POLL - len(due)])
+        _log.info(
+            "名单较长，本轮只读其中一段",
+            名单=len(watched),
+            本轮=len(due),
+            正聊着=len(hot),
+            热读=min(len(hot), hot_slots),
+        )
         return due
 
     def set_unreachable_handler(self, handler) -> None:
