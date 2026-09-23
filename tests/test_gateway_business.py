@@ -1306,9 +1306,9 @@ class LostCursorAnchorTests(StoreTestCase):
         fresh, _ = split_new_messages(window, "游标不在窗口里", known=["在吗", "好的"])
         self.assertEqual([m["text"] for m in fresh], ["工种是什么", "好的"])
 
-    def test_emoji_code_does_not_break_the_anchor(self) -> None:
-        """我们发的「早上好[微笑]」，微信渲染成图后读回来没有那几个字，内容键要对得上。"""
-        window = [{"text": "早上好"}, {"text": "在的"}]
+    def test_emoji_code_is_part_of_the_anchor(self) -> None:
+        """UIA 把表情按 `[微笑]` 原文读回来，锚也按原文比。"""
+        window = [{"text": "早上好[微笑]"}, {"text": "在的"}]
         fresh, _ = split_new_messages(window, "游标不在窗口里", known=["在吗", "早上好[微笑]"])
         self.assertEqual([m["text"] for m in fresh], ["在的"])
 
@@ -1446,10 +1446,12 @@ class OwnEchoTests(StoreTestCase):
         self.assertTrue(self.store.claim_sent_echo("a", "p", "第二句"))
         self.assertFalse(self.store.claim_sent_echo("a", "p", "第一句"), "认一次销一条")
 
-    def test_emoji_codes_are_ignored_when_matching(self) -> None:
-        """107 的开场白带 `[微笑]`，微信渲染成图后 UIA 读回来没有这几个字，也要认得出。"""
+    def test_emoji_codes_must_match_literally(self) -> None:
+        """线上实测 UIA 把黄脸表情按 `[微笑]` 原文读回来，所以原文带表情就按带表情比；
+        对方恰好说了一句没表情的同一句话，不是我们的回声。"""
         self.store.remember_sent_text("a", "p", "早上好[微笑]，看到您在找普工")
-        self.assertTrue(self.store.claim_sent_echo("a", "p", "早上好，看到您在找普工"))
+        self.assertFalse(self.store.claim_sent_echo("a", "p", "早上好，看到您在找普工"))
+        self.assertTrue(self.store.claim_sent_echo("a", "p", "早上好[微笑]，看到您在找普工"))
 
 
 class QuietHoursTests(StoreTestCase):

@@ -9,7 +9,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sqlite3
 from collections.abc import Iterable, Sequence
 from contextlib import closing
@@ -249,22 +248,17 @@ CREATE INDEX IF NOT EXISTS idx_sent_echo_peer
 _log = structlog.get_logger(__name__)
 
 
-#: 微信内置表情的占位代码：`[微笑]` `[抱拳]` `[加油加油]`（AI 端 107 写进回复文字，微信渲染成黄脸）。
-#: 只认方括号里 1–8 个非空白、非括号字符，不会碰「[对方发来一张图片，没能保存下来]」这种占位句。
-_EMOJI_CODE_RE = re.compile(r"\[[^\[\]\s]{1,8}\]")
-
-
 def text_key(text: str) -> str:
-    """一段聊天文字 → 可比对的键：去掉内置表情代码、去首尾空白、把所有空白折成一个空格。
+    """一段聊天文字 → 可比对的键：去首尾空白、把所有空白折成一个空格。
 
     微信把一段文字显示成气泡时会吞掉首尾换行、UIA 读到的 name 再被 `strip()`；
     多行文本的换行在不同版本里读回来可能是换行也可能是空格。按原文逐字比对就会漏认。
-    表情代码同理：我们发的是「早上好[微笑]」，微信把 `[微笑]` 画成图，UIA 读回来的文字里
-    未必还有这几个字——计划开场白正好都带一个（107），不抹掉就永远认不出是自己说的。
+    `[微笑]` 这类内置表情代码**不抹**：线上实测（2026-09-23，微信 4.1.x）UIA 把渲染成黄脸的表情
+    仍按 `[微笑]` 原文读回来，两边本来就对得上；抹了反而会把对方恰好说的同一句无表情原话认成回声。
     出站原文认亲（`remember_sent_text`）和聊天记录的内容键（`gateway_messages.raw_key`）
     都用这一个函数——两边算法一分岔，读回来的行就对不上记录。
     """
-    return " ".join(_EMOJI_CODE_RE.sub("", str(text or "")).split())
+    return " ".join(str(text or "").split())
 
 
 _echo_key = text_key
