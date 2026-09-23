@@ -325,6 +325,7 @@ class InboundLoop:
             else min(active_poll_interval_seconds, poll_interval_seconds)
         )
         self._hot_window = max(0.0, hot_window_seconds)
+        self._sync_source_hot_window()
         self._last_activity: datetime | None = None
         self._debouncer = Debouncer(debounce_seconds)
         self._is_active = is_active or (lambda _now: True)
@@ -639,6 +640,12 @@ class InboundLoop:
             return self._active_interval
         return self._poll_interval
 
+    def _sync_source_hot_window(self) -> None:
+        """热窗只有一个数：读多勤（这里）和先读谁（`QueueMessageSource._due_peers`）用同一个。"""
+        setter = getattr(self._source, "set_hot_window", None)
+        if callable(setter):
+            setter(self._hot_window)
+
     def set_pace(
         self,
         *,
@@ -660,6 +667,7 @@ class InboundLoop:
             self._hot_window = max(0.0, min(float(hot_window_seconds), 3600.0))
         # 快档不该比慢档还慢——两个值一起下发时顺手保证这条。
         self._active_interval = min(self._active_interval, self._poll_interval)
+        self._sync_source_hot_window()
         pace = {
             "idle_seconds": self._poll_interval,
             "active_seconds": self._active_interval,

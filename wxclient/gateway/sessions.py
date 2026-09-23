@@ -1727,6 +1727,47 @@ class GatewayStore:
         keys = [str(raw_key or "") or text_key(text) for raw_key, text in rows]
         return [key for key in reversed(keys) if key]
 
+    def recent_peer_activity(self, account_id: str, *, since: datetime) -> dict[str, datetime]:
+        """``since`` 之后**这台机器跟哪些会话有过来往**：会话名 → 最近一次来往的时刻（UTC）。
+
+        给 `wechat_io.QueueMessageSource._due_peers` 判「谁正热着」：名单一长，每轮只读得起
+        几个窗口，得把有限的窗口先给正在聊的人——对方刚说过话、或我们刚回过话正等他回，
+        这两种都算来往。读到的消息在 ``gateway_messages``（双方都记）；刚发出去、还没从微信
+        读回来的那句在 ``gateway_sent_echo``（读回即销），两张表取最近的那一笔。
+
+        只按时间筒选，不管内容；``since`` 之前的会话一律不出现在结果里。
+        """
+        edge = since.isoformat()
+        activity: dict[str, datetime] = {}
+
+        def note(peer_id: str, raw: str) -> None:
+            try:
+                at = datetime.fromisoformat(str(raw or ""))
+            except ValueError:
+                return
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            if at < since:
+                return
+            current = activity.get(peer_id)
+            if current is None or at > current:
+                activity[peer_id] = at
+
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT peer_id, MAX(at) FROM gateway_messages
+                   WHERE account_id=? AND at >= ? GROUP BY peer_id""",
+                (account_id, edge),
+            ).fetchall()
+            echoes = conn.execute(
+                """SELECT peer_id, MAX(sent_at) FROM gateway_sent_echo
+                   WHERE account_id=? AND sent_at >= ? GROUP BY peer_id""",
+                (account_id, edge),
+            ).fetchall()
+        for peer_id, raw in list(rows) + list(echoes):
+            note(str(peer_id), raw)
+        return activity
+
     def purge_messages_before(self, cutoff: datetime) -> int:
         """清掉太老的聊天记录，返回清了几条。
 

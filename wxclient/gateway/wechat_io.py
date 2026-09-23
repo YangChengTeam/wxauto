@@ -17,7 +17,8 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import re
 from hashlib import sha256
 from typing import Any
 
@@ -318,6 +319,127 @@ def preview(raw: dict[str, Any]) -> str:
     return text[:PREVIEW_CHARS] + "…" if len(text) > PREVIEW_CHARS else text or "（空）"
 
 
+# ───────────── 会话列表预筛（少开窗口） ─────────────
+
+#: 会话列表预览里的媒体占位（微信写成「[图片]」，聊天记录里同一条读出来是「图片」）。
+_PREVIEW_MEDIA = {
+    "[图片]": "图片", "[视频]": "视频", "[文件]": "文件", "[语音]": "语音",
+    "[动画表情]": "动画表情", "[表情]": "表情", "[位置]": "位置", "[链接]": "链接",
+    "[名片]": "名片", "[视频通话]": "视频通话", "[语音通话]": "语音通话",
+}
+_PREVIEW_COUNT_RE = re.compile(r"^\[\d+条\]\s*")
+_PREVIEW_SENDER_RE = re.compile(r"^[^:：\s]{1,32}[:：]\s*")
+_PREVIEW_DRAFT_RE = re.compile(r"^\[草稿\]")
+_ROW_TIME_RE = re.compile(r"(?P<h>\d{1,2}):(?P<m>\d{2})")
+_ROW_DATE_RE = re.compile(r"(?:(?P<y>\d{4})[年/-])?(?P<mo>\d{1,2})[月/-](?P<d>\d{1,2})日?")
+_WEEKDAYS = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+
+
+def preview_keys(text: Any) -> list[str]:
+    """会话列表预览可能对应聊天记录里哪几种原文键（内容键，见 `sessions.text_key`）。
+
+    预览是微信自己排的：群聊带「某人: 」前缀、免打扰群带「[7条] 」前缀、图片写成「[图片]」
+    而聊天记录里读出来是「图片」。给出几种剥法，**任一种**跟记录对上就算没变——
+    对不上的一律当「变了」（宁开勿漏）。带「[草稿]」的一律算变了：专员在打字，开窗无害。
+    """
+    raw = " ".join(str(text or "").split())
+    if not raw or _PREVIEW_DRAFT_RE.match(raw):
+        return []
+    keys: list[str] = []
+
+    def add(value: str) -> None:
+        value = value.strip()
+        if value and value not in keys:
+            keys.append(value)
+            mapped = _PREVIEW_MEDIA.get(value)
+            if mapped:
+                keys.append(mapped)
+
+    add(raw)
+    no_count = _PREVIEW_COUNT_RE.sub("", raw)
+    add(no_count)
+    add(_PREVIEW_SENDER_RE.sub("", no_count))
+    return keys
+
+
+def preview_matches(preview_text: Any, last_key: str) -> bool:
+    """预览跟我们记下的最后一条原文对得上吗。预览可能被截断，所以允许「记录以预览开头」。"""
+    last = text_key(last_key)
+    if not last:
+        return False
+    for key in preview_keys(preview_text):
+        key = text_key(key)
+        if key == last:
+            return True
+        if len(key) >= 6 and last.startswith(re.sub(r"[….]+$", "", key)):
+            return True
+    return False
+
+
+def row_time(timestamp_text: Any, now: datetime) -> datetime | None:
+    """会话列表那一行右上角的时间 → 时刻（UTC）。认不出来返回 None（＝不知道，按变了处理）。
+
+    微信写法：「17:01」（今天）、「昨天 17:26」、「星期日」、「9月20日」/「2025/9/20」。
+    只写日期没写几点的，按那一天的**最后一刻**算——宁可高估「有多新」。
+    显示的是本机时区的时间，按本机时区换算。
+    """
+    value = " ".join(str(timestamp_text or "").split())
+    if not value:
+        return None
+    local = now.astimezone()
+    tz = local.tzinfo
+    day = local.date()
+    day_known = False
+    if "昨天" in value:
+        day, day_known = day - timedelta(days=1), True
+    elif "前天" in value:
+        day, day_known = day - timedelta(days=2), True
+    elif value.startswith(("星期", "周")):
+        weekday = _WEEKDAYS.get(value[-1])
+        if weekday is None:
+            return None
+        day, day_known = day - timedelta(days=(local.weekday() - weekday) % 7 or 7), True
+    else:
+        date_match = _ROW_DATE_RE.search(value)
+        if date_match:
+            try:
+                day = day.replace(
+                    year=int(date_match.group("y") or day.year),
+                    month=int(date_match.group("mo")),
+                    day=int(date_match.group("d")),
+                )
+            except ValueError:
+                return None
+            day_known = True
+    clock = _ROW_TIME_RE.search(value)
+    try:
+        if clock:
+            moment = datetime(day.year, day.month, day.day, int(clock.group("h")), int(clock.group("m")), tzinfo=tz)
+        elif day_known:
+            moment = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=tz)
+        else:
+            return None
+    except ValueError:
+        return None
+    return moment.astimezone(timezone.utc)
+
+
+def session_rows(result: Any) -> dict[str, dict[str, Any]]:
+    """`read_chat_sessions` 的结果 → 会话名 → 那一行。坏数据一律忽略。"""
+    body = result.get("result") if isinstance(result, dict) and isinstance(result.get("result"), dict) else result
+    rows = body.get("sessions") if isinstance(body, dict) else None
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        if name and name not in out:
+            out[name] = row
+    return out
+
+
 #: 表情 / 视频 / 拿不到的图片文件，喂给 AI 端的占位正文（104）。方括号写法与 AI 端
 #: `context.mjs` 的 `FILLER_RE` 同口径——表情那条要让它认出「这不是一句话」。
 EMOJI_TEXT = "[动画表情]"
@@ -387,6 +509,10 @@ class QueueMessageSource:
         clock=None,
         on_unreachable=None,
         attachment_fetcher=None,
+        hot_window_seconds: float = 600.0,
+        prefilter_by_session_list: bool = True,
+        allow_real_actions: bool = False,
+        confirmation: str = "",
     ) -> None:
         self._runtime = runtime
         self._store = store
@@ -395,7 +521,15 @@ class QueueMessageSource:
         # 104：对方发来的图片/文件另存到本机的那一手。None = 不另存（只在正文里说「发了张图」）。
         self._attachments = attachment_fetcher
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._rotation = 0
+        # 名单超长时的排序依据（见 `_due_peers`）：多久之内有来往算「正聊着」，
+        # 以及每个会话上一次被我们读是什么时候（只在内存里，重启后大家重新排队）。
+        self._hot_window = max(0.0, float(hot_window_seconds))
+        self._last_read: dict[str, datetime] = {}
+        # 先看左侧会话列表再决定开哪些窗口（见 `_skip_unchanged`）。读列表要过 dry_run 授权，
+        # 所以要带上真实动作的确认短语；dry-run 机器读回来的是空壳，等于不筛。
+        self._prefilter = bool(prefilter_by_session_list)
+        self._allow_real = bool(allow_real_actions)
+        self._confirmation = confirmation
         # 092：连续 UNREACHABLE_STRIKES 轮读不到时喊一声。**只是「读不到」，不是「不是好友」**
         # ——判定留给回调那边（`autofriend.py`），这里一行都不管策略。
         self._on_unreachable = on_unreachable
@@ -425,9 +559,66 @@ class QueueMessageSource:
             return []
 
         collected: list[InboundMessage] = []
-        for peer_id in self._due_peers(watched):
+        now = self._clock()
+        if self._prefilter:
+            watched = await self._skip_unchanged(account_id, watched, now)
+        for peer_id in self._due_peers(account_id, watched, now):
+            self._last_read[peer_id] = now
             collected.extend(await self._fetch_peer(account_id, peer_id))
         return collected
+
+    async def _skip_unchanged(self, account_id: str, watched: Sequence[str], now: datetime) -> list[str]:
+        """先读一遍左侧会话列表（不开任何聊天窗口），把**肯定没变**的会话从这一轮里拿掉。
+
+        读一个会话要开一次窗口（真机约 9 秒），读一遍会话列表不用开窗（真机实测 11 行约 18 秒，
+        2026-09-23）。名单一长，大多数会话大多数时候根本没新消息——列表那一行的预览和时间
+        跟我们上次读到的对得上，就不必再开它的窗口。
+
+        判「没变」要**两个条件同时**成立，缺一个都当变了（宁开勿漏）：
+        - 预览对得上我们记下的这个会话最后一条原文（`preview_matches`；对方连发两句一样的话
+          单靠这条会看漏，所以还要下一条）；
+        - 那一行的时间不晚于我们上次读它的时刻（`row_time`；重启后没有上次时刻＝全开一遍）。
+
+        ★ 这**不是**看未读红点（用户裁决 2026-08-14 否掉的那条路）：红点会被免打扰、被手机上
+        瞄一眼抹掉；这里看的是「最后一条是什么、几点」，跟微信觉得你读没读过无关。
+        列表读失败、名字不在列表里（列表只显示最近的一段）、行认不出来 → 照旧开窗。
+        """
+        if len(watched) <= 1:
+            return list(watched)
+        try:
+            result = await self._runtime.submit(
+                TaskType.READ_CHAT_SESSIONS,
+                {"dry_run": not self._allow_real},
+                confirmation=self._confirmation if self._allow_real else "",
+            )
+        except Exception as exc:  # noqa: BLE001 —— 预筛只是省事，读不到列表就都开一遍
+            _log.warning("读会话列表失败，这一轮不预筛、照旧开窗", error=str(exc))
+            return list(watched)
+        rows = session_rows(result)
+        if not rows:
+            return list(watched)
+
+        kept: list[str] = []
+        skipped = 0
+        for peer_id in watched:
+            row = rows.get(peer_id)
+            last_read = self._last_read.get(peer_id)
+            if row is None or last_read is None:
+                kept.append(peer_id)
+                continue
+            seen = row_time(row.get("timestamp_text"), now)
+            keys = self._store.recent_raw_keys(account_id, peer_id, limit=1)
+            if seen is None or seen > last_read or not keys or not preview_matches(row.get("preview"), keys[-1]):
+                kept.append(peer_id)
+                continue
+            skipped += 1
+        if skipped:
+            _log.info("会话列表里这些会话没变，这一轮不开它们的窗口", 名单=len(watched), 跳过=skipped, 要读=len(kept))
+        return kept
+
+    def set_hot_window(self, seconds: float) -> None:
+        """跟 `InboundLoop` 用同一个热窗（AI 端下发节拍时一起改）。"""
+        self._hot_window = max(0.0, float(seconds))
 
     def _drop_handed_off(self, account_id: str, watched: Sequence[str]) -> list[str]:
         """人工接管中的候选人，这一轮连读都不读（用户裁决 2026-08-28）。
@@ -461,20 +652,47 @@ class QueueMessageSource:
         self._paused_peers = set(paused)
         return kept
 
-    def _due_peers(self, watched: Sequence[str]) -> list[str]:
-        """这一轮读哪几个。名单长了就轮着来，一轮最多 ``MAX_PEERS_PER_POLL`` 个。
+    def _due_peers(self, account_id: str, watched: Sequence[str], now: datetime) -> list[str]:
+        """这一轮读哪几个。名单长了一轮最多 ``MAX_PEERS_PER_POLL`` 个，**正聊着的人先读**。
 
-        读一个会话 = 打开一次聊天窗口。名单有五十个人时，每轮把五十个窗口挨个点一遍
-        既慢又正是风控最不喜欢的形状（2026-08-12 自动退登事故）。轮转的代价只是
-        「名单很长时，某个人的消息最多晚几轮被看到」——比被封号强得多。
+        读一个会话 = 打开一次聊天窗口（真机约 9 秒）。名单有五十个人时，每轮把五十个窗口
+        挨个点一遍既慢又正是风控最不喜欢的形状（2026-08-12 自动退登事故），所以每轮只读几个。
+
+        原来是机械轮转：谁排到谁读，正在聊的人和三天没动静的人一样，都得等两三轮才轮到
+        自己——对方刚回了一句，网关却先去翻另外十几个没人说话的窗口。现在分两档：
+
+        - **热**：``hot_window`` 之内有过来往的（对方刚说过话，或我们刚回过正等他回，
+          见 `GatewayStore.recent_peer_activity`），每轮都读。热的人比槛位多时，先读最久没被
+          我们读过的那几个——谁都不会一直排在门外。
+        - **冷**：其余的，按「上次被我们读是什么时候」从最久远的开始，轮着补满剩下的槛位。
+
+        只要还有冷的人，热档最多占 ``MAX_PEERS_PER_POLL - 1`` 个位子：至少留一个给冷档往前走，
+        否则八个人同时聊着的那半小时里，第九个人来的消息一条也看不见。
+        名单不超过上限时一律全读，跟原来一样。
         """
         if len(watched) <= MAX_PEERS_PER_POLL:
             return list(watched)
-        start = self._rotation % len(watched)
-        self._rotation = start + MAX_PEERS_PER_POLL
-        doubled = list(watched) + list(watched)
-        due = doubled[start:start + MAX_PEERS_PER_POLL]
-        _log.info("名单较长，本轮只读其中一段", 名单=len(watched), 本轮=len(due))
+
+        since = now - timedelta(seconds=self._hot_window)
+        activity = self._store.recent_peer_activity(account_id, since=since) if self._hot_window > 0 else {}
+        order = {peer_id: index for index, peer_id in enumerate(watched)}
+        never = datetime.min.replace(tzinfo=timezone.utc)
+
+        def least_recently_read(peer_id: str) -> tuple[datetime, int]:
+            return (self._last_read.get(peer_id, never), order[peer_id])
+
+        hot = sorted((p for p in watched if p in activity), key=least_recently_read)
+        cold = sorted((p for p in watched if p not in activity), key=least_recently_read)
+        hot_slots = MAX_PEERS_PER_POLL - (1 if cold else 0)
+        due = hot[:hot_slots]
+        due.extend(cold[: MAX_PEERS_PER_POLL - len(due)])
+        _log.info(
+            "名单较长，本轮只读其中一段",
+            名单=len(watched),
+            本轮=len(due),
+            正聊着=len(hot),
+            热读=min(len(hot), hot_slots),
+        )
         return due
 
     def set_unreachable_handler(self, handler) -> None:
