@@ -50,11 +50,13 @@ class _FakeRuntime:
     def __init__(self, sessions: list[dict] | None = None, *, boom: bool = False) -> None:
         self.sessions = sessions or []
         self.calls: list[dict] = []
+        self.confirmations: list[str] = []
         self.boom = boom
 
     async def submit(self, task_type, payload, confirmation: str = ""):
         assert task_type is TaskType.READ_CHAT_SESSIONS
         self.calls.append(dict(payload))
+        self.confirmations.append(confirmation)
         if self.boom:
             raise RuntimeError("微信没开")
         return {"status": "succeeded", "result": {"sessions": self.sessions}}
@@ -118,6 +120,13 @@ class StrangerAdmissionTests(unittest.IsolatedAsyncioTestCase):
         runtime = _FakeRuntime([_session("陌生的王工")])
         await self._watcher(runtime).tick()
         self.assertEqual(runtime.calls[0]["dry_run"], False)
+
+    async def test_真机读列表要带确认短语(self) -> None:
+        """dry_run=False 的读也要过 `WeChatRuntime._authorize_payload`：没带确认短语会被拒，
+        扫描就一直「读会话列表失败」——此前真机上正是这样默默没跑（2026-09-23 发现）。"""
+        runtime = _FakeRuntime([_session("陌生的王工")])
+        await self._watcher(runtime, confirmation="口令").tick()
+        self.assertEqual(runtime.confirmations, ["口令"])
 
     async def test_dry_run_机器如实按_dry_run_跑(self) -> None:
         runtime = _FakeRuntime([])

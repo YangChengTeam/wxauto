@@ -37,10 +37,13 @@ from wxclient.gateway.guard import (
     ACTION_MESSAGE,
     ACTION_MOMENTS,
 )
-from wxclient.gateway.inbound import PENDING_MAX_AGE_HOURS, PENDING_MAX_ATTEMPTS
+from wxclient.gateway.inbound import PENDING_MAX_AGE_HOURS, PENDING_MAX_ATTEMPTS, message_to_row
 from wxclient.gateway.wechat_io import (
     FIRST_SEEN_TAIL,
     MAX_PEERS_PER_POLL,
+    preview_keys,
+    preview_matches,
+    row_time,
     QueueMessageSource,
     legacy_message_signature,
     message_signature,
@@ -987,17 +990,31 @@ class PendingInboundTests(StoreTestCase):
 class FakeRuntime:
     """只回放事先摆好的未读列表与聊天记录，并记下都调了什么。"""
 
-    def __init__(self, unread: list[dict], history: dict[str, list[dict]]) -> None:
+    def __init__(
+        self, unread: list[dict], history: dict[str, list[dict]], sessions: list[dict] | None = None
+    ) -> None:
         self.unread = unread
         self.history = history
+        #: 左侧会话列表（`read_chat_sessions`）。None = 假装读不到（老测试不关心它，一律开窗）。
+        self.sessions = sessions
         self.calls: list[tuple[Any, Any]] = []
+        self.confirmations: list[str] = []
 
-    async def submit(self, task_type, payload=None, **_kw):
+    async def submit(self, task_type, payload=None, *, confirmation: str = "", **_kw):
         self.calls.append((task_type, payload))
+        self.confirmations.append(confirmation)
         if task_type is TaskType.GET_UNREAD_MESSAGES:
             return {"result": {"unread_sessions": self.unread}}
+        if task_type is TaskType.READ_CHAT_SESSIONS:
+            if self.sessions is None:
+                raise RuntimeError("读不到会话列表")
+            return {"status": "succeeded", "result": {"sessions": list(self.sessions)}}
         friend = (payload or {}).get("friend")
         return {"result": {"messages": self.history.get(friend, [])}}
+
+    def listed(self) -> int:
+        """读了几次会话列表。"""
+        return sum(1 for task_type, _ in self.calls if task_type is TaskType.READ_CHAT_SESSIONS)
 
     def opened(self) -> list[str]:
         """被真正打开读过历史的会话名。打开窗口本身就是打扰，所以要能断言。"""
@@ -1207,6 +1224,122 @@ class InboundScopeTests(StoreTestCase):
         activity = self.store.recent_peer_activity("acct-1", since=now - timedelta(minutes=15))
         self.assertEqual(set(activity), {"甲"}, "别的账号、太早的来往都不该出现")
         self.assertEqual(activity["甲"], now - timedelta(minutes=2))
+
+    async def test_unchanged_session_row_skips_the_window(self) -> None:
+        """会话列表里预览和时间都跟上次读到的一样 → 这一轮不开它的窗口；变了的、不在列表里的照旧开。"""
+        a, b, c = "候选人-甲", "候选人-乙", "候选人-丙"
+        now = datetime(2026, 9, 23, 2, 5, tzinfo=timezone.utc)  # 本机时区下的某个上午
+        stamp = now.astimezone().strftime("%H:%M")
+        runtime = FakeRuntime(
+            unread=[],
+            history={a: [{"text": "ok", "is_self": False}], b: [{"text": "在吗", "is_self": False}], c: []},
+            sessions=[
+                {"name": a, "preview": "ok", "timestamp_text": stamp, "timestamp_is_today": True},
+                {"name": b, "preview": "在吗", "timestamp_text": stamp, "timestamp_is_today": True},
+            ],
+        )
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[a, b, c]),
+            clock=lambda: now, allow_real_actions=True, confirmation="口令",
+        )
+        # 第一轮：上次读的时刻都还没有 → 全开一遍
+        messages = await source.fetch("acct-1")
+        self.assertEqual(set(runtime.opened()), {a, b, c})
+        self.assertEqual(runtime.confirmations[0], "口令", "真机读会话列表要带确认短语，否则被授权闸拒掉")
+        self.store.record_messages("acct-1", a, [message_to_row(m) for m in messages if m.peer_id == a])
+        self.store.record_messages("acct-1", b, [message_to_row(m) for m in messages if m.peer_id == b])
+
+        # 第二轮：甲没变；乙预览变了（对方又说了一句）；丙不在列表里
+        runtime.sessions[1] = dict(runtime.sessions[1], preview="还招人吗")
+        runtime.calls.clear()
+        now = now + timedelta(minutes=3)
+        await source.fetch("acct-1")
+        self.assertEqual(set(runtime.opened()), {b, c}, "甲没变不该开窗；乙变了、丙不在列表里都得开")
+        self.assertEqual(runtime.listed(), 1)
+
+    async def test_same_preview_but_newer_time_still_opens(self) -> None:
+        """对方连发两句一样的话：预览对得上、但时间比上次读晚 → 还是要开（单看预览会看漏）。"""
+        a = "候选人-甲"
+        now = datetime(2026, 9, 23, 2, 5, tzinfo=timezone.utc)
+        runtime = FakeRuntime(
+            unread=[], history={a: [{"text": "在吗", "is_self": False}]},
+            sessions=[{"name": a, "preview": "在吗", "timestamp_text": now.astimezone().strftime("%H:%M")}],
+        )
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[a, "候选人-乙"]),
+            clock=lambda: now,
+        )
+        messages = await source.fetch("acct-1")
+        self.store.record_messages("acct-1", a, [message_to_row(m) for m in messages])
+        runtime.calls.clear()
+        later = (now + timedelta(minutes=2)).astimezone().strftime("%H:%M")
+        runtime.sessions[0] = dict(runtime.sessions[0], timestamp_text=later)
+        now = now + timedelta(minutes=4)
+        await source.fetch("acct-1")
+        self.assertIn(a, runtime.opened())
+
+    async def test_list_failure_or_draft_falls_back_to_opening(self) -> None:
+        """列表读不到、或那一行带「[草稿]」→ 照旧开窗（预筛只是省事，宁开勿漏）。"""
+        a = "候选人-甲"
+        now = datetime(2026, 9, 23, 2, 5, tzinfo=timezone.utc)
+        runtime = FakeRuntime(unread=[], history={a: [{"text": "ok", "is_self": False}]}, sessions=None)
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[a, "候选人-乙"]),
+            clock=lambda: now,
+        )
+        messages = await source.fetch("acct-1")
+        self.store.record_messages("acct-1", a, [message_to_row(m) for m in messages])
+        runtime.calls.clear()
+        with capture_logs() as logs:
+            await source.fetch("acct-1")
+        self.assertIn(a, runtime.opened())
+        self.assertTrue(any(log["event"] == "读会话列表失败，这一轮不预筛、照旧开窗" for log in logs))
+
+        stamp = now.astimezone().strftime("%H:%M")
+        runtime.sessions = [{"name": a, "preview": "[草稿] ok", "timestamp_text": stamp}]
+        runtime.calls.clear()
+        await source.fetch("acct-1")
+        self.assertIn(a, runtime.opened(), "专员正在打字（草稿）时不确定有没有新消息，得开")
+
+    def test_prefilter_can_be_switched_off(self) -> None:
+        runtime = FakeRuntime(unread=[], history={}, sessions=[])
+        source = QueueMessageSource(runtime=runtime, store=self.store, prefilter_by_session_list=False)
+        self.assertFalse(source._prefilter)
+
+    def test_preview_keys_strip_wechat_decorations(self) -> None:
+        """预览剥法：免打扰群「[7条] 」、群聊「某人: 」、「[图片]」对应聊天记录里的「图片」。"""
+        self.assertEqual(preview_keys("ok"), ["ok"])
+        self.assertIn("图片", preview_keys("[图片] "))
+        self.assertIn("收到", preview_keys("[7条] 依凡: 收到"))
+        self.assertIn("依凡: 收到", preview_keys("[7条] 依凡: 收到"))
+        self.assertEqual(preview_keys("[草稿] 明天"), [], "草稿不算任何原文")
+        self.assertEqual(preview_keys(""), [])
+
+    def test_preview_matches_allows_truncated_preview(self) -> None:
+        self.assertTrue(preview_matches("ok", "ok"))
+        self.assertTrue(preview_matches("[图片]", "图片"))
+        self.assertTrue(preview_matches("需要带什么我这边还没确认到，我让招聘老师…", "需要带什么我这边还没确认到，我让招聘老师跟厂里问一下"))
+        self.assertFalse(preview_matches("在吗", "在吗？"))
+        self.assertFalse(preview_matches("在吗", ""))
+        self.assertFalse(preview_matches("在", "在吗在吗在吗"), "太短的前缀不算对上")
+
+    def test_row_time_reads_wechat_labels_in_local_time(self) -> None:
+        now = datetime(2026, 9, 23, 9, 30, tzinfo=timezone.utc)
+        local = now.astimezone()
+        today = local.date()
+        tz = local.tzinfo
+        self.assertEqual(row_time("17:01", now), datetime(today.year, today.month, today.day, 17, 1, tzinfo=tz))
+        yesterday = today - timedelta(days=1)
+        self.assertEqual(
+            row_time("昨天 17:26", now), datetime(yesterday.year, yesterday.month, yesterday.day, 17, 26, tzinfo=tz)
+        )
+        sunday = row_time("星期日", now)
+        self.assertIsNotNone(sunday)
+        self.assertEqual(sunday.astimezone(tz).weekday(), 6)
+        self.assertLess(sunday, now)
+        self.assertEqual(row_time("9月20日", now).astimezone(tz).day, 20)
+        self.assertIsNone(row_time("", now))
+        self.assertIsNone(row_time("消息免打扰", now))
 
     async def test_transcript_uses_wechat_own_timestamp(self) -> None:
         """时间点用微信自己标的那个。

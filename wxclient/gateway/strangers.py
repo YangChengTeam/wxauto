@@ -67,6 +67,7 @@ class StrangerWatcher:
         enabled: bool = False,
         active_hours: str = "",
         allow_real_actions: bool = False,
+        confirmation: str = "",
         on_change: Callable[[], None] | None = None,
         clock: Callable[[], datetime] | None = None,
         rng: random.Random | None = None,
@@ -78,6 +79,9 @@ class StrangerWatcher:
         self._enabled = bool(enabled)
         self._active_hours = active_hours
         self._allow_real = allow_real_actions
+        # 真机上 dry_run=False 的读也要过 `WeChatRuntime._authorize_payload`，没带确认短语会被拒
+        # （PermissionError → 下面只记一条 warning，扫描等于一直没跑）。
+        self._confirmation = confirmation
         self._on_change = on_change
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._rng = rng
@@ -120,7 +124,9 @@ class StrangerWatcher:
             # ⚠️ dry_run 必须显式给：底座默认 True，dry-run 下 `read_chat_sessions`
             # 返回的是空壳（`wechat_api/uia.py`），扫了等于没扫。
             result = await self._runtime.submit(
-                TaskType.READ_CHAT_SESSIONS, {"dry_run": not self._allow_real}
+                TaskType.READ_CHAT_SESSIONS,
+                {"dry_run": not self._allow_real},
+                confirmation=self._confirmation if self._allow_real else "",
             )
         except Exception as exc:  # noqa: BLE001 —— 扫失败不该拖垮循环
             _log.warning("读会话列表失败", account=account_id, error=str(exc))

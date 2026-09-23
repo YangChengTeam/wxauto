@@ -224,6 +224,10 @@ def build_gateway(
             runtime=runtime,
             store=store,
             watchlist=watchlist,
+            hot_window_seconds=gateway_settings.hot_window_seconds,
+            prefilter_by_session_list=gateway_settings.prefilter_by_session_list,
+            allow_real_actions=allow_real_actions,
+            confirmation=REAL_ACTION_CONFIRMATION,
             # 104：对方发来的图片/文件另存到本机随轮送 AI 端。目录跟 gateway.db 放一起，
             # 同样在 `.wxclient/` 下、同样禁止入库。
             attachment_fetcher=(
@@ -286,6 +290,7 @@ def build_gateway(
             enabled=gateway_settings.stranger_intake,
             active_hours=gateway_settings.active_hours,
             allow_real_actions=allow_real_actions,
+            confirmation=REAL_ACTION_CONFIRMATION,
         ),
         # 用户 2026-09-08：本机自己巡看朋友圈，只碰新动态。**默认关**（间隔 0）。
         moments_watcher=MomentsWatcher(
