@@ -249,6 +249,23 @@ class SentEchoRecordTests(CommandTestCase):
         })
         self.assertFalse(self.store.claim_sent_echo(ACCOUNT, "张三", "在吗"))
 
+    async def test_add_friend_greeting_is_recorded_under_the_session_name(self) -> None:
+        """验证语在对方通过后会以我们的气泡出现在会话里，第一次读那个会话时要认得出是自己说的。"""
+        runtime = FakeRuntime(result={"already_friend": False, "session_name": "候选人-张三"})
+        await self._executor(runtime).execute({
+            "command_id": "c1", "op": "add_friend",
+            "args": {"number": "13800000001", "greetings": "你好，我是劳小智的招聘老师", "remark": "候选人-张三"},
+        })
+        self.assertTrue(self.store.claim_sent_echo(ACCOUNT, "候选人-张三", "你好，我是劳小智的招聘老师"))
+
+    async def test_already_friend_records_no_greeting(self) -> None:
+        runtime = FakeRuntime(result={"already_friend": True, "session_name": "老朋友"})
+        await self._executor(runtime).execute({
+            "command_id": "c1", "op": "add_friend",
+            "args": {"number": "13800000001", "greetings": "你好", "remark": "老朋友"},
+        })
+        self.assertFalse(self.store.claim_sent_echo(ACCOUNT, "老朋友", "你好"), "没发申请就没有这句气泡")
+
 
 class DeliveryReceiptTests(CommandTestCase):
     """真发出去一条微信 → 回执带**发送凭据**（面试天气提醒契约：`done` 不算发成，

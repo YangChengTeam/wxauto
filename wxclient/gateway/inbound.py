@@ -77,6 +77,9 @@ class InboundMessage:
     attachments: tuple[dict, ...] = ()
     """这条消息另存下来的附件（104）：``{"kind", "file_name", "path", "bytes"}``。
     路径是**本机**的临时目录，只在起轮时读一次字节送 AI 端；过保鲜期整目录清掉。"""
+    raw_text: str = ""
+    """这条在微信里**读到的原始文字**（图片气泡就是「图片」两个字，不是 ``text`` 里的占位句）。
+    只为下一次从微信读回同一条时认得出来（`GatewayStore.recent_raw_keys`），不喂给 AI 端。"""
 
     @property
     def key(self) -> PeerKey:
@@ -95,6 +98,7 @@ def message_to_row(message: InboundMessage) -> dict:
         "at_text": message.at_text,
         "message_type": message.message_type,
         "attachments": [dict(entry) for entry in message.attachments],
+        "raw_text": message.raw_text,
     }
 
 
@@ -118,6 +122,7 @@ def message_from_row(account_id: str, peer_id: str, row: dict) -> InboundMessage
         attachments=tuple(
             dict(entry) for entry in (row.get("attachments") or []) if isinstance(entry, dict)
         ),
+        raw_text=str(row.get("raw_text") or ""),
     )
 
 

@@ -1258,6 +1258,91 @@ class PacingTests(unittest.TestCase):
         self.assertGreater(len(set(values)), 150, "间隔还是整齐的，等于没抖")
 
 
+class LostCursorAnchorTests(StoreTestCase):
+    """★ 游标丢了不能把处理过的旧消息再跑一遍（2026-09-23 线上事故）。
+
+    聊天窗口被翻上去（专员在看历史 / 读完那下 {END} 没生效），网关读到的是一窗**旧消息**：
+    游标在里面找不到，老逻辑「只对齐游标」把游标拽回到旧消息上；下一趟窗口回到底部，
+    从旧游标往后的整段（含早已回过的问题、以及分身自己的回复）全被当成新消息派了一轮——
+    候选人同一个问题被回了两遍。修法：这台机器处理过哪几条**我们是知道的**（`gateway_messages`），
+    拿最近处理过的那条在窗口里的位置当第二道锚；整窗都是处理过的就一条不接、游标不动。
+    """
+
+    PEER = "候选人-李四"
+
+    def _source(self, runtime: FakeRuntime) -> QueueMessageSource:
+        return QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=[self.PEER]),
+            history_limit=4,
+        )
+
+    def _record(self, texts: list[str]) -> None:
+        rows = [{"msg_id": f"k{i}", "text": t, "raw_text": t, "at": T0.isoformat()} for i, t in enumerate(texts)]
+        self.store.record_messages("acct-1", self.PEER, rows)
+
+    def test_anchor_on_last_processed_message(self) -> None:
+        window = [{"text": "老1"}, {"text": "老2"}, {"text": "新1"}, {"text": "新2"}]
+        fresh, cursor = split_new_messages(window, "游标不在窗口里", known=["更老", "老1", "老2"])
+        self.assertEqual([m["text"] for m in fresh], ["新1", "新2"])
+        self.assertEqual(cursor, message_signature(window[-1]))
+
+    def test_whole_window_already_processed_keeps_cursor(self) -> None:
+        window = [{"text": "老1"}, {"text": "老2"}, {"text": "老3"}]
+        with capture_logs() as logs:
+            fresh, cursor = split_new_messages(window, "游标不在窗口里", known=["老1", "老2", "老3", "老4", "老5"])
+        self.assertEqual(fresh, [])
+        self.assertEqual(cursor, "游标不在窗口里", "游标绝不能被拽回旧消息上")
+        self.assertTrue(any("翻上去" in e["event"] for e in logs), logs)
+
+    def test_nothing_known_falls_back_to_realign(self) -> None:
+        window = [{"text": "a"}, {"text": "b"}]
+        fresh, cursor = split_new_messages(window, "游标不在窗口里", known=["x", "y"])
+        self.assertEqual(fresh, [])
+        self.assertEqual(cursor, message_signature(window[-1]))
+
+    def test_repeated_phrase_anchors_on_the_right_occurrence(self) -> None:
+        """对方后来又说了一句一模一样的「好的」：单看一行会对到新的那条上，把中间几条跳过。"""
+        window = [{"text": "在吗"}, {"text": "好的"}, {"text": "工种是什么"}, {"text": "好的"}]
+        fresh, _ = split_new_messages(window, "游标不在窗口里", known=["在吗", "好的"])
+        self.assertEqual([m["text"] for m in fresh], ["工种是什么", "好的"])
+
+    def test_emoji_code_does_not_break_the_anchor(self) -> None:
+        """我们发的「早上好[微笑]」，微信渲染成图后读回来没有那几个字，内容键要对得上。"""
+        window = [{"text": "早上好"}, {"text": "在的"}]
+        fresh, _ = split_new_messages(window, "游标不在窗口里", known=["在吗", "早上好[微笑]"])
+        self.assertEqual([m["text"] for m in fresh], ["在的"])
+
+    async def test_scrolled_up_window_does_not_replay_old_messages(self) -> None:
+        """端到端：三趟读取——正常 / 窗口翻上去 / 窗口回底——只有真正的新消息被接进来。"""
+        history = [{"text": f"第{i}句", "is_self": False} for i in range(1, 9)]   # 第1句…第8句
+        runtime = FakeRuntime(unread=[], history={self.PEER: history[-4:]})       # 窗口=最新 4 条
+        source = self._source(runtime)
+        first = await source.fetch("acct-1")          # 第一次读：接尾部那几条，建游标
+        self.assertTrue(first)
+        # 网关那边处理完会把这些记进聊天记录（InboundLoop._ingest 做的事，这里手动落）
+        self.store.record_messages("acct-1", self.PEER, [
+            {"msg_id": m.msg_id, "text": m.text, "raw_text": m.raw_text, "at": m.at.isoformat()} for m in first
+        ])
+
+        # 第二趟：聊天窗口被翻上去了，读到的是最老的 4 条（全是处理前的历史）
+        runtime.history[self.PEER] = history[:4]
+        with capture_logs() as logs:
+            self.assertEqual(await source.fetch("acct-1"), [], "一窗旧消息，一条都不该接")
+        self.assertTrue(any("找不到" in e["event"] for e in logs), logs)
+
+        # 第三趟：窗口回到底部，对方又说了一句
+        runtime.history[self.PEER] = history[-3:] + [{"text": "第9句", "is_self": False}]
+        got = await source.fetch("acct-1")
+        self.assertEqual([m.text for m in got], ["第9句"], "第5–8句已处理过，只能接第9句")
+
+    async def test_recent_raw_keys_are_oldest_first_and_use_raw_text(self) -> None:
+        self.store.record_messages("acct-1", self.PEER, [
+            {"msg_id": "m1", "text": "[图片：a.jpg（已附上）]", "raw_text": "图片", "at": "2026-09-23T01:00:00+00:00"},
+            {"msg_id": "m2", "text": "在吗", "at": "2026-09-23T01:01:00+00:00"},
+        ])
+        self.assertEqual(self.store.recent_raw_keys("acct-1", self.PEER, limit=5), ["图片", "在吗"])
+
+
 class OwnEchoTests(StoreTestCase):
     """★ 自己发出去的回复被读回来时，不能被当成对方的新消息（2026-09-09 真机：自问自答）。
 
@@ -1360,6 +1445,11 @@ class OwnEchoTests(StoreTestCase):
         self.assertTrue(self.store.claim_sent_echo("a", "p", "第一句"))
         self.assertTrue(self.store.claim_sent_echo("a", "p", "第二句"))
         self.assertFalse(self.store.claim_sent_echo("a", "p", "第一句"), "认一次销一条")
+
+    def test_emoji_codes_are_ignored_when_matching(self) -> None:
+        """107 的开场白带 `[微笑]`，微信渲染成图后 UIA 读回来没有这几个字，也要认得出。"""
+        self.store.remember_sent_text("a", "p", "早上好[微笑]，看到您在找普工")
+        self.assertTrue(self.store.claim_sent_echo("a", "p", "早上好，看到您在找普工"))
 
 
 class QuietHoursTests(StoreTestCase):

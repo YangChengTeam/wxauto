@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Iterable, Sequence
 from contextlib import closing
@@ -229,6 +230,7 @@ CREATE TABLE IF NOT EXISTS gateway_messages (
   from_self  INTEGER NOT NULL DEFAULT 0,
   from_gateway INTEGER NOT NULL DEFAULT 0,
   text       TEXT NOT NULL DEFAULT '',
+  raw_key    TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (account_id, peer_id, msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_peer_time
@@ -247,13 +249,25 @@ CREATE INDEX IF NOT EXISTS idx_sent_echo_peer
 _log = structlog.get_logger(__name__)
 
 
-def _echo_key(text: str) -> str:
-    """发送原文 → 读回来时可比对的键：去首尾空白、把所有空白折成一个空格。
+#: 微信内置表情的占位代码：`[微笑]` `[抱拳]` `[加油加油]`（AI 端 107 写进回复文字，微信渲染成黄脸）。
+#: 只认方括号里 1–8 个非空白、非括号字符，不会碰「[对方发来一张图片，没能保存下来]」这种占位句。
+_EMOJI_CODE_RE = re.compile(r"\[[^\[\]\s]{1,8}\]")
+
+
+def text_key(text: str) -> str:
+    """一段聊天文字 → 可比对的键：去掉内置表情代码、去首尾空白、把所有空白折成一个空格。
 
     微信把一段文字显示成气泡时会吞掉首尾换行、UIA 读到的 name 再被 `strip()`；
     多行文本的换行在不同版本里读回来可能是换行也可能是空格。按原文逐字比对就会漏认。
+    表情代码同理：我们发的是「早上好[微笑]」，微信把 `[微笑]` 画成图，UIA 读回来的文字里
+    未必还有这几个字——计划开场白正好都带一个（107），不抹掉就永远认不出是自己说的。
+    出站原文认亲（`remember_sent_text`）和聊天记录的内容键（`gateway_messages.raw_key`）
+    都用这一个函数——两边算法一分岔，读回来的行就对不上记录。
     """
-    return " ".join(str(text or "").split())
+    return " ".join(_EMOJI_CODE_RE.sub("", str(text or "")).split())
+
+
+_echo_key = text_key
 
 
 def _utcnow() -> datetime:
@@ -328,6 +342,9 @@ class GatewayStore:
             _ensure_column(conn, "gateway_friend_checks", "requested_at", "TEXT NOT NULL DEFAULT ''")
             # 2026-09-19：历史里分身自己的回声要标「分身」而不是「专员本人」（AI 端否则当成老师插话）。
             _ensure_column(conn, "gateway_messages", "from_gateway", "INTEGER NOT NULL DEFAULT 0")
+            # 2026-09-23：记下每条消息在微信里读到的**原始文字**的键，游标丢了时按它认「这段早就处理过」
+            # （见 `recent_text_keys`）。老行留空，查询时退回按 `text` 算。
+            _ensure_column(conn, "gateway_messages", "raw_key", "TEXT NOT NULL DEFAULT ''")
             # ★ 补列之后还要**回填**：老库里这两列是空的，而复查按 `session_name` 搜、
             #   按 `requested_at` 算期限——不回填，升级那一刻**所有在途的人当场消失**，
             #   一个都不会再被查（正是这次要治的病，不能靠升级又制造一遍）。
@@ -1628,6 +1645,9 @@ class GatewayStore:
 
         只记**这台机器亲眼读到的**：微信里更早的聊天记录我们没读过，也不去翻。
         重复推同一条不会记两遍（PK 就是 msg_id）。
+
+        ``raw_key`` 是这条在微信里**读到的原始文字**的键（图片气泡是「图片」两个字，不是我们
+        写进 ``text`` 的占位句）：下一次从微信读回同一条时按它认得出来（`recent_text_keys`）。
         """
         values = [
             (
@@ -1639,6 +1659,7 @@ class GatewayStore:
                 1 if row.get("from_self") else 0,
                 1 if row.get("from_gateway") else 0,
                 str(row.get("text") or ""),
+                text_key(row.get("raw_text") or row.get("text") or ""),
             )
             for row in rows
             if row.get("msg_id")
@@ -1649,8 +1670,8 @@ class GatewayStore:
             before = conn.total_changes
             conn.executemany(
                 """INSERT OR IGNORE INTO gateway_messages
-                       (account_id, peer_id, msg_id, at, at_text, from_self, from_gateway, text)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (account_id, peer_id, msg_id, at, at_text, from_self, from_gateway, text, raw_key)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 values,
             )
             conn.commit()
@@ -1690,6 +1711,27 @@ class GatewayStore:
             if row[0] not in skip
         ]
         return list(reversed(out[:limit]))
+
+    def recent_raw_keys(self, account_id: str, peer_id: str, *, limit: int = 2) -> list[str]:
+        """这个会话最近处理过的几条消息**在微信里长什么样**（内容键，老→新）。
+
+        给 `wechat_io.split_new_messages` 当第二道锚：游标是按「上一窗最后一条」的签名存的，
+        聊天窗口一旦被人翻上去，读到的那一窗里没有它，游标就对不回来。而**这台机器处理过哪几条
+        我们是确定知道的**——最后处理的那两条在刚读到的窗口里出现在哪儿，那儿之前的就都不是新的
+        （2026-09-23 线上事故：一窗旧消息把游标带回 09:03，下一趟把 09:03–09:09 整段当新消息
+        重跑了一遍，候选人的问题被回了两遍）。
+
+        老行（升级前记的）没有 ``raw_key``，退回按 ``text`` 算——文字消息两者本来就相同。
+        """
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT raw_key, text FROM gateway_messages
+                   WHERE account_id=? AND peer_id=?
+                   ORDER BY at DESC, rowid DESC LIMIT ?""",
+                (account_id, peer_id, max(1, limit)),
+            ).fetchall()
+        keys = [str(raw_key or "") or text_key(text) for raw_key, text in rows]
+        return [key for key in reversed(keys) if key]
 
     def purge_messages_before(self, cutoff: datetime) -> int:
         """清掉太老的聊天记录，返回清了几条。

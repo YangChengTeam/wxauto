@@ -27,7 +27,7 @@ from wxclient.queue import TaskStatus, TaskType
 
 from .attachments import SAVABLE_TYPES as SAVABLE_ATTACHMENT_TYPES
 from .inbound import InboundMessage
-from .sessions import HUMAN_TAKEOVER, GatewayStore
+from .sessions import HUMAN_TAKEOVER, GatewayStore, text_key
 from .watchlist import Watchlist
 
 _log = structlog.get_logger(__name__)
@@ -36,6 +36,10 @@ SELF_SENDER = "我"
 
 #: 一轮最多读几个会话。见 ``QueueMessageSource._due_peers``——每读一个就要开一次聊天窗口。
 MAX_PEERS_PER_POLL = 8
+
+#: 游标丢了时拿最近处理过的几条当锚，一次从记录里取多少条（见 ``split_new_messages`` 的 ``known``）。
+#: 要比一窗读取量（``history_limit``，默认 20）大：判「这一窗是不是全是旧的」靠的是窗口和记录重叠。
+KNOWN_KEYS_LIMIT = 60
 
 #: 连续几轮读不到才算「这个会话真有问题」（092）。
 #: 一轮读不到太常见了——微信卡一下、窗口没起来都会。拿一次失败就去加好友是误加。
@@ -173,13 +177,42 @@ def cursor_candidates(raw: dict[str, Any], dup_index: int = 0) -> set[str]:
     }
 
 
+def _anchor_index(keys: Sequence[str], anchors: Sequence[str]) -> int:
+    """最近处理过的那条（``anchors[-1]``）在这一窗里最后一次出现的位置；找不到 -1。
+
+    有两条锚时要求它前一行也对得上（``anchors[-2]``）：对方或我们后来又说了一句一模一样的话
+    （「好的」「收到」），单看一行会对到那条**新**的上，把中间真正没处理的几条跳过去。
+    锚正好是窗口第一行时验不了前一行，认它——窗口是往上翻出来的，前面本来就该是更老的。
+    """
+    if not anchors:
+        return -1
+    for index in range(len(keys) - 1, -1, -1):
+        if keys[index] != anchors[-1]:
+            continue
+        if len(anchors) >= 2:
+            # 前一行要跳过空文本行（没转写出来的语音、空气泡）——它们没被记录过，比不上。
+            previous = next((k for k in reversed(keys[:index]) if k), None)
+            if previous is not None and previous != anchors[-2]:
+                continue
+        return index
+    return -1
+
+
 def split_new_messages(
-    raw_messages: Sequence[dict[str, Any]], last_signature: str | None
+    raw_messages: Sequence[dict[str, Any]],
+    last_signature: str | None,
+    known: Sequence[str] = (),
 ) -> tuple[list[dict[str, Any]], str | None]:
     """按游标切出新消息，返回 (新消息, 新游标签名)。
 
     - 游标为空（第一次读这个会话）→ 只取**尾部今天的、对方发的**那几条，见 ``first_seen_fresh``。
-    - 游标找不到（历史滚出了读取窗口）→ 保守处理：不回溯，只对齐游标。
+    - 游标找不到 → 先拿 ``known``（这台机器**处理过**的最近几条消息在微信里的内容键，老→新，
+      见 `GatewayStore.recent_raw_keys`）当第二道锚：
+        · 最近处理的那条在窗口里 → 它之后的才是新的；
+        · 它不在，但窗口最后一行是处理过的 → 这一窗是**往上翻出来的旧消息**，一条不接、
+          **游标也不动**（动了就是把游标拽回旧位置，下一趟把整段旧对话当新消息重跑一遍——
+          2026-09-23 线上：候选人 09:05–09:09 的问题在 09:23 被原样重播、又回了一遍）；
+        · 都对不上（历史真的滚出了读取窗口）→ 老规矩：不回溯，只对齐游标。
     """
     if not raw_messages:
         return [], last_signature
@@ -201,6 +234,25 @@ def split_new_messages(
             if last_signature in cursor_candidates(raw_messages[index], dups[index]):
                 cursor_index = index
                 break
+
+    if cursor_index < 0 and known:
+        # 两边都过一遍 `text_key`：记录里存的已经是键，但调用方也可能直接给原文（测试、老行）。
+        keys = [text_key(raw.get("text")) for raw in raw_messages]
+        known = [text_key(k) for k in known if text_key(k)]
+        anchor = _anchor_index(keys, known[-2:])
+        if anchor >= 0:
+            _log.info(
+                "游标在刚读到的记录里找不到，按最近处理过的那条对上了位置，接着往后接",
+                已读到=len(raw_messages),
+                新消息=len(raw_messages) - anchor - 1,
+            )
+            return list(raw_messages[anchor + 1:]), latest_signature
+        if keys and keys[-1] in set(known):
+            _log.warning(
+                "读到的这一窗全是处理过的旧消息（聊天窗口可能被翻上去了），一条不接、游标不动",
+                已读到=len(raw_messages),
+            )
+            return [], last_signature
 
     if cursor_index < 0:
         # 这条**不是**日常噪音：正常情况下游标就在刚读到的这批里。连着出现 =
@@ -314,6 +366,7 @@ def to_inbound(
         at_text=str(raw.get("timestamp_text") or "").strip(),
         message_type=str(raw.get("message_type") or "text"),
         attachments=(attachment,) if attachment else (),
+        raw_text=str(raw.get("text") or ""),
     )
 
 
@@ -500,7 +553,12 @@ class QueueMessageSource:
         #   之后的那几条——游标之前的早已处理，再拿它们销账会把后面真正的回声漏掉。
         if last_signature is None:
             raw_messages = self._claim_own_echoes(account_id, peer_id, raw_messages)
-        fresh, new_signature = split_new_messages(raw_messages, last_signature)
+        # 游标找不到时的第二道锚：这台机器处理过的最近几条在微信里长什么样（见 split_new_messages）。
+        known = (
+            self._store.recent_raw_keys(account_id, peer_id, limit=KNOWN_KEYS_LIMIT)
+            if last_signature is not None else ()
+        )
+        fresh, new_signature = split_new_messages(raw_messages, last_signature, known)
         if last_signature is not None:
             fresh = self._claim_own_echoes(account_id, peer_id, fresh)
         if last_signature is None and raw_messages:
@@ -514,7 +572,7 @@ class QueueMessageSource:
                 已读到=len(raw_messages),
                 要处理=len(fresh),
             )
-        if new_signature is not None:
+        if new_signature is not None and (new_signature != last_signature or fresh):
             self._store.set_cursor(account_id, peer_id, new_signature, seq + len(fresh))
 
         # ★ 读完必须说清楚「读到几条、其中几条算新的、新的都是谁说的什么」（用户 2026-08-14：

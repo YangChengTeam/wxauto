@@ -603,6 +603,14 @@ class CommandExecutor:
                 # 计划发出去的那句话同样会被下一轮轮询读回来，同样要认得出是自己说的
                 # （见 `GatewayStore.remember_sent_text`）。
                 self._store.remember_sent_text(self._account, peer, str(payload["text"]), at=now)
+            if op == "add_friend" and not result.get("already_friend"):
+                # 加好友的验证语在对方通过后会以**我们的气泡**出现在会话里；会话名是我们定的备注
+                # （`session_name`）。记下来，第一次读这个会话时才认得出「尾部那句是自己说的」，
+                # 不会对着自己的打招呼再回一句。
+                greeting = str(payload.get("greetings") or "").strip()
+                session_name = str(result.get("session_name") or payload.get("remark") or "").strip()
+                if greeting and session_name:
+                    self._store.remember_sent_text(self._account, session_name, greeting, at=now)
             _log.info("指令执行完成", op=op, dry_run=(spec.writes and not self._allow_real))
             self._note_message_sent(command_id, op, peer, args, raw)
             state = self._friend_state(op, result, raw)

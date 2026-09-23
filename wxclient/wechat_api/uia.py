@@ -2855,6 +2855,16 @@ class UiaWeChatDriver:
         chat_list = self._resolve_chat_list(window)
         if chat_list is None:
             raise WeChatApiError("未找到聊天消息列表")
+        # ★ 先回到底部再读（2026-09-23 线上）：这里往上翻了几页之后靠末尾那个 {END} 回底，
+        #   它一旦没生效（或专员自己翻着历史看），下一趟读到的就是一窗**旧消息**——最新的
+        #   几条根本不在里面，网关那头游标对不上，整段旧对话被当成新消息重跑一遍。
+        #   读取窗口的语义是「最新的 N 条」，那就每次都从底部开始。
+        try:
+            chat_list.click_input()
+            chat_list.type_keys("{END}")
+            time.sleep(0.15)
+        except Exception:  # noqa: BLE001, S110 —— 回不了底就按现状读，后面的翻页照旧
+            pass
         messages: list[dict[str, Any]] = []
         seen: set[tuple[Any, ...]] = set()
         max_pages = min(max((safe_limit + 7) // 8, 2), 30)
