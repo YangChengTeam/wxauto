@@ -129,6 +129,26 @@ class TaskFailureTests(CommandTestCase):
         })
         self.assertIn("profile pane", result.reason)
 
+    async def test_查无此人带稳定码报上去(self) -> None:
+        """队列判成「微信里搜不到这个人」→ 回执原因以 CONTACT_NOT_FOUND 打头，业务端靠码归类（2026-09-24）。"""
+        class _Rt(FakeRuntime):
+            async def submit(self, task_type, payload=None, *, confirmation="", **_kw):
+                await super().submit(task_type, payload, confirmation=confirmation)
+                return {
+                    "status": "failed",
+                    "last_error": "微信里搜不到「张三」这个会话（备注名对不上，或还不是好友），消息没有发出去",
+                    "result": {"outcome": "not_sent", "reason_code": "CONTACT_NOT_FOUND", "retry_suppressed": True},
+                }
+
+        result = await self._executor(_Rt()).execute({
+            "command_id": "c1", "op": "send_message", "args": {"to": "张三", "text": "在吗"},
+        })
+        self.assertEqual(result.status, "failed")
+        self.assertTrue(result.reason.startswith("CONTACT_NOT_FOUND："), result.reason)
+        self.assertIn("没有发出去", result.reason)
+        self.assertNotIn("结果未知", result.reason)
+        self.assertEqual(result.result, {"reason_code": "CONTACT_NOT_FOUND", "outcome": "not_sent"})
+
     async def test_没做成就把额度还回去(self) -> None:
         """额度是动微信**之前**占的。一件没做成还扣着，等于一次失败白烧一个名额。"""
         ex = self._executor(FakeRuntime(status="failed"), max_sends_per_hour=1)

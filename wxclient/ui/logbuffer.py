@@ -14,6 +14,8 @@ import threading
 from collections import deque
 from collections.abc import Callable, Iterable
 
+from wxclient.logging_config import make_formatter
+
 DEFAULT_CAPACITY = 2000
 
 Listener = Callable[[str], None]
@@ -41,7 +43,7 @@ class LogBuffer:
             # 一个瞎了的监听者（比如窗口已经销毁）不该让日志链路跟着崩
             try:
                 listener(line)
-            except Exception:  # noqa: BLE001 - 日志路径上绝不抛异常
+            except Exception:  # noqa: BLE001, S110 - 日志路径上绝不抛异常
                 pass
 
     def snapshot(self) -> list[str]:
@@ -118,16 +120,13 @@ class LogPipeline:
 
 
 def attach_to_root(buffer: LogBuffer, level: int = logging.INFO) -> LogBufferHandler:
-    """把缓冲挂到 root logger 上，沿用已有 handler 的 formatter。
+    """把缓冲挂到 root logger 上，用不带执行栈的中文 formatter。
 
     必须在 ``configure_logging()`` **之后**调用——它会清空 root 上的 handler。
     """
     root = logging.getLogger()
     handler = LogBufferHandler(buffer, level)
-    for existing in root.handlers:
-        formatter = existing.formatter
-        if formatter is not None:
-            handler.setFormatter(formatter)
-            break
+    # 界面上不贴 Python 执行栈（只留异常最后一行），完整执行栈仍在日志文件里。
+    handler.setFormatter(make_formatter(show_traceback=False))
     root.addHandler(handler)
     return handler

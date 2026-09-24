@@ -107,6 +107,27 @@ class DailyFileHandler(logging.Handler):
         super().close()
 
 
+def _pre_chain() -> list[Any]:
+    return [
+        structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
+        structlog.processors.add_log_level,
+        # 写日志的是哪个模块。**角色列全靠它**：没显式标 `对端=` 的行，靠模块名认对端
+        # （见 `logrole`）。这个 processor 同时认 structlog 原生记录和 stdlib 转进来的
+        # 外来记录（后者读 record.name），所以两条路上的行都能定到角色。
+        structlog.stdlib.add_logger_name,
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+    ]
+
+
+def make_formatter(show_traceback: bool = True) -> logging.Formatter:
+    """中文日志的 formatter。``show_traceback=False`` 给界面上的实时日志用：不贴 Python 执行栈。"""
+    return structlog.stdlib.ProcessorFormatter(
+        processor=ChineseLogRenderer(show_traceback=show_traceback),
+        foreign_pre_chain=_pre_chain(),
+    )
+
+
 def configure_logging(level: str = "INFO", log_dir: Path | None = None) -> None:
     """网关与微信任务执行器的中文精简日志。
 
@@ -120,26 +141,13 @@ def configure_logging(level: str = "INFO", log_dir: Path | None = None) -> None:
         handler.close()
     root.setLevel(level_value)
 
-    processors = [
-        structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S", utc=False),
-        structlog.processors.add_log_level,
-        # 写日志的是哪个模块。**角色列全靠它**：没显式标 `对端=` 的行，靠模块名认对端
-        # （见 `logrole`）。这个 processor 同时认 structlog 原生记录和 stdlib 转进来的
-        # 外来记录（后者读 record.name），所以两条路上的行都能定到角色。
-        structlog.stdlib.add_logger_name,
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-    ]
     structlog.configure(
-        processors=processors + [structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
+        processors=_pre_chain() + [structlog.stdlib.ProcessorFormatter.wrap_for_formatter],
         wrapper_class=structlog.stdlib.BoundLogger,
         logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )
-    formatter = structlog.stdlib.ProcessorFormatter(
-        processor=ChineseLogRenderer(),
-        foreign_pre_chain=processors,
-    )
+    formatter = make_formatter(show_traceback=True)
 
     console = logging.StreamHandler()
     console.setLevel(level_value)
@@ -154,6 +162,12 @@ def configure_logging(level: str = "INFO", log_dir: Path | None = None) -> None:
 
 
 class ChineseLogRenderer:
+    def __init__(self, show_traceback: bool = True) -> None:
+        # 界面上的实时日志是给专员看的，一整屏 Python 执行栈只会吓人（用户 2026-09-24：
+        # 「python 执行栈不要显示出来」）。那里只留异常的最后一行（类型 + 说明）；
+        # 完整执行栈照样写进日志文件，排障时从「打开目录」里取。
+        self.show_traceback = show_traceback
+
     def __call__(
         self,
         logger: logging.Logger,
@@ -174,11 +188,21 @@ class ChineseLogRenderer:
         stack = payload.pop("stack", None)
         message = _render_event(event, payload)
         prefix = f"{timestamp} [{_LEVEL_LABELS.get(level, level)}] [{role}]".strip()
+        if exception and not self.show_traceback:
+            exception = _exception_summary(str(exception))
+            if exception and exception in message:
+                exception = ""
         if exception:
             message = f"{message}\n{exception}"
-        if stack:
+        if stack and self.show_traceback:
             message = f"{message}\n{stack}"
         return f"{prefix} {message}"
+
+
+def _exception_summary(text: str) -> str:
+    """执行栈 → 只剩最后一行非空的（``NoSuchFriendError: 好友或群聊备注有误！查无此人！``）。"""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return lines[-1] if lines else ""
 
 
 #: 附件类型码（客户端 `SAVABLE_TYPES` 的口径）→ 日志页上的叫法。

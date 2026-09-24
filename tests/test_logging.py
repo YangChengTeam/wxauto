@@ -483,3 +483,25 @@ class BoundRoleLoggerTests(unittest.TestCase):
         for bound, expected in cases:
             with self.subTest(expected=expected):
                 self.assertEqual(bound._context.get(logrole.ROLE_KEY), expected)
+
+
+class UiTracebackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.logger = logging.getLogger("test")
+
+    def test_ui_renderer_hides_the_python_traceback(self) -> None:
+        """界面上的实时日志不贴执行栈，只留最后一行；日志文件那份照样完整（2026-09-24）。"""
+        traceback = (
+            "Traceback (most recent call last):\n"
+            '  File "wxclient/queue/worker.py", line 121, in run_once\n'
+            "    outcome = self.dispatch(task)\n"
+            "RuntimeError: 窗口不见了"
+        )
+        event = {"timestamp": "2026-09-24 15:42:44", "level": "error", "event": "看不懂的事", "exception": traceback}
+        ui = ChineseLogRenderer(show_traceback=False)(self.logger, "error", dict(event))
+        self.assertNotIn("Traceback", ui)
+        self.assertNotIn("worker.py", ui)
+        self.assertIn("RuntimeError: 窗口不见了", ui)
+        full = ChineseLogRenderer()(self.logger, "error", dict(event))
+        self.assertIn("Traceback", full)
+        self.assertIn("worker.py", full)

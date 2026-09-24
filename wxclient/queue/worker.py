@@ -8,6 +8,7 @@ from uuid import uuid4
 import structlog
 
 from wxclient.wechat_api import WeChatApi, WeChatApiError, WeChatApiUnavailableError
+from wxclient.wechat_api.errors import CONTACT_NOT_FOUND_CODE, is_contact_not_found
 
 from .models import Task, TaskType, is_real_write
 from .store import TaskStore
@@ -144,12 +145,16 @@ class OperationWorker:
         if isinstance(outcome, WeChatApiUnavailableError):
             self.store.block(task.id, str(outcome), owner_id=self.worker_id)
             task_logger.warning("task.blocked", error=str(outcome))
-        elif isinstance(outcome, WeChatApiError):
-            self._record_execution_failure(task, outcome)
-            task_logger.warning("task.failed", error=str(outcome))
+        elif isinstance(outcome, WeChatApiError) or (
+            isinstance(outcome, Exception) and is_contact_not_found(outcome)
+        ):
+            # 「查无此人」是预料之中的业务失败（名字对不上），不是程序出错：不带执行栈。
+            error = self._record_execution_failure(task, outcome)
+            task_logger.warning("task.failed", error=error)
         elif isinstance(outcome, Exception):
-            self._record_execution_failure(task, outcome)
-            task_logger.error("task.failed", error=str(outcome), exc_info=outcome)
+            error = self._record_execution_failure(task, outcome)
+            # 执行栈只进日志文件，界面上的实时日志不显示（见 logging_config 的 show_traceback）。
+            task_logger.error("task.failed", error=error, exc_info=outcome)
         elif isinstance(outcome, TaskContinuation):
             self.store.yield_task(
                 task.id,
@@ -162,7 +167,30 @@ class OperationWorker:
             self.store.complete(task.id, outcome, owner_id=self.worker_id)
             task_logger.info("task.succeeded", action=outcome.get("action"))
 
-    def _record_execution_failure(self, task: Task, exc: Exception) -> None:
+    def _record_execution_failure(self, task: Task, exc: Exception) -> str:
+        """把失败落成终态，返回记下的原因（日志里照这句说）。"""
+        if is_real_write(task) and is_contact_not_found(exc):
+            # ★ 搜联系人那一步就没找到：聊天窗口没打开、一个字都没发，结论是**确定没发出去**，
+            #   不能跟下面那种「真动过微信、不知道成没成」混成一句（2026-09-24 生产：业务端收到
+            #   「执行结果未知」，只能当作不确定，一遍遍重投同一个对不上的名字）。
+            #   也不自动重试：名字对不上，重试多少遍都一样，要人去核对备注名。
+            friend = str(task.payload.get("friend") or "").strip()
+            error = (
+                f"微信里搜不到「{friend or '-'}」这个会话（备注名对不上，或还不是好友），"
+                "消息没有发出去"
+            )
+            self.store.fail(
+                task.id,
+                error,
+                retry=False,
+                owner_id=self.worker_id,
+                result={
+                    "outcome": "not_sent",
+                    "reason_code": CONTACT_NOT_FOUND_CODE,
+                    "retry_suppressed": True,
+                },
+            )
+            return error
         if is_real_write(task):
             self.store.fail(
                 task.id,
@@ -175,7 +203,7 @@ class OperationWorker:
                     "error": str(exc),
                 },
             )
-            return
+            return f"真实写操作执行结果未知，已禁止自动重试：{exc}"
         self.store.fail(
             task.id,
             str(exc),
@@ -183,6 +211,7 @@ class OperationWorker:
             owner_id=self.worker_id,
             retry_delay_seconds=self._retry_delay(task.attempts),
         )
+        return str(exc)
 
     def _retry_delay(self, attempts: int) -> float:
         exponent = max(0, attempts - 1)

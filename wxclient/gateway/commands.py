@@ -592,6 +592,14 @@ class CommandExecutor:
                     reservation.release()   # 有明确终态且不是成功 —— 一件没做成，全额还回去
                     message = why or f"微信任务{status or 'unknown'}"
                 _log.warning("微信任务没有成功", op=op, status=status or "unknown", error=why)
+                # 队列给了稳定码（如 CONTACT_NOT_FOUND = 微信里搜不到这个人、确定没发）→ 码放在原因最前面
+                # 一起报上去：AI 端把原因原样转给业务端，业务端靠这个码归类，不去猜中文句子。
+                code = str(result.get("reason_code") or "").strip() if isinstance(result, dict) else ""
+                if code:
+                    return CommandResult(
+                        command_id, "failed", f"{code}：{message}",
+                        result={"reason_code": code, "outcome": str(result.get("outcome") or "")},
+                    )
                 return CommandResult(command_id, "failed", message)
 
             if spec.writes:

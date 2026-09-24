@@ -531,6 +531,45 @@ class WorkerDispatchTests(unittest.TestCase):
         self.assertEqual(current.result["outcome"], "unknown")  # type: ignore[union-attr,index]
         self.assertTrue(current.result["retry_suppressed"])  # type: ignore[union-attr,index]
 
+    def test_contact_not_found_is_a_definite_not_sent_failure(self) -> None:
+        """「查无此人」是搜联系人那一步就失败：确定没发出去，不是「结果未知」，也不自动重试（2026-09-24）。"""
+
+        class NoSuchFriendError(Exception):  # 同名即认：vendor 那个类不在这里 import
+            pass
+
+        class _NoSuchFriendApi(_FakeApi):
+            def send_message(self, friend: str, text: str, dry_run: bool | None) -> dict[str, Any]:
+                raise NoSuchFriendError("好友或群聊备注有误！查无此人！")
+
+            def send_files(self, friend: str, files: list[str], text: str = "", dry_run: bool | None = None) -> dict[str, Any]:
+                try:
+                    raise NoSuchFriendError("好友或群聊备注有误！查无此人！")
+                except NoSuchFriendError as exc:
+                    raise WeChatApiError(f"发送文件失败：{exc}") from exc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "tasks.db")
+            worker = OperationWorker(store, _NoSuchFriendApi())  # type: ignore[arg-type]
+            message = store.create_task(
+                TaskType.SEND_MESSAGE, {"friend": "张三", "text": "你好", "dry_run": False}, "default",
+            )
+            self.assertTrue(worker.run_once())
+            files = store.create_task(
+                TaskType.SEND_FILES,
+                {"friend": "李四", "files": [str(Path(tmp) / "a.png")], "dry_run": False},
+                "default",
+            )
+            self.assertTrue(worker.run_once())
+            sent, filed = store.get(message.id), store.get(files.id)
+
+        for task, name in ((sent, "张三"), (filed, "李四")):
+            self.assertEqual(task.status, TaskStatus.FAILED)  # type: ignore[union-attr]
+            self.assertEqual(task.attempts, 1)  # type: ignore[union-attr]
+            self.assertEqual(task.result["outcome"], "not_sent")  # type: ignore[union-attr,index]
+            self.assertEqual(task.result["reason_code"], "CONTACT_NOT_FOUND")  # type: ignore[union-attr,index]
+            self.assertIn(f"「{name}」", task.last_error)  # type: ignore[union-attr,operator]
+            self.assertNotIn("结果未知", task.last_error)  # type: ignore[union-attr,operator]
+
     def test_search_contacts_is_dispatched_through_worker(self) -> None:
         api = _FakeApi()
         with tempfile.TemporaryDirectory() as tmp:
