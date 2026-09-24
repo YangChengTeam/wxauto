@@ -611,9 +611,13 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         )
     if event == "chat.attachment.save.start":
         return f"开始另存对方发来的附件：「{payload.get('friend') or '-'}」，气泡：{payload.get('text') or '-'}"
+    if event == "chat.attachment.bubble.screenshot_failed":
+        return f"截消息行失败，改点行中心：{payload.get('error') or '-'}"
+    if event == "chat.attachment.bubble.not_found":
+        return "截图里没认出气泡，改点行中心"
     if event == "chat.attachment.save.done":
         return (
-            f"附件已另存：「{payload.get('friend') or '-'}」，"
+            f"附件已另存到本机：「{payload.get('friend') or '-'}」，"
             f"{payload.get('name') or '-'}（{payload.get('bytes', 0)} 字节）"
         )
     if event == "chat.voice.row":

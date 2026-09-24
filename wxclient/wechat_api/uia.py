@@ -154,6 +154,107 @@ def find_gray_tile(
     return xs[len(xs) // 2], ys[len(ys) // 2]
 
 
+def find_bubble_span(
+    pixels: Any, width: int, height: int, *, tolerance: int = 6, min_width: int = 30,
+) -> tuple[int, int] | None:
+    """在一条消息行的截图里找气泡本体，返回它的中心（相对行左上角）；认不出回 None。
+
+    ★ 为什么截图找（2026-09-24 真机 4.1.13.12）：消息行的 ``ListItem`` 横跨整个聊天区，
+      UIA 下面**没有子控件**，气泡在哪一侧、多宽都拿不到；点行中心落在空白上，右键菜单不弹。
+      行中心那一点就是背景色（对方发的在左、自己发的在右，中间总是空的），拿它当背景，
+      在几条横线上找「跟背景不一样」的连续段，**最长那段**就是气泡——头像只有 40px 上下。
+    ★ 容差要小：文件气泡是纯白 (255,255,255)，聊天背景是 (250,250,250)，三通道差加起来才 15。
+    """
+    background = pixels[width // 2, height // 2][:3]
+    best: tuple[int, int, int] | None = None
+    for fraction in (0.5, 0.35, 0.65):
+        y = min(height - 1, int(height * fraction))
+        start: int | None = None
+        for x in range(width + 1):
+            differs = x < width and sum(
+                abs(a - b) for a, b in zip(pixels[x, y][:3], background)
+            ) > tolerance
+            if differs and start is None:
+                start = x
+            elif not differs and start is not None:
+                if best is None or x - start > best[1] - best[0]:
+                    best = (start, x, y)
+                start = None
+    if best is None or best[1] - best[0] < min_width:
+        return None
+    return (best[0] + best[1]) // 2, best[2]
+
+
+def find_save_dialog(windows: Any) -> Any | None:
+    """从一组窗口里挑出「另存为」对话框：Win32 ``#32770`` 且标题像保存（跟系统语言走）。"""
+    for candidate in windows:
+        with suppress(Exception):
+            if candidate.element_info.class_name != "#32770":
+                continue
+            title = str(candidate.element_info.name or "")
+            if any(mark in title for mark in _SAVE_DIALOG_TITLE_MARKS):
+                return candidate
+    return None
+
+
+_SAVE_DIALOG_TITLE_MARKS = ("另存为", "另存為", "Save As", "Save as", "保存")
+
+
+def dialog_control(dialog: Any, control_type: str, automation_id: str) -> Any | None:
+    """在保存对话框里按 (控件类型, AutomationId) 找控件：文件名框 1001、「保存」1、「取消」2（Win32 通用对话框的固定 ID）。
+
+    ★ 对话框是从 ``window.children()`` 拿到的 **wrapper**，没有 ``child_window``（那是
+      ``WindowSpecification`` 才有的）——2026-09-24 真机第一次端到端就栽在这：调用抛 AttributeError
+      被吞，报「找不到文件名输入框」。所以遍历 ``descendants()`` 按 element_info 比。
+    """
+    for control in dialog.descendants():
+        with suppress(Exception):
+            info = control.element_info
+            if info.control_type == control_type and str(info.automation_id or "") == automation_id:
+                return control
+    return None
+
+
+def save_path_for(target: Path, default_name: str) -> Path:
+    """保存对话框该填的完整路径：我们的目录 + 微信给的默认名（只取文件名那段，防默认名里带路径）。"""
+    name = Path(str(default_name or "").replace("\\", "/")).name.strip()
+    if not name:
+        raise WeChatApiError("保存对话框里没有默认文件名")
+    return target / name
+
+
+def _edit_value(edit: Any) -> str:
+    try:
+        return str(edit.get_value() or "")
+    except Exception:  # noqa: BLE001 —— 不支持 ValuePattern 的退回窗口文字
+        return str(_safe_call(edit.window_text) or "")
+
+
+def _cancel_save_dialog(dialog: Any) -> None:
+    """点对话框的「取消」关掉它。只点对话框自己的按钮，绝不按 ESC（焦点一偏就关掉微信主窗口）。"""
+    with suppress(Exception):
+        button = dialog_control(dialog, "Button", "2")
+        if button is not None:
+            button.invoke()
+
+
+def _await_saved_file(target: Path, before: set[str], timeout: float) -> Path:
+    """等目录里多出一个文件且大小不再变化（微信是流式写盘的）。扩展名由微信补，所以不按文件名等。"""
+    deadline = time.monotonic() + timeout
+    last_size: dict[str, int] = {}
+    while time.monotonic() < deadline:
+        fresh = [entry for entry in target.iterdir() if entry.name not in before and entry.is_file()]
+        fresh = [entry for entry in fresh if not entry.name.lower().endswith((".tmp", ".crdownload", ".part"))]
+        if fresh:
+            entry = max(fresh, key=lambda e: e.stat().st_mtime)
+            size = entry.stat().st_size
+            if size > 0 and last_size.get(entry.name) == size:
+                return entry
+            last_size[entry.name] = size
+        time.sleep(0.5)
+    raise WeChatApiError("另存为没有落下文件（等超时了）")
+
+
 class UiaWeChatDriver:
     driver_name = "uia"
 
@@ -2737,23 +2838,27 @@ class UiaWeChatDriver:
     ) -> dict[str, Any]:
         """把当前会话里的一条图片/文件气泡另存到 ``target_dir``（104）。
 
-        走的是**右键 → 「另存为…」 → 系统保存对话框**这条最短的路：两次点击、一次回车。
-        vendor 的批量保存（聊天记录窗口多选 + 「保存」按钮）要多开一个窗口、多一轮翻页，
-        而我们一轮只取一两个附件，短路更省、也更不像机器。
+        走**右键 → 「另存为...」 → 系统保存对话框**，但**存到哪由我们定**（用户 2026-09-24：
+        「需要我们保存，但是保存到我们的地址，我们控制选择什么」）：文件名框里读出微信给的默认名，
+        换成 ``target_dir / 默认名`` 的**完整路径**写回去、读回核对，再点「保存(S)」。扩展名由微信按
+        「保存类型」补（默认名不带扩展名，真机见过 ``微信图片_20260924171455_3963_4`` → ``.jpg``），
+        所以落没落下按「目录里多出一个文件」判，不按文件名判。
 
-        保存对话框里**不改文件名**：先把目标目录贴进文件名框回车（对话框跳到该目录），
-        再回车一次按微信给的默认名保存——扩展名由微信定，我们不猜。
+        ★ 2026-09-24 真机 4.1.13.12 查出的两个老毛病：
+          · 右键原来点在消息行中心——行横跨整个聊天区、UIA 下没有子控件，中心是空白，菜单根本不弹，
+            线上一直报「右键菜单里没有『另存为』」。现在截行图按颜色找气泡本体（`find_bubble_span`）。
+          · 保存对话框（``#32770``「另存为...」）在 UIA 里挂在**微信主窗口下面**，不是桌面顶层窗口；
+            原来只在桌面顶层里等，永远等不到。现在先看主窗口的子节点，再看桌面顶层（老版本）。
 
-        ⚠️ 未在真机验证前，这里每一步的控件判据都可能跟微信版本走
-        （memory `wechat-uia-window-state`）；失败一律抛 `WeChatApiError` 让网关如实放弃，
-        不重试、不猜路径。
+        失败一律抛 `WeChatApiError` 让网关如实放弃，不重试、不猜路径；对话框点「取消」关掉，
+        绝不对微信主窗口按 ESC。
         """
         normalized_friend = str(friend or "").strip()
         if not normalized_friend:
             raise ValueError("会话名称不能为空")
-        target = Path(str(target_dir or "")).expanduser()
         if not str(target_dir or "").strip():
             raise ValueError("保存目录不能为空")
+        target = Path(str(target_dir)).expanduser()
         target.mkdir(parents=True, exist_ok=True)
         self._ensure_ready()
         logger.info("chat.attachment.save.start", friend=normalized_friend, text=str(text or "")[:40])
@@ -2768,33 +2873,33 @@ class UiaWeChatDriver:
         if item is None:
             raise WeChatApiError("这条消息不在当前窗口的可见区里，没法另存")
 
+        with suppress(Exception):
+            window.set_focus()
+            time.sleep(0.3)
         before = {entry.name for entry in target.iterdir()}
         mouse = __import__("pywinauto", fromlist=["mouse"]).mouse
-        rect = item.rectangle()
-        click_at = (int(rect.mid_point().x), int(rect.mid_point().y))
+        click_at = self._bubble_click_point(item)
         mouse.right_click(coords=click_at)
         time.sleep(random.uniform(0.4, 0.9))
 
         Uielements = self._pyweixin_submodule("Uielements")
         save_item = window.child_window(**Uielements.MenuItems.SaveMenuItem)
         if not save_item.exists(timeout=2.0):
-            # 菜单没有「另存为」= 这不是可保存的气泡（表情、已过期的图、系统消息）。
+            # 菜单没弹 / 没有「另存为」= 这不是可保存的气泡（表情、已过期的图、系统消息）。
             # 把菜单点掉（vendor 同款：在原位再点一下），绝不按 ESC——那会关掉微信窗口。
             with suppress(Exception):
                 mouse.click(coords=click_at)
             raise WeChatApiError("右键菜单里没有「另存为」，这条内容不可保存（可能已过期或不是图片/文件）")
         save_item.click_input()
 
-        dialog = self._await_native_save_dialog(timeout=8.0)
+        dialog = self._await_save_dialog(window, timeout=8.0)
         if dialog is None:
-            raise WeChatApiError("点了「另存为」但系统保存对话框没出现")
+            raise WeChatApiError("点了「另存为」但保存对话框没出现")
         try:
-            self._drive_native_save_dialog(dialog, target)
-            saved = self._await_saved_file(target, before, timeout=timeout_seconds)
+            self._fill_save_dialog(dialog, target)
+            saved = _await_saved_file(target, before, timeout=timeout_seconds)
         except Exception:
-            with suppress(Exception):
-                if dialog.exists(timeout=0.2):
-                    dialog.type_keys("{ESC}")   # 只关系统对话框；微信主窗口不在这个键的作用域里
+            _cancel_save_dialog(dialog)
             raise
         size = saved.stat().st_size
         logger.info("chat.attachment.save.done", friend=normalized_friend, name=saved.name, bytes=size)
@@ -2806,64 +2911,61 @@ class UiaWeChatDriver:
             "bytes": size,
         }
 
-    def _await_native_save_dialog(self, timeout: float) -> Any | None:
-        """等 Windows 的「另存为」对话框（Win32 `#32770`）弹出来。"""
+    @staticmethod
+    def _await_save_dialog(window: Any, timeout: float) -> Any | None:
+        """等「另存为」对话框（Win32 ``#32770``）。4.1.13 挂在微信主窗口下面，老版本在桌面顶层。"""
         Desktop = __import__("pywinauto", fromlist=["Desktop"]).Desktop
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            try:
-                desktop = Desktop(backend="uia")
-                for candidate in desktop.windows():
-                    if _safe_call(candidate.class_name) != "#32770":
-                        continue
-                    title = str(_safe_call(candidate.window_text) or "")
-                    if any(mark in title for mark in ("另存为", "另存為", "Save As", "保存")):
-                        return candidate
-            except Exception:  # noqa: BLE001, S110 —— 枚举桌面窗口时任何一扇窗都可能正在消失，跳过继续等
-                pass
+            with suppress(Exception):  # 窗口正在出现/消失时枚举会抛，下一拍再看
+                found = find_save_dialog(window.children())
+                if found is None:
+                    found = find_save_dialog(Desktop(backend="uia").windows())
+                if found is not None:
+                    return found
             time.sleep(0.25)
         return None
 
-    def _drive_native_save_dialog(self, dialog: Any, target: Path) -> None:
-        """文件名框里贴目标目录 → 回车（跳目录）→ 再回车（按默认名保存）。"""
-        edit = None
-        for kwargs in ({"class_name": "Edit", "found_index": 0}, {"control_type": "Edit", "found_index": 0}):
-            try:
-                candidate = dialog.child_window(**kwargs)
-                if candidate.exists(timeout=1.5):
-                    edit = candidate
-                    break
-            except Exception:  # noqa: BLE001, S112 —— 两种判据挨个试，这个不成就下一个
-                continue
+    @staticmethod
+    def _fill_save_dialog(dialog: Any, target: Path) -> None:
+        """文件名框：默认名 → ``target / 默认名`` 完整路径，读回核对，再点「保存(S)」。"""
+        edit = dialog_control(dialog, "Edit", "1001")
         if edit is None:
             raise WeChatApiError("保存对话框里找不到文件名输入框")
-        edit.set_focus()
-        # 贴路径而不是逐字敲：路径里可能有中文，键盘事件对输入法不可控；剪贴板是 vendor 一直在用的路。
-        SystemSettings = self._pyweixin_class("SystemSettings")
-        SystemSettings.copy_text_to_clipboard(str(target))
-        edit.type_keys("^a^v", set_foreground=True)
-        time.sleep(0.2)
-        edit.type_keys("{ENTER}", set_foreground=True)
-        time.sleep(random.uniform(0.6, 1.1))
-        # 第二次回车：文件名框此时是微信给的默认名，直接保存。
-        edit.type_keys("{ENTER}", set_foreground=True)
+        default_name = _edit_value(edit)
+        full_path = save_path_for(target, default_name)
+        # set_edit_text 走 UIA ValuePattern：不经键盘、不经剪贴板，中文路径也不会被输入法吃掉。
+        edit.set_edit_text(str(full_path))
+        time.sleep(0.3)
+        if _edit_value(edit) != str(full_path):
+            raise WeChatApiError("保存对话框的文件名没填进去（读回来对不上）")
+        button = dialog_control(dialog, "Button", "1")
+        if button is None:
+            raise WeChatApiError("保存对话框里找不到「保存」按钮")
+        try:
+            button.invoke()
+        except Exception:  # noqa: BLE001 —— invoke 不支持就老实点一下
+            button.click_input()
 
     @staticmethod
-    def _await_saved_file(target: Path, before: set[str], timeout: float) -> Path:
-        """等目录里多出一个文件且大小不再变化（微信是流式写盘的）。"""
-        deadline = time.monotonic() + timeout
-        last_size: dict[str, int] = {}
-        while time.monotonic() < deadline:
-            fresh = [entry for entry in target.iterdir() if entry.name not in before and entry.is_file()]
-            fresh = [entry for entry in fresh if not entry.name.lower().endswith((".tmp", ".crdownload", ".part"))]
-            if fresh:
-                entry = max(fresh, key=lambda e: e.stat().st_mtime)
-                size = entry.stat().st_size
-                if size > 0 and last_size.get(entry.name) == size:
-                    return entry
-                last_size[entry.name] = size
-            time.sleep(0.5)
-        raise WeChatApiError("另存为没有落下文件（等超时了）")
+    def _bubble_click_point(item: Any) -> tuple[int, int]:
+        """这一行里气泡本体的中心（屏幕坐标）。截不到图 / 认不出气泡就退回行中心（原来的点法）。"""
+        rect = item.rectangle()
+        fallback = (int(rect.mid_point().x), int(rect.mid_point().y))
+        try:
+            ImageGrab = __import__("PIL.ImageGrab", fromlist=["ImageGrab"])
+            shot = ImageGrab.grab(
+                bbox=(rect.left, rect.top, rect.right, rect.bottom), all_screens=True
+            ).convert("RGB")
+        except Exception as exc:  # noqa: BLE001 —— 截不到就按老办法点，别在这儿断
+            logger.info("chat.attachment.bubble.screenshot_failed", error=str(exc)[:120])
+            return fallback
+        span = find_bubble_span(shot.load(), *shot.size)
+        if span is None:
+            logger.info("chat.attachment.bubble.not_found", width=shot.size[0], height=shot.size[1])
+            return fallback
+        x, y = span
+        return (rect.left + x, rect.top + y)
 
     def _collect_history_pages(
         self, window: Any, chat_name: str, safe_limit: int
