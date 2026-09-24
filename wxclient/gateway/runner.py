@@ -58,8 +58,7 @@ from .moments import MomentsWatcher
 from .outbound import DeliveryResult, MessageSink, OutboundSender
 from .pacing import MIN_READ_INTERVAL_SECONDS, PACING_EVENT, clamp_interval
 from .schedule import ScheduleLoop, parse_schedule_at
-from .sessions import CANDIDATE_MODES, STRANGER_ORIGIN_FRIEND_REQUEST, GatewayStore
-from .strangers import StrangerWatcher
+from .sessions import CANDIDATE_MODES, GatewayStore
 from .ticket import TicketProvider
 from .watchlist import PUSH_EVENT, Watchlist
 from .wsclient import AgentWsClient, AgentWsError, TurnResult, Unauthorized
@@ -227,7 +226,6 @@ class GatewayRunner:
         accounts: Sequence[str],
         watchlist: Watchlist | None = None,
         friend_watcher: FriendWatcher | None = None,
-        stranger_watcher: StrangerWatcher | None = None,
         command_executor: CommandExecutor | None = None,
         contacts: ContactDirectory | None = None,
         candidates: CandidateDirectory | None = None,
@@ -247,7 +245,6 @@ class GatewayRunner:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._watchlist = watchlist
         self._friends = friend_watcher
-        self._strangers = stranger_watcher
         self._commands = command_executor
         self._auto_friend = auto_friend
         self._friend_checker = friend_checker
@@ -633,24 +630,28 @@ class GatewayRunner:
             await self._sync_contacts_once()
             await asyncio.sleep(CONTACTS_SYNC_INTERVAL_SECONDS)
 
-    async def _sync_contacts_once(self) -> None:
-        """同步一轮。失败只记账——同步不上不该把网关带停（ContactDirectory 自己不抛）。"""
+    async def _sync_contacts_once(self, *, full: bool = False) -> None:
+        """同步一轮。失败只记账——同步不上不该把网关带停（ContactDirectory 自己不抛）。
+
+        ``full=True``（点「同步名单」）：全量拉、**以业务端为准**删掉本机多出来的人。
+        后台定时那条照旧增量——全量每 120 秒拉一遍不值当，也用不着：删人是专员点了才要立刻见效。
+        """
         if self._contacts is None:
             return
         for account_id in self._accounts:
+            if full:
+                rows = await self._contacts.pull_all()
+                if rows is None:
+                    _backend.warning("全量同步没拉全，这次不删本机名单", account=account_id)
+                    continue
+                dropped = self._store.replace_accepted_contacts(account_id, rows)
+                _backend.info("候选人会话名已全量同步", account=account_id, saved=len(rows), 移除=dropped)
+                continue
             since = self._store.contacts_synced_until(account_id)
             rows = await self._contacts.pull(updated_since=since)
             if rows:
                 saved = self._store.save_contacts(account_id, rows)
                 _backend.info("候选人会话名已同步", account=account_id, saved=saved, incremental=bool(since))
-            # 090：刚才还不认识的人，后端已经给他建好档、会话名也归位了 → 他不再是「陌生人」。
-            # 不摘掉的话，这个人会同时出现在两份来源里，而临时准入到期时会被当成过期清掉，
-            # 名单反而少了一个正经候选人。
-            settled = [name for name in self._store.stranger_names(account_id)
-                       if name in self._store.known_session_names(account_id)]
-            if settled:
-                self._store.drop_strangers(account_id, settled)
-                _log.info("陌生人已归位成候选人，转入正式名单", account=account_id, 数量=len(settled))
         self._apply_derived_watchlist()
 
     def _apply_derived_watchlist(self) -> int:
@@ -666,9 +667,10 @@ class GatewayRunner:
         names: list[str] = []
         seen: set[str] = set()
         for account_id in self._accounts:
-            # 090：临时准入的陌生会话并进来。**并集不是替换**——他们是「还没归位的人」，
-            # 归位之后 `gateway_contacts` 里就有了，这份临时准入过期自然消失。
-            for name in (*self._store.watched_session_names(account_id), *self._store.stranger_names(account_id)):
+            # ★ 只认同步来的（用户 2026-09-24：「监听逻辑是同步的，不应该自己添加」）。
+            #   以前这里还并进本机「临时准入」的陌生会话（090 扫会话列表 / 通过好友申请），
+            #   0.1.80 让扫描真跑起来后把「腾讯新闻」这类服务号也收进了监听——已整条拆掉。
+            for name in self._store.watched_session_names(account_id):
                 if name not in seen:
                     seen.add(name)
                     names.append(name)
@@ -843,26 +845,12 @@ class GatewayRunner:
     async def _on_friend_requests_accepted(
         self, command: dict[str, Any], result: CommandResult | None, names: Sequence[str],
     ) -> None:
-        """自动通过了几个人的好友申请（`friends.py`）→ 让他们**立刻**进监听，别等下一次扫会话列表。
+        """自动通过了几个人的好友申请（`friends.py`）→ 认得出号的报 `accepted` 给业务端。
 
-        候选人扫招聘老师的名片加进来的人，既不在候选人库里也不在监听名单里：通过之后他发的
-        第一句网关照样读不到（085 名单 fail-closed）。这里把他按「friend_request 来源」放进临时准入
-        （不过期、不占名额），第一轮带 `first_contact` + `friend_request_accepted` 交给 AI 端：
-        AI 端据此**先接一句**并建档，不再按「判不出求职就一条都不发」收紧——他是主动加过来的。
-        已经是候选人（会话名归位过）的名字不再当陌生人。认得出号的照旧报 `accepted` 给业务端。
+        ★ **不再自己把人加进监听**（用户 2026-09-24：「监听逻辑是同步的，不应该自己添加」）。
+        他要被自动回复，得等业务端把他写进 `GET /client/contacts`、下一轮同步带回来。
         """
         await self._report_contact(command, result)
-        account_id = self._account()
-        known = self._store.known_session_names(account_id)
-        fresh = [str(n or "").strip() for n in names if str(n or "").strip() and str(n).strip() not in known]
-        if not fresh:
-            return
-        admitted = self._store.note_strangers(
-            account_id, fresh, now=self._clock(), origin=STRANGER_ORIGIN_FRIEND_REQUEST,
-        )
-        _log.info("已通过好友申请，先临时纳入监听（第一轮由 AI 端接话并建档）", account=account_id, 数量=len(fresh))
-        if admitted or fresh:
-            self._apply_derived_watchlist()
 
     async def _note_friend_accepted(self, account_id: str, peer_id: str) -> None:
         """和这个人有过一次成功的消息往来 = 他通过了我们的申请（api2 §4.1「检测到对方通过」）。
@@ -1301,7 +1289,8 @@ class GatewayRunner:
         那正是这个按钮存在的理由（专员说不准屏幕上这份新不新）。
         """
         if self._contacts is not None and self._contacts.configured:
-            await self._sync_contacts_once()
+            # 全量：业务端已经不让盯的人要在这一下里消失，不能等增量（它永远不会带回删掉的行）。
+            await self._sync_contacts_once(full=True)
             if self._watchlist is not None and self._watchlist.watched():
                 return {
                     "watching": len(self._watchlist.watched()),
@@ -1352,14 +1341,6 @@ class GatewayRunner:
         )
         return format_history(rows)
 
-    def _stranger_origin(self, peer_id: str) -> str | None:
-        """这个会话现在还挂在「临时准入」里吗（090）；在的话是哪种来源（scan / friend_request）。"""
-        for account in self._accounts:
-            origin = self._store.stranger_origin(account, peer_id)
-            if origin:
-                return origin
-        return None
-
     def _peer_refs(self, account_id: str, peer_id: str) -> list[dict[str, Any]]:
         """这一轮对面是哪个候选人（047 的 `@` 引用协议）。
 
@@ -1389,18 +1370,6 @@ class GatewayRunner:
             "funnel": "inbound",
             "operator_intervened": any(m.from_self for m in messages),
         }
-        # 090：这个会话是**临时准入的陌生人**（我们不认识他，他主动找上来的）。
-        # AI 端据此收紧第一轮：判不出对方在求职就一条都不发（spec 090 / v1 §9.5）。
-        # ★ 必须由这一层说，不能让 AI 端拿「refs 是空的」去推：入站 refs 为空是常态
-        #   （会话名还没归位到候选人，后端明说允许），拿它当判据会让名单里的正常联系人
-        #   一起哑掉。
-        origin = self._stranger_origin(peer_id)
-        if origin:
-            meta["first_contact"] = True
-        if origin == STRANGER_ORIGIN_FRIEND_REQUEST:
-            # 2026-09-12：他是我们**通过了申请**才进来的（扫名片主动加的），AI 端第一轮要接一句，
-            # 不按「判不出求职就一条都不发」收紧。
-            meta["friend_request_accepted"] = True
         watching = self.watched_peers()
         if watching:
             meta["watching"] = watching
@@ -1554,9 +1523,6 @@ class GatewayRunner:
         ]
         if self._friends is not None:
             side_tasks.append(asyncio.create_task(self._friends.run(), name="gw-friends"))
-        # 090：陌生人主动发起。**默认关**，开了才会真起循环（见 `StrangerWatcher.enabled`）。
-        if self._strangers is not None:
-            side_tasks.append(asyncio.create_task(self._strangers.run(), name="gw-strangers"))
         # 093：已申请、还没通过的人隔一阵复查一次（`interval<=0` 时 run() 自己就返回了）。
         if self._friend_checker is not None:
             side_tasks.append(

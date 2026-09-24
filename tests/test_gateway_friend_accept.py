@@ -2,12 +2,12 @@
 
 现场：候选人扫招聘老师的名片主动加好友，「新的朋友」一直挂着未读，没人点通过——之前整条链上
 没有任何一处会点（spec 090 的边界）。现在 ``FriendWatcher`` 开着 ``auto_accept`` 就走指令那条路
-下 ``accept_new_friends``，真通过了谁再由 runner 临时纳入监听、第一轮交 AI 端接话并建档。
+下 ``accept_new_friends``，真通过了谁、认得出号的报给业务端。
 
 守四件事：
 ★ 通过必须走 ``CommandExecutor``（能力闸 / 配额 / 时间窗 / 幂等一道不绕），不是直接敲底座；
 ★ 「通过了谁」只认驱动层的 ``accepted``，不拿「新的朋友」整个列表当通过（老条目会被再报一遍）；
-★ 通过的人立刻进监听、不过期、不占陌生人名额，元信息带 ``friend_request_accepted``；
+★ 通过的人**不**自己进监听（2026-09-24：监听只认 ``GET /client/contacts`` 同步名单）；
 ★ 开关关着 / dry-run 机器 / 没有执行器 → 退回原来「只看不通过」。
 """
 
@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -27,11 +27,7 @@ from wxclient.gateway import (
     LocalFileTicketProvider,
 )
 from wxclient.gateway.commands import COMMANDS, CommandResult, accepted_names
-from wxclient.gateway.sessions import (
-    STRANGER_ORIGIN_FRIEND_REQUEST,
-    STRANGER_ORIGIN_SCAN,
-    GatewayStore,
-)
+from wxclient.gateway.sessions import GatewayStore
 from wxclient.gateway.watchlist import Watchlist
 from wxclient.queue import TaskType
 
@@ -173,56 +169,45 @@ class FriendWatcherAutoAcceptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(commands.executed, [])
 
 
-class StoreOriginTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.store = GatewayStore(Path(self._tmp.name) / "gateway.db")
-
-    def tearDown(self) -> None:
-        self._tmp.cleanup()
-
-    def test_x_通过的人不过期_扫到的照旧清(self) -> None:
-        old = NOW - timedelta(days=30)
-        self.store.note_strangers(ACCOUNT, ["路过问一句的"], now=old)
-        self.store.note_strangers(ACCOUNT, ["扫名片加的"], now=old, origin=STRANGER_ORIGIN_FRIEND_REQUEST)
-        self.assertEqual(self.store.stranger_origin(ACCOUNT, "路过问一句的"), STRANGER_ORIGIN_SCAN)
-        self.assertEqual(self.store.stranger_origin(ACCOUNT, "扫名片加的"), STRANGER_ORIGIN_FRIEND_REQUEST)
-        self.assertIsNone(self.store.stranger_origin(ACCOUNT, "没来过的"))
-        purged = self.store.purge_strangers_before(ACCOUNT, NOW - timedelta(days=7))
-        self.assertEqual(purged, ["路过问一句的"])
-        self.assertEqual(self.store.stranger_names(ACCOUNT), ["扫名片加的"])
-
-    def test_通过的人不占陌生人名额_同名升级来源(self) -> None:
-        self.store.note_strangers(ACCOUNT, [f"陌生人{i}" for i in range(3)], now=NOW, limit=3)
-        self.assertEqual(self.store.note_strangers(ACCOUNT, ["再来一个"], now=NOW, limit=3), [], "名额满了")
-        self.assertEqual(
-            self.store.note_strangers(ACCOUNT, ["扫名片加的"], now=NOW, limit=3, origin=STRANGER_ORIGIN_FRIEND_REQUEST),
-            ["扫名片加的"],
-        )
-        self.store.note_strangers(ACCOUNT, ["陌生人0"], now=NOW, origin=STRANGER_ORIGIN_FRIEND_REQUEST)
-        self.assertEqual(self.store.stranger_origin(ACCOUNT, "陌生人0"), STRANGER_ORIGIN_FRIEND_REQUEST)
-
-    def test_老库补列_默认按_scan_算(self) -> None:
-        """升级前就在表里的行没有 origin 列，补列后按 scan 算——保鲜期照旧管它们。"""
+class RetiredStrangerTableTests(unittest.TestCase):
+    def test_x_升级时清掉临时准入_连同落盘名单里经它加进去的名字(self) -> None:
+        """那张表是本机自己攒的名字（090 扫会话列表 / 通过好友申请）。现场：「腾讯新闻」和自己的群
+        被扫进监听、界面上删不掉。同步名单里真有的（张三）和原本就在名单里的（李四）不能误删。"""
         import sqlite3
         from contextlib import closing
 
-        path = Path(self._tmp.name) / "old.db"
-        with closing(sqlite3.connect(path)) as conn:
-            conn.executescript(
-                """CREATE TABLE gateway_strangers (
-                     account_id TEXT NOT NULL, session_name TEXT NOT NULL,
-                     first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
-                     PRIMARY KEY (account_id, session_name));
-                   INSERT INTO gateway_strangers VALUES ('acct-1', '老行', '2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00');"""
-            )
-        store = GatewayStore(path)
-        self.assertEqual(store.stranger_origin(ACCOUNT, "老行"), STRANGER_ORIGIN_SCAN)
-        self.assertEqual(store.purge_strangers_before(ACCOUNT, NOW), ["老行"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.db"
+            store = GatewayStore(path)
+            store.save_contacts(ACCOUNT, [{
+                "number": "138", "session_name": "张三·普工", "profile_name": "", "contact_status": "accepted",
+                "worker_id": "w-1", "updated_at": "2026-09-12T01:00:00.000Z",
+            }])
+            store.put_watchlist({"only": ["AI Agent 群", "张三·普工", "李四", "腾讯新闻"], "never": ["黑名单"]})
+            with closing(sqlite3.connect(path)) as conn:
+                conn.executescript(
+                    """CREATE TABLE gateway_strangers (
+                         account_id TEXT NOT NULL, session_name TEXT NOT NULL,
+                         first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+                         origin TEXT NOT NULL DEFAULT 'scan',
+                         PRIMARY KEY (account_id, session_name));
+                       INSERT INTO gateway_strangers VALUES ('acct-1', '腾讯新闻', 't', 't', 'scan');
+                       INSERT INTO gateway_strangers VALUES ('acct-1', 'AI Agent 群', 't', 't', 'scan');
+                       INSERT INTO gateway_strangers VALUES ('acct-1', '张三·普工', 't', 't', 'friend_request');"""
+                )
+            store = GatewayStore(path)
+            self.assertEqual(store.get_watchlist(), {"only": ["张三·普工", "李四"], "never": ["黑名单"]})
+            with closing(sqlite3.connect(path)) as conn:
+                left = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='gateway_strangers'"
+                ).fetchall()
+            self.assertEqual(left, [])
+            GatewayStore(path)  # 再开一次：表已经没了，不再动名单
+            self.assertEqual(store.get_watchlist()["only"], ["张三·普工", "李四"])
 
 
 class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
-    """通过之后：立刻进监听名单、那一轮的元信息带两个标记。"""
+    """通过之后：只上报，不自己进监听名单。"""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -254,7 +239,7 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
             clock=lambda: NOW,
         )
 
-    async def test_x_通过之后立刻进监听_元信息带标记(self) -> None:
+    async def test_x_通过之后不自己进监听(self) -> None:
         self.store.save_contacts(ACCOUNT, [{
             "number": "138", "session_name": "张三·普工", "profile_name": "", "contact_status": "accepted",
             "worker_id": "w-1", "updated_at": "2026-09-12T01:00:00.000Z",
@@ -268,20 +253,12 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
         runner = self._runner(wl, watcher)
         self.assertIsNotNone(watcher.on_accepted, "runner 装好后回调必须接上")
         await watcher.tick()
-        # 已经是候选人的张三不当陌生人；王建国进临时准入且来源是 friend_request
-        self.assertEqual(self.store.stranger_names(ACCOUNT), ["王建国"])
-        self.assertEqual(self.store.stranger_origin(ACCOUNT, "王建国"), STRANGER_ORIGIN_FRIEND_REQUEST)
-        self.assertEqual(sorted(runner.watched_peers()), ["张三·普工", "王建国"])
+        # ★ 监听只认同步名单：王建国刚被通过、业务端还没把他写进 contacts → 不在监听里
+        runner._apply_derived_watchlist()
+        self.assertEqual(runner.watched_peers(), ["张三·普工"])
         meta = runner._turn_meta("王建国", [])
-        self.assertTrue(meta.get("first_contact"))
-        self.assertTrue(meta.get("friend_request_accepted"))
-        # 扫会话列表进来的人只有 first_contact，没有第二个标记
-        self.store.note_strangers(ACCOUNT, ["路过的"], now=NOW)
-        meta2 = runner._turn_meta("路过的", [])
-        self.assertTrue(meta2.get("first_contact"))
-        self.assertNotIn("friend_request_accepted", meta2)
-        # 归位成正式候选人后，第二个标记也没有
-        self.assertNotIn("first_contact", runner._turn_meta("张三·普工", []))
+        self.assertNotIn("first_contact", meta)
+        self.assertNotIn("friend_request_accepted", meta)
 
 
 if __name__ == "__main__":

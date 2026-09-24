@@ -35,7 +35,6 @@ from .moments import MomentsWatcher
 from .pacing import MIN_FRIEND_INTERVAL_SECONDS, clamp_interval
 from .runner import GatewayRunner
 from .sessions import GatewayStore
-from .strangers import StrangerWatcher
 from .ticket import ClientTokenTicketProvider, LocalFileTicketProvider, TicketProvider
 from .watchlist import Watchlist, WatchScope
 from .wechat_io import QueueMessageSink, QueueMessageSource
@@ -279,18 +278,6 @@ def build_gateway(
             # 让路和占闸都按「加好友最小间隔」来，和加好友自己守的是同一个数。
             friend_interval_seconds=gateway_settings.friend_interval_seconds,
             active_hours=gateway_settings.active_hours,
-        ),
-        # 090：陌生人主动发起。**默认关**（`stranger_intake`）——放开 fail-closed 名单
-        # 是专员的一次知情选择，不是缺省行为。
-        stranger_watcher=StrangerWatcher(
-            accounts=resolved_accounts,
-            runtime=runtime,
-            store=store,
-            interval_seconds=gateway_settings.stranger_scan_interval_seconds,
-            enabled=gateway_settings.stranger_intake,
-            active_hours=gateway_settings.active_hours,
-            allow_real_actions=allow_real_actions,
-            confirmation=REAL_ACTION_CONFIRMATION,
         ),
         # 用户 2026-09-08：本机自己巡看朋友圈，只碰新动态。**默认关**（间隔 0）。
         moments_watcher=MomentsWatcher(

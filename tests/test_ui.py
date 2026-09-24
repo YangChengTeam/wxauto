@@ -1139,7 +1139,6 @@ class SettingsDefaultsTests(unittest.TestCase):
             "WXCLIENT_GATEWAY_MOMENTS_AUTO_LIKE": gateway.moments_auto_like,
             "WXCLIENT_GATEWAY_MOMENTS_AUTO_COMMENT": gateway.moments_auto_comment,
             "WXCLIENT_GATEWAY_MOMENTS_COMMENT_MATERIAL": gateway.moments_comment_material,
-            "WXCLIENT_GATEWAY_STRANGER_INTAKE": gateway.stranger_intake,
             "WXCLIENT_UI_AUTOSTART": ui.autostart,
             "WXCLIENT_UI_START_HIDDEN": ui.start_hidden,
             "WXCLIENT_UI_AUTO_UPDATE": ui.auto_update,

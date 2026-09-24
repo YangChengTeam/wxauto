@@ -128,13 +128,6 @@ CREATE TABLE IF NOT EXISTS gateway_contacts (
   updated_at   TEXT NOT NULL,
   PRIMARY KEY (account_id, number)
 );
-CREATE TABLE IF NOT EXISTS gateway_strangers (
-  account_id   TEXT NOT NULL,
-  session_name TEXT NOT NULL,
-  first_seen_at TEXT NOT NULL,
-  last_seen_at  TEXT NOT NULL,
-  PRIMARY KEY (account_id, session_name)
-);
 CREATE TABLE IF NOT EXISTS gateway_candidate_mode (
   account_id   TEXT NOT NULL,
   -- 本机寻址用的**会话名**（微信备注名）。主键用它而不是 candidate_id：
@@ -275,9 +268,45 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str)
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
-#: 临时准入的两种来源：会话列表里扫到的（090，有保鲜期）/ 我们自动通过了他的好友申请（2026-09-12，不过期）。
-STRANGER_ORIGIN_SCAN = "scan"
-STRANGER_ORIGIN_FRIEND_REQUEST = "friend_request"
+def _retire_strangers(conn: sqlite3.Connection) -> None:
+    """拆掉「临时准入」（2026-09-24）：监听名单只认 `GET /client/contacts` 同步来的。
+
+    用户：「监听逻辑是同步的，不应该自己添加」。090 扫会话列表 / 通过好友申请后本机自己往监听里
+    加人，0.1.80 让扫描真跑起来后把「腾讯新闻」、自己的群都收了进去，界面上还删不掉。
+
+    老库要收拾两处：那张表本身，以及**落盘的生效名单**（`gateway_watchlist`）里经它加进去的名字——
+    后者不清的话，派生名单为空的机器（按 085 沿用上一份）会一直盯着它们。同步名单里真有的名字留着。
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='gateway_strangers'"
+    ).fetchone()
+    if not exists:
+        return
+    added = {str(r[0]).strip() for r in conn.execute("SELECT session_name FROM gateway_strangers").fetchall()}
+    synced = {
+        str(r[0]).strip()
+        for r in conn.execute(
+            "SELECT session_name FROM gateway_contacts WHERE status='accepted' AND TRIM(session_name)<>''"
+        ).fetchall()
+    }
+    stale = added - synced
+    row = conn.execute("SELECT payload FROM gateway_watchlist WHERE id=1").fetchone()
+    if stale and row:
+        try:
+            payload = json.loads(row[0])
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("only"), list):
+            kept = [n for n in payload["only"] if str(n).strip() not in stale]
+            if len(kept) != len(payload["only"]):
+                payload["only"] = kept
+                conn.execute(
+                    "UPDATE gateway_watchlist SET payload=?, updated_at=? WHERE id=1",
+                    (json.dumps(payload, ensure_ascii=False), _utcnow().isoformat()),
+                )
+    conn.execute("DROP TABLE gateway_strangers")
+    conn.commit()
+
 
 #: 候选人级接管/托管的两个词（业务端 v1.5 §4，本机原样沿用，不再翻译一遍）。
 HUMAN_TAKEOVER = "human_takeover"
@@ -331,8 +360,7 @@ class GatewayStore:
             # 093 改口径（2026-09-01）：复查台账从「进度」升级成「我们真发过申请」的权威，
             # 老库那两列不补就是 "no such column"。
             _ensure_column(conn, "gateway_friend_checks", "session_name", "TEXT NOT NULL DEFAULT ''")
-            # 2026-09-12 自动通过好友申请：通过的人也走临时准入，但**不过期**（他是真好友，不是路过的）。
-            _ensure_column(conn, "gateway_strangers", "origin", f"TEXT NOT NULL DEFAULT '{STRANGER_ORIGIN_SCAN}'")
+            _retire_strangers(conn)
             _ensure_column(conn, "gateway_friend_checks", "requested_at", "TEXT NOT NULL DEFAULT ''")
             # 2026-09-19：历史里分身自己的回声要标「分身」而不是「专员本人」（AI 端否则当成老师插话）。
             _ensure_column(conn, "gateway_messages", "from_gateway", "INTEGER NOT NULL DEFAULT 0")
@@ -436,6 +464,33 @@ class GatewayStore:
                 )
             conn.commit()
         return saved
+
+    def replace_accepted_contacts(self, account_id: str, rows: Iterable[dict]) -> int:
+        """全量同步落库：先按 `save_contacts` 落，再删掉本机多出来的 `accepted` 行。返回删了几条。
+
+        ★ 为什么要删：增量同步（`updated_since`）只会带回**变了**的行，后端删掉/不再给的行
+        永远不会再来，本机那一行就一直挂在监听名单里、界面上还删不掉（2026-09-24 用户：
+        「监听计划已经没有监听了，但是监听名单里面还有……点击同步应该能重新同步」）。
+        只删 `accepted`：`requested` 里有本机自己记的「刚发出的好友申请」，那是复查用的台账，
+        不影响名单，也不该被一次同步抹掉。调用方必须保证 `rows` 是**拉全了的**。
+        """
+        rows = list(rows)
+        self.save_contacts(account_id, rows)
+        keep = {str(row.get("number") or "").strip() for row in rows} - {""}
+        with closing(self._connect()) as conn:
+            stale = [
+                str(r[0]) for r in conn.execute(
+                    "SELECT number FROM gateway_contacts WHERE account_id=? AND status='accepted'",
+                    (account_id,),
+                ).fetchall()
+                if str(r[0]) not in keep
+            ]
+            conn.executemany(
+                "DELETE FROM gateway_contacts WHERE account_id=? AND number=?",
+                [(account_id, number) for number in stale],
+            )
+            conn.commit()
+        return len(stale)
 
     # 本机刚按下的接管，多久之内不许被同步名单里的 `ai_managed` 盖回去（秒）。
     # 见 `_absorb_conversation_mode` 的说明。
@@ -592,126 +647,8 @@ class GatewayStore:
             ).fetchall()
         return [row[0].strip() for row in rows]
 
-    # ───────────── 陌生人主动发起（spec 090 / v1 §9.5）─────────────
-
-    def note_strangers(
-        self,
-        account_id: str,
-        names: Iterable[str],
-        *,
-        now: datetime | None = None,
-        limit: int = 50,
-        origin: str = STRANGER_ORIGIN_SCAN,
-    ) -> list[str]:
-        """会话列表里出现了、但本机会话名映射里没有的名字 —— 记下来。返回**新**记下的那些。
-
-        ``origin=friend_request``：我们自动通过了他的申请。这种不受名额上限、也不过期
-        （`purge_strangers_before` 只清 scan 来的）——他已经是真好友，不是「路过问一句」的人；
-        同名已在（扫到的）就把来源升级成 friend_request。
-
-        为什么要单独一张表：候选人主动加好友、主动发第一句话时，他既不在任何招聘计划里、
-        也没有候选人档案，因此 `gateway_contacts` 里没有他 —— 而监听名单正是从那张表派生的
-        （spec 085）。没有这一层，**他的消息网关根本读不到**，§9.5 那条「主动推进」无从谈起。
-
-        **有上限**：这是给「刚来的陌生人」用的临时准入，不是第二份名单。满了就不再收新的，
-        老的由 `purge_strangers_before` 按保鲜期清掉。
-        """
-        stamp = (now or _utcnow()).isoformat()
-        added: list[str] = []
-        with closing(self._connect()) as conn:
-            existing = {
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT session_name FROM gateway_strangers WHERE account_id=?", (account_id,)
-                ).fetchall()
-            }
-            for raw in names:
-                name = str(raw or "").strip()
-                if not name:
-                    continue
-                if name in existing:
-                    if origin == STRANGER_ORIGIN_FRIEND_REQUEST:
-                        conn.execute(
-                            "UPDATE gateway_strangers SET last_seen_at=?, origin=? WHERE account_id=? AND session_name=?",
-                            (stamp, origin, account_id, name),
-                        )
-                    else:
-                        conn.execute(
-                            "UPDATE gateway_strangers SET last_seen_at=? WHERE account_id=? AND session_name=?",
-                            (stamp, account_id, name),
-                        )
-                    continue
-                if origin != STRANGER_ORIGIN_FRIEND_REQUEST and len(existing) >= limit:
-                    break
-                existing.add(name)
-                added.append(name)
-                conn.execute(
-                    """INSERT INTO gateway_strangers (account_id, session_name, first_seen_at, last_seen_at, origin)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (account_id, name, stamp, stamp, origin),
-                )
-            conn.commit()
-        return added
-
-    def stranger_names(self, account_id: str) -> list[str]:
-        """当前临时准入的陌生会话名。"""
-        with closing(self._connect()) as conn:
-            rows = conn.execute(
-                """SELECT session_name FROM gateway_strangers
-                   WHERE account_id=? ORDER BY session_name""",
-                (account_id,),
-            ).fetchall()
-        return [str(row[0]) for row in rows]
-
-    def stranger_origin(self, account_id: str, session_name: str) -> str | None:
-        """这个会话在不在临时准入里；在的话是哪种来源（scan / friend_request），不在回 None。"""
-        with closing(self._connect()) as conn:
-            row = conn.execute(
-                "SELECT origin FROM gateway_strangers WHERE account_id=? AND session_name=?",
-                (account_id, str(session_name or "").strip()),
-            ).fetchone()
-        return str(row[0] or STRANGER_ORIGIN_SCAN) if row else None
-
-    def drop_strangers(self, account_id: str, names: Iterable[str]) -> int:
-        """不再当陌生人（已经归位成候选人，或专员说了别理他）。"""
-        wanted = [str(n or "").strip() for n in names]
-        wanted = [n for n in wanted if n]
-        if not wanted:
-            return 0
-        with closing(self._connect()) as conn:
-            cur = conn.execute(
-                f"""DELETE FROM gateway_strangers WHERE account_id=?
-                    AND session_name IN ({",".join("?" * len(wanted))})""",
-                (account_id, *wanted),
-            )
-            conn.commit()
-            return int(cur.rowcount or 0)
-
-    def purge_strangers_before(self, account_id: str, cutoff: datetime) -> list[str]:
-        """过了保鲜期的临时准入清掉。返回清掉的名字。
-
-        没有这一条，一台机器跑上几个月就会攒出一份谁也没审过的长名单 ——
-        而名单的每一项都意味着「这个人会被自动回复」。
-        """
-        stamp = cutoff.isoformat()
-        with closing(self._connect()) as conn:
-            rows = conn.execute(
-                "SELECT session_name FROM gateway_strangers WHERE account_id=? AND last_seen_at < ? AND origin=?",
-                (account_id, stamp, STRANGER_ORIGIN_SCAN),
-            ).fetchall()
-            conn.execute(
-                "DELETE FROM gateway_strangers WHERE account_id=? AND last_seen_at < ? AND origin=?",
-                (account_id, stamp, STRANGER_ORIGIN_SCAN),
-            )
-            conn.commit()
-        return [str(row[0]) for row in rows]
-
     def known_session_names(self, account_id: str) -> set[str]:
-        """本机会话名映射里已有的名字（不分 accepted/requested）。
-
-        判「是不是陌生人」用的是**这一份**，不是监听名单：刚发出好友申请、还没通过的那些
-        （`requested`）也已经在册，他们通过之后发来的消息不该被当成陌生人二次准入。
-        """
+        """本机会话名映射里已有的名字（不分 accepted/requested）。派生名单为空时拿来分诊。"""
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 "SELECT DISTINCT session_name FROM gateway_contacts WHERE account_id=? AND TRIM(session_name)<>''",

@@ -152,13 +152,6 @@ FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_MOMENTS_COMMENT_MATERIAL", "朋友圈评论素材",
           "想传达什么、什么口吻，清空就不评", section="sched",
           default="岗位、招工、上班生活相关的动态可以接一句；语气自然、简短，不硬推销"),
-    # 090：**默认开**（用户裁决 2026-08-29）。原来默认关，理由是「装上不会自动回复
-    # 家人朋友」——但真实用法里主动来问的人正是要接的那一类，默认关等于每台机器装完
-    # 都要有人记得来打开一次。真正兜住误伤的是后面那几道确定性闸（判不出在找工作
-    # 就一条都不发），不是这个开关默认值。不想接的人在这里关掉即可。
-    Field("WXCLIENT_GATEWAY_STRANGER_INTAKE", "来问陌生人",
-          "没档案的人来问也接待，判出求职才回话",
-          kind="bool", section="sched", default="1"),
     Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动自动运行服务",
           kind="bool", section="boot", default="1"),
     Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", "启动后最小化到系统托盘",

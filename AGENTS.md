@@ -384,42 +384,25 @@ Implemented in `gateway/message_events.py` + the `gateway_message_events` table;
 
 ---
 
-## 10. Inbound strangers (090 / takeover-and-hosting sync interface v1 §9.5)
+## 10. The watchlist comes only from sync (090 stranger intake retired 2026-09-24)
 
-Contract: `lxz_agent_backend/docs/招聘分身_客户端接管托管同步接口_v1.md` §9
-(**that document lives in the AI service repo; there is no copy here** — writing it as a local relative path
-is a broken link, do not copy that mistake). The authoritative source is the same-named file under the root
-repo's `requirement/`.
-Implemented in `gateway/strangers.py` + the `gateway_strangers` table + the union in
-`runner._apply_derived_watchlist`.
+**The watchlist is exactly the `accepted` session names synced from `GET /client/contacts` (spec 085).
+Nothing on this machine adds to it.** User ruling 2026-09-24: 「监听逻辑是同步的，不应该自己添加」.
 
-- **Why this layer exists**: inbound only reads sessions on the watchlist, and that list is derived from
-  `GET /client/contacts` (spec 085) = "candidates the backend already knows about". Someone who added us
-  first and spoke first **is not in it**, so the gateway cannot even read their message — and the AI service's
-  "collect information proactively, create a profile proactively" flow dies at step one.
-- **On by default** (`WXCLIENT_GATEWAY_STRANGER_INTAKE`, user ruling 2026-08-29, titled 「来问陌生人」 in the
-  settings center). It used to default to off, reasoning "a fresh install should not auto-reply to the
-  recruiter's family and friends" (069 / requirements §13.1) — but in real use, people who reach out first are
-  exactly the ones we want, and defaulting to off means every machine needs someone to remember to switch it
-  on, and nobody does. **What actually prevents collateral damage is the deterministic gates further down**
-  (send nothing if we cannot tell they are job hunting), not this switch's default. Anyone who does not want
-  it can turn it off in the settings center.
-- **Read the session list only, never open a chat window**: via `read_chat_sessions` (that list control on the
-  main window), paced at the "friend lookup" tier (≥300s) plus jitter plus the working-hours window.
-  **Read operations must pass `dry_run=False` explicitly**, otherwise the base layer returns an empty shell
-  (scanning that scans nothing).
-- **Only take sessions active today**, with a headcount cap (50) and a freshness window (7 days). Dumping the
-  whole session list in turns a fail-closed list into a fail-open one.
-- **Revoke on attribution**: once the backend has created the profile and the session name syncs back, the
-  person joins the real list and the temporary admission is deleted — leave both hanging and the temporary
-  admission's expiry will evict a perfectly good candidate.
-- **The first turn carries `first_contact`**: the AI service tightens up on it and sends nothing if it cannot
-  tell the person is job hunting. ★ **This flag must come from the local machine**: an empty inbound `refs` is
-  normal (the session name has not been attributed to a candidate yet, which the backend explicitly permits),
-  so letting the AI service use that as the criterion would silence normal contacts on the list too.
-- **Friend requests are never auto-accepted**: `check_new_friends(verify=True)` **accepts all of them and
-  cannot pick per person** (see `third_party/pywechat/pyweixin/WeChatAuto.py`), and its daily cap is very
-  strict. This path still only looks, never accepts.
+- **Retired**: `gateway/strangers.py` (scanning the session list and admitting unknown names), the
+  `gateway_strangers` table, and "admit on auto-accepted friend request". Once 0.1.80 made the scan actually run,
+  it admitted service accounts (「腾讯新闻」) and the recruiter's own groups, and the settings-center remove button
+  could not take them out. `sessions._retire_strangers` drops the table on upgrade and strips the names it had
+  added from the persisted watchlist. **Do not bring a local admission path back** — if someone new must be
+  auto-replied to, the business backend writes them into contacts.
+- **The session-list read that remains only prioritises within the list** (`wechat_io._skip_unchanged` /
+  `_due_peers`): it decides which watched sessions to open this round, never who is watched.
+- **「同步名单」 is a full resync** (`runner.sync_watched` → `_sync_contacts_once(full=True)`): pull every page,
+  and only if every page arrived, delete local `accepted` rows the backend no longer returns. Incremental sync
+  never brings a deleted row back, which is why a stopped plan's people used to linger. Local `requested`
+  rows (the friend-request ledger) are never touched by it.
+- Auto-accepting friend requests (110) still accepts and reports `accepted` to the backend; it does not add
+  anyone to the watchlist.
 
 ---
 

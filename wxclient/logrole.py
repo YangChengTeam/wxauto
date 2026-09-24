@@ -51,7 +51,6 @@ _MODULE_ROLES: dict[str, str] = {
     "wxclient.gateway.friends": WECHAT,
     "wxclient.gateway.friendcheck": WECHAT,
     "wxclient.gateway.autofriend": WECHAT,
-    "wxclient.gateway.strangers": WECHAT,
     # 入站读消息 / 出站发消息 / 执行 AI 端下发的微信指令：这三条主干**默认**都在操作
     # 微信客户端；其中夹着的少数几行（派轮给 AI 端、上报业务后端、纯本机判定）在调用处
     # 用 `_ai` / `_backend` / `_local` 显式标了角色，会盖掉这个默认值。

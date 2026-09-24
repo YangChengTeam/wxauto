@@ -21,6 +21,7 @@ from wxclient.gateway import GatewayRunner, GatewaySettings, LocalFileTicketProv
 from wxclient.gateway.commands import CommandResult
 from wxclient.gateway.contacts import ContactDirectory
 from wxclient.gateway.sessions import GatewayStore
+from wxclient.gateway.watchlist import Watchlist
 
 
 def directory(handler, token: str = "tok") -> ContactDirectory:
@@ -136,6 +137,32 @@ class PullTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(await directory(handler).pull()), 1)
 
+    async def test_全量同步_半截一律不算(self) -> None:
+        """★ 全量这份要拿来删本机多出来的人——第二页挂了还交回半截，没拉到的正经候选人就被删了。"""
+        calls = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            self.assertNotIn("updated_since", dict(request.url.params))
+            if calls["n"] == 1:
+                return httpx.Response(200, json={"contacts": [{"number": "1"}], "next_cursor": "c2", "has_more": True})
+            return httpx.Response(503, text="unavailable")
+
+        self.assertIsNone(await directory(handler).pull_all())
+
+    async def test_全量同步_拉全了才交(self) -> None:
+        pages = [
+            {"contacts": [{"number": "1"}], "next_cursor": "c2", "has_more": True},
+            {"contacts": [], "next_cursor": None, "has_more": False},
+        ]
+        calls: list[int] = []
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(200, json=pages[len(calls) - 1])
+
+        self.assertEqual(await directory(handler).pull_all(), [{"number": "1"}])
+
     async def test_limit_is_clamped(self) -> None:
         seen: list[dict[str, str]] = []
         await directory(lambda r: seen.append(dict(r.url.params)) or httpx.Response(200, json={})).pull(limit=9999)
@@ -202,6 +229,13 @@ class FakeDirectory:
     async def pull(self, *, updated_since: str = "", limit: int = 200) -> list[dict[str, Any]]:
         self.pulled.append(updated_since)
         return self._rows
+
+    full_fails = False
+    """`pull_all` 回 None（某一页没拉到）。"""
+
+    async def pull_all(self) -> list[dict[str, Any]] | None:
+        self.pulled.append("<full>")
+        return None if self.full_fails else list(self._rows)
 
 
 class SilentSource:
@@ -492,6 +526,74 @@ class RunnerWiringTests(unittest.IsolatedAsyncioTestCase):
         await runner._sync_contacts_once()
         # 第一次没水位（全量），第二次带上本机已知的最新时间
         self.assertEqual(d.pulled, ["", "2026-08-18T09:12:00.000Z"])
+
+
+class FullResyncTests(unittest.IsolatedAsyncioTestCase):
+    """配置中心点「同步名单」= 全量、以业务端为准（用户 2026-09-24：「监听计划已经没有监听了，
+    但是监听名单里面还有，并且无法删除，点击同步应该能重新同步」）。
+
+    增量同步只带回**变了**的行，业务端不再给的人永远不会再来——本机那一行就一直挂在名单上。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.store = GatewayStore(root / "gateway.db")
+        self.tickets = root / "tickets.json"
+        self.tickets.write_text(json.dumps({"acct-1": "tkt"}), encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _runner(self, directory: FakeDirectory) -> tuple[GatewayRunner, Watchlist]:
+        watchlist = Watchlist()
+        runner = GatewayRunner(
+            settings=GatewaySettings(ai_ws_url="ws://127.0.0.1:1/ws", local_ticket_file=self.tickets),
+            ticket_provider=LocalFileTicketProvider(self.tickets),
+            store=self.store,
+            source=SilentSource(),
+            sink=SilentSink(),
+            accounts=["acct-1"],
+            watchlist=watchlist,
+            contacts=directory,
+        )
+        return runner, watchlist
+
+    @staticmethod
+    def _row(number: str, name: str, status: str = "accepted") -> dict[str, Any]:
+        return {"number": number, "session_name": name, "contact_status": status,
+                "updated_at": "2026-09-24T01:00:00.000Z"}
+
+    async def test_x_业务端不再给的人_点同步就从名单里消失(self) -> None:
+        d = FakeDirectory([self._row("1", "张三"), self._row("2", "计划已停的李四")])
+        runner, watchlist = self._runner(d)
+        await runner._sync_contacts_once()
+        runner._apply_derived_watchlist()
+        self.assertEqual(watchlist.watched(), ["张三", "计划已停的李四"])
+
+        d._rows = [self._row("1", "张三")]
+        await runner._sync_contacts_once()  # 增量：删掉的行不会回来，名单还挂着他
+        self.assertEqual(watchlist.watched(), ["张三", "计划已停的李四"])
+
+        result = await runner.sync_watched()
+        self.assertEqual(d.pulled[-1], "<full>")
+        self.assertEqual(watchlist.watched(), ["张三"])
+        self.assertEqual(result["watching"], 1)
+
+    async def test_x_全量没拉全_一个都不删(self) -> None:
+        d = FakeDirectory([self._row("1", "张三"), self._row("2", "李四")])
+        runner, _ = self._runner(d)
+        await runner._sync_contacts_once()
+        d._rows, d.full_fails = [], True
+        await runner._sync_contacts_once(full=True)
+        self.assertEqual(self.store.watched_session_names("acct-1"), ["张三", "李四"])
+
+    async def test_本机记的好友申请台账不被全量同步抹掉(self) -> None:
+        d = FakeDirectory([self._row("1", "张三")])
+        runner, _ = self._runner(d)
+        self.store.note_friend_request("acct-1", "13900139000", "王五·叉车")
+        await runner._sync_contacts_once(full=True)
+        self.assertEqual(self.store.pending_friend_request("acct-1", "王五·叉车"), "13900139000")
 
 
 class RejectionReasonTests(unittest.IsolatedAsyncioTestCase):

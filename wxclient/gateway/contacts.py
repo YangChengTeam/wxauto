@@ -117,6 +117,31 @@ class ContactDirectory(BackendEndpoint):
         _log.info("会话名同步完成", count=len(out))
         return out
 
+    async def pull_all(self) -> list[dict[str, Any]] | None:
+        """全量拉一遍（配置中心点「同步名单」用）。**拉全了才返回**，任何一页没拉到回 None。
+
+        和 `pull` 的区别就在这里：`pull` 拉不动时交回半截，增量落库没问题；而全量这份要拿来
+        **删掉本机多出来的行**（业务端已经不让盯的人），半截当全量会把没拉到的正经候选人删掉。
+        """
+        out: list[dict[str, Any]] = []
+        params: dict[str, Any] = {"limit": MAX_LIMIT}
+        for _ in range(_MAX_PAGES):
+            body = await self._request("GET", CONTACTS_PATH, params=params)
+            if body is None:
+                return None
+            rows = body.get("contacts")
+            if isinstance(rows, list):
+                out.extend(row for row in rows if isinstance(row, dict))
+            cursor = body.get("next_cursor")
+            if not body.get("has_more"):
+                _log.info("会话名全量同步完成", count=len(out))
+                return out
+            if not isinstance(cursor, str) or not cursor:
+                return None
+            params["cursor"] = cursor
+        _log.warning("会话名全量同步翻页超上限，这次不按全量处理", pages=_MAX_PAGES)
+        return None
+
     # ── 发请求 ───────────────────────────────────────────────────
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any] | None:
