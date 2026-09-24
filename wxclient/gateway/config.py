@@ -59,13 +59,17 @@ class GatewaySettings(BaseSettings):
     这个数只往大了调、不往小了调：原来的 5 秒是「一秒不差地翻聊天列表」，正是
     2026-08-12 那次自动退登（判定触发风控）的可疑行为之一。之后先改成 60 秒，现在
     再放宽到 180 秒。**正聊着的时候不受它影响**——对方刚说过话就切到
-    ``active_poll_interval_seconds``（60 秒），聊完自动回到这个节拍，所以放慢它
+    ``active_poll_interval_seconds``（30 秒），聊完自动回到这个节拍，所以放慢它
     不会让人干等。实际间隔还会带随机抖动。"""
 
-    active_poll_interval_seconds: float = 60.0
+    active_poll_interval_seconds: float = 30.0
     """**正聊着的时候**多久读一次。对方刚说过话 → 接下来 ``hot_window_seconds`` 内按这个
     节拍读，聊完自动回到 ``poll_interval_seconds``。人的节奏本来就是「在聊就盯着，聊完放下」，
     固定 5 分钟既让对方干等，又在没人说话时白翻微信。
+    ★ 正聊着的这几轮**只读在聊的人**，整份名单每隔 ``poll_interval_seconds`` 才全量巡检一次
+    （`wechat_io.QueueMessageSource._quick_round_due`）——快档调快不等于把整份名单翻得更勤。
+    默认 30 秒（用户 2026-09-24 从 60 秒调快；要过 10 秒，没给——一轮开 8 个窗口本身就要一分多钟，
+    且 30 秒是 08-12 自动退登之后定的下限）。AI 端下发的快档（`wechatChannel.ts`）同步改成 30。
     ⚠️ 仍然被 ``pacing.MIN_READ_INTERVAL_SECONDS``（30 秒）把住下限，抖动和工作时间窗不变。"""
 
     hot_window_seconds: float = 600.0

@@ -41,6 +41,7 @@ from wxclient.gateway.inbound import PENDING_MAX_AGE_HOURS, PENDING_MAX_ATTEMPTS
 from wxclient.gateway.wechat_io import (
     FIRST_SEEN_TAIL,
     MAX_PEERS_PER_POLL,
+    MAX_PEERS_PER_QUICK_POLL,
     preview_keys,
     preview_matches,
     row_time,
@@ -1301,6 +1302,81 @@ class InboundScopeTests(StoreTestCase):
         await source.fetch("acct-1")
         self.assertIn(a, runtime.opened(), "专员正在打字（草稿）时不确定有没有新消息，得开")
 
+    async def test_between_full_rounds_only_the_peers_in_conversation_are_read(self) -> None:
+        """在聊快读（用户 2026-09-24「合理化一下」）：两次全量巡检之间只读热窗里有来往的人。
+
+        原来正聊着的时候每 30~60 秒就把整份名单过一遍（读列表 18 秒 + 最多 8 个窗口），
+        哪怕真在聊的只有一个。
+        """
+        names = [f"候选人-{i:02d}" for i in range(20)]
+        hot = "候选人-13"
+        clock = {"now": datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)}
+        runtime = FakeRuntime(unread=[], history={n: [] for n in names}, sessions=[])
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=names),
+            clock=lambda: clock["now"], hot_window_seconds=600,
+        )
+        source.set_full_interval(180)
+        self.store.record_messages("acct-1", hot, [{
+            "msg_id": f"{hot}#1", "text": "还招人吗", "from_self": False,
+            "at": (clock["now"] - timedelta(minutes=1)).isoformat(),
+        }])
+
+        await source.fetch("acct-1")  # 第一轮：全量巡检
+        self.assertEqual(len(runtime.opened()), MAX_PEERS_PER_POLL)
+
+        for seconds in (30, 60, 90):  # 巡检间隔内：只读在聊的那一个，也不读会话列表
+            runtime.calls.clear()
+            clock["now"] += timedelta(seconds=30)
+            await source.fetch("acct-1")
+            self.assertEqual(runtime.opened(), [hot], f"第 {seconds} 秒那轮该只读正在聊的人")
+            self.assertEqual(runtime.listed(), 0, "只有一两个人在聊时直接开窗，不先读列表")
+
+        runtime.calls.clear()
+        clock["now"] += timedelta(seconds=100)  # 距上次巡检满 180 秒 → 又是全量
+        await source.fetch("acct-1")
+        self.assertEqual(len(runtime.opened()), MAX_PEERS_PER_POLL, "巡检不能被快读一直顶掉")
+
+    async def test_quick_round_with_nobody_in_conversation_touches_nothing(self) -> None:
+        names = [f"候选人-{i:02d}" for i in range(20)]
+        clock = {"now": datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)}
+        runtime = FakeRuntime(unread=[], history={n: [] for n in names}, sessions=[])
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=names),
+            clock=lambda: clock["now"], hot_window_seconds=600,
+        )
+        source.set_full_interval(180)
+        await source.fetch("acct-1")
+        runtime.calls.clear()
+        clock["now"] += timedelta(seconds=30)
+        await source.fetch("acct-1")
+        self.assertEqual(runtime.calls, [], "没人在聊时快读一个微信动作都不该有")
+
+    async def test_quick_round_caps_windows_and_prefilters_when_many_are_talking(self) -> None:
+        """在聊的人多（>2）：先读列表剔掉没变的，一轮最多开 3 个窗口。"""
+        names = [f"候选人-{i:02d}" for i in range(20)]
+        hots = names[:6]
+        clock = {"now": datetime(2026, 9, 23, 10, 0, tzinfo=timezone.utc)}
+        runtime = FakeRuntime(unread=[], history={n: [] for n in names}, sessions=[])
+        source = QueueMessageSource(
+            runtime=runtime, store=self.store, watchlist=Watchlist.from_local(only=names),
+            clock=lambda: clock["now"], hot_window_seconds=600,
+        )
+        source.set_full_interval(180)
+        for name in hots:
+            self.store.record_messages("acct-1", name, [{
+                "msg_id": f"{name}#1", "text": "在吗", "from_self": False,
+                "at": (clock["now"] - timedelta(minutes=1)).isoformat(),
+            }])
+        await source.fetch("acct-1")
+        runtime.calls.clear()
+        clock["now"] += timedelta(seconds=30)
+        await source.fetch("acct-1")
+        opened = runtime.opened()
+        self.assertLessEqual(len(opened), MAX_PEERS_PER_QUICK_POLL)
+        self.assertTrue(set(opened) <= set(hots))
+        self.assertEqual(runtime.listed(), 1)
+
     def test_prefilter_can_be_switched_off(self) -> None:
         runtime = FakeRuntime(unread=[], history={}, sessions=[])
         source = QueueMessageSource(runtime=runtime, store=self.store, prefilter_by_session_list=False)
@@ -1892,6 +1968,25 @@ class AdaptivePaceTests(StoreTestCase):
         self.assertEqual(pace["idle_seconds"], 120.0)
         self.assertEqual(pace["active_seconds"], 30.0, "低于下限必须被抬上来")
         self.assertEqual(pace["hot_window_seconds"], 3600.0, "热窗不许无限长")
+
+    async def test_the_idle_interval_is_the_full_sweep_interval_on_the_source(self) -> None:
+        """慢档间隔同步给读消息那一侧当「全量巡检间隔」——没接上的话快读永远不会发生。"""
+        full: list[float] = []
+
+        class _Source(FakeSource):
+            def set_full_interval(self, seconds: float) -> None:
+                full.append(seconds)
+
+        async def handler(_a: str, _p: str, _t: str, _m) -> None:
+            return None
+
+        source = _Source([[]])
+        loop = InboundLoop(accounts=["acct-1"], source=source, store=self.store, handler=handler,
+                           clock=lambda: self._now, poll_interval_seconds=180.0,
+                           active_poll_interval_seconds=30.0)
+        self.assertEqual(full[-1], 180.0)
+        loop.set_pace(idle_seconds=240, floor=30.0)
+        self.assertEqual(full[-1], 240.0, "AI 端改了慢档，巡检间隔要跟着改")
 
     async def test_fast_lane_never_slower_than_the_idle_one(self) -> None:
         loop = self._loop()

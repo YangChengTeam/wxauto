@@ -38,6 +38,14 @@ SELF_SENDER = "我"
 #: 一轮最多读几个会话。见 ``QueueMessageSource._due_peers``——每读一个就要开一次聊天窗口。
 MAX_PEERS_PER_POLL = 8
 
+#: 「在聊快读」那一轮最多开几个窗口（见 `QueueMessageSource.fetch`）。快读每 30 秒一次，
+#: 一轮开多了（每个约 9 秒）就是不停地切窗口——那正是风控最不喜欢的形状。
+MAX_PEERS_PER_QUICK_POLL = 3
+
+#: 在聊的人不超过这么多时，快读直接开他们的窗口，不先读会话列表：读一遍列表约 18 秒，
+#: 开两个窗口也就 18 秒，先读列表省不下什么（2026-09-23 打包机实测）。
+QUICK_POLL_DIRECT_MAX = 2
+
 #: 游标丢了时拿最近处理过的几条当锚，一次从记录里取多少条（见 ``split_new_messages`` 的 ``known``）。
 #: 要比一窗读取量（``history_limit``，默认 20）大：判「这一窗是不是全是旧的」靠的是窗口和记录重叠。
 KNOWN_KEYS_LIMIT = 60
@@ -525,6 +533,10 @@ class QueueMessageSource:
         # 以及每个会话上一次被我们读是什么时候（只在内存里，重启后大家重新排队）。
         self._hot_window = max(0.0, float(hot_window_seconds))
         self._last_read: dict[str, datetime] = {}
+        # 全量巡检多久一次（= 慢档间隔，`InboundLoop` 同步过来）；上次全量巡检是什么时候。
+        # 两次巡检之间的那几轮只读在聊的人（见 `fetch`）。0 = 每轮都全量（老行为）。
+        self._full_interval = 0.0
+        self._last_full_at: datetime | None = None
         # 先看左侧会话列表再决定开哪些窗口（见 `_skip_unchanged`）。读列表要过 dry_run 授权，
         # 所以要带上真实动作的确认短语；dry-run 机器读回来的是空壳，等于不筛。
         self._prefilter = bool(prefilter_by_session_list)
@@ -558,14 +570,52 @@ class QueueMessageSource:
         if not watched:
             return []
 
-        collected: list[InboundMessage] = []
         now = self._clock()
-        if self._prefilter:
-            watched = await self._skip_unchanged(account_id, watched, now)
-        for peer_id in self._due_peers(account_id, watched, now):
+        if self._quick_round_due(now):
+            peers = await self._quick_peers(account_id, watched, now)
+        else:
+            self._last_full_at = now
+            if self._prefilter:
+                watched = await self._skip_unchanged(account_id, watched, now)
+            peers = self._due_peers(account_id, watched, now)
+        collected: list[InboundMessage] = []
+        for peer_id in peers:
             self._last_read[peer_id] = now
             collected.extend(await self._fetch_peer(account_id, peer_id))
         return collected
+
+    def _quick_round_due(self, now: datetime) -> bool:
+        """这一轮是「在聊快读」而不是「全量巡检」吗（用户 2026-09-24：「合理化一下，看怎么最优」）。
+
+        原来正聊着时每 30~60 秒就把**整份名单**过一遍（先读列表约 18 秒、再开最多 8 个窗口），
+        哪怕真在聊的只有一个人。现在分两种轮：
+        - **全量巡检**：每隔慢档间隔（默认 180 秒）一次，照旧预筛 + 冷热排序，谁都不会被漏掉；
+        - **在聊快读**：两次巡检之间，只读热窗里有来往的那几个（`_quick_peers`）。
+        刚启动、从没巡检过、或没配慢档间隔 → 一律全量。
+        """
+        if self._full_interval <= 0 or self._last_full_at is None:
+            return False
+        return (now - self._last_full_at).total_seconds() < self._full_interval
+
+    async def _quick_peers(self, account_id: str, watched: Sequence[str], now: datetime) -> list[str]:
+        """快读这一轮开谁：热窗里有来往的会话，最久没读的先，最多 ``MAX_PEERS_PER_QUICK_POLL`` 个。
+
+        在聊的人不多（≤ ``QUICK_POLL_DIRECT_MAX``）就直接开，不先读列表——读列表本身就要 18 秒；
+        多了才先读列表，把没变的剔掉。一个在聊的都没有 → 这一轮什么都不动（等下一次巡检）。
+        """
+        if self._hot_window <= 0:
+            return []
+        activity = self._store.recent_peer_activity(
+            account_id, since=now - timedelta(seconds=self._hot_window)
+        )
+        hot = [peer_id for peer_id in watched if peer_id in activity]
+        if not hot:
+            return []
+        if self._prefilter and len(hot) > QUICK_POLL_DIRECT_MAX:
+            hot = await self._skip_unchanged(account_id, hot, now)
+        never = datetime.min.replace(tzinfo=timezone.utc)
+        hot.sort(key=lambda peer_id: self._last_read.get(peer_id, never))
+        return hot[:MAX_PEERS_PER_QUICK_POLL]
 
     async def _skip_unchanged(self, account_id: str, watched: Sequence[str], now: datetime) -> list[str]:
         """先读一遍左侧会话列表（不开任何聊天窗口），把**肯定没变**的会话从这一轮里拿掉。
@@ -619,6 +669,10 @@ class QueueMessageSource:
     def set_hot_window(self, seconds: float) -> None:
         """跟 `InboundLoop` 用同一个热窗（AI 端下发节拍时一起改）。"""
         self._hot_window = max(0.0, float(seconds))
+
+    def set_full_interval(self, seconds: float) -> None:
+        """全量巡检间隔 = `InboundLoop` 的慢档（AI 端下发节拍时一起改）。"""
+        self._full_interval = max(0.0, float(seconds))
 
     def _drop_handed_off(self, account_id: str, watched: Sequence[str]) -> list[str]:
         """人工接管中的候选人，这一轮连读都不读（用户裁决 2026-08-28）。

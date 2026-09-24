@@ -641,10 +641,14 @@ class InboundLoop:
         return self._poll_interval
 
     def _sync_source_hot_window(self) -> None:
-        """热窗只有一个数：读多勤（这里）和先读谁（`QueueMessageSource._due_peers`）用同一个。"""
+        """热窗只有一个数：读多勤（这里）和先读谁（`QueueMessageSource._due_peers`）用同一个。
+        慢档间隔也同步过去：读消息那一侧据此决定这一轮是全量巡检还是只读在聊的人。"""
         setter = getattr(self._source, "set_hot_window", None)
         if callable(setter):
             setter(self._hot_window)
+        full = getattr(self._source, "set_full_interval", None)
+        if callable(full):
+            full(self._poll_interval)
 
     def set_pace(
         self,
