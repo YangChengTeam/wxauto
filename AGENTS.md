@@ -263,6 +263,9 @@ Every line here was learned on a real machine. Read the reason before changing o
   chat list shows.
 - So to be able to reply reliably, **pass a `remark` when adding the friend** (e.g. `张三-仓库工`).
   Do not rely on the nickname.
+- ★ When a `remark` (the candidate's label) is present, it is also what gets typed into the box under
+  「发送添加朋友申请」, replacing `greetings` (user, 2026-09-24; `CommandExecutor` in `gateway/commands.py`).
+  No remark → the greeting rules of 092 still apply.
 - Failing to read the nickname is not a failure (`name` becomes `null`, logged as `friend.add.fallback`).
   But **a number that cannot be found raises an error**, no longer silently returning success — otherwise the
   AI service waits forever on a request that was never sent.

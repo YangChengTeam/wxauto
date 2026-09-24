@@ -254,9 +254,41 @@ class SentEchoRecordTests(CommandTestCase):
         runtime = FakeRuntime(result={"already_friend": False, "session_name": "候选人-张三"})
         await self._executor(runtime).execute({
             "command_id": "c1", "op": "add_friend",
-            "args": {"number": "13800000001", "greetings": "你好，我是劳小智的招聘老师", "remark": "候选人-张三"},
+            "args": {"number": "13800000001", "greetings": "你好，我是劳小智的招聘老师"},
         })
         self.assertTrue(self.store.claim_sent_echo(ACCOUNT, "候选人-张三", "你好，我是劳小智的招聘老师"))
+
+    async def test_the_label_goes_into_the_request_box_instead_of_the_greeting(self) -> None:
+        """★ 用户 2026-09-24：「发送添加朋友申请」下面那格填 label（备注名），不填验证语。"""
+        runtime = FakeRuntime(result={"already_friend": False, "session_name": "张三-仓库工"})
+        await self._executor(runtime).execute({
+            "command_id": "c1", "op": "add_friend",
+            "args": {"number": "13800000001", "greetings": "你好", "remark": "张三-仓库工"},
+        })
+        _, payload, _ = runtime.calls[-1]
+        self.assertEqual(payload["greetings"], "张三-仓库工")
+        self.assertTrue(self.store.claim_sent_echo(ACCOUNT, "张三-仓库工", "张三-仓库工"),
+                        "记账跟着填进去的那句走")
+
+    async def test_the_known_session_name_is_what_goes_into_the_request_box(self) -> None:
+        self.store.save_contacts(ACCOUNT, [
+            {"number": "13800000001", "session_name": "候选人-张建国", "updated_at": "2026-08-18T09:00:00.000Z"},
+        ])
+        runtime = FakeRuntime()
+        await self._executor(runtime).execute({
+            "command_id": "c1", "op": "add_friend",
+            "args": {"number": "13800000001", "greetings": "你好", "remark": "张先生"},
+        })
+        _, payload, _ = runtime.calls[-1]
+        self.assertEqual(payload["greetings"], "候选人-张建国")
+
+    async def test_without_a_label_the_greeting_stays(self) -> None:
+        runtime = FakeRuntime()
+        await self._executor(runtime).execute({
+            "command_id": "c1", "op": "add_friend", "args": {"number": "13800000001", "greetings": "你好"},
+        })
+        _, payload, _ = runtime.calls[-1]
+        self.assertEqual(payload["greetings"], "你好")
 
     async def test_already_friend_records_no_greeting(self) -> None:
         runtime = FakeRuntime(result={"already_friend": True, "session_name": "老朋友"})

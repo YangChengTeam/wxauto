@@ -454,6 +454,11 @@ class CommandExecutor:
             if known and known != payload.get("remark"):
                 _log.info("按后端已知的会话名设置备注", op=op)   # 名字本身不进日志
                 payload["remark"] = known
+            # ★ 有备注名（label）就把它填进「发送添加朋友申请」下面那一格（用户 2026-09-24），
+            # 顶掉验证语。放在上面那步之后：填进去的必须是最终定下的会话名，
+            # 验证语记账（`remember_sent_text`）读的也是这一格，两处跟着一起对。
+            if str(payload.get("remark") or "").strip():
+                payload["greetings"] = str(payload["remark"]).strip()
         if refs and self._fetcher is None:
             _ai.warning("收到发文件指令但没配下载通道", op=op)
             return CommandResult(command_id, "rejected", "本机没有配取文件通道，发不了 AI 端产出的文件")
