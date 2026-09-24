@@ -132,6 +132,24 @@ class Watchlist:
             "（spec 085：名单 = /client/contacts 里 accepted 的那些会话名）",
         )
 
+    def exclude(self, peer_id: str) -> bool:
+        """配置中心点「移出」：把这个会话放进本机「不管」（``never``），落盘。返回是否真移出了。
+
+        ★ 移出发生在**本机**（用户 2026-09-24：「删除报不在其白名单内，应该把界面上删除」）。
+          名单权威 0.1.83 起在业务后端，AI 端手上已经没有这份名单，原来请 AI 端删
+          永远回「本来就不在」，界面上那一行怎么点都还在。业务后端又没有「移出」的接口，
+          所以落进 ``never``：后端同步只换 ``only``（`_merge`）、重启会读回来，
+          下一次同步也不会把这个人带回来。
+        """
+        name = str(peer_id or "").strip()
+        if not name or name not in self.watched():
+            return False
+        self._scope = replace(self._scope, never=self._scope.never | {name})
+        if self._persist is not None:
+            self._persist(self._scope)
+        _log.info("已在本机移出监听名单", 只管=len(self._scope.only), 不管=len(self._scope.never))
+        return True
+
     def apply_scope(self, scope: WatchScope) -> None:
         """直接装一份名单（从库里读回来时用），不落盘、不打日志。"""
         self._scope = scope

@@ -630,18 +630,23 @@ class GatewayRunner:
             await self._sync_contacts_once()
             await asyncio.sleep(CONTACTS_SYNC_INTERVAL_SECONDS)
 
-    async def _sync_contacts_once(self, *, full: bool = False) -> None:
+    async def _sync_contacts_once(self, *, full: bool = False) -> bool:
         """同步一轮。失败只记账——同步不上不该把网关带停（ContactDirectory 自己不抛）。
 
         ``full=True``（点「同步名单」）：全量拉、**以业务端为准**删掉本机多出来的人。
         后台定时那条照旧增量——全量每 120 秒拉一遍不值当，也用不着：删人是专员点了才要立刻见效。
+
+        返回「这是不是一次每个账号都拉全了的全量」——是的话名单**照业务端原样**换上，空的也换
+        （用户 2026-09-24：「同步的时候应该及时更新列表」）。
         """
         if self._contacts is None:
-            return
+            return False
+        complete = full and bool(self._accounts)
         for account_id in self._accounts:
             if full:
                 rows = await self._contacts.pull_all()
                 if rows is None:
+                    complete = False
                     _backend.warning("全量同步没拉全，这次不删本机名单", account=account_id)
                     continue
                 dropped = self._store.replace_accepted_contacts(account_id, rows)
@@ -652,15 +657,20 @@ class GatewayRunner:
             if rows:
                 saved = self._store.save_contacts(account_id, rows)
                 _backend.info("候选人会话名已同步", account=account_id, saved=saved, incremental=bool(since))
-        self._apply_derived_watchlist()
+        self._apply_derived_watchlist(authoritative=complete)
+        return complete
 
-    def _apply_derived_watchlist(self) -> int:
+    def _apply_derived_watchlist(self, *, authoritative: bool = False) -> int:
         """从本机会话名映射派生监听名单（spec 085，用户 2026-08-20 定的口径）。返回名单长度。
 
         ★ **空的一律不接管**。这不是洁癖：名单是 fail-closed 白名单，空名单意味着一个会话
         都不碰；而 `apply_backend` 一旦被调用就会把 AI 端那条推送永久挡掉（`_backend_seen`）。
         现网 `gateway_contacts` 眼下还是 0 行——真拿一个空名单去接管，等来的就是整台机器全哑，
         而且退不回去。所以「派生出来是空的」按「这轮没拿到」处理，沿用现有那份。
+
+        ``authoritative``（点「同步名单」且每个账号都全量拉全了）是唯一的例外：那一刻业务端
+        **明说了**一个都没有，还留着旧名单 = 屏幕上挂着业务端早已不让回的人、网关也照回不误
+        （2026-09-24 用户：同步了列表却不更新）。
         """
         if self._watchlist is None:
             return 0
@@ -675,6 +685,9 @@ class GatewayRunner:
                     seen.add(name)
                     names.append(name)
         if not names:
+            if authoritative:
+                self._watchlist.apply_backend({"only": []})
+                return 0
             self._note_derived_empty()
             return 0
         # 恢复出货了 → 把「空」的去重态清掉，下次再空还得再喊一次。
@@ -1290,8 +1303,8 @@ class GatewayRunner:
         """
         if self._contacts is not None and self._contacts.configured:
             # 全量：业务端已经不让盯的人要在这一下里消失，不能等增量（它永远不会带回删掉的行）。
-            await self._sync_contacts_once(full=True)
-            if self._watchlist is not None and self._watchlist.watched():
+            complete = await self._sync_contacts_once(full=True)
+            if self._watchlist is not None and (complete or self._watchlist.watched()):
                 return {
                     "watching": len(self._watchlist.watched()),
                     "blocked": len(self._watchlist.scope.never),
@@ -1302,15 +1315,20 @@ class GatewayRunner:
         return await client.sync_watchlist()
 
     async def remove_watched(self, name: str) -> dict[str, Any]:
-        """把一个会话移出自动回复名单（配置中心里点的那个删除）。
+        """把一个会话移出自动回复名单（配置中心里点的那个删除）。返回 ``{removed, watching, blocked}``。
 
-        走常驻那条 WS，删在 AI 端；删完 AI 端会立刻把新名单推回来，本机名单跟着变
-        （`_on_push` → `Watchlist.apply_push`），界面不用自己去改那份列表。
+        ★ 删在**本机**（`Watchlist.exclude`，用户 2026-09-24）。原来走 WS 请 AI 端删，可名单权威
+          0.1.83 起在业务后端，AI 端手上没有这份名单，永远回「本来就不在」，界面那一行删不掉。
+          业务后端没有「移出」接口，本机「不管」就是这里唯一能落地的地方，同步也不会把人带回来。
         """
-        if not self._accounts:
-            raise AgentWsError("这台机器上没有可用的微信账号")
-        client = await self._pool.acquire(self._accounts[0])
-        return await client.remove_watchlist([name])
+        if self._watchlist is None:
+            raise AgentWsError("监听名单还没准备好")
+        removed = [name] if self._watchlist.exclude(name) else []
+        return {
+            "removed": removed,
+            "watching": len(self._watchlist.watched()),
+            "blocked": len(self._watchlist.scope.never),
+        }
 
     def set_command_listener(
         self, listener: Callable[[dict[str, Any]], None] | None

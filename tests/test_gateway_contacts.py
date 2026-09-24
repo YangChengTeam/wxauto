@@ -580,6 +580,39 @@ class FullResyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(watchlist.watched(), ["张三"])
         self.assertEqual(result["watching"], 1)
 
+    async def test_x_业务端一个都不给了_点同步名单就清空(self) -> None:
+        """★ 用户 2026-09-24：「同步的时候应该及时更新列表」。全量拉全了、业务端明说没人，
+        屏幕上的旧名单要当场清掉——原来派生为空一律当「没拿到」，旧名单一直挂着。"""
+        d = FakeDirectory([self._row("1", "张三")])
+        runner, watchlist = self._runner(d)
+        await runner._sync_contacts_once()
+        self.assertEqual(watchlist.watched(), ["张三"])
+
+        d._rows = []
+        result = await runner.sync_watched()
+        self.assertEqual(watchlist.watched(), [])
+        self.assertEqual(result["watching"], 0)
+
+    async def test_x_后台增量派生为空_照旧不清名单(self) -> None:
+        d = FakeDirectory([self._row("1", "张三")])
+        runner, watchlist = self._runner(d)
+        await runner._sync_contacts_once()
+        self.store.replace_accepted_contacts("acct-1", [])  # 本机映射意外空了
+        await runner._sync_contacts_once()
+        self.assertEqual(watchlist.watched(), ["张三"], "不是业务端明说的空，fail-closed 不接管")
+
+    async def test_x_本机移出的人_点同步名单也不回来(self) -> None:
+        d = FakeDirectory([self._row("1", "张三"), self._row("2", "大月")])
+        runner, watchlist = self._runner(d)
+        await runner._sync_contacts_once()
+
+        result = await runner.remove_watched("大月")
+        self.assertEqual(result["removed"], ["大月"])
+        self.assertEqual(watchlist.watched(), ["张三"])
+
+        await runner.sync_watched()
+        self.assertEqual(watchlist.watched(), ["张三"], "★ 移出了又被同步带回来 = 删不掉")
+
     async def test_x_全量没拉全_一个都不删(self) -> None:
         d = FakeDirectory([self._row("1", "张三"), self._row("2", "李四")])
         runner, _ = self._runner(d)

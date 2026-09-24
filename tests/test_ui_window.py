@@ -1407,9 +1407,8 @@ class WatchRemovalTests(unittest.TestCase):
 
     ★ 三条不许破：
       ① **先问一句**——名单是白名单，删掉 = 从此不再自动回他；
-      ② **删在 AI 端**（069 权威在那儿）。本机把行抹掉是假的：名单推一次覆盖一次，
-         下一次推送又把他带回来，用户看到的是「删了又回来」；
-      ③ AI 端说「本来就不在名单里」时，**不许当成删成功**。
+      ② 删在本机「不管」里（2026-09-24：AI 端已不持有名单，请它删永远回「本来就不在」）；
+      ③ 回来的是「本来就不在」也照样从界面上拿掉，不弹框（用户 2026-09-24）。
     """
 
     def setUp(self) -> None:
@@ -1492,15 +1491,25 @@ class WatchRemovalTests(unittest.TestCase):
         self.assertIn("候选人-王建国", self.window._watch_removing,
                       "★ 还没回话就不算删掉了——这一行得停在「正在移出…」")
 
-    def test_a_no_op_removal_is_not_reported_as_success(self) -> None:
+    def test_a_no_op_removal_still_takes_the_row_off_the_screen(self) -> None:
+        """★ 用户 2026-09-24：「删除报不在其白名单内，应该把界面上删除」——不再弹「没有变化」。"""
         self.future = _DoneFuture({"removed": [], "watching": 3})
         made, patches = self._dialogs(True)
         with patches[0], patches[1]:
             self.window._ask_remove_watched("查无此人")
             self.window._poll_watch_removals()
 
-        self.assertEqual(len(made), 2, "确认框 + 「没有变化」各一个")
-        self.assertIn("本来就不在", made[1][2])
+        self.assertEqual(len(made), 1, "只有确认框，不再弹「没有变化」")
+        self.assertIn("查无此人", self.window._watch_gone)
+
+    def test_a_removed_row_is_gone_before_the_snapshot_catches_up(self) -> None:
+        _made, patches = self._dialogs(True)
+        with patches[0], patches[1]:
+            self.window._ask_remove_watched("候选人-王建国")
+            self.window._poll_watch_removals()
+
+        self.assertIn("候选人-王建国", self.window._watch_gone,
+                      "★ 快照一秒一拍，这一拍之内那一行不许闪回来")
 
     def test_a_failure_is_told_as_a_failure(self) -> None:
         self.future = _FailedFuture(RuntimeError("AI 端连不上"))

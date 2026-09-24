@@ -200,8 +200,10 @@ class MainWindow:
         # 它还没建出来时被问到，而 tk 回调里的 AttributeError 是**看不见的**（没有控制台），
         # 现场表现就是「点了没反应」（2026-08-17 那次的形状）。
         self._watch_hint: Any = None
-        #: 正在请 AI 端移出的会话名 → 那次请求的 Future（tk 线程读，别在别处改）。
+        #: 正在移出的会话名 → 那次请求的 Future（tk 线程读，别在别处改）。
         self._watch_removing: dict[str, Any] = {}
+        #: 刚移出完、状态快照（每秒一拍）还没跟上的会话名——先从界面上拿掉，别让那一行闪回来。
+        self._watch_gone: set[str] = set()
         #: 「同步名单」那一次请求的 Future；None = 现在没有在同步的。
         self._watch_syncing: Any = None
         #: 名单那一节要临时顶出来的一句话 `(文本, 颜色, 到期时刻)`；到期时刻 None = 不自己消失。
@@ -577,7 +579,7 @@ class MainWindow:
             return
         _log.info("请求同步监听名单")
         # 不自己消失：等回话那一刻由 `_poll_watch_sync` 换掉，中间别让人以为点空了。
-        self._note_watch("正在向 AI 端要最新名单…", theme.TEXT_MUTED, hold=True)
+        self._note_watch("正在从业务端同步名单…", theme.TEXT_MUTED, hold=True)
 
     def _note_watch(self, text: str, color: str, *, hold: bool = False) -> None:
         """在名单那一节顶出一句话。`hold` = 一直挂着，否则几秒后自己让位给常规说明。"""
@@ -671,11 +673,10 @@ class MainWindow:
                 self._mode_notes.pop(name, None)
 
     def _ask_remove_watched(self, name: str) -> None:
-        """「移出」：先问一句，再请 AI 端删。
+        """「移出」：先问一句，再在本机移出（`GatewayRunner.remove_watched`）。
 
-        ★ 问的这一句要说清后果和归属：删掉之后**他再来消息不会被自动回复**；名单的权威
-        在 AI 端，所以这里是「请 AI 端删」，删完新名单推回来、这一行才会消失——
-        不在本机先把行删掉装成功（那样下一次推送又会把它带回来，看起来像「删不掉」）。
+        ★ 问的这一句要说清后果：删掉之后**他再来消息不会被自动回复**。移出落在本机「不管」里，
+        同步名单不会把他带回来（用户 2026-09-24：原来请 AI 端删，永远回「本来就不在」，删不掉）。
 
         ★ 弹框的 parent 必须是**真控件**（`self.root`）：`MainWindow` 不是 tk 控件，
         传 `self` 会在 `winfo_toplevel()` 上抛 AttributeError——而 tk 回调里的异常在
@@ -688,7 +689,7 @@ class MainWindow:
         if not dialog.ask(
             self.root, "移出监听名单",
             f"移出「{name}」之后，他再发消息就不会被自动回复了。\n\n"
-            "名单由 AI 端保管，这里会请 AI 端删掉；删完新名单会自动同步回这台电脑。",
+            "只在这台电脑上移出，之后同步名单也不会把他加回来。",
             confirm="移出", cancel="取消",
         ):
             return
@@ -715,20 +716,22 @@ class MainWindow:
                 dialog.tell(self.root, "没能移出", f"{name}：{exc}", tone="error")
                 continue
             removed = list(result.get("removed") or []) if isinstance(result, dict) else []
-            if not removed:
-                # AI 端说它本来就不在名单上。**别当成删成功**——那会让人以为改过了。
-                _log.info("移出监听名单：AI 端说本来就不在名单里", 会话=name)
-                dialog.tell(self.root, "没有变化",
-                            f"AI 端说「{name}」本来就不在自动回复名单里。")
+            # 本来就不在名单里也一样从界面上拿掉（用户 2026-09-24）——屏幕上那一行是旧的，
+            # 留着它只会让人一直点、一直删不掉。
+            self._watch_gone.add(name)
+            if removed:
+                _log.info("已移出监听名单", 会话=name)
             else:
-                _log.info("已移出监听名单", 会话=name, 删掉=removed)
+                _log.info("移出监听名单：本来就不在名单里，界面上一并拿掉", 会话=name)
 
     def _render_watch_page(self) -> None:
         """把名单铺到页面上。停在配置中心时每秒刷一次——名单是 AI 端随时会改的。"""
         if self._page != "settings" or self._watch_card is None:
             return
         snapshot = self.service.status()
-        watched = tuple(snapshot.watched)
+        # 快照跟上了（那人已不在里面）就不用再替它藏了。
+        self._watch_gone &= set(snapshot.watched)
+        watched = tuple(name for name in snapshot.watched if name not in self._watch_gone)
         running = self.service.state is ServiceState.RUNNING
         self._watch_next.configure(text=_next_read_text(snapshot, running))
         if not running:
@@ -787,14 +790,13 @@ class MainWindow:
                  fg=theme.TEXT_MUTED).pack(side=tk.LEFT, padx=(14, 0))
 
         if name in self._watch_removing:
-            # 请求还在路上。**不提前把这一行抹掉**——AI 端还没说删掉了，抹了就是假装。
+            # 请求还在路上。**不提前把这一行抹掉**——还没移出成功，抹了就是假装。
             tk.Label(row, text="正在移出…", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
                      fg=theme.ORANGE).pack(side=tk.RIGHT, padx=(0, 16))
             return
 
         # ★「移出」放在最右：名单是白名单，删掉 = 从此不再自动回他，是有后果的动作，
-        # 所以点了先问一句（`_ask_remove_watched`），而且**删在 AI 端**——本机删只能撑到
-        # 下一次推送（名单推一次覆盖一次），删了立刻又回来，那是假的删除。
+        # 所以点了先问一句（`_ask_remove_watched`）；落在本机「不管」里，同步不会把人带回来。
         remove = tk.Label(row, text="移出", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
                           fg=theme.TEXT_MUTED, cursor="hand2")
         remove.pack(side=tk.RIGHT, padx=(0, 16))

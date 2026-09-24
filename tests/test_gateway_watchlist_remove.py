@@ -1,10 +1,9 @@
 """把会话移出监听名单——真 runner + 真 WS + 假 AI 端。
 
-断言的是**整条路**：桌面端发出去的是哪个 op、AI 端删完推回来的新名单有没有真的落到
-本机这份上。后者正是「界面会不会更新」的根：界面读的就是 `runner.watched_peers()`。
+界面读的就是 `runner.watched_peers()`，所以断言都落在本机这份名单上。
 
-★ 为什么删除必须发生在 AI 端（069）：名单权威在那儿，推一次覆盖一次——本机把行抹掉
-只能撑到下一次推送，删了立刻又回来，用户看到的是「删不掉」。
+★ 移出在本机（2026-09-24 起）：名单权威在业务后端、业务端没有移出接口，AI 端也不再持有名单。
+落进本机「不管」，同步只换 ``only``，人不会被带回来。
 """
 
 from __future__ import annotations
@@ -77,31 +76,31 @@ class _WatchlistCase(unittest.IsolatedAsyncioTestCase):
 
 
 class WatchlistRemovalTests(_WatchlistCase):
-    def _removes(self, server: FakeAgentServer) -> list[dict[str, Any]]:
-        return [f.get("data") or {}
-                for f in server.received if f.get("op") == "wechat.watchlist.remove"]
+    """★ 移出发生在**本机**（用户 2026-09-24）：名单权威 0.1.83 起在业务后端，AI 端手上没有这份名单，
+    原来请 AI 端删永远回「本来就不在」，界面那一行怎么点都还在。"""
 
-    async def test_it_asks_the_ai_side_and_takes_the_new_list_from_it(self) -> None:
-        """★ 桌面端只发意图；名单以 AI 端推回来的那一份为准。"""
+    async def test_it_removes_locally_without_asking_the_ai_side(self) -> None:
+        saved: list[dict] = []
+        self.watchlist = Watchlist(persist=lambda scope: saved.append(
+            {"only": sorted(scope.only), "never": sorted(scope.never)}))
         async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
-            server.watchlist = {"候选人-王建国", "普工招聘群"}
             runner = self._runner(server)
-            # 先让 AI 端把当前名单推下来（真实链路里握手完就推）
-            self.watchlist.apply_push({"only": sorted(server.watchlist), "never": []})
+            self.watchlist.apply_backend({"only": ["候选人-王建国", "普工招聘群"]})
 
             result = await runner.remove_watched("候选人-王建国")
 
-            self.assertEqual(self._removes(server), [{"names": ["候选人-王建国"]}])
             self.assertEqual(result["removed"], ["候选人-王建国"])
-            self.assertEqual(self.watchlist.watched(), ["普工招聘群"],
-                             "★ AI 端推回来的新名单要真的落到本机——界面读的就是这份")
+            self.assertEqual(self.watchlist.watched(), ["普工招聘群"], "★ 界面读的就是这份")
+            self.assertFalse([f for f in server.received if f.get("op") == "wechat.watchlist.remove"])
+            self.assertEqual(saved[-1]["never"], ["候选人-王建国"], "★ 要落盘，重启后还在「不管」里")
+
+            self.watchlist.apply_backend({"only": ["候选人-王建国", "普工招聘群"]})
+            self.assertEqual(self.watchlist.watched(), ["普工招聘群"], "★ 下一次同步不许把他带回来")
 
     async def test_removing_someone_not_on_the_list_says_so(self) -> None:
-        """AI 端说「他本来就不在名单里」时，如实返回空的 removed，本机名单一个不动。"""
         async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
-            server.watchlist = {"普工招聘群"}
             runner = self._runner(server)
-            self.watchlist.apply_push({"only": ["普工招聘群"], "never": []})
+            self.watchlist.apply_backend({"only": ["普工招聘群"]})
 
             result = await runner.remove_watched("查无此人")
 
