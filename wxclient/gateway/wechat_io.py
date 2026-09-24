@@ -16,15 +16,16 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-import re
 from hashlib import sha256
 from typing import Any
 
 import structlog
 
 from wxclient.queue import TaskStatus, TaskType
+from wxclient.wechat_api.errors import CONTACT_NOT_FOUND_CODE
 
 from .attachments import SAVABLE_TYPES as SAVABLE_ATTACHMENT_TYPES
 from .inbound import InboundMessage
@@ -547,6 +548,11 @@ class QueueMessageSource:
         self._on_unreachable = on_unreachable
         # 会话名 → 连续读不到了几轮（092：从 set 改成计数）
         self._unreachable: dict[str, int] = {}
+        # 会话名 → 连续几轮都是「查无此人」（队列回的 reason_code = CONTACT_NOT_FOUND）。
+        # 跟上面那个分开数：那个任何读失败都算（微信卡了、窗口打不开），这个只认「搜不到这个名字」。
+        # 数够 UNREACHABLE_STRIKES 轮就喊 `_on_not_found`，由 runner 移出监听名单（用户 2026-09-24）。
+        self._not_found: dict[str, int] = {}
+        self._on_not_found = None
         # (会话名, 语音标签) → 转写等了几轮（见 `hold_pending_voice`）
         self._voice_waits: dict[tuple[str, str], int] = {}
         # 上一轮因人工接管被跳过的会话，只为「变了才喊一声」（见 `_drop_handed_off`）
@@ -757,6 +763,27 @@ class QueueMessageSource:
         """
         self._on_unreachable = handler
 
+    def set_not_found_handler(self, handler) -> None:
+        """装上「连续几轮都查无此人就喊一声」的回调：``async (account_id, peer_id) -> None``。"""
+        self._on_not_found = handler
+
+    async def _count_not_found(self, account_id: str, peer_id: str, history: dict[str, Any] | None) -> None:
+        """这一轮读失败是不是「查无此人」：是就 +1，数够了喊一声；不是就清零（得**连续**才算）。
+
+        ★ 要连续几轮才动手，不是一次就移：移出落在本机「不管」里，界面上没有恢复按钮。
+          搜索那一刻 UI 没刷出来也会走到 vendor 的「查无此人」分支，一次偶发不能把人永久踢出去。
+        """
+        result = (history or {}).get("result")
+        code = str(result.get("reason_code") or "") if isinstance(result, dict) else ""
+        if code != CONTACT_NOT_FOUND_CODE:
+            self._not_found.pop(peer_id, None)
+            return
+        count = self._not_found.get(peer_id, 0) + 1
+        self._not_found[peer_id] = count
+        if count >= UNREACHABLE_STRIKES and self._on_not_found is not None:
+            self._not_found.pop(peer_id, None)
+            await self._on_not_found(account_id, peer_id)
+
     def _claim_own_echoes(
         self, account_id: str, peer_id: str, raw_messages: Sequence[dict[str, Any]]
     ) -> list[dict[str, Any]]:
@@ -802,7 +829,9 @@ class QueueMessageSource:
             # 拿它直接去加好友就是误加。到底是不是好友由回调那边再确定性判一次。
             if strikes == UNREACHABLE_STRIKES and self._on_unreachable is not None:
                 await self._on_unreachable(account_id, peer_id, reason)
+            await self._count_not_found(account_id, peer_id, history)
             return []
+        self._not_found.pop(peer_id, None)
         if self._unreachable.pop(peer_id, 0):
             _log.info("名单里的这个会话又能读了", 会话=peer_id)
         raw_messages = ((history or {}).get("result") or {}).get("messages") or []

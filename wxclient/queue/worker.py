@@ -169,15 +169,17 @@ class OperationWorker:
 
     def _record_execution_failure(self, task: Task, exc: Exception) -> str:
         """把失败落成终态，返回记下的原因（日志里照这句说）。"""
-        if is_real_write(task) and is_contact_not_found(exc):
+        if is_contact_not_found(exc):
             # ★ 搜联系人那一步就没找到：聊天窗口没打开、一个字都没发，结论是**确定没发出去**，
             #   不能跟下面那种「真动过微信、不知道成没成」混成一句（2026-09-24 生产：业务端收到
             #   「执行结果未知」，只能当作不确定，一遍遍重投同一个对不上的名字）。
-            #   也不自动重试：名字对不上，重试多少遍都一样，要人去核对备注名。
+            #   也不自动重试（读也一样）：名字对不上，重试多少遍都一样。读消息那条路上
+            #   「连续几轮都搜不到」由网关按 reason_code 数，数够了移出监听名单（wechat_io）。
             friend = str(task.payload.get("friend") or "").strip()
+            write = is_real_write(task)
             error = (
                 f"微信里搜不到「{friend or '-'}」这个会话（备注名对不上，或还不是好友），"
-                "消息没有发出去"
+                + ("消息没有发出去" if write else "没读到消息")
             )
             self.store.fail(
                 task.id,
@@ -185,7 +187,7 @@ class OperationWorker:
                 retry=False,
                 owner_id=self.worker_id,
                 result={
-                    "outcome": "not_sent",
+                    "outcome": "not_sent" if write else "not_found",
                     "reason_code": CONTACT_NOT_FOUND_CODE,
                     "retry_suppressed": True,
                 },

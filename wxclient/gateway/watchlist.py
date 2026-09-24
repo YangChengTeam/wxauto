@@ -150,6 +150,21 @@ class Watchlist:
         _log.info("已在本机移出监听名单", 只管=len(self._scope.only), 不管=len(self._scope.never))
         return True
 
+    def include(self, peer_id: str) -> bool:
+        """把这个会话从本机「不管」里拿出来，落盘。返回是否真拿出来了。
+
+        只给「查无此人被自动移出、后来又确认通过了好友」那一种情况用（``runner._on_friend_accepted``）：
+        名字在微信里重新找得到了，还一直挂在 ``never`` 里就永远不回他。
+        """
+        name = str(peer_id or "").strip()
+        if not name or name not in self._scope.never:
+            return False
+        self._scope = replace(self._scope, never=self._scope.never - {name})
+        if self._persist is not None:
+            self._persist(self._scope)
+        _log.info("已把这个会话放回监听名单", 会话=name, 只管=len(self._scope.only), 不管=len(self._scope.never))
+        return True
+
     def apply_scope(self, scope: WatchScope) -> None:
         """直接装一份名单（从库里读回来时用），不落盘、不打日志。"""
         self._scope = scope

@@ -570,6 +570,28 @@ class WorkerDispatchTests(unittest.TestCase):
             self.assertIn(f"「{name}」", task.last_error)  # type: ignore[union-attr,operator]
             self.assertNotIn("结果未知", task.last_error)  # type: ignore[union-attr,operator]
 
+    def test_contact_not_found_on_a_read_is_not_retried_and_carries_the_code(self) -> None:
+        """读消息也「查无此人」：不重试（名字对不上），带 reason_code 给网关去数连击。"""
+
+        class NoSuchFriendError(Exception):
+            pass
+
+        class _Api(_FakeApi):
+            def search_contacts(self, query: str, limit: int) -> dict[str, Any]:
+                raise NoSuchFriendError("好友或群聊备注有误！查无此人！")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "tasks.db")
+            worker = OperationWorker(store, _Api())  # type: ignore[arg-type]
+            task = store.create_task(TaskType.SEARCH_CONTACTS, {"query": "张三", "limit": 5}, "default")
+            self.assertTrue(worker.run_once())
+            current = store.get(task.id)
+
+        self.assertEqual(current.status, TaskStatus.FAILED)  # type: ignore[union-attr]
+        self.assertEqual(current.result["reason_code"], "CONTACT_NOT_FOUND")  # type: ignore[union-attr,index]
+        self.assertEqual(current.result["outcome"], "not_found")  # type: ignore[union-attr,index]
+        self.assertIn("没读到消息", current.last_error)  # type: ignore[union-attr,operator]
+
     def test_search_contacts_is_dispatched_through_worker(self) -> None:
         api = _FakeApi()
         with tempfile.TemporaryDirectory() as tmp:

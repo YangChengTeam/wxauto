@@ -320,6 +320,10 @@ class GatewayRunner:
         if auto_friend is not None and hasattr(source, "set_unreachable_handler"):
             auto_friend.on_added = self._report_contact
             source.set_unreachable_handler(auto_friend.on_unreachable)
+        # 连续几轮都「查无此人」→ 移出监听名单（用户 2026-09-24）。跟 092 各装各的：
+        # 自动补加好友关着的机器上也得生效。
+        if hasattr(source, "set_not_found_handler"):
+            source.set_not_found_handler(self._on_contact_not_found)
         # 093：反过来的那半边——已申请、还没通过的人，隔一阵复查一次是不是通过了。
         # 092 管「在名单里却不是好友」，093 管「是好友了却不在名单里」。
         if friend_checker is not None:
@@ -946,6 +950,22 @@ class GatewayRunner:
                 if attempt == 2:
                     raise
 
+    async def _on_contact_not_found(self, account_id: str, peer_id: str) -> None:
+        """名单里这个会话连续几轮都「查无此人」→ 在本机移出监听名单，之后不再去读它（用户 2026-09-24）。
+
+        落在本机「不管」里（同配置中心的「移出」，`Watchlist.exclude`）：业务端同步只换「只管」，
+        不会把他带回来；每轮白开一次搜不到的会话，既浪费读名额，又在日志里刷一遍查无此人。
+        唯一放回来的路：093 复查确认他通过了好友（`_on_friend_accepted` → `Watchlist.include`）。
+        """
+        if self._watchlist is None:
+            return
+        if self._watchlist.exclude(peer_id):
+            _log.warning(
+                "名单里这个会话连续几轮都查无此人，已移出监听名单，不再读它（请核对微信里的备注名）",
+                会话=peer_id,
+                account=account_id,
+            )
+
     async def _on_friend_accepted(self, account_id: str, session_name: str) -> None:
         """复查确认对方通过了（093）→ 走**既有**那条上报路，并让他立刻进监听名单。
 
@@ -964,6 +984,9 @@ class GatewayRunner:
           销账只发生在 `_report_accepted_now` 里真报成功那一刻。
         """
         await self._note_friend_accepted(account_id, session_name)
+        # 之前因「查无此人」被自动移出过的，名字现在找得到了 → 放回来，不然他永远不会被回。
+        if self._watchlist is not None:
+            self._watchlist.include(session_name)
         self._apply_derived_watchlist()
 
     # ────────────────────────── 一轮 ──────────────────────────
