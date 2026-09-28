@@ -18,6 +18,7 @@ from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
 from .. import logrole
+from .agent_files import AgentFileUploader, http_base_from_ws
 from .attachments import AttachmentFetcher
 from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
@@ -249,6 +250,16 @@ def build_gateway(
         candidates=candidates,
         message_events=message_events,
         command_executor=command_executor,
+        # 2026-09-28：另存下来的附件直接传到 AI 端这个会话拿 file_id（docs/21 §2.0），不再塞进 WS。
+        # 地址从 WS 门推出来（同一反代前缀）；票和 WS 建连一样每次现换。传不上去 runner 自己退回内联。
+        file_uploader=(
+            AgentFileUploader(
+                base_url=http_base_from_ws(gateway_settings.ai_ws_url),
+                ticket_provider=ticket_provider,
+            )
+            if gateway_settings.inbound_attachments
+            else None
+        ),
         # 092：名单里还不是好友的人自动补加。加好友本身仍走 `command_executor`——
         # 能力闸、频控闸、时间窗、幂等一道不绕。
         auto_friend=AutoFriendWatcher(

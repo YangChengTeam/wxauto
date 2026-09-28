@@ -22,7 +22,13 @@ from typing import Any
 import structlog
 
 from .. import logrole
-from .attachments import LEFT_BEHIND_TEXT, MATERIAL_TYPE_TEXT, inline_attachments
+from .agent_files import AgentFileUploader
+from .attachments import (
+    LEFT_BEHIND_TEXT,
+    MATERIAL_TYPE_TEXT,
+    collect_attachments,
+    to_inline,
+)
 from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
 from .candidates import CandidateDirectory
@@ -237,8 +243,11 @@ class GatewayRunner:
         auto_friend: AutoFriendWatcher | None = None,
         friend_checker: PendingFriendWatcher | None = None,
         moments_watcher: MomentsWatcher | None = None,
+        file_uploader: AgentFileUploader | None = None,
     ) -> None:
         self._settings = settings
+        # 2026-09-28：对方发来的图片/文件先直接传到 AI 端的会话拿 file_id，传不上去才随消息内联。
+        self._uploader = file_uploader
         self._store = store
         self._accounts = tuple(accounts)
         self._connect_error: str | None = None
@@ -1095,8 +1104,10 @@ class GatewayRunner:
         """
         history = self._history_for(account_id, peer_id, messages)
         refs = self._peer_refs(account_id, peer_id)
-        # 104：这一批消息另存下来的图片/文件，随轮送过去（AI 端落到会话 inbox）。
-        attachments, left_behind = inline_attachments(messages)
+        # 104：这一批消息另存下来的图片/文件，这一轮送过去（AI 端落到会话 inbox）。
+        # 怎么送在拿到会话之后定（`_turn_files`）：先直接上传拿 file_id，不成再内联。
+        attachments, left_behind = collect_attachments(messages)
+        uploaded: dict[str, list[str]] = {}
         if left_behind:
             _ai.warning(
                 "这一轮有附件没能带上",
@@ -1107,9 +1118,6 @@ class GatewayRunner:
                     for e in left_behind
                 ],
             )
-        extra_turn: dict[str, Any] = {}
-        if attachments:
-            extra_turn["attachments"] = attachments
         for attempt in (1, 2):
             started = self._clock()
             _ai.info(
@@ -1121,7 +1129,7 @@ class GatewayRunner:
                 附件=len(attachments),
                 # 只记名 / 类型 / 大小，不记内容（另存那步的口径一样）。base64 长度 ×3/4 ≈ 原字节数，够看。
                 附件清单=[
-                    {"文件": a["file_name"], "类型": a["kind"], "字节": len(a["data_base64"]) * 3 // 4}
+                    {"文件": a["file_name"], "类型": a["kind"], "字节": len(a["data"])}
                     for a in attachments
                 ],
                 第几次=attempt,
@@ -1130,6 +1138,7 @@ class GatewayRunner:
             try:
                 client = await self._pool.acquire(account_id)
                 session_id = await self._ensure_session(client, account_id, peer_id)
+                extra_turn = await self._turn_files(account_id, peer_id, session_id, attachments, uploaded)
                 result = await client.send_message(
                     session_id,
                     transcript,
@@ -1189,6 +1198,32 @@ class GatewayRunner:
             self._log_claimed_documents(peer_id, attachments, result.card)
             return result.card
         return None
+
+    async def _turn_files(
+        self,
+        account_id: str,
+        peer_id: str,
+        session_id: str,
+        files: Sequence[dict[str, Any]],
+        uploaded: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        """这一轮的附件怎么带：直接传到这个会话、只带 ``file_ids``；传不上去才随消息内联 base64。
+
+        用户 2026-09-28：「wx 客户端直接上传到 AI 端、不用 ws」。契约 AI 服务仓 docs/21 §2.0。
+        ``uploaded`` 是这一轮里已经传过的（按会话记）：断线重试接回的是**同一个**会话就不再传一遍；
+        会话被清掉重建了（`Unauthorized` 那条）是新会话，得重新传。
+        """
+        if not files:
+            return {}
+        if self._uploader is not None:
+            ids = uploaded.get(session_id)
+            if ids is None:
+                ids = await self._uploader.upload(account_id, peer_id, session_id, files)
+                if ids is not None:
+                    uploaded[session_id] = ids
+            if ids is not None:
+                return {"file_ids": ids}
+        return {"attachments": to_inline(files)}
 
     @staticmethod
     def _log_claimed_documents(peer_id: str, attachments: Sequence[dict[str, Any]], card: Any) -> None:

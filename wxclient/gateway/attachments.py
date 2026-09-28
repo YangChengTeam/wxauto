@@ -179,13 +179,16 @@ class _suppress_oserror:
         return exc_type is not None and issubclass(exc_type, OSError)
 
 
-def inline_attachments(messages: Sequence[Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """把这一批消息带的附件读成 AI 端 ``message.send.attachments`` 的形状。
+def collect_attachments(messages: Sequence[Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """这一批消息带的附件里，这一轮送哪几份：返回 (要送的, 没能带上的清单)。
 
-    返回 (随行附件, 没能带上的清单)。清单每条 ``{"file_name", "reason"}``，``reason`` 是
-    ``LEFT_BEHIND_TEXT`` 的键——超出个数或总量上限的**不送**，交给调用方在正文里如实说；
-    文件已经不在了（过保鲜期 / 被清）也算没带上。原来只回一个数，日志页上只见「有 2 份没带上」
-    却说不出是哪两份、为什么；对方追问「我发的身份证你收到没」时这台电脑答不上来。
+    要送的每项 ``{"file_name", "content_type", "kind", "data"}``（``data`` 是字节）。两种送法共用这一份挑选：
+    直接传到 AI 端（`agent_files.AgentFileUploader`，2026-09-28 起的主路）和随 WS 内联（兜底，见
+    `inline_attachments`）——个数和总量上限只在这里判一次，两条路看到的是同一批。
+
+    清单每条 ``{"file_name", "reason"}``，``reason`` 是 ``LEFT_BEHIND_TEXT`` 的键——超出个数或总量上限的
+    **不送**，交给调用方在正文里如实说；文件已经不在了（过保鲜期 / 被清）也算没带上。原来只回一个数，
+    日志页上只见「有 2 份没带上」却说不出是哪两份、为什么；对方追问「我发的身份证你收到没」时这台电脑答不上来。
     """
     out: list[dict[str, Any]] = []
     left_behind: list[dict[str, str]] = []
@@ -210,8 +213,26 @@ def inline_attachments(messages: Sequence[Any]) -> tuple[list[dict[str, Any]], l
                     "file_name": file_name,
                     "content_type": guess_content_type(file_name),
                     "kind": str(entry.get("kind") or "file"),
-                    "data_base64": base64.b64encode(data).decode("ascii"),
+                    "data": data,
                 }
             )
     return out, left_behind
 
+
+def to_inline(files: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """`collect_attachments` 挑出来的那批 → AI 端 ``message.send.attachments`` 的形状（兜底路）。"""
+    return [
+        {
+            "file_name": f["file_name"],
+            "content_type": f["content_type"],
+            "kind": f["kind"],
+            "data_base64": base64.b64encode(f["data"]).decode("ascii"),
+        }
+        for f in files
+    ]
+
+
+def inline_attachments(messages: Sequence[Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """把这一批消息带的附件读成 AI 端 ``message.send.attachments`` 的形状。挑选口径见 `collect_attachments`。"""
+    files, left_behind = collect_attachments(messages)
+    return to_inline(files), left_behind
