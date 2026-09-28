@@ -1411,6 +1411,11 @@ class GatewayRunner:
             "funnel": "inbound",
             "operator_intervened": any(m.from_self for m in messages),
         }
+        # 名单外、看到红点才读的会话（用户 2026-09-28）：AI 端据此收紧——判不出对方在找工作就
+        # 一条都不发、在找就建档接待（spec 090）。★ 必须由网关说，不能让 AI 端拿「refs 是空的」去推：
+        # 名单里没归位到候选人的会话 refs 也是空的，拿它当判据会让正常联系人一起哑掉。
+        if any(m.first_contact for m in messages):
+            meta["first_contact"] = True
         watching = self.watched_peers()
         if watching:
             meta["watching"] = watching

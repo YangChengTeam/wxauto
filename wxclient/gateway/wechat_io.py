@@ -51,6 +51,19 @@ QUICK_POLL_DIRECT_MAX = 2
 #: 要比一窗读取量（``history_limit``，默认 20）大：判「这一窗是不是全是旧的」靠的是窗口和记录重叠。
 KNOWN_KEYS_LIMIT = 60
 
+#: 不在名单里、但会话列表上挂着红点数的单聊，每轮最多开几个窗口去读（用户 2026-09-28）。
+#: 每开一个就是一次切窗口、清一个红点，跟名单那边的 8 个分开算，别让陌生会话挤掉名单里的人。
+MAX_UNREAD_STRANGERS_PER_POLL = 3
+
+#: 红点数读回来也不开的会话：微信自己的功能入口和服务号/公众号类（用户 2026-09-28「排除服务号公众号」）。
+#: 服务号/公众号两个折叠入口 vendor 已经滤掉（`pyweixin.utils` 的 NotCare），这里是第二道：
+#: 单独露在列表里的服务号（「微信支付」「腾讯新闻」这种）只能按名字认——打开之前判不出它是不是人。
+SYSTEM_SESSION_NAMES = frozenset({
+    "服务号", "公众号", "订阅号", "订阅号消息", "服务通知", "微信支付", "微信团队", "文件传输助手",
+    "腾讯新闻", "微信运动", "新的朋友", "朋友推荐消息", "QQ邮箱提醒", "漂流瓶", "腾讯视频",
+    "微信游戏", "微信收款助手", "微信收款商业版", "企业微信", "微信读书",
+})
+
 #: 连续几轮读不到才算「这个会话真有问题」（092）。
 #: 一轮读不到太常见了——微信卡一下、窗口没起来都会。拿一次失败就去加好友是误加。
 UNREACHABLE_STRIKES = 3
@@ -433,6 +446,26 @@ def row_time(timestamp_text: Any, now: datetime) -> datetime | None:
     return moment.astimezone(timezone.utc)
 
 
+def unread_counts(result: Any) -> list[tuple[str, int]]:
+    """`get_unread_messages` 的结果 → [(会话名, 红点数)]，保持列表里从上到下的顺序。坏数据一律忽略。"""
+    body = result.get("result") if isinstance(result, dict) and isinstance(result.get("result"), dict) else result
+    rows = body.get("unread_sessions") if isinstance(body, dict) else None
+    out: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "").strip()
+        try:
+            count = int(row.get("unread_count") or 0)
+        except (TypeError, ValueError):
+            continue
+        if name and count > 0 and name not in seen:
+            seen.add(name)
+            out.append((name, count))
+    return out
+
+
 def session_rows(result: Any) -> dict[str, dict[str, Any]]:
     """`read_chat_sessions` 的结果 → 会话名 → 那一行。坏数据一律忽略。"""
     body = result.get("result") if isinstance(result, dict) and isinstance(result.get("result"), dict) else result
@@ -484,6 +517,7 @@ def to_inbound(
     seq: int,
     at: datetime | None = None,
     attachment: dict[str, Any] | None = None,
+    first_contact: bool = False,
 ) -> InboundMessage:
     return InboundMessage(
         account_id=account_id,
@@ -498,6 +532,7 @@ def to_inbound(
         message_type=str(raw.get("message_type") or "text"),
         attachments=(attachment,) if attachment else (),
         raw_text=str(raw.get("text") or ""),
+        first_contact=first_contact,
     )
 
 
@@ -520,6 +555,7 @@ class QueueMessageSource:
         attachment_fetcher=None,
         hot_window_seconds: float = 600.0,
         prefilter_by_session_list: bool = True,
+        read_unread_strangers: bool = True,
         allow_real_actions: bool = False,
         confirmation: str = "",
     ) -> None:
@@ -543,6 +579,8 @@ class QueueMessageSource:
         self._prefilter = bool(prefilter_by_session_list)
         self._allow_real = bool(allow_real_actions)
         self._confirmation = confirmation
+        # 不在名单里、挂着红点数的单聊也读（见 `_unread_strangers`）。dry-run 机器回不了话，读了白读，不开。
+        self._read_unread = bool(read_unread_strangers)
         # 092：连续 UNREACHABLE_STRIKES 轮读不到时喊一声。**只是「读不到」，不是「不是好友」**
         # ——判定留给回调那边（`autofriend.py`），这里一行都不管策略。
         self._on_unreachable = on_unreachable
@@ -565,30 +603,77 @@ class QueueMessageSource:
         群多半设了消息免打扰、不进未读；专员在手机上瞄过一眼的也不再是未读——
         于是「该回的消息网关压根看不见」。名单本来就是「要盯的会话」清单，
         直接读它、按游标判新，跟「微信觉得你读没读过」彻底脱钩。
+
+        名单之外只多一条窄路：全量巡检那一轮顺带看一眼红点数，**不在名单里**、挂着红点的
+        单聊开窗读（`_unread_strangers`，用户 2026-09-28）。红点在这里只用来「发现有人找上门」，
+        名单里的人照旧不看红点。
         """
-        # 名单空着 = 一个会话都不碰。这时候必须喊一嗓子，否则现场表现是
+        # 名单空着 = 名单里的会话一个都不碰。这时候必须喊一嗓子，否则现场表现是
         # 「微信有新消息、网关一声不吭」，看的人只会以为功能坏了（069）。
         self._watchlist.warn_if_idle()
-        watched = self._watchlist.watched()
-        if not watched:
-            return []
-        watched = self._drop_handed_off(account_id, watched)
-        if not watched:
-            return []
+        listed = self._watchlist.watched()
+        watched = self._drop_handed_off(account_id, listed) if listed else []
 
         now = self._clock()
+        strangers: list[tuple[str, int]] = []
         if self._quick_round_due(now):
-            peers = await self._quick_peers(account_id, watched, now)
+            peers = await self._quick_peers(account_id, watched, now) if watched else []
         else:
             self._last_full_at = now
-            if self._prefilter:
+            if self._prefilter and watched:
                 watched = await self._skip_unchanged(account_id, watched, now)
-            peers = self._due_peers(account_id, watched, now)
+            peers = self._due_peers(account_id, watched, now) if watched else []
+            strangers = await self._unread_strangers(account_id, listed)
         collected: list[InboundMessage] = []
         for peer_id in peers:
             self._last_read[peer_id] = now
             collected.extend(await self._fetch_peer(account_id, peer_id))
+        for peer_id, unread in strangers:
+            collected.extend(await self._fetch_peer(account_id, peer_id, unread=unread))
         return collected
+
+    async def _unread_strangers(self, account_id: str, listed: Sequence[str]) -> list[tuple[str, int]]:
+        """不在名单里、会话列表上挂着红点数的单聊 → [(会话名, 红点数)]，最多 ``MAX_UNREAD_STRANGERS_PER_POLL`` 个。
+
+        用户 2026-09-28：「不在监听列表的候选人，消息都没有查看……有红点数就读取一下」
+        「只读有消息数据」「排除服务号公众号」，群也排除，读完交 AI 端判断是不是来找工作的。
+
+        ★ 这**不是** 09-24 拆掉的本机准入：谁也不会因此进名单（名单仍只认同步，AGENTS.md §10）。
+          读到的消息这一轮带 `first_contact` 交给 AI 端，判不出在找工作就一条都不发（spec 090）；
+          建了档、业务端写进 contacts 之后，同步自然把他带进名单。
+        ★ 读红点数本身不开窗（`get_unread_messages`，vendor 先看左上角总数，是 0 就立刻回来）。
+          开窗读会把他的红点清掉——这是用户选「开窗读全」时认下的代价。
+        排除：名单里的（含人工接管中、本机「不管」的）、本机拉黑的、判过是群的、服务号/功能入口。
+        """
+        if not self._read_unread or not self._allow_real:
+            return []
+        try:
+            result = await self._runtime.submit(TaskType.GET_UNREAD_MESSAGES, {})
+        except Exception as exc:  # noqa: BLE001 —— 看不到红点就这轮不看，别拖垮名单那边
+            _log.warning("读未读红点失败，这一轮不看名单外的会话", error=str(exc))
+            return []
+        if str((result or {}).get("status") or "") not in {"", "succeeded"}:
+            _log.warning("读未读红点失败，这一轮不看名单外的会话", 原因=str((result or {}).get("last_error") or "")[:120])
+            return []
+        skip = set(listed) | set(self._watchlist.scope.never)
+        picked: list[tuple[str, int]] = []
+        for name, count in unread_counts(result):
+            if (
+                name in skip
+                or name in SYSTEM_SESSION_NAMES
+                or self._store.is_blacklisted(account_id, name)
+                or self._store.is_known_group(account_id, name)
+                or self._store.candidate_mode(account_id, name).mode == HUMAN_TAKEOVER
+            ):
+                continue
+            picked.append((name, count))
+        if picked:
+            _log.info(
+                "名单外有人发来消息（挂着红点），开窗读一下交 AI 端判断",
+                有红点=len(picked),
+                本轮读=min(len(picked), MAX_UNREAD_STRANGERS_PER_POLL),
+            )
+        return picked[:MAX_UNREAD_STRANGERS_PER_POLL]
 
     def _quick_round_due(self, now: datetime) -> bool:
         """这一轮是「在聊快读」而不是「全量巡检」吗（用户 2026-09-24：「合理化一下，看怎么最优」）。
@@ -809,10 +894,19 @@ class QueueMessageSource:
             out.append(dict(raw, is_self=True, sender=SELF_SENDER, gateway_echo=True))
         return out
 
-    async def _fetch_peer(self, account_id: str, peer_id: str) -> list[InboundMessage]:
+    async def _fetch_peer(
+        self, account_id: str, peer_id: str, *, unread: int | None = None
+    ) -> list[InboundMessage]:
+        """读一个会话、切出新消息。``unread`` 不为 None = 名单外挂红点的会话（见 `_unread_strangers`）。"""
         history = await self._runtime.submit(
             TaskType.READ_CHAT_HISTORY, {"friend": peer_id, "limit": self._history_limit}
         )
+        stranger = unread is not None
+        if stranger and str((history or {}).get("status") or "") not in {"", "succeeded"}:
+            # 名单外的会话读不到就算了：**不进**下面「连续读不到」的计数——那条数够了会去加好友（092）、
+            # 会移出名单（查无此人），都是给名单里的人准备的，陌生会话一条都不该触发。
+            _log.info("名单外这个会话读不到，跳过", 会话=peer_id, 原因=str((history or {}).get("last_error") or "")[:120])
+            return []
         # 读不到要说清楚是**哪个名字**读不到。名单里的名字必须和微信里显示的**一字不差**
         # （网关按会话名寻址），差一个空格就是「查无此人」——而这条错误如果只落在队列日志里，
         # 现场表现就成了「名单加了、可他就是不回」，谁也想不到是名字对不上（2026-08-14 实测）。
@@ -847,6 +941,10 @@ class QueueMessageSource:
         # **不再拿它决定处理与否**（069）：群和单聊一样都只看监听名单。
         if any(raw.get("is_group") for raw in raw_messages):
             self._store.mark_peer_kind(account_id, peer_id, is_group=True)
+            if stranger:
+                # 名单外的群不接（用户 2026-09-28）。记下是群，下回红点再亮连窗口都不开。
+                _log.info("名单外挂红点的是个群，不处理，以后也不再开它", 会话=peer_id)
+                return []
 
         last_signature, seq = self._store.get_cursor(account_id, peer_id)
         # ★ 自己发过的原文读回来要认亲（2026-09-09 真机：自己的回复被当成对方的新消息，
@@ -862,6 +960,9 @@ class QueueMessageSource:
         fresh, new_signature = split_new_messages(raw_messages, last_signature, known)
         if last_signature is not None:
             fresh = self._claim_own_echoes(account_id, peer_id, fresh)
+        if stranger and len(fresh) > unread:
+            # 红点数就是微信说的「新来了几条」：名单外的人只接这么多，多出来的是历史。
+            fresh = fresh[-unread:] if unread > 0 else []
         if last_signature is None and raw_messages:
             # 第一次读这个会话：只接尾部今天、对方发的那几条（见 first_seen_fresh），
             # 更早的算历史不回溯。**必须说出来**——不然日志上就是「读完了 N 条」然后
@@ -911,7 +1012,10 @@ class QueueMessageSource:
             ):
                 attachment = await self._attachments.fetch(account_id, peer_id, raw)
             inbound.append(
-                to_inbound(account_id, peer_id, raw, seq=seq + offset + 1, at=now, attachment=attachment)
+                to_inbound(
+                    account_id, peer_id, raw, seq=seq + offset + 1, at=now, attachment=attachment,
+                    first_contact=stranger,
+                )
             )
         return inbound
 

@@ -406,6 +406,16 @@ Nothing on this machine adds to it.** User ruling 2026-09-24: 「监听逻辑是
   rows (the friend-request ledger) are never touched by it.
 - Auto-accepting friend requests (110) still accepts and reports `accepted` to the backend; it does not add
   anyone to the watchlist.
+- **Reading an unlisted chat that shows a red-dot count is allowed; admitting it is not** (user ruling
+  2026-09-28, 0.1.90, `wechat_io._unread_strangers`, switch `read_unread_strangers`). On a full sweep round only,
+  `get_unread_messages` (no window opened) lists sessions with a badge; unlisted one-to-one chats are opened —
+  at most `MAX_UNREAD_STRANGERS_PER_POLL` — and at most that many trailing messages go to the AI service with
+  `first_contact`, which stays silent unless the peer is job-seeking (spec 090). Excluded without opening:
+  anything on the list or in local `never`, blacklisted, under human takeover, a known group,
+  `SYSTEM_SESSION_NAMES` (service/official accounts, WeChat feature entries). A group found on opening is
+  remembered and dropped. **Nobody enters the watchlist this way**, and an unlisted read failure never feeds
+  the unreachable / not-found strike counters (those add friends and remove list entries). Known cost the user
+  accepted: opening the chat clears the recruiter's red dot, including for peers the AI then ignores.
 
 ---
 

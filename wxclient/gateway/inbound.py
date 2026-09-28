@@ -80,6 +80,9 @@ class InboundMessage:
     raw_text: str = ""
     """这条在微信里**读到的原始文字**（图片气泡就是「图片」两个字，不是 ``text`` 里的占位句）。
     只为下一次从微信读回同一条时认得出来（`GatewayStore.recent_raw_keys`），不喂给 AI 端。"""
+    first_contact: bool = False
+    """True = 这个会话**不在监听名单里**，是看到红点数才去读的（`wechat_io._unread_strangers`，
+    用户 2026-09-28）。这一轮要带 `first_contact` 给 AI 端：判不出在找工作就一条都不发（spec 090）。"""
 
     @property
     def key(self) -> PeerKey:
@@ -99,6 +102,7 @@ def message_to_row(message: InboundMessage) -> dict:
         "message_type": message.message_type,
         "attachments": [dict(entry) for entry in message.attachments],
         "raw_text": message.raw_text,
+        "first_contact": message.first_contact,
     }
 
 
@@ -123,6 +127,7 @@ def message_from_row(account_id: str, peer_id: str, row: dict) -> InboundMessage
             dict(entry) for entry in (row.get("attachments") or []) if isinstance(entry, dict)
         ),
         raw_text=str(row.get("raw_text") or ""),
+        first_contact=bool(row.get("first_contact")),
     )
 
 

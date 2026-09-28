@@ -225,6 +225,7 @@ def build_gateway(
             watchlist=watchlist,
             hot_window_seconds=gateway_settings.hot_window_seconds,
             prefilter_by_session_list=gateway_settings.prefilter_by_session_list,
+            read_unread_strangers=gateway_settings.read_unread_strangers,
             allow_real_actions=allow_real_actions,
             confirmation=REAL_ACTION_CONFIRMATION,
             # 104：对方发来的图片/文件另存到本机随轮送 AI 端。目录跟 gateway.db 放一起，
