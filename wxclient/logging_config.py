@@ -721,6 +721,11 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         return f"已把微信窗口拉回前台{forced}"
     if event == "window.restore_failed":
         return f"拉起微信窗口失败：{payload.get('error') or '-'}"
+    if event == "window.main.ambiguous_picked":
+        return (
+            f"有 {payload.get('candidates', 0)} 个叫「微信」的窗口，按会话列表认出主窗口"
+            f"（得分 {payload.get('score', 0)}，句柄 {payload.get('hwnd') or '-'}）"
+        )
 
     if event == "task.yielded":
         return f"微信任务让出这一轮，稍后接着做：{task_type} #{task_id}"

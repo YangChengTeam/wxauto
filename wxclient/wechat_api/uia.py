@@ -3320,12 +3320,41 @@ class UiaWeChatDriver:
     def _current_main_window(self) -> Any:
         try:
             Application = __import__("pywinauto", fromlist=["Application"]).Application
-            app = Application(backend="uia").connect(title="微信")
-            main_window = app.window(title="微信")
-            main_window.wait("ready", timeout=5)
-            return main_window
+            try:
+                app = Application(backend="uia").connect(title="微信")
+                main_window = app.window(title="微信")
+                main_window.wait("ready", timeout=5)
+                return main_window
+            except Exception as exc:
+                # 2026-09-28 用户机：「There are 2 elements that match the criteria」——同时有两个标题叫「微信」的
+                # 顶层窗口（主窗口之外还开着别的同名窗口），按标题连不上就整条「读取会话列表」失败。
+                # 同名时挑真正有会话列表/输入框的那个，按句柄连；只认歧义这一种错，别的照旧报。
+                if type(exc).__name__ != "ElementAmbiguousError" and "elements that match" not in str(exc):
+                    raise
+                handle = self._pick_main_window_handle(self._titled_wechat_windows())
+                if handle is None:
+                    raise
+                app = Application(backend="uia").connect(handle=handle)
+                main_window = app.window(handle=handle)
+                main_window.wait("ready", timeout=5)
+                return main_window
         except Exception as exc:
             raise WeChatApiError(f"无法定位当前微信主窗口：{exc}") from exc
+
+    @staticmethod
+    def _titled_wechat_windows() -> list[Any]:
+        windows = _pywinauto_top_windows() or _win32_top_windows()[0]
+        return [w for w in windows if str(_safe_call(w.window_text) or "").strip() == "微信"]
+
+    def _pick_main_window_handle(self, candidates: list[Any]) -> int | None:
+        """几个同叫「微信」的顶层窗口里挑主窗口：有会话列表/输入框的分高；同分取先枚举到的。"""
+        scored = [(self._current_window_score(w), index, w) for index, w in enumerate(candidates)]
+        scored = [(score, index, w) for score, index, w in scored if _window_handle(w) is not None]
+        if not scored:
+            return None
+        score, _, best = max(scored, key=lambda row: (row[0], -row[1]))
+        logger.info("window.main.ambiguous_picked", candidates=len(candidates), score=score, hwnd=_window_handle(best))
+        return _window_handle(best)
 
     def _current_window_score(self, window: Any) -> int:
         score = 0
