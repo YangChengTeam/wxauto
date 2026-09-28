@@ -614,7 +614,12 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
     if event == "chat.attachment.bubble.screenshot_failed":
         return f"截消息行失败，改点行中心：{payload.get('error') or '-'}"
     if event == "chat.attachment.bubble.not_found":
-        return "截图里没认出气泡，改点行中心"
+        return (
+            f"截图里没认出气泡，改点行中心：消息行 {payload.get('row') or '-'}，"
+            f"可见区 {payload.get('view') or '-'}"
+        )
+    if event == "chat.attachment.bubble.click":
+        return f"右键点在气泡上：({payload.get('x')}, {payload.get('y')})，消息行 {payload.get('row') or '-'}"
     if event == "chat.attachment.save.done":
         return (
             f"附件已另存到本机：「{payload.get('friend') or '-'}」，"

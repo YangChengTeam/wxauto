@@ -51,6 +51,12 @@ class FindBubbleSpanTests(unittest.TestCase):
         x, _ = uia.find_bubble_span(pixels, 988, 60)  # type: ignore[misc]
         self.assertEqual(x, 200)
 
+    def test_文件卡片盖住行中心_也点在卡片上不点右边空白(self) -> None:
+        # 2026-09-28 真机那一行：598x151，文件卡片 (238,238,240) 从 88 到 397，盖住行中心 299。
+        # 原来拿行中心当背景 → 最长「不一样」的段成了右边空白 396..598，右键点空、菜单不弹。
+        pixels = _Pixels([(16, 0, 56, 40, (90, 120, 160)), (88, 0, 397, 151, (238, 238, 240))])
+        self.assertEqual(uia.find_bubble_span(pixels, 598, 151), (242, 75))
+
     def test_整行都是背景_认不出就回None(self) -> None:
         self.assertIsNone(uia.find_bubble_span(_Pixels([]), 988, 60))
 
@@ -181,6 +187,69 @@ class AwaitSavedFileTests(unittest.TestCase):
             with self.assertRaises(WeChatApiError):
                 uia._await_saved_file(Path(tmp), set(), timeout=0.6)
             self.assertLess(time.monotonic() - started, 3)
+
+
+class _Rect:
+    def __init__(self, left: int, top: int, right: int, bottom: int) -> None:
+        self.left, self.top, self.right, self.bottom = left, top, right, bottom
+
+    def mid_point(self) -> Any:
+        class _P:
+            pass
+
+        p = _P()
+        p.x, p.y = (self.left + self.right) // 2, (self.top + self.bottom) // 2  # type: ignore[attr-defined]
+        return p
+
+
+class _Row:
+    def __init__(self, rect: _Rect, text: str = "文件\n简历.docx") -> None:
+        self._rect, self._text = rect, text
+
+    def rectangle(self) -> _Rect:
+        return self._rect
+
+    def window_text(self) -> str:
+        return self._text
+
+
+class _ScrollingList:
+    """每滚一格，行整体往下挪 60px（滚轮向上 = 看更早的消息 = 内容往下走）。"""
+
+    def __init__(self, row_top: int) -> None:
+        self.row_top = row_top
+
+    def rectangle(self) -> _Rect:
+        return _Rect(805, 272, 1403, 733)
+
+    def children(self, control_type: str = "") -> list[_Row]:
+        return [_Row(_Rect(805, self.row_top, 1403, self.row_top + 151))]
+
+
+class _Mouse:
+    def __init__(self, chat_list: _ScrollingList) -> None:
+        self.chat_list, self.wheels = chat_list, []
+
+    def scroll(self, coords: Any, wheel_dist: int) -> None:
+        self.wheels.append(wheel_dist)
+        self.chat_list.row_top += 60 * wheel_dist
+
+
+class ScrollIntoViewTests(unittest.TestCase):
+    def test_行半截露在列表上面_先往上滚到整条可见(self) -> None:
+        chat_list = _ScrollingList(row_top=171)  # 真机：行顶 171、列表顶 272
+        mouse = _Mouse(chat_list)
+        row = uia.UiaWeChatDriver._scroll_row_into_view(
+            chat_list, chat_list.children()[0], "文件\n简历.docx", mouse
+        )
+        self.assertEqual(mouse.wheels, [1, 1])
+        self.assertGreaterEqual(row.rectangle().top, 272)
+
+    def test_本来就整条可见_一格都不滚(self) -> None:
+        chat_list = _ScrollingList(row_top=400)
+        mouse = _Mouse(chat_list)
+        uia.UiaWeChatDriver._scroll_row_into_view(chat_list, chat_list.children()[0], "文件\n简历.docx", mouse)
+        self.assertEqual(mouse.wheels, [])
 
 
 class SaveFlowSourceTests(unittest.TestCase):

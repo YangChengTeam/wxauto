@@ -164,8 +164,12 @@ def find_bubble_span(
       行中心那一点就是背景色（对方发的在左、自己发的在右，中间总是空的），拿它当背景，
       在几条横线上找「跟背景不一样」的连续段，**最长那段**就是气泡——头像只有 40px 上下。
     ★ 容差要小：文件气泡是纯白 (255,255,255)，聊天背景是 (250,250,250)，三通道差加起来才 15。
+    ★ 背景取**行最左边**那一点，不取行中心（2026-09-28 真机）：文件卡片宽 300px 上下、从 x≈88 起，
+      正好盖住 598px 宽那一行的中心——中心取到的是卡片本身的灰，于是「跟背景不一样」的最长段
+      成了右边那片空白，右键点空，线上报「右键菜单里没有『另存为』」。行最左边在头像（x≈16 起）外侧，
+      对方发的、自己发的都是空白。
     """
-    background = pixels[width // 2, height // 2][:3]
+    background = pixels[2, height // 2][:3]
     best: tuple[int, int, int] | None = None
     for fraction in (0.5, 0.35, 0.65):
         y = min(height - 1, int(height * fraction))
@@ -2878,7 +2882,8 @@ class UiaWeChatDriver:
             time.sleep(0.3)
         before = {entry.name for entry in target.iterdir()}
         mouse = __import__("pywinauto", fromlist=["mouse"]).mouse
-        click_at = self._bubble_click_point(item)
+        item = self._scroll_row_into_view(chat_list, item, text or "", mouse)
+        click_at = self._bubble_click_point(item, _safe_call(chat_list.rectangle))
         mouse.right_click(coords=click_at)
         time.sleep(random.uniform(0.4, 0.9))
 
@@ -2948,24 +2953,59 @@ class UiaWeChatDriver:
             button.click_input()
 
     @staticmethod
-    def _bubble_click_point(item: Any) -> tuple[int, int]:
-        """这一行里气泡本体的中心（屏幕坐标）。截不到图 / 认不出气泡就退回行中心（原来的点法）。"""
+    def _scroll_row_into_view(chat_list: Any, item: Any, text: str, mouse: Any) -> Any:
+        """把这一行整条滚进消息列表的可见区，返回滚完之后的那一行（控件对象会换）。
+
+        ★ 2026-09-28 真机：文件气泡一行 151px 高，常常半截露在列表外（行顶 171、列表顶 272）。
+          截图截到的是窗口标题栏，认不出气泡就退回行中心——那一点也在标题栏上，右键不弹消息菜单。
+        """
+        for _ in range(8):
+            rect = _safe_call(item.rectangle)
+            view = _safe_call(chat_list.rectangle)
+            if rect is None or view is None:
+                return item
+            if rect.top < view.top:
+                wheel = 1
+            elif rect.bottom > view.bottom:
+                wheel = -1
+            else:
+                return item
+            mouse.scroll(coords=(int(view.mid_point().x), int(view.mid_point().y)), wheel_dist=wheel)
+            time.sleep(0.3)
+            again = _matching_list_item_for_message(chat_list, {"text": text}) if text else None
+            if again is not None:
+                item = again
+        return item
+
+    @staticmethod
+    def _bubble_click_point(item: Any, view: Any = None) -> tuple[int, int]:
+        """这一行里气泡本体的中心（屏幕坐标）。截不到图 / 认不出气泡就退回行中心（原来的点法）。
+
+        ``view`` 是消息列表的可见区：只截行在可见区里的那一段，行半截露在外面时也点不到列表外头去。
+        """
         rect = item.rectangle()
-        fallback = (int(rect.mid_point().x), int(rect.mid_point().y))
+        left, top, right, bottom = rect.left, rect.top, rect.right, rect.bottom
+        if view is not None:
+            top, bottom = max(top, view.top), min(bottom, view.bottom)
+            if bottom - top < 10:
+                top, bottom = rect.top, rect.bottom
+        fallback = (int((left + right) // 2), int((top + bottom) // 2))
         try:
             ImageGrab = __import__("PIL.ImageGrab", fromlist=["ImageGrab"])
-            shot = ImageGrab.grab(
-                bbox=(rect.left, rect.top, rect.right, rect.bottom), all_screens=True
-            ).convert("RGB")
+            shot = ImageGrab.grab(bbox=(left, top, right, bottom), all_screens=True).convert("RGB")
         except Exception as exc:  # noqa: BLE001 —— 截不到就按老办法点，别在这儿断
-            logger.info("chat.attachment.bubble.screenshot_failed", error=str(exc)[:120])
+            logger.warning("chat.attachment.bubble.screenshot_failed", error=str(exc)[:120])
             return fallback
         span = find_bubble_span(shot.load(), *shot.size)
         if span is None:
-            logger.info("chat.attachment.bubble.not_found", width=shot.size[0], height=shot.size[1])
+            logger.warning(
+                "chat.attachment.bubble.not_found",
+                width=shot.size[0], height=shot.size[1], row=str(rect), view=str(view),
+            )
             return fallback
         x, y = span
-        return (rect.left + x, rect.top + y)
+        logger.info("chat.attachment.bubble.click", x=left + x, y=top + y, row=str(rect), view=str(view))
+        return (left + x, top + y)
 
     def _collect_history_pages(
         self, window: Any, chat_name: str, safe_limit: int
