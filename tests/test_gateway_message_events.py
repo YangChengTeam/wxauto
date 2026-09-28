@@ -421,6 +421,64 @@ class OutboundReportingTests(StoreTestCase):
         await sender.deliver(ACCOUNT, PEER, self._card([]))
         self.assertEqual(self.store.count_message_events(), 0)
 
+    # ── AI 端 123 节前祝福：指令号只跟着带祝福的那一段走 ──
+
+    SUFFIX = "。提前祝您国庆节快乐！"
+
+    def _holiday_card(self, *, valid_until: str | None = "2026-08-10T15:00:00Z", command_id: str | None = "holiday:claim-1",
+                      segments: list[str] | None = None) -> dict[str, Any]:
+        slot: dict[str, Any] = {"festival_ids": ["2026:national"], "calendar_digest": "d" * 64, "segment_index": 1, "suffix": self.SUFFIX}
+        if command_id is not None:
+            slot["command_id"] = command_id
+        if valid_until is not None:
+            slot["valid_until"] = valid_until
+        return {"type": "info", "body": {"kind": "wechat_reply",
+                                         "reply_segments": segments or ["包住的", "四人间，有空调" + self.SUFFIX],
+                                         "holiday_greeting": slot}}
+
+    async def test_节前祝福那一段带指令号_其余段不带(self) -> None:
+        known_candidate(self.store)
+        seen: list[dict[str, Any]] = []
+        rep = reporter(self.store, accepting(seen))
+        sender, sink = self._sender(rep)
+        await sender.deliver(ACCOUNT, PEER, self._holiday_card())
+        self.assertEqual([t for _, _, t in sink.sent], ["包住的", "四人间，有空调" + self.SUFFIX])
+        self.assertEqual(await rep.flush(), 2)
+        self.assertNotIn("commandId", seen[0]["body"])
+        self.assertEqual(seen[1]["body"]["commandId"], "holiday:claim-1")
+        self.assertEqual(seen[1]["body"]["status"], "sent")
+
+    async def test_节前祝福过了截止时间_剥掉那句照发正文且不带指令号(self) -> None:
+        known_candidate(self.store)
+        seen: list[dict[str, Any]] = []
+        rep = reporter(self.store, accepting(seen))
+        sender, sink = self._sender(rep)
+        await sender.deliver(ACCOUNT, PEER, self._holiday_card(valid_until="2026-08-10T14:00:00Z"))
+        self.assertEqual([t for _, _, t in sink.sent], ["包住的", "四人间，有空调"])
+        await rep.flush()
+        self.assertFalse(any("commandId" in b["body"] for b in seen))
+
+    async def test_节前祝福没有指令号或截止时间读不懂_剥掉照发(self) -> None:
+        known_candidate(self.store)
+        for card in (self._holiday_card(command_id=None), self._holiday_card(valid_until="明天"), self._holiday_card(valid_until=None)):
+            seen: list[dict[str, Any]] = []
+            rep = reporter(self.store, accepting(seen))
+            sender, sink = self._sender(rep)
+            await sender.deliver(ACCOUNT, PEER, card)
+            self.assertEqual([t for _, _, t in sink.sent], ["包住的", "四人间，有空调"])
+            await rep.flush()
+            self.assertFalse(any("commandId" in b["body"] for b in seen))
+
+    async def test_节前祝福原文对不上那一段_不挂指令号(self) -> None:
+        known_candidate(self.store)
+        seen: list[dict[str, Any]] = []
+        rep = reporter(self.store, accepting(seen))
+        sender, sink = self._sender(rep)
+        await sender.deliver(ACCOUNT, PEER, self._holiday_card(segments=["包住的", "四人间，有空调"]))
+        self.assertEqual([t for _, _, t in sink.sent], ["包住的", "四人间，有空调"])
+        await rep.flush()
+        self.assertFalse(any("commandId" in b["body"] for b in seen))
+
 
 # ────────────────────────── 指令：计划驱动那条路 ──────────────────────────
 

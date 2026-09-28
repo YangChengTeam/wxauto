@@ -83,6 +83,80 @@ def extract_reply(card: dict[str, Any] | None) -> tuple[list[str], list[dict[str
     return segments, actions, ""
 
 
+@dataclass(frozen=True)
+class HolidayGreeting:
+    """卡上的节前祝福（AI 端 123）：业务端写的那句祝福接在第 ``index`` 段末尾，原文 = ``suffix``。
+
+    AI 端在卡下发前已向业务端占位成功，``command_id`` 是业务端给的指令号——带祝福的那一段发出去后，
+    出站消息事件**必须**带上它，业务端才会确认「祝过了」。``valid_until`` 过了就不能再祝（剥掉那句照发正文）。
+
+    ★ 命令与内容不可变绑定：剥掉祝福的那一段**不带**这个指令号——指令号只跟着带祝福的原文走。
+    """
+
+    index: int
+    """在 ``extract_reply`` 过滤后的段列表里的下标。"""
+    suffix: str
+    command_id: str
+    valid_until: datetime
+
+    def expired(self, now: datetime) -> bool:
+        return now >= self.valid_until
+
+
+def holiday_greeting(card: dict[str, Any] | None) -> tuple[HolidayGreeting | None, str]:
+    """读卡上的 ``holiday_greeting``。返回 (可用的祝福, 不可用时追加原文)。
+
+    - 没有槽位 → ``(None, "")``：普通回复。
+    - 槽位齐全、原文确实在那一段末尾 → ``(HolidayGreeting, "")``。
+    - 槽位缺指令号 / 截止时间读不懂 → ``(None, suffix)``：调用方把 suffix 剥掉再发（没占上的祝福不许发）。
+    - 原文对不上那一段 → ``(None, "")``：文字里没有它，也就没什么可剥、不挂指令号。
+    """
+    if not isinstance(card, dict) or not isinstance(card.get("body"), dict):
+        return None, ""
+    body = card["body"]
+    slot = body.get("holiday_greeting")
+    if not isinstance(slot, dict):
+        return None, ""
+    raw = body.get("reply_segments")
+    index = slot.get("segment_index")
+    suffix = slot.get("suffix")
+    if not isinstance(raw, list) or not isinstance(index, int) or isinstance(index, bool) or not isinstance(suffix, str) or not suffix:
+        return None, ""
+    if not 0 <= index < len(raw) or not isinstance(raw[index], str) or not raw[index].strip():
+        return None, ""
+    if not raw[index].endswith(suffix):
+        return None, ""
+    command_id = slot.get("command_id")
+    valid_until = _parse_time(slot.get("valid_until"))
+    if not isinstance(command_id, str) or not command_id.strip() or valid_until is None:
+        return None, suffix
+    # 过滤掉空段之后的下标（extract_reply 只保留非空字符串）。
+    filtered = sum(1 for s in raw[:index] if isinstance(s, str) and s.strip())
+    return HolidayGreeting(filtered, suffix, command_id.strip(), valid_until), ""
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else None
+
+
+def _strip_suffix(segments: list[str], index: int, suffix: str) -> list[str]:
+    """把第 ``index`` 段末尾的 ``suffix`` 剥掉；剥空了整段拿掉（别发一条空消息）。"""
+    out = list(segments)
+    if 0 <= index < len(out) and out[index].endswith(suffix):
+        rest = out[index][: -len(suffix)]
+        if rest.strip():
+            out[index] = rest
+        else:
+            del out[index]
+    return out
+
+
 class OutboundSender:
     """出站发送器：守门 → 逐段投递 → 记账。"""
 
@@ -107,6 +181,14 @@ class OutboundSender:
         self, account_id: str, peer_id: str, card: dict[str, Any] | None
     ) -> DeliveryResult:
         segments, actions, no_reply_reason = extract_reply(card)
+        # AI 端 123 节前祝福：没占上 / 槽位不全的祝福先剥掉；占上的，发到那一段前再看一眼有没有过期。
+        holiday, unclaimed_suffix = holiday_greeting(card)
+        if unclaimed_suffix:
+            for i, seg in enumerate(segments):
+                if seg.endswith(unclaimed_suffix):
+                    segments = _strip_suffix(segments, i, unclaimed_suffix)
+                    break
+            _local.info("节前祝福没有指令号，剥掉照发正文", account=account_id, 会话=peer_id)
 
         # 卡片里的拉黑提案先落地——即使这一轮不发消息，拉黑也要生效。
         self._apply_blacklist_actions(account_id, peer_id, actions)
@@ -138,9 +220,23 @@ class OutboundSender:
             )
 
         task_ids: list[str] = []
+        command_ids: list[str] = []
+        sent_texts: list[str] = []
         try:
-            for segment in segments:
+            for i, segment in enumerate(segments):
+                command_id = ""
+                if holiday is not None and i == holiday.index:
+                    if holiday.expired(self._clock()):
+                        # 过了业务端给的截止时间（守门排队、网关慢）：祝福不能再发，正文照发、不挂指令号。
+                        segment = segment.removesuffix(holiday.suffix)
+                        _local.info("节前祝福已过截止时间，剥掉照发正文", account=account_id, 会话=peer_id)
+                        if not segment.strip():
+                            continue
+                    else:
+                        command_id = holiday.command_id
                 task_ids.append(await self._sink.send(account_id, peer_id, segment))
+                command_ids.append(command_id)
+                sent_texts.append(segment)
                 # ★ 发成功一段就记一段原文：下一轮从微信读回来时靠它认出「这是我说的」，
                 #   不再全押在 UI 的左右气泡判定上（判错 = 自问自答刷屏）。
                 self._store.remember_sent_text(account_id, peer_id, segment, at=now)
@@ -148,12 +244,17 @@ class OutboundSender:
             # 发到一半炸了：没发出去的那几段不该占着额度（发出去的照记）。
             reservation.settle(len(task_ids))
             # 同理，真发出去的那几段照样要上报——「多久没回」是从**发出的那一刻**起算的。
-            self._note_outbound(account_id, peer_id, task_ids, segments)
+            self._note_outbound(account_id, peer_id, task_ids, sent_texts, command_ids)
         _log.info("已投递回复", account=account_id, 会话=peer_id, segments=len(task_ids))
         return DeliveryResult(sent=task_ids, actions=actions)
 
     def _note_outbound(
-        self, account_id: str, peer_id: str, task_ids: Sequence[str], segments: Sequence[str]
+        self,
+        account_id: str,
+        peer_id: str,
+        task_ids: Sequence[str],
+        segments: Sequence[str],
+        command_ids: Sequence[str] = (),
     ) -> None:
         """我方消息发出去了 → 登记一条 outbound 事件（业务后端据此排「未回复跟进」）。
 
@@ -173,7 +274,8 @@ class OutboundSender:
             _backend.info("发出的回复没能归位到候选人，不上报消息事件", account=account_id)
             return
         now = self._clock()
-        for task_id, segment in zip(task_ids, segments):
+        ids = list(command_ids) + [""] * (len(task_ids) - len(command_ids))
+        for task_id, segment, command_id in zip(task_ids, segments, ids):
             self._message_events.record(
                 account_id,
                 candidate_id=candidate_id,
@@ -183,6 +285,8 @@ class OutboundSender:
                 occurred_at=now,
                 content=segment,
                 source="auto_reply",
+                # AI 端 123：带节前祝福的那一段挂业务端占位时给的指令号（业务端据此确认「祝过了」）；其余段不带。
+                command_id=command_id,
             )
 
     async def _apply_ai_status_actions(

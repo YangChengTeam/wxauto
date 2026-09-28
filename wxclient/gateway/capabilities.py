@@ -30,6 +30,9 @@ CAP_READ = "read"
 #: 发消息的回执里能带回发送凭据（`message_id` + `delivery_status`，0.1.77 起）。AI 端投面试天气提醒前
 #: 看这一项：老版本助手发了也报不出凭据，业务端只能记「结果未知」交 HR——不如在投递前就明确拒。
 CAP_DELIVERY_RECEIPT = "delivery_receipt"
+#: AI 端 123 节前祝福：认得回复卡上的 `holiday_greeting`（过截止时间剥掉那句、带祝福那段的出站事件挂业务端指令号）。
+#: AI 端没见到这一项就不向业务端占位、不拼祝福——老助手不认这个槽位，发了也对不上账（0.1.89 起）。
+CAP_HOLIDAY_GREETING = "holiday_greeting_v1"
 
 #: 网关 → AI 端上报能力用的 op。
 CAPABILITIES_OP = "wechat.capabilities"
@@ -45,6 +48,7 @@ CAPABILITY_LABELS: dict[str, str] = {
     CAP_MOMENTS_COMMENT: "给朋友圈评论",
     CAP_READ: "查看联系人/聊天记录/朋友圈",
     CAP_DELIVERY_RECEIPT: "回报消息发送凭据",
+    CAP_HOLIDAY_GREETING: "节前祝福对账",
 }
 
 #: op → 能力键。没登记的 op 一律按「读」处理（读类不改变外部世界）。
@@ -139,6 +143,8 @@ def probe_capabilities(
         CAP_ADD_FRIEND, CAP_ACCEPT_FRIEND, CAP_MOMENTS, CAP_MOMENTS_LIKE, CAP_MOMENTS_COMMENT,
         # 凭据只在真发出去时才有：只走流程不真发 = 没有凭据可报。
         CAP_DELIVERY_RECEIPT,
+        # 指令号只挂在真发出去的那一段上：只走流程不真发 = 业务端永远确认不了，不如别让 AI 端占位。
+        CAP_HOLIDAY_GREETING,
     )
     if not allow_real_actions:
         for key in write_keys:

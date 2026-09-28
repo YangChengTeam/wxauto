@@ -20,6 +20,7 @@ from wxclient.gateway import CommandExecutor, GatewayStore, OutboundGuard
 from wxclient.gateway.capabilities import (
     CAP_DELIVERY_RECEIPT,
     CAP_GROUP_MESSAGE,
+    CAP_HOLIDAY_GREETING,
     CAP_MOMENTS,
     CAP_PRIVATE_MESSAGE,
     CAP_READ,
@@ -1026,6 +1027,11 @@ class CapabilityProbeTests(unittest.TestCase):
     def test_dry_run_cannot_promise_a_delivery_receipt(self) -> None:
         caps = self._caps(allow_real_actions=False)
         self.assertFalse(caps[CAP_DELIVERY_RECEIPT].available)
+
+    def test_holiday_greeting_key_only_when_really_sending(self) -> None:
+        """AI 端 123：见到这一项才向业务端占位、拼节前祝福；只走流程不真发时指令号永远对不上账。"""
+        self.assertTrue(self._caps()[CAP_HOLIDAY_GREETING].available)
+        self.assertFalse(self._caps(allow_real_actions=False)[CAP_HOLIDAY_GREETING].available)
 
     def test_login_screen_blocks_everything_with_a_human_reason(self) -> None:
         caps = self._caps(uia={"logged_in": False, "login_window": True})
