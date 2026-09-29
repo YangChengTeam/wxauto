@@ -144,7 +144,8 @@ class 两处发送都接上了(unittest.TestCase):
     def test_发消息和发文件都过重试外壳(self) -> None:
         import inspect
 
-        for name in ("send_message", "send_files"):
+        # 发消息的底座调用收在 `_send_text_once`（09-29：输入框内容不对时要清空重发一次，两处共用）
+        for name in ("_send_text_once", "send_files"):
             src = inspect.getsource(getattr(UiaWeChatDriver, name))
             self.assertIn("_with_edit_retry", src, f"{name} 没接上重试外壳")
 

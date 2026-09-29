@@ -74,51 +74,78 @@ class SendMessageVerificationTests(unittest.TestCase):
     回执却报 done）。宁可报失败也不谎报「已发送」：AI 会照着回执告诉用户「已经发过去了」。
     """
 
-    def _driver(self, leftovers: list[int]) -> UiaWeChatDriver:
+    def _driver(self, leftovers: list[str | None]) -> UiaWeChatDriver:
         driver = UiaWeChatDriver(dry_run=False)
         self.nudged = 0
+        self.cleared = 0
+        self.sent = 0
 
-        def fake_len(_friend: str) -> int:
-            return leftovers.pop(0) if leftovers else 0
+        def fake_text(_friend: str) -> str | None:
+            return leftovers.pop(0) if leftovers else ""
 
         def fake_nudge(_friend: str) -> None:
             self.nudged += 1
 
+        def fake_clear(_friend: str) -> None:
+            self.cleared += 1
+
+        def fake_send(_friend: str, _text: str) -> None:
+            self.sent += 1
+
         driver._ensure_ready = lambda: None                     # type: ignore[method-assign]
-        driver._pyweixin_class = lambda _name: _FakeMessages    # type: ignore[method-assign]
-        driver._chat_input_text_len = fake_len                  # type: ignore[method-assign]
+        driver._send_text_once = fake_send                      # type: ignore[method-assign]
+        driver._chat_input_text = fake_text                     # type: ignore[method-assign]
         driver._nudge_send = fake_nudge                         # type: ignore[method-assign]
+        driver._clear_chat_input = fake_clear                   # type: ignore[method-assign]
         return driver
 
     def test_empty_input_box_means_it_really_went_out(self) -> None:
-        result = self._driver([0]).send_message("王建国", "您好")
+        result = self._driver([""]).send_message("王建国", "您好")
         self.assertTrue(result["verified"])
-        self.assertEqual(self.nudged, 0)
+        self.assertEqual((self.sent, self.nudged), (1, 0))
 
     def test_stuck_text_gets_one_nudge_then_succeeds(self) -> None:
         """补按一次回车把停在框里的那条发走。这**不是**重发——不会产生第二条消息。"""
-        result = self._driver([5, 0]).send_message("王建国", "您好")
+        result = self._driver(["您好", ""]).send_message("王建国", "您好")
         self.assertTrue(result["verified"])
-        self.assertEqual(self.nudged, 1)
+        self.assertEqual((self.sent, self.nudged), (1, 1))
+
+    def test_stuck_text_matches_across_line_breaks(self) -> None:
+        """框里读回来换行变了样（\r / 空格）仍认作我们这条，照常补回车。"""
+        self._driver(["第一行\r第二行", ""]).send_message("王建国", "第一行\n第二行")
+        self.assertEqual((self.sent, self.nudged, self.cleared), (1, 1, 0))
 
     def test_still_stuck_raises_instead_of_reporting_success(self) -> None:
         """★ 核心：发不出去就要报失败，不能让 AI 去跟用户说「已经发过去了」。"""
-        driver = self._driver([5, 5])
+        driver = self._driver(["您好", "您好"])
         with self.assertRaises(WeChatApiError) as caught:
             driver.send_message("王建国", "您好")
         self.assertIn("没能发出去", str(caught.exception))
 
+    def test_foreign_text_in_box_is_never_sent(self) -> None:
+        """★ 2026-09-29 真机：粘贴落空、Alt 被吞，框里只剩「s」——绝不能补回车把它发出去。
+        清空后重来一次，重来发走了就算成。"""
+        result = self._driver(["s", ""]).send_message("王建国", "早上好，今天有什么需要随时跟我说。")
+        self.assertTrue(result["verified"])
+        self.assertEqual((self.sent, self.cleared, self.nudged), (2, 1, 0))
+
+    def test_foreign_text_twice_clears_and_raises(self) -> None:
+        driver = self._driver(["s", "s"])
+        with self.assertRaises(WeChatApiError) as caught:
+            driver.send_message("王建国", "早上好")
+        self.assertIn("不一致", str(caught.exception))
+        self.assertEqual((self.sent, self.cleared, self.nudged), (2, 2, 0))
+
+    def test_text_plus_stray_s_is_foreign_too(self) -> None:
+        """粘贴成功但 Alt 被吞：框里是「正文s」——同样不是我们这条，不补回车。"""
+        self._driver(["早上好s", ""]).send_message("王建国", "早上好")
+        self.assertEqual((self.sent, self.cleared, self.nudged), (2, 1, 0))
+
     def test_unprobeable_input_box_is_reported_as_unverified_not_failed(self) -> None:
         """探测不到输入框 = 「不知道」，据实说没核对过，别把不知道讲成已确认。"""
-        result = self._driver([-1]).send_message("王建国", "您好")
+        result = self._driver([None]).send_message("王建国", "您好")
         self.assertFalse(result["verified"])
         self.assertEqual(self.nudged, 0)
-
-
-class _FakeMessages:
-    @staticmethod
-    def send_messages_to_friend(**_kwargs) -> None:
-        return None
 
 
 class _FakeControl:

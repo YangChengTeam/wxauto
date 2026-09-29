@@ -1183,16 +1183,7 @@ class UiaWeChatDriver:
         if self._is_dry_run(dry_run):
             return {"dry_run": True, "action": "send_message", "friend": friend}
         self._ensure_ready()
-        Messages = self._pyweixin_class("Messages")
-        self._with_edit_retry(friend, "send_message", lambda: Messages.send_messages_to_friend(
-            friend=friend,
-            messages=[text],
-            search_pages=5,
-            clear=True,
-            send_delay=0.2,
-            is_maximize=False,
-            close_weixin=False,
-        ))
+        self._send_text_once(friend, text)
         # ★ 发后核对（075，需求文档 §12.4）：文字没发走会**留在输入框里**，
         # 而底座照样返回成功——067 的文件路径上真机踩过一模一样的坑
         # （文件躺在输入框里、回执却报 done）。宁可报失败，也不谎报「已发送」：
@@ -1200,13 +1191,30 @@ class UiaWeChatDriver:
         #
         # 判据只看**文字**，不看子元素：空输入框天生就带子元素（067 的教训），
         # 但它的 window_text() 一定是空的——所以这里不需要跟基线较劲。
-        leftover = self._chat_input_text_len(friend)
-        verified = leftover >= 0
-        if leftover > 0:
+        #
+        # ★ 补按回车之前先认一认框里是不是**我们这条**（2026-09-29 真机事故）：AI 回的是
+        # 「早上好，今天有什么需要随时跟我说。」，对方收到的却是一个「s」。底座是
+        # 「剪贴板 → Ctrl+V → Alt+S」：粘贴落空、Alt 又被吞掉时，框里只剩一个 s；
+        # 旧逻辑见框里有字就补回车，把这个 s 发给了候选人。框里的东西和要发的不一致
+        # = 粘贴或发送键没生效、**一个字都还没发出去**（发出去了框就是空的），所以清空后
+        # 重来一次不会多发；重来还不对就清空报失败，绝不把不是我们这条的东西按出去。
+        leftover = self._chat_input_text(friend)
+        if leftover and not _same_chat_text(leftover, text):
+            logger.warning("message.send.input_mismatch", friend=friend,
+                           left=len(leftover), expected=len(text))
+            self._clear_chat_input(friend)
+            self._send_text_once(friend, text)
+            leftover = self._chat_input_text(friend)
+            if leftover and not _same_chat_text(leftover, text):
+                logger.warning("message.send.input_mismatch_again", friend=friend, left=len(leftover))
+                self._clear_chat_input(friend)
+                raise WeChatApiError("输入框里的内容和要发的不一致（粘贴或发送键没生效），已清空，对方没有收到")
+        verified = leftover is not None
+        if leftover:
             self._nudge_send(friend)
-            leftover = self._chat_input_text_len(friend)
-            if leftover > 0:
-                logger.warning("message.send.stuck_in_input", friend=friend, left=leftover)
+            leftover = self._chat_input_text(friend)
+            if leftover:
+                logger.warning("message.send.stuck_in_input", friend=friend, left=len(leftover))
                 raise WeChatApiError("消息打进输入框后没能发出去，已停在输入框里，对方没有收到")
         return {
             "dry_run": False,
@@ -1381,22 +1389,44 @@ class UiaWeChatDriver:
             logger.warning("files.send.input_probe_failed", error=str(exc))
             return -1
 
-    def _chat_input_text_len(self, friend: str) -> int:
-        """输入框里还剩多少**文字**。``-1`` = 看不出来（判不了，不当作失败）。
+    def _send_text_once(self, friend: str, text: str) -> None:
+        """底座发一条文字：清空输入框 → 粘贴 → Alt+S。发没发走由调用方看输入框核对。"""
+        Messages = self._pyweixin_class("Messages")
+        self._with_edit_retry(friend, "send_message", lambda: Messages.send_messages_to_friend(
+            friend=friend,
+            messages=[text],
+            search_pages=5,
+            clear=True,
+            send_delay=0.2,
+            is_maximize=False,
+            close_weixin=False,
+        ))
 
-        只数文字是刻意的：空输入框本来就可能带子元素（067 真机教训），拿子元素个数
+    def _chat_input_text(self, friend: str) -> str | None:
+        """输入框里还剩的**文字**（去掉首尾空白）。``None`` = 看不出来（判不了，不当作失败）。
+
+        只看文字是刻意的：空输入框本来就可能带子元素（067 真机教训），拿子元素个数
         判「发没发出去」要跟空态基线比才准；而文字不用——发走了就是空的。
         """
         try:
             edit_area = self._chat_input_area(friend)
             if edit_area is None:
-                return -1
-            left = len(str(edit_area.window_text() or "").strip())
-            logger.info("message.send.input_state", text=left)
+                return None
+            left = str(edit_area.window_text() or "").strip()
+            logger.info("message.send.input_state", text=len(left))
             return left
         except Exception as exc:  # noqa: BLE001 —— 探测失败只是没法判定，不改变发送结论
             logger.warning("message.send.input_probe_failed", error=str(exc))
-            return -1
+            return None
+
+    def _clear_chat_input(self, friend: str) -> None:
+        """把输入框清空。清不掉只记日志：结论由之后那次核对给。"""
+        try:
+            edit_area = self._chat_input_area(friend)
+            if edit_area is not None:
+                edit_area.set_text("")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("message.send.clear_failed", error=str(exc))
 
     def _nudge_send(self, friend: str) -> None:
         """补按一次回车把停在输入框里的内容发走。
@@ -3941,6 +3971,11 @@ _MOMENTS_PAUSES: dict[str, tuple[float, float]] = {
 def _squash(text: str) -> str:
     """认动态用的归一：去掉所有空白。列表项文本里换行/空格的位置和读回来的正文对不上。"""
     return re.sub(r"\s+", "", str(text or ""))
+
+
+def _same_chat_text(left: str, text: str) -> bool:
+    """输入框里读回来的字是不是要发的那条。换行在框里读回来可能变成 \r 或空格，只比去空白后的正文。"""
+    return _squash(left) == _squash(text)
 
 
 def _parse_post_text(text: str, when: str, timestamp: Any, images_pattern: Any) -> dict[str, Any]:

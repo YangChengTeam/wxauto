@@ -700,6 +700,18 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         )
     if event == "message.send.input_state":
         return f"发送前后核对输入框：还剩 {payload.get('text', 0)} 个字"
+    if event == "message.send.input_mismatch":
+        return (
+            f"输入框里的内容不是要发的那条（粘贴或发送键没生效）：「{payload.get('friend') or '-'}」，"
+            f"框里 {payload.get('left', 0)} 个字、要发 {payload.get('expected', 0)} 个字；已清空，重发一次"
+        )
+    if event == "message.send.input_mismatch_again":
+        return (
+            f"重发后输入框里仍不是要发的那条：「{payload.get('friend') or '-'}」，"
+            f"已清空，按「没发出去」处理，对方没有收到"
+        )
+    if event == "message.send.clear_failed":
+        return f"清空输入框失败：{payload.get('error') or '-'}"
     if event == "message.send.input_probe_failed":
         return f"读不到输入框，这次发没发出去判定不了：{payload.get('error') or '-'}"
     if event == "message.send.retry_failed":
