@@ -29,6 +29,7 @@ from wxclient.gateway import (
     InboundMessage,
     LocalFileTicketProvider,
     is_timestamp_row,
+    latest_cursor,
     message_signature,
     split_new_messages,
     to_inbound,
@@ -557,7 +558,7 @@ class WeChatIoMappingTests(unittest.TestCase):
         ]
         fresh, cursor = split_new_messages(history, None)
         self.assertEqual(fresh, [])
-        self.assertEqual(cursor, message_signature(history[-1]))
+        self.assertEqual(cursor, latest_cursor(history))
 
     def test_only_messages_after_cursor_are_new(self) -> None:
         history = [
@@ -568,14 +569,14 @@ class WeChatIoMappingTests(unittest.TestCase):
         cursor = message_signature(history[1])
         fresh, new_cursor = split_new_messages(history, cursor)
         self.assertEqual([m["text"] for m in fresh], ["新问题"])
-        self.assertEqual(new_cursor, message_signature(history[-1]))
+        self.assertEqual(new_cursor, latest_cursor(history))
 
     def test_cursor_scrolled_out_does_not_backfill(self) -> None:
         """游标滚出读取窗口 → 保守跳过，不回溯几十条老消息。"""
         history = [{"sender": "对方", "text": "只剩这条"}]
         fresh, cursor = split_new_messages(history, "signature-that-no-longer-exists")
         self.assertEqual(fresh, [])
-        self.assertEqual(cursor, message_signature(history[0]))
+        self.assertEqual(cursor, latest_cursor(history[:1]))
 
     def test_empty_history(self) -> None:
         self.assertEqual(split_new_messages([], "abc"), ([], "abc"))

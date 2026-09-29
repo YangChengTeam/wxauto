@@ -22,6 +22,7 @@ from wxclient.gateway.wechat_io import (
     VOICE_TRANSCRIPT_STRIKES,
     VOICE_UNTRANSCRIBED_TEXT,
     hold_pending_voice,
+    latest_cursor,
     message_signature,
     split_new_messages,
     to_inbound,
@@ -72,7 +73,7 @@ class VoiceSignatureTests(unittest.TestCase):
         ]
         fresh, cursor = split_new_messages(history, message_signature(history[0]))
         self.assertEqual([m["text"] for m in fresh], ["工资多少"])
-        self.assertEqual(cursor, message_signature(history[1]))
+        self.assertEqual(cursor, latest_cursor(history[:2]))
 
 
 class HoldPendingVoiceTests(unittest.TestCase):

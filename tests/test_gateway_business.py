@@ -46,6 +46,7 @@ from wxclient.gateway.wechat_io import (
     preview_matches,
     row_time,
     QueueMessageSource,
+    latest_cursor,
     legacy_message_signature,
     message_signature,
     split_new_messages,
@@ -1598,7 +1599,7 @@ class LostCursorAnchorTests(StoreTestCase):
         window = [{"text": "老1"}, {"text": "老2"}, {"text": "新1"}, {"text": "新2"}]
         fresh, cursor = split_new_messages(window, "游标不在窗口里", known=["更老", "老1", "老2"])
         self.assertEqual([m["text"] for m in fresh], ["新1", "新2"])
-        self.assertEqual(cursor, message_signature(window[-1]))
+        self.assertEqual(cursor, latest_cursor(window))
 
     def test_whole_window_already_processed_keeps_cursor(self) -> None:
         window = [{"text": "老1"}, {"text": "老2"}, {"text": "老3"}]
@@ -1612,7 +1613,7 @@ class LostCursorAnchorTests(StoreTestCase):
         window = [{"text": "a"}, {"text": "b"}]
         fresh, cursor = split_new_messages(window, "游标不在窗口里", known=["x", "y"])
         self.assertEqual(fresh, [])
-        self.assertEqual(cursor, message_signature(window[-1]))
+        self.assertEqual(cursor, latest_cursor(window))
 
     def test_repeated_phrase_anchors_on_the_right_occurrence(self) -> None:
         """对方后来又说了一句一模一样的「好的」：单看一行会对到新的那条上，把中间几条跳过。"""
@@ -2010,7 +2011,7 @@ class FirstSightTests(unittest.TestCase):
         ]
         fresh, cursor = split_new_messages(history, None)
         self.assertEqual([m["text"] for m in fresh], ["在吗", "还招人吗"])
-        self.assertEqual(cursor, message_signature(history[-1]))
+        self.assertEqual(cursor, latest_cursor(history))
 
     def test_history_before_today_is_not_replayed(self) -> None:
         history = [
@@ -2029,7 +2030,7 @@ class FirstSightTests(unittest.TestCase):
         ]
         fresh, cursor = split_new_messages(history, None)
         self.assertEqual(fresh, [])
-        self.assertEqual(cursor, message_signature(history[-1]), "不回也要对齐游标")
+        self.assertEqual(cursor, latest_cursor(history), "不回也要对齐游标")
 
     def test_tail_is_capped(self) -> None:
         """一屏都是今天的也不至于整屏倒给模型。"""
@@ -2072,6 +2073,39 @@ class CursorSignatureStabilityTests(unittest.TestCase):
         second = [{"text": "你好"}, {"text": "在吗"}, {"text": "有个岗位想问下"}]
         fresh, _ = split_new_messages(second, cursor)
         self.assertEqual([m["text"] for m in fresh], ["有个岗位想问下"])
+
+    def test_same_text_again_after_an_older_copy_scrolls_out_is_new(self) -> None:
+        """★ 2026-09-29 线上：候选人又说一声「你好」，读完报「没有新消息」、分身不回。
+
+        窗口是尾部固定条数，新消息一来最前面就滑出一条。滑出去的正好是一句更早的「你好」时，
+        按「第几个同文」记的老游标会认到新来的这句身上。
+        """
+        first = [{"text": "你好"}, {"text": "在的", "is_self": True}, {"text": "x"},
+                 {"text": "y", "is_self": True}, {"text": "你好"}]
+        _, cursor = split_new_messages(first, None)
+        second = first[1:] + [{"text": "你好"}]
+        fresh, _ = split_new_messages(second, cursor)
+        self.assertEqual([m["text"] for m in fresh], ["你好"])
+        # 同一窗再读一遍：什么都不是新的
+        _, cursor2 = split_new_messages(second, cursor)
+        self.assertEqual(split_new_messages(second, cursor2)[0], [])
+
+    def test_same_text_twice_in_a_row_each_counts_once(self) -> None:
+        # 限度：连着三句以上一模一样、中间没有别人插话，前文也全一样，就分不开了（真实对话里中间有分身的回复）。
+        rows = [{"text": "a"}, {"text": "好的"}]
+        _, cursor = split_new_messages(rows, None)
+        for _ in range(2):
+            rows = rows + [{"text": "好的"}]
+            fresh, cursor = split_new_messages(rows, cursor)
+            self.assertEqual([m["text"] for m in fresh], ["好的"])
+
+    def test_dup_index_cursor_from_before_the_upgrade_still_matches(self) -> None:
+        """老格式（带同文序号、没有前文）的游标认一次，之后写成新格式。"""
+        rows = [{"text": "图片"}, {"text": "图片"}]
+        old_cursor = message_signature(rows[0])
+        fresh, cursor = split_new_messages(rows + [{"text": "新消息"}], old_cursor)
+        self.assertEqual([m["text"] for m in fresh], ["图片", "新消息"])
+        self.assertIn("~", cursor)
 
     def test_old_style_cursor_still_matches_once(self) -> None:
         """换算法不该让当天每个会话白丢一条消息。"""

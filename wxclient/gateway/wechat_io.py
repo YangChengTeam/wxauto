@@ -200,6 +200,62 @@ def cursor_candidates(raw: dict[str, Any], dup_index: int = 0) -> set[str]:
     }
 
 
+#: 游标里带上它前面几条的签名（2026-09-29）。两条够分开「同一句话又说了一遍」，再多只是让
+#: 窗口顶上那几行更难验证。
+CURSOR_CONTEXT = 2
+#: 新游标 = ``<这条的签名>~<前一条>,<前两条>``（各取签名前 12 位）。老游标没有 ``~``。
+CURSOR_CONTEXT_SEP = "~"
+
+
+def _context_signatures(raw_messages: Sequence[dict[str, Any]], index: int) -> list[str]:
+    """第 ``index`` 行前面最近几条（近→远）的签名前缀；空文本行（没转写的语音、空气泡）跳过。"""
+    out: list[str] = []
+    for raw in reversed(raw_messages[:index]):
+        if not (str(raw.get("text") or "").strip() or raw.get("voice_label")):
+            continue
+        out.append(message_signature(raw)[:12])
+        if len(out) >= CURSOR_CONTEXT:
+            break
+    return out
+
+
+def cursor_at(raw_messages: Sequence[dict[str, Any]], index: int) -> str:
+    """把第 ``index`` 行记成游标：它自己的签名 + 前面两条的签名。
+
+    ★ 原来的游标是「文本 + 这是窗口里第几个同文（dup_index）」。窗口是**尾部固定条数**，
+    新消息一来最前面就滑出去一条——滑出去的要是一句同文的（「你好」「好的」「在吗」），
+    后面每条同文的序号全减一，**新来的那句「你好」正好顶上游标原来那个序号**，于是游标
+    认到新消息身上：「读到 11 条，没有新消息」，这一轮不回（2026-09-29 线上：候选人再说
+    一声「你好」，分身就是不回）。前面两条是谁不随窗口滑动变，拿它区分同文。
+    """
+    index = index if index >= 0 else len(raw_messages) + index
+    context = ",".join(_context_signatures(raw_messages, index))
+    return f"{message_signature(raw_messages[index])}{CURSOR_CONTEXT_SEP}{context}"
+
+
+def latest_cursor(raw_messages: Sequence[dict[str, Any]]) -> str | None:
+    """这一窗最后一条记成的游标；空窗 None。"""
+    return cursor_at(raw_messages, len(raw_messages) - 1) if raw_messages else None
+
+
+def _find_cursor(raw_messages: Sequence[dict[str, Any]], cursor: str) -> int:
+    """新格式游标在这一窗里的位置，从后往前找；找不到 -1。
+
+    文本要对上，前面几条也要对上。窗口顶上那一两行前面本来就没读到东西，只比读到的那几条——
+    窗口是往上翻出来的，顶上本来就是更老的。
+    """
+    signature, _, context = cursor.partition(CURSOR_CONTEXT_SEP)
+    expected = [part for part in context.split(",") if part]
+    for index in range(len(raw_messages) - 1, -1, -1):
+        if message_signature(raw_messages[index]) != signature:
+            continue
+        actual = _context_signatures(raw_messages, index)
+        common = min(len(actual), len(expected))
+        if actual[:common] == expected[:common]:
+            return index
+    return -1
+
+
 def _anchor_index(keys: Sequence[str], anchors: Sequence[str]) -> int:
     """最近处理过的那条（``anchors[-1]``）在这一窗里最后一次出现的位置；找不到 -1。
 
@@ -241,18 +297,21 @@ def split_new_messages(
         return [], last_signature
 
     dups = dup_indexes(raw_messages)
-    latest_signature = message_signature(raw_messages[-1], dups[-1])
+    latest_signature = latest_cursor(raw_messages)
     if last_signature is None:
         return first_seen_fresh(raw_messages), latest_signature
 
-    # 从后往前找游标最后一次出现的位置。先按带同文序号的新签名精确找（104：连发两张
-    # 「图片」时停在正确的那一张），找不到再按老签名认（库里 104 之前记的游标）。
     cursor_index = -1
-    for index in range(len(raw_messages) - 1, -1, -1):
-        if last_signature == message_signature(raw_messages[index], dups[index]):
-            cursor_index = index
-            break
-    if cursor_index < 0:
+    if CURSOR_CONTEXT_SEP in last_signature:
+        cursor_index = _find_cursor(raw_messages, last_signature)
+    else:
+        # 老游标（2026-09-29 之前记的）：先按带同文序号的签名精确找（104：连发两张
+        # 「图片」时停在正确的那一张），找不到再按更老的签名认。认上一次之后就换成新格式。
+        for index in range(len(raw_messages) - 1, -1, -1):
+            if last_signature == message_signature(raw_messages[index], dups[index]):
+                cursor_index = index
+                break
+    if cursor_index < 0 and CURSOR_CONTEXT_SEP not in last_signature:
         for index in range(len(raw_messages) - 1, -1, -1):
             if last_signature in cursor_candidates(raw_messages[index], dups[index]):
                 cursor_index = index
