@@ -5120,6 +5120,20 @@ _FILE_PREFIXES = ("文件", "[文件]", "檔案", "[檔案]", "File", "[File]")
 _FILE_NAME_RE = re.compile(r"([^\[\]:：/\\\r\n]*?[^\s\[\]:：/\\]\.[A-Za-z][A-Za-z0-9]{0,7})(?![A-Za-z0-9.])")
 
 
+#: 文件气泡上的大小那一行：「7.2K」「1.3M」「512B」「2.0 MB」。微信按 1024 进位、保留一位小数。
+_FILE_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([BKMG])B?\s*$", re.I)
+_SIZE_UNITS = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
+
+
+def _file_size_in(body: str) -> int | None:
+    """文件气泡上标的大小（字节，按显示值折算，只是个约数）；没有大小那一行回 None。"""
+    for line in str(body or "").splitlines():
+        match = _FILE_SIZE_RE.match(line)
+        if match:
+            return int(float(match.group(1)) * _SIZE_UNITS[match.group(2).upper()])
+    return None
+
+
 def _file_name_in(body: str) -> str:
     """文件气泡的 UIA 名字里取文件名：先去掉打头的「文件」标签，再逐行找第一个像文件名的。"""
     rest = body
@@ -5174,7 +5188,11 @@ def _annotate_attachment_row(class_name: Any, text: str) -> dict[str, Any] | Non
     if body in _IMAGE_LABELS or "Image" in name:
         return {"message_type": "image"}
     if body.startswith(_FILE_PREFIXES) or "File" in name:
-        return {"message_type": "file", "file_name": _file_name_in(body)}
+        row = {"message_type": "file", "file_name": _file_name_in(body)}
+        size = _file_size_in(body)
+        if size is not None:
+            row["file_size"] = size
+        return row
     return None
 
 

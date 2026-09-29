@@ -201,6 +201,71 @@ class SourceAttachmentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(back.attachments, message.attachments)
 
 
+class ReuseSavedFileTests(unittest.IsolatedAsyncioTestCase):
+    """2026-09-29 用户：先看自己的存储目录里有没有，没有再另存为；不碰微信自己的目录。"""
+
+    PEER = "候选人-王建国"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name) / "attachments"
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _fetcher(self, runtime: FakeRuntime) -> AttachmentFetcher:
+        return AttachmentFetcher(runtime=runtime, root=self.root)
+
+    def _put(self, fetcher: AttachmentFetcher, name: str, size: int) -> Path:
+        target = fetcher.dir_for("acct-1", self.PEER)
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / name
+        path.write_bytes(b"x" * size)
+        return path
+
+    async def test_same_name_and_size_is_reused_without_save_as(self) -> None:
+        runtime = FakeRuntime({}, name="简历.pdf")
+        fetcher = self._fetcher(runtime)
+        path = self._put(fetcher, "简历.pdf", 7373)  # 气泡上显示 7.2K
+        raw = {"message_type": "file", "file_name": "简历.pdf", "file_size": int(7.2 * 1024)}
+        with capture_logs() as logs:
+            got = await fetcher.fetch("acct-1", self.PEER, raw)
+        self.assertEqual(runtime.saves, [], "本机已有就不再另存")
+        self.assertEqual(got["path"], str(path))
+        self.assertEqual(got["bytes"], 7373)
+        notes = [e["说明"] for e in logs if e["event"] == "附件进度"]
+        self.assertTrue(any("已经存过" in n for n in notes), notes)
+
+    async def test_same_name_different_size_is_saved_again(self) -> None:
+        """对方改了简历再发一份同名的：不能拿旧的那份去分析。"""
+        runtime = FakeRuntime({}, name="简历(1).pdf")
+        fetcher = self._fetcher(runtime)
+        self._put(fetcher, "简历.pdf", 7373)
+        raw = {"message_type": "file", "file_name": "简历.pdf", "file_size": int(1.3 * 1024 * 1024)}
+        got = await fetcher.fetch("acct-1", self.PEER, raw)
+        self.assertEqual(len(runtime.saves), 1)
+        self.assertEqual(got["file_name"], "简历(1).pdf")
+
+    async def test_images_are_always_saved(self) -> None:
+        """图片气泡没有名字，认不出是不是同一张。"""
+        runtime = FakeRuntime({})
+        fetcher = self._fetcher(runtime)
+        self._put(fetcher, "微信图片_1.jpg", 11)
+        await fetcher.fetch("acct-1", self.PEER, {"message_type": "image"})
+        self.assertEqual(len(runtime.saves), 1)
+
+    async def test_nothing_local_goes_to_save_as(self) -> None:
+        runtime = FakeRuntime({}, name="简历.pdf")
+        got = await self._fetcher(runtime).fetch("acct-1", self.PEER, {"message_type": "file", "file_name": "简历.pdf"})
+        self.assertEqual(len(runtime.saves), 1)
+        self.assertEqual(got["file_name"], "简历.pdf")
+
+    def test_bubble_size_is_read(self) -> None:
+        self.assertEqual(_annotate_attachment_row("", "文件\n简历.pdf\n7.2K")["file_size"], int(7.2 * 1024))
+        self.assertEqual(_annotate_attachment_row("", "文件\n简历.pdf\n1.3M")["file_size"], int(1.3 * 1024 ** 2))
+        self.assertNotIn("file_size", _annotate_attachment_row("", "文件\n简历.pdf"))
+
+
 class InlineTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

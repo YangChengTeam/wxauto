@@ -115,9 +115,17 @@ class AttachmentFetcher:
             return None
         self.purge_stale()
         label = str(raw.get("file_name") or "") or ("一张图片" if kind == "image" else "一个文件")
-        _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=label, 步骤="1/4", 说明="发现附件，开始另存到本机")
         target = self.dir_for(account_id, peer_id)
         target.mkdir(parents=True, exist_ok=True)
+        # 先看自己的目录里是不是已经存过这份（上一轮存过、这条被重读、上次上传没成）：有就直接用，不再另存。
+        # 另存到同名文件上微信会弹「是否替换」，而另存那边按「目录里多出一个文件」判成败——覆盖不多出文件，
+        # 重存反而会失败。只看我们自己的目录，不碰微信的存储目录（权限问题，用户 2026-09-29）。
+        existing = self._already_saved(target, raw)
+        if existing is not None:
+            _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=existing.name, 步骤="1/4",
+                      说明="发现附件，本机目录里已经存过这份，不再另存")
+            return self._accept(peer_id, kind, existing, existing.name, existing.stat().st_size, "本机已有")
+        _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=label, 步骤="1/4", 说明="发现附件，本机没有，开始另存到本机")
         payload = {
             "friend": peer_id,
             "target_dir": str(target),
@@ -141,18 +149,51 @@ class AttachmentFetcher:
                          说明="另存任务报成功，但本机目录里找不到文件")
             return None
         size = int(body.get("bytes") or path.stat().st_size)
-        file_name = str(body.get("file_name") or path.name)
+        return self._accept(peer_id, kind, path, str(body.get("file_name") or path.name), size, "已另存到本机")
+
+    @staticmethod
+    def _already_saved(target: Path, raw: dict[str, Any]) -> Path | None:
+        """自己目录里同名、且大小对得上气泡上标的那份；没有回 None。
+
+        只认文件气泡：图片气泡没有名字（另存默认名是「微信图片_时间戳」），认不出是不是同一张。
+        气泡标了大小就要对上（微信显示保留一位小数，差在一个显示单位的 1/10 以内算同一份）——
+        对方改了简历再发一份同名的，不能拿旧的那份去分析。没标大小只认名字。
+        """
+        if str(raw.get("message_type") or "") != "file":
+            return None
+        name = str(raw.get("file_name") or "").strip()
+        if not name or Path(name).name != name:
+            return None
+        path = target / name
+        try:
+            if not path.is_file():
+                return None
+            actual = path.stat().st_size
+        except OSError:
+            return None
+        if actual <= 0:
+            return None
+        shown = raw.get("file_size")
+        if isinstance(shown, int) and shown > 0:
+            unit = 1024 ** 3 if shown >= 1024 ** 3 else 1024 ** 2 if shown >= 1024 ** 2 else 1024 if shown >= 1024 else 1
+            # 显示值保留一位小数，四舍五入最多差半个 0.1 单位；再宽一点点防进位口径不一。
+            if abs(actual - shown) > unit * 0.06 + 1:
+                return None
+        return path
+
+    def _accept(self, peer_id: str, kind: str, path: Path, file_name: str, size: int, how: str) -> dict[str, Any] | None:
+        """本机这份能不能送 AI 端（类型、体积），能就回附件描述；不能就删掉并记日志。"""
         if not allowed_file(file_name):
             _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=file_name, 步骤="2/4", 失败=True,
-                      说明=f"已另存，但类型 {Path(file_name).suffix.lower() or '（无扩展名）'} 不在名单里，不送 AI 端")
+                      说明=f"{how}，但类型 {Path(file_name).suffix.lower() or '（无扩展名）'} 不在名单里，不送 AI 端")
             path.unlink(missing_ok=True)
             return None
         if size > MAX_ATTACHMENT_BYTES:
             _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=file_name, 步骤="2/4", 失败=True,
-                      说明=f"已另存，但 {_kb(size)} 超过单份 {MAX_ATTACHMENT_BYTES // (1024 * 1024)}MB 上限，不送 AI 端")
+                      说明=f"{how}，但 {_kb(size)} 超过单份 {MAX_ATTACHMENT_BYTES // (1024 * 1024)}MB 上限，不送 AI 端")
             path.unlink(missing_ok=True)
             return None
-        _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=file_name, 步骤="2/4", 说明=f"已另存到本机（{_kb(size)}）")
+        _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=file_name, 步骤="2/4", 说明=f"{how}（{_kb(size)}）")
         return {"kind": kind, "file_name": file_name, "path": str(path), "bytes": size}
 
     def purge_stale(self) -> int:
