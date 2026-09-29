@@ -638,6 +638,11 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
             f"另存失败：「{payload.get('friend') or '-'}」已完成 {payload.get('step', 0)}/{payload.get('total', 0)} 步，"
             f"卡在「{payload.get('stage') or '-'}」：{payload.get('error') or '-'}"
         )
+    if event == "chat.attachment.save.reuse":
+        return (
+            f"保存时提示同名文件已存在：「{payload.get('friend') or '-'}」，"
+            f"点了「否」不覆盖，直接用本机那份 {payload.get('name') or '-'}"
+        )
     if event == "chat.attachment.save.done":
         return (
             f"附件已另存到本机：「{payload.get('friend') or '-'}」，"

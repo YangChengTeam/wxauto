@@ -267,11 +267,71 @@ def _cancel_save_dialog(dialog: Any) -> None:
             button.invoke()
 
 
-def _await_saved_file(target: Path, before: set[str], timeout: float) -> Path:
-    """等目录里多出一个文件且大小不再变化（微信是流式写盘的）。扩展名由微信补，所以不按文件名等。"""
+#: 「确认另存为」框正文里「已存在」前面那段就是文件名（系统语言跟着走）。
+_OVERWRITE_MARKS = (" 已存在。", " 已存在", " already exists")
+
+
+def find_overwrite_confirm(dialog: Any) -> Any | None:
+    """「另存为」对话框下面弹出的「确认另存为」（``#32770``：「X 已存在。要替换它吗?」 是(Y)/否(N)）。
+
+    ★ 2026-09-29 真机实测：它挂在另存为对话框**下面**（不是桌面顶层），按钮 AutomationId
+      ``CommandButton_6``（是）/ ``CommandButton_7``（否）。它不关掉，另存为对话框的「取消」也点不动——
+      用户实报的「还是卡住了」就是这个框没人管。
+    """
+    with suppress(Exception):
+        for child in dialog.children():
+            with suppress(Exception):
+                if child.element_info.class_name == "#32770" and _overwrite_name(child) is not None:
+                    return child
+    return None
+
+
+def _overwrite_name(confirm: Any) -> str | None:
+    """确认框正文里说「已存在」的那个文件名；不是这种框回 None。"""
+    for control in confirm.descendants():
+        with suppress(Exception):
+            text = str(control.element_info.name or "")
+            for mark in _OVERWRITE_MARKS:
+                if mark in text:
+                    return text.split(mark, 1)[0].strip()
+    return None
+
+
+def _dismiss_overwrite_confirm(dialog: Any) -> str | None:
+    """有「确认另存为」就点「否」（不覆盖——名字相同就算同一份），回它说的文件名；没有回 None。"""
+    confirm = find_overwrite_confirm(dialog)
+    if confirm is None:
+        return None
+    name = _overwrite_name(confirm) or ""
+    for control in confirm.descendants():
+        with suppress(Exception):
+            info = control.element_info
+            if info.control_type != "Button":
+                continue
+            if str(info.automation_id or "") == "CommandButton_7" or str(info.name or "").startswith(("否", "No")):
+                control.invoke()
+                time.sleep(0.3)
+                break
+    return name
+
+
+def _await_saved_file(target: Path, before: set[str], timeout: float, dialog: Any = None) -> Path:
+    """等目录里多出一个文件且大小不再变化（微信是流式写盘的）。扩展名由微信补，所以不按文件名等。
+
+    给了 ``dialog`` 就同时盯着「确认另存为」：点了保存才发现目录里已有同名文件（对话框里没认出来，
+    比如默认名不带扩展名、目录里同名不同扩展名的有好几份）→ 点「否」、关掉对话框、直接用目录里那份。
+    """
     deadline = time.monotonic() + timeout
     last_size: dict[str, int] = {}
     while time.monotonic() < deadline:
+        if dialog is not None:
+            name = _dismiss_overwrite_confirm(dialog)
+            if name is not None:
+                _cancel_save_dialog(dialog)
+                existing = target / Path(name.replace("\\", "/")).name if name else None
+                if existing is not None and existing.is_file() and existing.stat().st_size > 0:
+                    return existing
+                raise WeChatApiError("保存时提示同名文件已存在，但在我们的目录里找不到那份")
         fresh = [entry for entry in target.iterdir() if entry.name not in before and entry.is_file()]
         fresh = [entry for entry in fresh if not entry.name.lower().endswith((".tmp", ".crdownload", ".part"))]
         if fresh:
@@ -2996,8 +3056,12 @@ class UiaWeChatDriver:
                 saved = existing
             else:
                 progress.done()   # 5 路径填好、点了保存
-                saved = _await_saved_file(target, before, timeout=timeout_seconds)
+                saved = _await_saved_file(target, before, timeout=timeout_seconds, dialog=dialog)
+                if saved.name in before:
+                    logger.info("chat.attachment.save.reuse", friend=normalized_friend, name=saved.name)
         except Exception:
+            # 「确认另存为」还开着的话「取消」点不动：先点掉它再取消。
+            _dismiss_overwrite_confirm(dialog)
             _cancel_save_dialog(dialog)
             raise
         size = saved.stat().st_size

@@ -215,6 +215,76 @@ class AwaitSavedFileTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 3)
 
 
+class _Named:
+    def __init__(self, control_type: str, name: str, automation_id: str = "", class_name: str = "") -> None:
+        self.element_info = type("I", (), {"control_type": control_type, "name": name,
+                                           "automation_id": automation_id, "class_name": class_name})()
+        self.pressed = 0
+
+    def invoke(self) -> None:
+        self.pressed += 1
+
+
+class _Confirm(_Named):
+    """真机 2026-09-29 dump：「确认另存为」#32770，正文 ContentText，是/否 = CommandButton_6/7。"""
+
+    def __init__(self, name: str) -> None:
+        super().__init__("Window", "确认另存为", class_name="#32770")
+        self.text = _Named("Text", f"{name} 已存在。\r\n要替换它吗?", "ContentText")
+        self.yes = _Named("Button", "是(Y)", "CommandButton_6")
+        self.no = _Named("Button", "否(N)", "CommandButton_7")
+
+    def descendants(self) -> list[Any]:
+        return [_Named("Image", "MainInstructionIcon", "MainIcon"), self.text, self.yes, self.no]
+
+
+class _DialogWithConfirm(_Dialog):
+    def __init__(self, confirm: _Confirm | None) -> None:
+        super().__init__(_Edit("x"))
+        self.confirm = confirm
+
+    def children(self) -> list[Any]:
+        return [self.confirm] if self.confirm is not None else []
+
+
+class OverwriteConfirmTests(unittest.TestCase):
+    """2026-09-29 用户实报「X 已存在。要替换它吗?」弹着不动、整条卡住：点了保存才撞同名，要自己点掉。"""
+
+    def test_弹了确认替换_点否_关对话框_用本机那份(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "李某-个人简历(9).docx").write_bytes(b"docx")
+            before = {entry.name for entry in target.iterdir()}
+            confirm = _Confirm("李某-个人简历(9).docx")
+            dialog = _DialogWithConfirm(confirm)
+            saved = uia._await_saved_file(target, before, timeout=3, dialog=dialog)
+            self.assertEqual(saved, target / "李某-个人简历(9).docx")
+            self.assertEqual((confirm.no.pressed, confirm.yes.pressed), (1, 0), "不覆盖：点「否」")
+            self.assertEqual(dialog.cancel.pressed, 1)
+
+    def test_说已存在但目录里找不到_如实报错不干等(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dialog = _DialogWithConfirm(_Confirm("不在这.pdf"))
+            started = time.monotonic()
+            with self.assertRaises(WeChatApiError):
+                uia._await_saved_file(Path(tmp), set(), timeout=3, dialog=dialog)
+            self.assertLess(time.monotonic() - started, 2)
+
+    def test_没有确认框_照常等新文件(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "新.pdf").write_bytes(b"pdf")
+            dialog = _DialogWithConfirm(None)
+            self.assertEqual(uia._await_saved_file(target, set(), timeout=3, dialog=dialog).name, "新.pdf")
+            self.assertEqual(dialog.cancel.pressed, 0)
+
+    def test_英文系统也认(self) -> None:
+        confirm = _Confirm("x")
+        confirm.text = _Named("Text", "resume.pdf already exists.\r\nDo you want to replace it?", "ContentText")
+        self.assertIs(uia.find_overwrite_confirm(_DialogWithConfirm(confirm)), confirm)
+        self.assertEqual(uia._overwrite_name(confirm), "resume.pdf")
+
+
 class _Rect:
     def __init__(self, left: int, top: int, right: int, bottom: int) -> None:
         self.left, self.top, self.right, self.bottom = left, top, right, bottom
@@ -286,6 +356,8 @@ class SaveFlowSourceTests(unittest.TestCase):
         self.assertIn("_cancel_save_dialog(dialog)\n                progress.done(\"本机已有同名文件", body)
         self.assertIn("find_save_dialog(window.children())", body)
         self.assertNotIn('"{ESC}"', body)
+        self.assertIn("_await_saved_file(target, before, timeout=timeout_seconds, dialog=dialog)", body)
+        self.assertIn("_dismiss_overwrite_confirm(dialog)\n            _cancel_save_dialog(dialog)", body)
 
 
 if __name__ == "__main__":
