@@ -977,7 +977,10 @@ class GatewayStore:
                 "SELECT last_signature, seq FROM gateway_cursors WHERE account_id=? AND peer_id=?",
                 (account_id, peer_id),
             ).fetchone()
-        return (row[0], int(row[1])) if row else (None, 0)
+        if not row:
+            return None, 0
+        # 空签名 = 交回分身时抹掉了（见 `_forget_cursor`），按第一次读算，序号接着用。
+        return (row[0] or None), int(row[1])
 
     @staticmethod
     def _forget_cursor(conn: sqlite3.Connection, account_id: str, peer_id: str) -> None:
@@ -987,10 +990,16 @@ class GatewayStore:
         游标停在接管前那条；直接续上的话，分身一睁眼就会拿到招聘老师自己打的那一串
         当「新消息」，还可能去回一句人家已经回过的话。抹掉之后走 `first_seen_fresh`：
         只认尾部今天、对方发的那几条——老师最后说话就什么都不接，候选人最后说话才接上。
+
+        ★ 只抹签名、**序号留着**（2026-09-29）。消息 id 是 ``会话#序号``，去重表
+        （``gateway_seen_messages``）永远记着用过的 id；原来整行删掉，序号从 0 重来，
+        交回之后候选人说的头几句拿到的正是 ``#1`` ``#2``——早就「见过」了，入站那边
+        一声不吭丢掉，下一趟游标又已经翻过去：「读到 5 条，没有新消息」，就是不回。
         """
         conn.execute(
-            "DELETE FROM gateway_cursors WHERE account_id=? AND peer_id=?",
-            (account_id, peer_id),
+            "UPDATE gateway_cursors SET last_signature='', updated_at=? "
+            "WHERE account_id=? AND peer_id=?",
+            (_utcnow().isoformat(), account_id, peer_id),
         )
 
     def clear_cursor(self, account_id: str, peer_id: str) -> None:
@@ -1663,6 +1672,28 @@ class GatewayStore:
             ).fetchall()
         keys = [str(raw_key or "") or text_key(text) for raw_key, text in rows]
         return [key for key in reversed(keys) if key]
+
+    def said_by_self(self, account_id: str, peer_id: str, text: str, *, limit: int = 10) -> bool:
+        """这句话在本机最近记下的几条里最近一次出现，是不是**自己**说的（专员或网关发的）。
+
+        给「最后一条是对方的就补一轮」（`wechat_io._owed_tail`）挡自问自答：UI 偶尔把
+        我们自己的气泡判成对方的，认亲台账又早在上一趟销过了。
+        """
+        key = text_key(text)
+        if not key:
+            return False
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT raw_key, text, from_self FROM gateway_messages
+                   WHERE account_id=? AND peer_id=?
+                   ORDER BY at DESC, rowid DESC LIMIT ?""",
+                (account_id, peer_id, max(1, limit)),
+            ).fetchall()
+        # 看**最近一次**出现：专员先说「你好」、候选人再回一句「你好」，后一句是对方的。
+        for raw_key, row_text, from_self in rows:
+            if (str(raw_key or "") or text_key(row_text)) == key:
+                return bool(from_self)
+        return False
 
     def recent_peer_activity(self, account_id: str, *, since: datetime) -> dict[str, datetime]:
         """``since`` 之后**这台机器跟哪些会话有过来往**：会话名 → 最近一次来往的时刻（UTC）。

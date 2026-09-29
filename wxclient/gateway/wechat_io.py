@@ -654,6 +654,8 @@ class QueueMessageSource:
         self._voice_waits: dict[tuple[str, str], int] = {}
         # 上一轮因人工接管被跳过的会话，只为「变了才喊一声」（见 `_drop_handed_off`）
         self._paused_peers: set[str] = set()
+        # (账号, 会话名) → 已经按「最后一条是对方的、欠一句回复」补派过的那个游标（见 `_owed_tail`）
+        self._owed_sent: dict[tuple[str, str], str] = {}
 
     async def fetch(self, account_id: str) -> list[InboundMessage]:
         """读名单里的会话，按游标切出新消息。
@@ -953,6 +955,56 @@ class QueueMessageSource:
             out.append(dict(raw, is_self=True, sender=SELF_SENDER, gateway_echo=True))
         return out
 
+    def _owed_tail(
+        self,
+        account_id: str,
+        peer_id: str,
+        raw_messages: Sequence[dict[str, Any]],
+        cursor: str | None,
+    ) -> list[dict[str, Any]]:
+        """游标说「没有新消息」，可窗口最后一条是对方说的——欠着他一句回复，补派一次。
+
+        用户 2026-09-29：「只要最后一条不是自己的就要回复」。候选人主动发了句「你好啊」，
+        实时日志却是「读到 5 条，没有新消息」——游标在读到的那一刻就翻过去了，之后那一轮
+        不管因为什么没回出去（去重 id 撞了、游标丢了只对齐、这一轮没结论就收了），
+        它都已经在游标之前，再也不会被当成新消息。游标只管「读没读过」，管不了「回没回」；
+        这里拿「最后一条是谁说的」兜底。
+
+        只补**尾部连续、今天、对方说的**那几条（同 `first_seen_fresh`），并且：
+
+        - 游标就指着这一窗最后一条（窗口被翻上去、游标没动的那一趟不算——看不到后面的回复）；
+        - 这个人没有正在跑 / 排着队的一轮（待处理表里有他 = 还在回，别抢）；
+        - 那条不是我们自己发出去被 UI 认反的（本机记录里它是自己说的就不补，否则自问自答）；
+        - 本机处理过的最近一条在这一窗里（证明窗口在底部，不是被翻上去的老历史）；
+        - 同一个位置只补一次：补了还是没回（AI 端这轮决定不说话），就到此为止，不每趟都派。
+        """
+        if not raw_messages or cursor is None or cursor != latest_cursor(raw_messages):
+            return []
+        key = (account_id, peer_id)
+        if self._owed_sent.get(key) == cursor:
+            return []
+        tail = first_seen_fresh(raw_messages)
+        if not tail:
+            return []
+        if any(row["peer_id"] == peer_id for row in self._store.list_pending_inbound(account_id)):
+            return []
+        if self._store.said_by_self(account_id, peer_id, str(tail[-1].get("text") or "")):
+            return []
+        # 这一窗得是「在底部」的：本机处理过的最近那条要在窗里。游标对不上时 `split_new_messages`
+        # 会把游标对齐到这一窗最后一条——窗口要是正被翻上去，那是一屏老历史，补了就是整段重播
+        # （2026-09-23 事故）。本机还一条都没记过（刚交回 / 刚加进名单）时没有可比的，放行。
+        processed = self._store.recent_raw_keys(account_id, peer_id, limit=1)
+        if processed and processed[-1] not in {text_key(raw.get("text")) for raw in raw_messages}:
+            return []
+        self._owed_sent[key] = cursor
+        _log.info(
+            "最后一条是对方说的、还没回，补派这一轮",
+            会话=peer_id,
+            条数=len(tail),
+            最近一条=preview(tail[-1]),
+        )
+        return tail
+
     async def _fetch_peer(
         self, account_id: str, peer_id: str, *, unread: int | None = None
     ) -> list[InboundMessage]:
@@ -1019,6 +1071,8 @@ class QueueMessageSource:
         fresh, new_signature = split_new_messages(raw_messages, last_signature, known)
         if last_signature is not None:
             fresh = self._claim_own_echoes(account_id, peer_id, fresh)
+            if not fresh:
+                fresh = self._owed_tail(account_id, peer_id, raw_messages, new_signature)
         if stranger and len(fresh) > unread:
             # 红点数就是微信说的「新来了几条」：名单外的人只接这么多，多出来的是历史。
             fresh = fresh[-unread:] if unread > 0 else []
