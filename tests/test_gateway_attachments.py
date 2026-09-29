@@ -54,6 +54,20 @@ class RowClassificationTests(unittest.TestCase):
         )
         self.assertEqual(_annotate_attachment_row("", "[文件]"), {"message_type": "file", "file_name": ""})
 
+    def test_file_name_with_spaces_is_kept_whole(self) -> None:
+        """★ 2026-09-29 真机：「李先洋-分拣员个人简历 (2).docx」原来只认出「(2).docx」。"""
+        for body in (
+            "文件\n李先洋-分拣员个人简历 (2).docx\n7.2K",
+            "文件李先洋-分拣员个人简历 (2).docx 7.2K",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(_annotate_attachment_row("", body)["file_name"], "李先洋-分拣员个人简历 (2).docx")
+
+    def test_size_line_is_not_a_file_name(self) -> None:
+        """大小那行（「7.2K」）扩展名不以字母打头，不当文件名。"""
+        self.assertEqual(_annotate_attachment_row("", "文件\n7.2K\n简历.pdf")["file_name"], "简历.pdf")
+        self.assertEqual(_annotate_attachment_row("", "文件\n7.2K")["file_name"], "")
+
     def test_plain_text_is_left_alone(self) -> None:
         self.assertIsNone(_annotate_attachment_row("mmui::ChatTextItemView", "还招人吗"))
         self.assertIsNone(_annotate_attachment_row("", "我发了图片给你"))
@@ -152,7 +166,9 @@ class SourceAttachmentTests(unittest.IsolatedAsyncioTestCase):
             messages = await self._source(runtime).fetch("acct-1")
         self.assertEqual(messages[0].text, IMAGE_UNSAVED_TEXT)
         self.assertEqual(messages[0].attachments, ())
-        self.assertTrue(any("没能另存" in entry["event"] for entry in logs), logs)
+        failed = [e for e in logs if e["event"] == "附件进度" and e.get("失败")]
+        self.assertEqual([e["步骤"] for e in failed], ["2/4"], logs)
+        self.assertIn("另存为", failed[0]["原因"], "失败那行要带上卡住的原因")
 
     async def test_disallowed_extension_is_dropped(self) -> None:
         runtime = FakeRuntime({self.PEER: [{"text": "文件 setup.exe", "message_type": "file", "is_self": False}]},

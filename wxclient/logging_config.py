@@ -337,6 +337,13 @@ def _render_gateway_line(event: str, payload: dict[str, Any]) -> str | None:
             f"喂给 AI 端：「{peer}」，本轮 {payload.get('本轮', 0)} 条 + "
             f"历史 {payload.get('历史行', 0)} 行，{known}{again}{with_files}"
         )
+    if event == "附件进度":
+        tail = f"——原因：{payload['原因']}" if payload.get("原因") else ""
+        mark = "✗ " if payload.get("失败") else ""
+        return (
+            f"附件进度 {payload.get('步骤') or '-'}：{mark}「{peer}」的「{payload.get('文件') or '-'}」"
+            f"{payload.get('说明') or ''}{tail}"
+        )
     if event == "这一轮有附件没能带上":
         items = [
             f"{item.get('文件') or '-'}（{item.get('原因') or '-'}）"
@@ -620,6 +627,17 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         )
     if event == "chat.attachment.bubble.click":
         return f"右键点在气泡上：({payload.get('x')}, {payload.get('y')})，消息行 {payload.get('row') or '-'}"
+    if event == "chat.attachment.save.step":
+        detail = f"（{payload['detail']}）" if payload.get("detail") else ""
+        return (
+            f"另存进度 {payload.get('step', 0)}/{payload.get('total', 0)}：「{payload.get('friend') or '-'}」"
+            f"{payload.get('stage') or '-'} ✓{detail}"
+        )
+    if event == "chat.attachment.save.failed":
+        return (
+            f"另存失败：「{payload.get('friend') or '-'}」已完成 {payload.get('step', 0)}/{payload.get('total', 0)} 步，"
+            f"卡在「{payload.get('stage') or '-'}」：{payload.get('error') or '-'}"
+        )
     if event == "chat.attachment.save.done":
         return (
             f"附件已另存到本机：「{payload.get('friend') or '-'}」，"

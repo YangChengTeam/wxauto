@@ -72,6 +72,15 @@ MATERIAL_TYPE_TEXT = {
 }
 
 
+#: 附件从发现到送达 AI 端的进度日志（像 AI 端阶段那样一步一行）：
+#: 1/4 发现 → 2/4 另存 → 3/4 上传 → 4/4 已送达（file_id 或随消息内联）。失败带 ``失败=True`` 与原因。
+PROGRESS_EVENT = "附件进度"
+
+
+def _kb(size: int) -> str:
+    return f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / (1024 * 1024):.1f} MB"
+
+
 def guess_content_type(file_name: str) -> str:
     guessed, _ = mimetypes.guess_type(file_name)
     return guessed or "application/octet-stream"
@@ -105,6 +114,8 @@ class AttachmentFetcher:
         if kind not in SAVABLE_TYPES:
             return None
         self.purge_stale()
+        label = str(raw.get("file_name") or "") or ("一张图片" if kind == "image" else "一个文件")
+        _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=label, 步骤="1/4", 说明="发现附件，开始另存到本机")
         target = self.dir_for(account_id, peer_id)
         target.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -118,28 +129,30 @@ class AttachmentFetcher:
         status = str((result or {}).get("status") or "")
         if status not in {"", "succeeded"}:
             _log.warning(
-                "对方发来的附件没能另存下来",
-                会话=peer_id,
-                类型=kind,
-                原因=str((result or {}).get("last_error") or "")[:120],
+                PROGRESS_EVENT, 会话=peer_id, 文件=label, 步骤="2/4", 失败=True,
+                说明="另存失败，这份不会送到 AI 端（对方会被请求再发一次）",
+                原因=str((result or {}).get("last_error") or status)[:160],
             )
             return None
         body = (result or {}).get("result") or {}
         path = Path(str(body.get("path") or ""))
         if not path.is_file():
-            _log.warning("另存任务成功了但文件不在", 会话=peer_id, 类型=kind)
+            _log.warning(PROGRESS_EVENT, 会话=peer_id, 文件=label, 步骤="2/4", 失败=True,
+                         说明="另存任务报成功，但本机目录里找不到文件")
             return None
         size = int(body.get("bytes") or path.stat().st_size)
         file_name = str(body.get("file_name") or path.name)
         if not allowed_file(file_name):
-            _log.info("附件类型不在名单里，不送 AI 端", 会话=peer_id, 扩展名=Path(file_name).suffix.lower())
+            _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=file_name, 步骤="2/4", 失败=True,
+                      说明=f"已另存，但类型 {Path(file_name).suffix.lower() or '（无扩展名）'} 不在名单里，不送 AI 端")
             path.unlink(missing_ok=True)
             return None
         if size > MAX_ATTACHMENT_BYTES:
-            _log.info("附件太大，不送 AI 端", 会话=peer_id, 字节=size)
+            _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=file_name, 步骤="2/4", 失败=True,
+                      说明=f"已另存，但 {_kb(size)} 超过单份 {MAX_ATTACHMENT_BYTES // (1024 * 1024)}MB 上限，不送 AI 端")
             path.unlink(missing_ok=True)
             return None
-        _log.info("对方发来的附件已另存", 会话=peer_id, 类型=kind, 文件=file_name, 字节=size)
+        _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=file_name, 步骤="2/4", 说明=f"已另存到本机（{_kb(size)}）")
         return {"kind": kind, "file_name": file_name, "path": str(path), "bytes": size}
 
     def purge_stale(self) -> int:

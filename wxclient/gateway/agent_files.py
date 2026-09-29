@@ -24,6 +24,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import httpx
 import structlog
 
+from .attachments import PROGRESS_EVENT, _kb
 from .ticket import TicketError, TicketProvider
 
 _log = structlog.get_logger(__name__)
@@ -72,10 +73,15 @@ class AgentFileUploader:
         """
         if not files:
             return []
+        names = "、".join(str(f["file_name"]) for f in files)
+        total = sum(len(f["data"]) for f in files)
+        _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=names, 步骤="3/4",
+                  说明=f"开始上传到 AI 端（{len(files)} 份，共 {_kb(total)}）")
         try:
             ticket = await self._tickets.mint(account_id)
         except TicketError as exc:
-            _log.warning("附件上传前换不到票，这一轮改随消息带过去", 会话=peer_id, 原因=str(exc))
+            _log.warning(PROGRESS_EVENT, 会话=peer_id, 文件=names, 步骤="3/4", 失败=True,
+                         说明="上传前换不到票，这一轮改随消息带过去", 原因=str(exc))
             return None
         url = f"{self._base_url}/v1/sessions/{quote(session_id, safe='')}/files"
         multipart = [
@@ -92,25 +98,25 @@ class AgentFileUploader:
                     response = await client.post(url, headers={TICKET_HEADER: ticket}, files=multipart)
         except Exception as exc:  # noqa: BLE001 —— 上传只是更好的那条路，坏了退回内联
             # 只记异常类型：url 之外的细节可能带上票据片段（同 ticket.py 的口径）。
-            _log.warning("附件上传到 AI 端失败，这一轮改随消息带过去", 会话=peer_id, 原因=type(exc).__name__)
+            _log.warning(PROGRESS_EVENT, 会话=peer_id, 文件=names, 步骤="3/4", 失败=True,
+                         说明="上传到 AI 端失败，这一轮改随消息带过去", 原因=type(exc).__name__)
             return None
         if response.status_code != 201:
             _log.warning(
-                "AI 端没收下附件，这一轮改随消息带过去", 会话=peer_id, 状态码=response.status_code,
-                错误码=_error_code(response),
+                PROGRESS_EVENT, 会话=peer_id, 文件=names, 步骤="3/4", 失败=True,
+                说明="AI 端没收下，这一轮改随消息带过去",
+                原因=f"状态码 {response.status_code} {_error_code(response)}".strip(),
             )
             return None
         ids = _file_ids(response)
         if ids is None or len(ids) != len(files):
             # 个数对不上就一个都不认：哪份对哪个 id 说不清，宁可整批退回内联再送一次。
-            _log.warning("AI 端回的文件编号个数对不上，这一轮改随消息带过去", 会话=peer_id, 送去=len(files))
+            _log.warning(PROGRESS_EVENT, 会话=peer_id, 文件=names, 步骤="3/4", 失败=True,
+                         说明=f"AI 端回的文件编号个数对不上（送去 {len(files)} 份），这一轮改随消息带过去")
             return None
-        _log.info(
-            "附件已直接传到 AI 端",
-            会话=peer_id,
-            个数=len(ids),
-            字节=sum(len(f["data"]) for f in files),
-        )
+        for f, file_id in zip(files, ids):
+            _log.info(PROGRESS_EVENT, 会话=peer_id, 文件=str(f["file_name"]), 步骤="4/4",
+                      说明=f"已上传到 AI 端（{_kb(len(f['data']))}，编号 {file_id[:8]}）")
         return ids
 
 

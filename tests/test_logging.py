@@ -178,6 +178,15 @@ class NoEnglishLeaksTests(ChineseLogRendererTests):
         self.assertFalse(rendered - emitted,
                          f"这些分支已经没人发了，删掉免得误导：{sorted(rendered - emitted)}")
 
+    def test_attachment_save_steps_read_like_progress(self) -> None:
+        step = self.render("chat.attachment.save.step", friend="李先洋", step=3, total=6, stage="右键点「另存为」", detail="")
+        self.assertIn("另存进度 3/6", step)
+        self.assertIn("右键点「另存为」", step)
+        failed = self.render("chat.attachment.save.failed", friend="李先洋", step=3, total=6,
+                             stage="保存对话框弹出", error="点了「另存为」但保存对话框没出现")
+        self.assertIn("卡在「保存对话框弹出」", failed)
+        self.assertIn("已完成 3/6 步", failed)
+
     def test_a_message_stuck_in_the_input_box_says_so_plainly(self) -> None:
         output = self.render("message.send.stuck_in_input", friend="王建国", left=5)
 
@@ -212,6 +221,17 @@ class GatewayLineTests(ChineseLogRendererTests):
         config = (Path(__file__).resolve().parent.parent / "wxclient" / "logging_config.py").read_text("utf-8")
         block = config.split("def _render_gateway_line")[1].split("def _render_event")[0]
         return re.findall(r'event == "([^"]+)"', block)
+
+    def test_attachment_progress_says_step_file_and_reason(self) -> None:
+        ok = self.render("附件进度", 会话="李先洋", 文件="简历 (2).docx", 步骤="2/4", 说明="已另存到本机（7.2 KB）")
+        self.assertIn("附件进度 2/4", ok)
+        self.assertIn("「简历 (2).docx」已另存到本机", ok)
+        self.assertNotIn("✗", ok)
+        bad = self.render("附件进度", 会话="李先洋", 文件="简历.docx", 步骤="2/4", 失败=True,
+                          说明="另存失败", 原因="右键菜单里没有「另存为」")
+        self.assertIn("✗", bad)
+        self.assertIn("原因：右键菜单里没有「另存为」", bad)
+        self.assertNotIn("失败=True", bad)
 
     def test_every_branch_matches_a_real_log_call(self) -> None:
         """★ 分支的键就是 `_log.info(...)` 的第一个参数——那边改措辞，这里必须跟着改。

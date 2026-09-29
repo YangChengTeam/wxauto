@@ -26,6 +26,7 @@ from .agent_files import AgentFileUploader
 from .attachments import (
     LEFT_BEHIND_TEXT,
     MATERIAL_TYPE_TEXT,
+    PROGRESS_EVENT,
     collect_attachments,
     to_inline,
 )
@@ -77,6 +78,11 @@ _wechat = _log.bind(**{logrole.ROLE_KEY: logrole.WECHAT})
 _ai = _log.bind(**{logrole.ROLE_KEY: logrole.AI})
 #: 跟业务后端打交道的那几行（Client Token 走的 HTTP）。
 _backend = _log.bind(**{logrole.ROLE_KEY: logrole.BACKEND})
+
+
+def _log_attachment_progress(peer_id: str, file_name: str, note: str) -> None:
+    """附件进度的最后一步（4/4）走内联兜底时打这一行；上传成功那条在 `agent_files` 里打。"""
+    _ai.info(PROGRESS_EVENT, 会话=peer_id, 文件=file_name, 步骤="4/4", 说明=note)
 
 #: 建连/保活的节拍。线上 nginx 对 /agent-ws 配的是 600s 空闲上限，30s 一拍既够续命，
 #: 也让「连接已经死了」最多 30s 就被发现（而不是攒到第一条真消息上）。
@@ -1223,6 +1229,8 @@ class GatewayRunner:
                     uploaded[session_id] = ids
             if ids is not None:
                 return {"file_ids": ids}
+        for f in files:
+            _log_attachment_progress(peer_id, str(f["file_name"]), "随这一轮消息内联送到 AI 端")
         return {"attachments": to_inline(files)}
 
     @staticmethod

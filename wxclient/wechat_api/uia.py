@@ -2896,16 +2896,45 @@ class UiaWeChatDriver:
         target.mkdir(parents=True, exist_ok=True)
         self._ensure_ready()
         logger.info("chat.attachment.save.start", friend=normalized_friend, text=str(text or "")[:40])
+        # 另存分六小步，每一步都打一行（像 AI 端阶段那样看得见走到哪），失败时说清停在哪一步。
+        # 2026-09-29：客户机上只看到「没能保存下来」，说不出卡在菜单、对话框还是落盘。
+        progress = _SaveProgress(normalized_friend)
+        try:
+            return self._save_message_attachment_steps(
+                progress, normalized_friend, target, runtime_id, order, text, timeout_seconds
+            )
+        except Exception as exc:
+            logger.warning(
+                "chat.attachment.save.failed",
+                friend=normalized_friend,
+                step=progress.step,
+                total=_SAVE_STEP_TOTAL,
+                stage=progress.next_label,
+                error=str(exc)[:160],
+            )
+            raise
 
+    def _save_message_attachment_steps(
+        self,
+        progress: _SaveProgress,
+        normalized_friend: str,
+        target: Path,
+        runtime_id: str,
+        order: int,
+        text: str,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
         window = self._open_main_dialog_window(normalized_friend, select=False)
         chat_list = self._resolve_chat_list(window)
         if chat_list is None:
             raise WeChatApiError("未找到聊天消息列表")
+        progress.done()   # 1 打开会话
         item = _matching_list_item_for_message(
             chat_list, {"runtime_id": runtime_id or "", "order": order, "text": text or ""}
         )
         if item is None:
             raise WeChatApiError("这条消息不在当前窗口的可见区里，没法另存")
+        progress.done()   # 2 找到这条消息
 
         with suppress(Exception):
             window.set_focus()
@@ -2926,17 +2955,21 @@ class UiaWeChatDriver:
                 mouse.click(coords=click_at)
             raise WeChatApiError("右键菜单里没有「另存为」，这条内容不可保存（可能已过期或不是图片/文件）")
         save_item.click_input()
+        progress.done()   # 3 右键菜单点了「另存为」
 
         dialog = self._await_save_dialog(window, timeout=8.0)
         if dialog is None:
             raise WeChatApiError("点了「另存为」但保存对话框没出现")
+        progress.done()   # 4 保存对话框弹出来了
         try:
             self._fill_save_dialog(dialog, target)
+            progress.done()   # 5 路径填好、点了保存
             saved = _await_saved_file(target, before, timeout=timeout_seconds)
         except Exception:
             _cancel_save_dialog(dialog)
             raise
         size = saved.stat().st_size
+        progress.done(f"{saved.name}，{size} 字节")   # 6 文件落到本机
         logger.info("chat.attachment.save.done", friend=normalized_friend, name=saved.name, bytes=size)
         return {
             "action": "save_message_attachment",
@@ -5082,7 +5115,46 @@ _EMOJI_LABELS = frozenset({"动画表情", "[动画表情]", "動畫表情", "[�
 _VIDEO_LABELS = frozenset({"视频", "[视频]", "影片", "[影片]", "Video", "[Video]"})
 _FILE_PREFIXES = ("文件", "[文件]", "檔案", "[檔案]", "File", "[File]")
 #: 文件气泡名字里的文件名：`xxx.pdf` / `报名表.docx`（扩展名 1–8 位字母数字）。
-_FILE_NAME_RE = re.compile(r"([^\s\[\]:：/\\]+\.[A-Za-z0-9]{1,8})(?![A-Za-z0-9.])")
+#: 名字中间可以有空格（2026-09-29 真机：「李先洋-分拣员个人简历 (2).docx」原来只认出「(2).docx」）；
+#: 按行找，所以大小那行（「7.2K」）不会粘进来；扩展名要以字母打头，免得把「7.2K」当成文件名。
+_FILE_NAME_RE = re.compile(r"([^\[\]:：/\\\r\n]*?[^\s\[\]:：/\\]\.[A-Za-z][A-Za-z0-9]{0,7})(?![A-Za-z0-9.])")
+
+
+def _file_name_in(body: str) -> str:
+    """文件气泡的 UIA 名字里取文件名：先去掉打头的「文件」标签，再逐行找第一个像文件名的。"""
+    rest = body
+    for prefix in sorted(_FILE_PREFIXES, key=len, reverse=True):
+        if rest.startswith(prefix):
+            rest = rest[len(prefix):]
+            break
+    for line in rest.splitlines():
+        match = _FILE_NAME_RE.search(line.strip())
+        if match:
+            return match.group(1).strip()
+    return ""
+
+
+#: 另存一条气泡的六小步（日志里「另存进度 k/6」）。
+_SAVE_STEPS = ("打开会话", "找到这条消息", "右键点「另存为」", "保存对话框弹出", "填好保存路径", "文件落到本机")
+_SAVE_STEP_TOTAL = len(_SAVE_STEPS)
+
+
+class _SaveProgress:
+    """另存走到第几步。每完成一步打一行；失败时 ``next_label`` 就是卡住的那一步。"""
+
+    def __init__(self, friend: str) -> None:
+        self.friend = friend
+        self.step = 0
+
+    @property
+    def next_label(self) -> str:
+        return _SAVE_STEPS[self.step] if self.step < _SAVE_STEP_TOTAL else "收尾"
+
+    def done(self, detail: str = "") -> None:
+        label = self.next_label
+        self.step += 1
+        logger.info("chat.attachment.save.step", friend=self.friend, step=self.step,
+                    total=_SAVE_STEP_TOTAL, stage=label, detail=detail)
 
 
 def _annotate_attachment_row(class_name: Any, text: str) -> dict[str, Any] | None:
@@ -5102,8 +5174,7 @@ def _annotate_attachment_row(class_name: Any, text: str) -> dict[str, Any] | Non
     if body in _IMAGE_LABELS or "Image" in name:
         return {"message_type": "image"}
     if body.startswith(_FILE_PREFIXES) or "File" in name:
-        match = _FILE_NAME_RE.search(body)
-        return {"message_type": "file", "file_name": match.group(1) if match else ""}
+        return {"message_type": "file", "file_name": _file_name_in(body)}
     return None
 
 
