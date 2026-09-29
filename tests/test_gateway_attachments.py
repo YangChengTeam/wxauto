@@ -227,7 +227,7 @@ class ReuseSavedFileTests(unittest.IsolatedAsyncioTestCase):
         runtime = FakeRuntime({}, name="简历.pdf")
         fetcher = self._fetcher(runtime)
         path = self._put(fetcher, "简历.pdf", 7373)  # 气泡上显示 7.2K
-        raw = {"message_type": "file", "file_name": "简历.pdf", "file_size": int(7.2 * 1024)}
+        raw = {"message_type": "file", "file_name": "简历.pdf"}
         with capture_logs() as logs:
             got = await fetcher.fetch("acct-1", self.PEER, raw)
         self.assertEqual(runtime.saves, [], "本机已有就不再另存")
@@ -236,15 +236,15 @@ class ReuseSavedFileTests(unittest.IsolatedAsyncioTestCase):
         notes = [e["说明"] for e in logs if e["event"] == "附件进度"]
         self.assertTrue(any("已经存过" in n for n in notes), notes)
 
-    async def test_same_name_different_size_is_saved_again(self) -> None:
-        """对方改了简历再发一份同名的：不能拿旧的那份去分析。"""
+    async def test_same_name_is_the_same_file_whatever_the_size(self) -> None:
+        """用户 2026-09-29：名字相同就算同一份，不比大小。"""
         runtime = FakeRuntime({}, name="简历(1).pdf")
         fetcher = self._fetcher(runtime)
-        self._put(fetcher, "简历.pdf", 7373)
-        raw = {"message_type": "file", "file_name": "简历.pdf", "file_size": int(1.3 * 1024 * 1024)}
+        path = self._put(fetcher, "简历.pdf", 7373)
+        raw = {"message_type": "file", "file_name": "简历.pdf"}
         got = await fetcher.fetch("acct-1", self.PEER, raw)
-        self.assertEqual(len(runtime.saves), 1)
-        self.assertEqual(got["file_name"], "简历(1).pdf")
+        self.assertEqual(runtime.saves, [])
+        self.assertEqual(got["path"], str(path))
 
     async def test_images_are_always_saved(self) -> None:
         """图片气泡没有名字，认不出是不是同一张。"""
@@ -259,11 +259,6 @@ class ReuseSavedFileTests(unittest.IsolatedAsyncioTestCase):
         got = await self._fetcher(runtime).fetch("acct-1", self.PEER, {"message_type": "file", "file_name": "简历.pdf"})
         self.assertEqual(len(runtime.saves), 1)
         self.assertEqual(got["file_name"], "简历.pdf")
-
-    def test_bubble_size_is_read(self) -> None:
-        self.assertEqual(_annotate_attachment_row("", "文件\n简历.pdf\n7.2K")["file_size"], int(7.2 * 1024))
-        self.assertEqual(_annotate_attachment_row("", "文件\n简历.pdf\n1.3M")["file_size"], int(1.3 * 1024 ** 2))
-        self.assertNotIn("file_size", _annotate_attachment_row("", "文件\n简历.pdf"))
 
 
 class InlineTests(unittest.TestCase):

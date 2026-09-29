@@ -227,6 +227,31 @@ def save_path_for(target: Path, default_name: str) -> Path:
     return target / name
 
 
+def existing_same_name(target: Path, default_name: str) -> Path | None:
+    """我们目录里已经有同名的那份就返回它（用户 2026-09-29：名字相同就算同一份）。
+
+    对话框给的默认名可能不带扩展名（图片是「微信图片_…」，扩展名微信保存时才补）：
+    那就认同名不同扩展名的——只有一个时才认，多个说不清是哪份，当没有。
+    """
+    try:
+        path = save_path_for(target, default_name)
+    except WeChatApiError:
+        return None
+    with suppress(OSError):
+        if path.is_file() and path.stat().st_size > 0:
+            return path
+        if not path.suffix:
+            hits = [p for p in target.glob(f"{glob_escape(path.name)}.*") if p.is_file() and p.stat().st_size > 0]
+            if len(hits) == 1:
+                return hits[0]
+    return None
+
+
+def glob_escape(name: str) -> str:
+    """glob 里的特殊字符（``[`` ``]`` ``*`` ``?``）按字面匹配。"""
+    return "".join(f"[{ch}]" if ch in "[]*?" else ch for ch in name)
+
+
 def _edit_value(edit: Any) -> str:
     try:
         return str(edit.get_value() or "")
@@ -2962,9 +2987,16 @@ class UiaWeChatDriver:
             raise WeChatApiError("点了「另存为」但保存对话框没出现")
         progress.done()   # 4 保存对话框弹出来了
         try:
-            self._fill_save_dialog(dialog, target)
-            progress.done()   # 5 路径填好、点了保存
-            saved = _await_saved_file(target, before, timeout=timeout_seconds)
+            existing = self._fill_save_dialog(dialog, target)
+            if existing is not None:
+                # 目录里已经有同名的：点「取消」直接用它。点「保存」会弹「是否替换」，
+                # 而那个确认框没人管、目录里也不会多出文件——整步判失败（2026-09-29 用户实报）。
+                _cancel_save_dialog(dialog)
+                progress.done("本机已有同名文件，不再保存")   # 5
+                saved = existing
+            else:
+                progress.done()   # 5 路径填好、点了保存
+                saved = _await_saved_file(target, before, timeout=timeout_seconds)
         except Exception:
             _cancel_save_dialog(dialog)
             raise
@@ -2995,12 +3027,18 @@ class UiaWeChatDriver:
         return None
 
     @staticmethod
-    def _fill_save_dialog(dialog: Any, target: Path) -> None:
-        """文件名框：默认名 → ``target / 默认名`` 完整路径，读回核对，再点「保存(S)」。"""
+    def _fill_save_dialog(dialog: Any, target: Path) -> Path | None:
+        """文件名框：默认名 → ``target / 默认名`` 完整路径，读回核对，再点「保存(S)」。
+
+        目录里已经有同名的那份 → 不填不点，返回它（调用方点「取消」直接用）；否则返回 None。
+        """
         edit = dialog_control(dialog, "Edit", "1001")
         if edit is None:
             raise WeChatApiError("保存对话框里找不到文件名输入框")
         default_name = _edit_value(edit)
+        existing = existing_same_name(target, default_name)
+        if existing is not None:
+            return existing
         full_path = save_path_for(target, default_name)
         # set_edit_text 走 UIA ValuePattern：不经键盘、不经剪贴板，中文路径也不会被输入法吃掉。
         edit.set_edit_text(str(full_path))
@@ -3014,6 +3052,7 @@ class UiaWeChatDriver:
             button.invoke()
         except Exception:  # noqa: BLE001 —— invoke 不支持就老实点一下
             button.click_input()
+        return None
 
     @staticmethod
     def _scroll_row_into_view(chat_list: Any, item: Any, text: str, mouse: Any) -> Any:
@@ -5120,20 +5159,6 @@ _FILE_PREFIXES = ("文件", "[文件]", "檔案", "[檔案]", "File", "[File]")
 _FILE_NAME_RE = re.compile(r"([^\[\]:：/\\\r\n]*?[^\s\[\]:：/\\]\.[A-Za-z][A-Za-z0-9]{0,7})(?![A-Za-z0-9.])")
 
 
-#: 文件气泡上的大小那一行：「7.2K」「1.3M」「512B」「2.0 MB」。微信按 1024 进位、保留一位小数。
-_FILE_SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([BKMG])B?\s*$", re.I)
-_SIZE_UNITS = {"B": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}
-
-
-def _file_size_in(body: str) -> int | None:
-    """文件气泡上标的大小（字节，按显示值折算，只是个约数）；没有大小那一行回 None。"""
-    for line in str(body or "").splitlines():
-        match = _FILE_SIZE_RE.match(line)
-        if match:
-            return int(float(match.group(1)) * _SIZE_UNITS[match.group(2).upper()])
-    return None
-
-
 def _file_name_in(body: str) -> str:
     """文件气泡的 UIA 名字里取文件名：先去掉打头的「文件」标签，再逐行找第一个像文件名的。"""
     rest = body
@@ -5188,11 +5213,7 @@ def _annotate_attachment_row(class_name: Any, text: str) -> dict[str, Any] | Non
     if body in _IMAGE_LABELS or "Image" in name:
         return {"message_type": "image"}
     if body.startswith(_FILE_PREFIXES) or "File" in name:
-        row = {"message_type": "file", "file_name": _file_name_in(body)}
-        size = _file_size_in(body)
-        if size is not None:
-            row["file_size"] = size
-        return row
+        return {"message_type": "file", "file_name": _file_name_in(body)}
     return None
 
 

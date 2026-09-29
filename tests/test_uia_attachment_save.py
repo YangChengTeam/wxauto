@@ -164,6 +164,32 @@ class FillSaveDialogTests(unittest.TestCase):
             uia.UiaWeChatDriver._fill_save_dialog(dialog, Path("/data/ours"))
         self.assertEqual(dialog.save.pressed, 0, "路径没填进去就点保存 = 存到微信默认的地方")
 
+    def test_目录里已有同名文件_不填不点保存_返回那份(self) -> None:
+        """2026-09-29 用户实报：同名点保存会弹「是否替换」，整步失败。名字相同就算同一份。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "简历.pdf").write_bytes(b"x")
+            dialog = _Dialog(_Edit("简历.pdf"))
+            got = uia.UiaWeChatDriver._fill_save_dialog(dialog, target)
+            self.assertEqual(got, target / "简历.pdf")
+            self.assertEqual(dialog.save.pressed, 0)
+            self.assertEqual(dialog.edit.value, "简历.pdf", "认出来就不再动文件名框")
+
+    def test_默认名不带扩展名_认同名唯一的那份(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            (target / "微信图片_1.jpg").write_bytes(b"x")
+            self.assertEqual(uia.existing_same_name(target, "微信图片_1"), target / "微信图片_1.jpg")
+            (target / "微信图片_1.png").write_bytes(b"x")
+            self.assertIsNone(uia.existing_same_name(target, "微信图片_1"), "两份说不清是哪份就当没有")
+            self.assertIsNone(uia.existing_same_name(target, "别的"))
+
+    def test_目录里没有才填路径点保存(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dialog = _Dialog(_Edit("简历.pdf"))
+            self.assertIsNone(uia.UiaWeChatDriver._fill_save_dialog(dialog, Path(tmp)))
+            self.assertEqual(dialog.save.pressed, 1)
+
     def test_出错收场只点取消_绝不按ESC(self) -> None:
         dialog = _Dialog(_Edit("x"))
         uia._cancel_save_dialog(dialog)
@@ -257,6 +283,7 @@ class SaveFlowSourceTests(unittest.TestCase):
         source = Path(uia.__file__).read_text(encoding="utf-8")
         body = source[source.index("    def save_message_attachment("):source.index("    def _bubble_click_point(")]
         self.assertIn("SaveMenuItem", body)
+        self.assertIn("_cancel_save_dialog(dialog)\n                progress.done(\"本机已有同名文件", body)
         self.assertIn("find_save_dialog(window.children())", body)
         self.assertNotIn('"{ESC}"', body)
 

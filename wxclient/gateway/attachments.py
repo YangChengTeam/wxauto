@@ -117,7 +117,7 @@ class AttachmentFetcher:
         label = str(raw.get("file_name") or "") or ("一张图片" if kind == "image" else "一个文件")
         target = self.dir_for(account_id, peer_id)
         target.mkdir(parents=True, exist_ok=True)
-        # 先看自己的目录里是不是已经存过这份（上一轮存过、这条被重读、上次上传没成）：有就直接用，不再另存。
+        # 先看自己的目录里是不是已经存过这份（同名就算，上一轮存过、这条被重读、上次上传没成）：有就直接用。
         # 另存到同名文件上微信会弹「是否替换」，而另存那边按「目录里多出一个文件」判成败——覆盖不多出文件，
         # 重存反而会失败。只看我们自己的目录，不碰微信的存储目录（权限问题，用户 2026-09-29）。
         existing = self._already_saved(target, raw)
@@ -153,11 +153,10 @@ class AttachmentFetcher:
 
     @staticmethod
     def _already_saved(target: Path, raw: dict[str, Any]) -> Path | None:
-        """自己目录里同名、且大小对得上气泡上标的那份；没有回 None。
+        """自己目录里同名的那份；没有回 None。名字相同就算同一份（用户 2026-09-29）。
 
-        只认文件气泡：图片气泡没有名字（另存默认名是「微信图片_时间戳」），认不出是不是同一张。
-        气泡标了大小就要对上（微信显示保留一位小数，差在一个显示单位的 1/10 以内算同一份）——
-        对方改了简历再发一份同名的，不能拿旧的那份去分析。没标大小只认名字。
+        只认文件气泡：图片气泡没有名字（另存默认名是「微信图片_时间戳」），认不出是不是同一张——
+        图片同名的情况由另存那一步在对话框里按默认名再认一次（`uia.existing_same_name`）。
         """
         if str(raw.get("message_type") or "") != "file":
             return None
@@ -166,20 +165,9 @@ class AttachmentFetcher:
             return None
         path = target / name
         try:
-            if not path.is_file():
-                return None
-            actual = path.stat().st_size
+            return path if path.is_file() and path.stat().st_size > 0 else None
         except OSError:
             return None
-        if actual <= 0:
-            return None
-        shown = raw.get("file_size")
-        if isinstance(shown, int) and shown > 0:
-            unit = 1024 ** 3 if shown >= 1024 ** 3 else 1024 ** 2 if shown >= 1024 ** 2 else 1024 if shown >= 1024 else 1
-            # 显示值保留一位小数，四舍五入最多差半个 0.1 单位；再宽一点点防进位口径不一。
-            if abs(actual - shown) > unit * 0.06 + 1:
-                return None
-        return path
 
     def _accept(self, peer_id: str, kind: str, path: Path, file_name: str, size: int, how: str) -> dict[str, Any] | None:
         """本机这份能不能送 AI 端（类型、体积），能就回附件描述；不能就删掉并记日志。"""
