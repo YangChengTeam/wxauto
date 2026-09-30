@@ -72,7 +72,7 @@ SETTINGS_SECTIONS: tuple[str, ...] = ("conn", "sched", "boot")
 DEMO_TOGGLE_KEY = "WXCLIENT_GATEWAY_DEMO_MODE"
 #: 极速模式开着时配置中心间隔的地板；抄自 `gateway/config.py` 的 `DEMO_MIN_SECONDS`（同 default，不 import 网关包）。
 DEMO_MIN_SECONDS = 1.0
-#: 开启极速模式时配置中心里跟着改掉的格子 → 开启后的值；关掉时恢复开启前的原值（`apply_demo_toggle`）。
+#: 开启极速模式时配置中心里跟着改掉的格子 → 开启后的值；关掉时恢复开启前的原值（`apply_demo_presets`）。
 #: 用户 2026-09-30：「开启极速模式读消息间隔变为 1，框框中的参数也要变」。
 DEMO_PRESETS: dict[str, str] = {"WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": "1"}
 #: 极速模式开着时保存检查降到 `DEMO_MIN_SECONDS` 的格子。查新好友那格不在里面（用户 2026-09-30：「查好友不能太快」）。
@@ -243,24 +243,34 @@ def _saved_key(key: str) -> str:
     return DEMO_SAVED_PREFIX + key.removeprefix("WXCLIENT_GATEWAY_")
 
 
-def apply_demo_toggle(before: dict[str, str], values: dict[str, str]) -> dict[str, str]:
-    """极速开关这次保存翻了面：开启 → `DEMO_PRESETS` 那几格备份原值后改成预设值；
-    关闭 → 从备份恢复（没备份就回默认）并删掉备份。没翻面原样返回。
+#: 0.1.103 及以前极速页上那三格的键（和配置中心重复，0.1.104 删了）。老机器文件里还留着，读到就清掉。
+_RETIRED_DEMO_KEYS = frozenset({
+    "WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS",
+    "WXCLIENT_GATEWAY_DEMO_FRIEND_INTERVAL_SECONDS",
+    "WXCLIENT_GATEWAY_DEMO_MOMENTS_INTERVAL_SECONDS",
+})
 
-    改的是**配置中心那几格本身**，界面上看到的就是真正生效的值，不另存一份间隔。
+
+def apply_demo_presets(values: dict[str, str]) -> dict[str, str]:
+    """按极速开关的**当前状态**对齐 `DEMO_PRESETS` 那几格，返回新的一份（不改入参）。
+
+    - 开着、还没备份过 → 备份原值，那一格改成预设值；
+    - 关着、有备份 → 恢复备份（备份是空的就回默认），删掉备份；
+    - 其余原样（开着期间在配置中心再改那一格，改多少算多少）。
+
+    ★ 按状态判、不按「这次保存有没有翻面」判（09-30 真机：0.1.103 存下的文件里开关早就是开的，
+      升级后保存不翻面，读消息间隔一直停在 180）。改的是配置中心那一格本身，界面上看到的就是生效值。
     """
-    was = as_bool(before.get(DEMO_TOGGLE_KEY, ""))
-    now = as_bool(values.get(DEMO_TOGGLE_KEY, ""))
-    if was == now:
-        return values
-    out = dict(values)
+    out = {key: value for key, value in values.items() if key not in _RETIRED_DEMO_KEYS}
+    on = as_bool(out.get(DEMO_TOGGLE_KEY, ""))
     defaults = {field.key: field.default for field in FIELDS}
     for key, preset in DEMO_PRESETS.items():
-        if now:
-            out[_saved_key(key)] = before.get(key) or defaults.get(key, "")
+        saved = _saved_key(key)
+        if on and saved not in out:
+            out[saved] = out.get(key) or defaults.get(key, "")
             out[key] = preset
-        else:
-            out[key] = out.pop(_saved_key(key), "") or defaults.get(key, "")
+        elif not on and saved in out:
+            out[key] = out.pop(saved) or defaults.get(key, "")
     return out
 
 
@@ -367,8 +377,13 @@ def load_into_environ(data_dir: Path, environ: dict[str, str] | None = None) -> 
     返回实际灌进去的那份，便于日志/测试核对。
     """
     values = effective(data_dir, environ)
-    apply_to_environ(values, environ, force=True)
-    return values
+    # 极速开关和读消息间隔对齐后落盘：升级上来的老文件（开关开着、间隔还是 180）启动一次就对上，
+    # 配置中心进页重读磁盘看到的也是这个数。
+    synced = apply_demo_presets(values)
+    if synced != values and settings_path(data_dir).exists():
+        save(data_dir, synced)
+    apply_to_environ(synced, environ, force=True)
+    return synced
 
 
 def as_bool(value: str, default: bool = False) -> bool:

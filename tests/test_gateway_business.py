@@ -1789,6 +1789,27 @@ class QuietHoursTests(StoreTestCase):
         self.assertEqual(await loop.tick(), 0)
         self.assertEqual(source.calls, 0, "非工作时段还去读了微信")
 
+    async def test_outside_the_window_each_round_still_says_so_at_most_once_a_minute(self) -> None:
+        """用户 2026-09-30：「为什么轮询的日志没有」——窗外也要报「开始新一轮轮询」，一分钟最多一条。"""
+        now = [T0]
+        loop = InboundLoop(
+            accounts=["acct-1"],
+            source=FakeSource([[]]),
+            store=self.store,
+            handler=lambda *_a: None,
+            is_active=lambda _now: False,
+            clock=lambda: now[0],
+        )
+        with capture_logs() as logs:
+            await loop.tick()
+            now[0] = T0 + timedelta(seconds=30)
+            await loop.tick()
+            now[0] = T0 + timedelta(seconds=61)
+            await loop.tick()
+        rounds = [e for e in logs if str(e["event"]).startswith("开始新一轮轮询")]
+        self.assertEqual(len(rounds), 2)
+        self.assertIn("不在工作时间窗", rounds[0]["event"])
+
     async def test_the_countdown_says_nothing_when_nothing_is_scheduled(self) -> None:
         """★ 界面上那个「下次读消息」的倒计时，源头在这儿（用户 2026-08-15）。
 

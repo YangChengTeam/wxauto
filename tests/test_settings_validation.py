@@ -113,6 +113,8 @@ class LoadIntoEnvironTests(unittest.TestCase):
     def test_every_field_saved_in_the_file_reaches_the_environ(self) -> None:
         """「保证所有的配置修改都能生效」（用户 2026-09-22）：不只总上限，每一格都一样。"""
         saved = {f.key: ("1" if f.kind == "bool" else "7") for f in FIELDS if not f.secret}
+        # 极速开关开着会按设计把读消息间隔改成 1（`apply_demo_presets`，另有用例守），这条只看「存了就生效」。
+        saved[settings_store.DEMO_TOGGLE_KEY] = "0"
         settings_store.save(self.data_dir, saved)
         env = {f.key: "stale" for f in FIELDS}
         settings_store.load_into_environ(self.data_dir, env)
@@ -188,35 +190,43 @@ class DemoModeTests(unittest.TestCase):
     def test_turning_on_sets_the_read_box_to_1_and_turning_off_puts_it_back(self) -> None:
         """用户 2026-09-30：「开启极速模式读消息间隔变为 1，框框中的参数也要变」。"""
         toggle = settings_store.DEMO_TOGGLE_KEY
-        off = {toggle: "0", self.READ: "120"}
-        on = settings_store.apply_demo_toggle(off, {**off, toggle: "1"})
+        on = settings_store.apply_demo_presets({toggle: "1", self.READ: "120"})
         self.assertEqual(on[self.READ], "1")
         self.assertEqual(validate(on), {})
-        back = settings_store.apply_demo_toggle(on, {**on, toggle: "0"})
+        back = settings_store.apply_demo_presets({**on, toggle: "0"})
         self.assertEqual(back[self.READ], "120")
         self.assertFalse([k for k in back if k.startswith(settings_store.DEMO_SAVED_PREFIX)])
 
-    def test_saving_without_flipping_the_toggle_changes_nothing(self) -> None:
+    def test_an_old_file_with_the_toggle_already_on_still_gets_1(self) -> None:
+        """★ 09-30 真机：0.1.103 存的文件开关早是开的，按「翻面」判就永远停在 180。"""
         toggle = settings_store.DEMO_TOGGLE_KEY
-        on = {toggle: "1", self.READ: "5"}
-        self.assertEqual(settings_store.apply_demo_toggle(on, dict(on)), on)
+        old = {toggle: "1", self.READ: "180", "WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS": "5"}
+        synced = settings_store.apply_demo_presets(old)
+        self.assertEqual(synced[self.READ], "1")
+        self.assertNotIn("WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS", synced)
+        self.assertEqual(settings_store.apply_demo_presets({**synced, toggle: "0"})[self.READ], "180")
 
-    def test_turning_off_without_a_backup_falls_back_to_the_default(self) -> None:
+    def test_editing_the_box_while_on_is_kept(self) -> None:
         toggle = settings_store.DEMO_TOGGLE_KEY
-        on = {toggle: "1", self.READ: "1"}
-        back = settings_store.apply_demo_toggle(on, {**on, toggle: "0"})
-        default = next(f.default for f in FIELDS if f.key == self.READ)
-        self.assertEqual(back[self.READ], default)
+        on = settings_store.apply_demo_presets({toggle: "1", self.READ: "120"})
+        edited = settings_store.apply_demo_presets({**on, self.READ: "5"})
+        self.assertEqual(edited[self.READ], "5")
+        self.assertEqual(settings_store.apply_demo_presets({**edited, toggle: "0"})[self.READ], "120")
 
-    def test_the_backup_survives_a_save_and_reload(self) -> None:
+    def test_turning_off_without_a_backup_keeps_the_value(self) -> None:
+        toggle = settings_store.DEMO_TOGGLE_KEY
+        values = {toggle: "0", self.READ: "60"}
+        self.assertEqual(settings_store.apply_demo_presets(values), values)
+
+    def test_startup_fixes_the_file_on_disk(self) -> None:
+        """启动灌环境变量时顺手对齐并落盘：配置中心进页重读磁盘就是 1。"""
         with tempfile.TemporaryDirectory() as tmp:
             toggle = settings_store.DEMO_TOGGLE_KEY
-            off = {toggle: "0", self.READ: "150"}
-            settings_store.save(Path(tmp), settings_store.apply_demo_toggle(off, {**off, toggle: "1"}))
-            loaded = settings_store.load(Path(tmp))
-            self.assertEqual(loaded[self.READ], "1")
-            back = settings_store.apply_demo_toggle(loaded, {**loaded, toggle: "0"})
-            self.assertEqual(back[self.READ], "150")
+            settings_store.save(Path(tmp), {toggle: "1", self.READ: "180"})
+            env: dict[str, str] = {}
+            settings_store.load_into_environ(Path(tmp), env)
+            self.assertEqual(env[self.READ], "1")
+            self.assertEqual(settings_store.load(Path(tmp))[self.READ], "1")
 
     def test_guard_and_jitter_follow_the_demo_floors(self) -> None:
         from wxclient.gateway import pacing

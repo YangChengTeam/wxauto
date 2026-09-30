@@ -386,7 +386,7 @@ class SettingsPage(tk.Frame):
         return values
 
     def _save(self, *, restart: bool) -> None:
-        values = settings_store.apply_demo_toggle(settings_store.effective(self.data_dir), self._collect())
+        values = settings_store.apply_demo_presets(self._collect())
         problems = settings_store.validate(values)
         if problems:
             # 网关地板以下的数：以前悄悄抬回去只打日志，界面上还显示你填的——「改了没反应」。

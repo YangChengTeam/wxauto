@@ -33,6 +33,9 @@ _local = _log.bind(**{logrole.ROLE_KEY: logrole.LOCAL})
 
 PeerKey = tuple[str, str]  # (account_id, peer_id)
 
+#: 工作时间窗外「这一轮不读」那条日志最短隔多久报一次（秒）。
+QUIET_ROUND_LOG_SECONDS = 60.0
+
 #: 只有专员本人说话时最多留几条当上下文。留着是为了下一轮别重复问他问过的，
 #: 但不能无上限攒——他自己聊一下午，缓冲和 prompt 都会被撑爆。
 _SELF_CONTEXT_LIMIT = 10
@@ -337,6 +340,7 @@ class InboundLoop:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._rng = rng
         self._sleeping = False
+        self._quiet_round_logged_at: datetime | None = None  # 窗外那条「本轮不读」上次报的时刻
         self._next_poll_at: datetime | None = None  # 下一趟读消息的时刻，给界面倒计时用
         self._inflight: dict[PeerKey, asyncio.Task[None]] = {}
         self._pending_loaded: set[str] = set()
@@ -362,7 +366,17 @@ class InboundLoop:
             if not self._sleeping:
                 self._sleeping = True
                 _log.info("不在工作时间窗，暂停轮询微信")
+            # 用户 2026-09-30：「为什么轮询的日志没有」——窗外一趟都不读，「开始新一轮轮询」
+            # （`wechat_io.QueueMessageSource.fetch`）永远不出，看日志像卡死。窗外照样每轮报一声，
+            # 但最多一分钟一条：极速模式读消息间隔是 1 秒，不限的话一秒刷一行。
+            if (
+                self._quiet_round_logged_at is None
+                or (now - self._quiet_round_logged_at).total_seconds() >= QUIET_ROUND_LOG_SECONDS
+            ):
+                self._quiet_round_logged_at = now
+                _log.info("开始新一轮轮询：不在工作时间窗，这一轮不读微信（工作时间窗在配置中心改）")
             return 0
+        self._quiet_round_logged_at = None
         if self._sleeping:
             self._sleeping = False
             _log.info("进入工作时间窗，恢复轮询微信")
