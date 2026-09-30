@@ -58,10 +58,10 @@ SECTIONS: tuple[Section, ...] = (
     Section("sched", "调度配置", "配置消息读取与任务调度规则", columns=2),
     Section("boot", "启动设置", "配置服务启动后的行为"),
     # 不在配置中心里渲染，单独一页「极速模式」（原名「演示」，用户 2026-09-30 要求改名）（`window._ensure_demo_page`）。
-    Section("demo", "极速开关", "开启后配置中心里的间隔最低可填 1 秒；下面各项关闭时只显示、不能改"),
-    Section("demo_wait", "等待与排队", "原来写死在代码里的等待时间与每轮个数", columns=2),
-    Section("demo_conn", "连接与超时", "心跳、超时与等待界面的时长", columns=2),
-    Section("demo_keep", "保留期限", "本机数据与重报的保留时长", columns=2),
+    Section("demo", "极速开关", "开启后读消息间隔改为 1 秒，关闭后恢复原值"),
+    Section("demo_wait", "等待与排队", "", columns=2),
+    Section("demo_conn", "连接与超时", "", columns=2),
+    Section("demo_keep", "保留期限", "", columns=2),
 )
 
 #: 「极速模式」那一页渲染的分段（`window._ensure_demo_page`）。
@@ -72,6 +72,13 @@ SETTINGS_SECTIONS: tuple[str, ...] = ("conn", "sched", "boot")
 DEMO_TOGGLE_KEY = "WXCLIENT_GATEWAY_DEMO_MODE"
 #: 极速模式开着时配置中心间隔的地板；抄自 `gateway/config.py` 的 `DEMO_MIN_SECONDS`（同 default，不 import 网关包）。
 DEMO_MIN_SECONDS = 1.0
+#: 开启极速模式时配置中心里跟着改掉的格子 → 开启后的值；关掉时恢复开启前的原值（`apply_demo_toggle`）。
+#: 用户 2026-09-30：「开启极速模式读消息间隔变为 1，框框中的参数也要变」。
+DEMO_PRESETS: dict[str, str] = {"WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": "1"}
+#: 极速模式开着时保存检查降到 `DEMO_MIN_SECONDS` 的格子。查新好友那格不在里面（用户 2026-09-30：「查好友不能太快」）。
+DEMO_UNLOCKED: frozenset[str] = frozenset({"WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS"})
+#: 开启前原值的备份键前缀（存在同一个 gateway.env 里，不上界面）。
+DEMO_SAVED_PREFIX = "WXCLIENT_GATEWAY_DEMO_SAVED_"
 
 
 #: 界面上只放**必须由这台机器的人来定**的参数（用户 2026-08-13：「配置简洁一点，不用搞一堆」）。
@@ -107,10 +114,10 @@ FIELDS: tuple[Field, ...] = (
     #   抄错了由 `tests/test_settings_validation.py` 判死。用户 2026-09-18：原来填低了网关
     #   悄悄抬回地板、只打一条日志，界面上还显示你填的数——「配置改了没反应」。现在保存时就拒。
     Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔",
-          "空闲时多久看一次未读；最低 30（极速 1）", section="sched", unit="秒",
+          "空闲时多久看一次未读；最低 30", section="sched", unit="秒",
           default="180", minimum=30),
     Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔",
-          "0=不查；最低 300（极速 1）", section="sched", unit="秒", default="900",
+          "0=不查；最低 300", section="sched", unit="秒", default="900",
           minimum=300, zero_means_off=True),
     # 用户 2026-09-07：说明太长把输入框挤坏了（调度配置一行两组），全部精简成半句。
     # 原来写在说明里的两条限定挪到这里：① 通过检测实际仍受「查好友」那档 ≥300 秒的
@@ -211,7 +218,7 @@ def validate(values: dict[str, str]) -> dict[str, str]:
         if field.minimum is None:
             continue
         minimum = field.minimum
-        if demo and field.section in SETTINGS_SECTIONS:
+        if demo and field.key in DEMO_UNLOCKED:
             minimum = min(minimum, DEMO_MIN_SECONDS)
         raw = str(values.get(field.key, "")).strip()
         if raw == "":
@@ -230,6 +237,31 @@ def validate(values: dict[str, str]) -> dict[str, str]:
                 + ("（0 表示关掉）" if field.zero_means_off else "")
             )
     return errors
+
+
+def _saved_key(key: str) -> str:
+    return DEMO_SAVED_PREFIX + key.removeprefix("WXCLIENT_GATEWAY_")
+
+
+def apply_demo_toggle(before: dict[str, str], values: dict[str, str]) -> dict[str, str]:
+    """极速开关这次保存翻了面：开启 → `DEMO_PRESETS` 那几格备份原值后改成预设值；
+    关闭 → 从备份恢复（没备份就回默认）并删掉备份。没翻面原样返回。
+
+    改的是**配置中心那几格本身**，界面上看到的就是真正生效的值，不另存一份间隔。
+    """
+    was = as_bool(before.get(DEMO_TOGGLE_KEY, ""))
+    now = as_bool(values.get(DEMO_TOGGLE_KEY, ""))
+    if was == now:
+        return values
+    out = dict(values)
+    defaults = {field.key: field.default for field in FIELDS}
+    for key, preset in DEMO_PRESETS.items():
+        if now:
+            out[_saved_key(key)] = before.get(key) or defaults.get(key, "")
+            out[key] = preset
+        else:
+            out[key] = out.pop(_saved_key(key), "") or defaults.get(key, "")
+    return out
 
 
 def settings_path(data_dir: Path) -> Path:

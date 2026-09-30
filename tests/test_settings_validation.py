@@ -153,19 +153,21 @@ class DemoModeTests(unittest.TestCase):
     def test_on_lowers_the_floors_but_keeps_the_config_center_intervals(self) -> None:
         """★ 用户 2026-09-30「和配置中心重复了」：间隔只在配置中心填，极速模式不再盖掉它。"""
         from wxclient.gateway.config import DEMO_MIN_SECONDS
+        from wxclient.gateway.pacing import MIN_FRIEND_INTERVAL_SECONDS
 
         settings = self._settings(WXCLIENT_GATEWAY_DEMO_MODE="1", **{self.READ: "5"})
         self.assertEqual(settings.poll_interval_seconds, 5.0)
         self.assertEqual(settings.friend_interval_seconds, 300.0)
         self.assertEqual(settings.read_floor_seconds, DEMO_MIN_SECONDS)
-        self.assertEqual(settings.friend_floor_seconds, DEMO_MIN_SECONDS)
+        self.assertEqual(settings.friend_floor_seconds, MIN_FRIEND_INTERVAL_SECONDS, "查好友不能太快")
         self.assertEqual(settings.moments_floor_seconds, DEMO_MIN_SECONDS)
         self.assertEqual(settings.jitter_ratio, 0.0)
 
     def test_save_check_follows_the_toggle(self) -> None:
         on = {"WXCLIENT_GATEWAY_DEMO_MODE": "1"}
-        self.assertEqual(validate({**on, self.READ: "5", self.FRIEND_CHECK: "10"}), {})
+        self.assertEqual(validate({**on, self.READ: "5"}), {})
         self.assertIn(self.READ, validate({**on, self.READ: "0.5"}))
+        self.assertIn(self.FRIEND_CHECK, validate({**on, self.FRIEND_CHECK: "10"}), "查好友不能太快")
         self.assertIn(self.FRIEND_CHECK, validate({self.FRIEND_CHECK: "10"}))
 
     def test_ui_floor_matches_the_gateway_floor(self) -> None:
@@ -183,6 +185,39 @@ class DemoModeTests(unittest.TestCase):
             ["WXCLIENT_GATEWAY_DEMO_MODE", "WXCLIENT_GATEWAY_DEMO_JITTER_PERCENT"],
         )
 
+    def test_turning_on_sets_the_read_box_to_1_and_turning_off_puts_it_back(self) -> None:
+        """用户 2026-09-30：「开启极速模式读消息间隔变为 1，框框中的参数也要变」。"""
+        toggle = settings_store.DEMO_TOGGLE_KEY
+        off = {toggle: "0", self.READ: "120"}
+        on = settings_store.apply_demo_toggle(off, {**off, toggle: "1"})
+        self.assertEqual(on[self.READ], "1")
+        self.assertEqual(validate(on), {})
+        back = settings_store.apply_demo_toggle(on, {**on, toggle: "0"})
+        self.assertEqual(back[self.READ], "120")
+        self.assertFalse([k for k in back if k.startswith(settings_store.DEMO_SAVED_PREFIX)])
+
+    def test_saving_without_flipping_the_toggle_changes_nothing(self) -> None:
+        toggle = settings_store.DEMO_TOGGLE_KEY
+        on = {toggle: "1", self.READ: "5"}
+        self.assertEqual(settings_store.apply_demo_toggle(on, dict(on)), on)
+
+    def test_turning_off_without_a_backup_falls_back_to_the_default(self) -> None:
+        toggle = settings_store.DEMO_TOGGLE_KEY
+        on = {toggle: "1", self.READ: "1"}
+        back = settings_store.apply_demo_toggle(on, {**on, toggle: "0"})
+        default = next(f.default for f in FIELDS if f.key == self.READ)
+        self.assertEqual(back[self.READ], default)
+
+    def test_the_backup_survives_a_save_and_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            toggle = settings_store.DEMO_TOGGLE_KEY
+            off = {toggle: "0", self.READ: "150"}
+            settings_store.save(Path(tmp), settings_store.apply_demo_toggle(off, {**off, toggle: "1"}))
+            loaded = settings_store.load(Path(tmp))
+            self.assertEqual(loaded[self.READ], "1")
+            back = settings_store.apply_demo_toggle(loaded, {**loaded, toggle: "0"})
+            self.assertEqual(back[self.READ], "150")
+
     def test_guard_and_jitter_follow_the_demo_floors(self) -> None:
         from wxclient.gateway import pacing
         from wxclient.gateway.config import DEMO_MIN_SECONDS
@@ -191,9 +226,10 @@ class DemoModeTests(unittest.TestCase):
             READ_FRIENDS_ACTION,
             read_intervals_from,
         )
+        from wxclient.gateway.pacing import MIN_FRIEND_INTERVAL_SECONDS
 
         on = self._settings(WXCLIENT_GATEWAY_DEMO_MODE="1")
-        self.assertEqual(read_intervals_from(on)[READ_FRIENDS_ACTION], DEMO_MIN_SECONDS)
+        self.assertEqual(read_intervals_from(on)[READ_FRIENDS_ACTION], MIN_FRIEND_INTERVAL_SECONDS)
         self.assertEqual(read_intervals_from(on)[READ_ACTION], DEMO_MIN_SECONDS)
         try:
             pacing.set_jitter_ratio(on.jitter_ratio)

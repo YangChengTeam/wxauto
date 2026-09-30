@@ -87,8 +87,8 @@ class GatewaySettings(BaseSettings):
 
     # ── 极速模式（用户 2026-09-30：「把等待时间压到极限」「只在演示模式下解除下限」「和配置中心重复了」）──
     demo_mode: bool = False
-    """演示用：**下限只在这里解除**。开着的时候，读消息 30 秒、好友 300 秒、朋友圈巡看 300 秒这几道
-    写死的地板降到 ``DEMO_MIN_SECONDS``，随机抖动按 ``demo_jitter_percent``（默认 0）。
+    """演示用：**下限只在这里解除**。开着的时候，读消息 30 秒、朋友圈巡看 300 秒这两道
+    地板降到 ``DEMO_MIN_SECONDS``（好友相关的 300 秒不解除：「查好友不能太快」），随机抖动按 ``demo_jitter_percent``（默认 0）。
     **间隔本身仍在配置中心填**（读消息间隔、查新好友间隔、加好友最小间隔、朋友圈巡看间隔……），
     极速模式只管「能填多低」，不再另存一份间隔（用户 2026-09-30：「和配置中心重复了」）。
     **默认关**，关着时一切照旧、地板照旧。
@@ -281,8 +281,8 @@ class GatewaySettings(BaseSettings):
 
     @property
     def friend_floor_seconds(self) -> float:
-        """好友相关的地板：平时 300 秒红线，极速模式 `DEMO_MIN_SECONDS`。"""
-        return DEMO_MIN_SECONDS if self.demo_mode else MIN_FRIEND_INTERVAL_SECONDS
+        """好友相关的地板：300 秒红线，**极速模式也不解除**（用户 2026-09-30：「查好友不能太快」）。"""
+        return MIN_FRIEND_INTERVAL_SECONDS
 
     @property
     def moments_floor_seconds(self) -> float:

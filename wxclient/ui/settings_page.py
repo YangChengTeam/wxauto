@@ -119,8 +119,9 @@ class SettingsPage(tk.Frame):
         head.pack(fill=tk.X)
         tk.Label(head, text=section.title, font=theme.FONT_HEADING,
                  bg=theme.CONTENT_BG, fg=theme.TEXT).pack(side=tk.LEFT)
-        tk.Label(head, text=section.desc, font=theme.FONT_SMALL,
-                 bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED).pack(side=tk.LEFT, padx=(14, 0))
+        if section.desc:
+            tk.Label(head, text=section.desc, font=theme.FONT_SMALL,
+                     bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED).pack(side=tk.LEFT, padx=(14, 0))
         if section.key == "conn":
             # 「测到端口通不通」是这台机器唯一能自证的事，鉴权对不对只有真连上才知道，
             # 所以结果文案里必须把这层边界说清楚（见 `_run_test`）。
@@ -385,7 +386,7 @@ class SettingsPage(tk.Frame):
         return values
 
     def _save(self, *, restart: bool) -> None:
-        values = self._collect()
+        values = settings_store.apply_demo_toggle(settings_store.effective(self.data_dir), self._collect())
         problems = settings_store.validate(values)
         if problems:
             # 网关地板以下的数：以前悄悄抬回去只打日志，界面上还显示你填的——「改了没反应」。

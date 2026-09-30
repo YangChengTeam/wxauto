@@ -214,6 +214,28 @@ class ConfigLookTests(unittest.TestCase):
         self.assertIn("最低 30", message)
         self.assertEqual(tell.call_args.kwargs.get("tone"), "error")
 
+    def test_turning_speed_mode_on_shows_1_in_the_config_center_read_box(self) -> None:
+        """用户 2026-09-30：「开启极速模式读消息间隔变为 1，框框中的参数也要变」；关掉恢复原值。"""
+        from unittest import mock
+
+        from wxclient.ui import dialog
+
+        read = "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS"
+        demo = SettingsPage(self.root, self.dir, sections=settings_store.DEMO_SECTIONS)
+        _KEEP_ALIVE.append(demo)
+        self.page._vars[read].set("120")
+        with mock.patch.object(dialog, "tell"):
+            self.page._save(restart=False)
+            demo.reload()
+            demo._vars[settings_store.DEMO_TOGGLE_KEY].set(True)
+            demo._save(restart=False)
+            self.page.reload()
+            self.assertEqual(self.page._vars[read].get(), "1")
+            demo._vars[settings_store.DEMO_TOGGLE_KEY].set(False)
+            demo._save(restart=False)
+            self.page.reload()
+        self.assertEqual(self.page._vars[read].get(), "120")
+
     def test_a_placeholder_never_becomes_a_value(self) -> None:
         """★ 占位文字要是塞进变量，那一格就会被存成提示语本身。
 
