@@ -121,11 +121,10 @@ class LoadIntoEnvironTests(unittest.TestCase):
 
 
 class DemoModeTests(unittest.TestCase):
-    """演示模式（用户 2026-09-30）：开着才解除写死的地板、不抖；关着一切照旧。"""
+    """极速模式（用户 2026-09-30）：开着只降地板、不抖，间隔照配置中心；关着一切照旧。"""
 
-    DEMO_READ = "WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS"
-    DEMO_FRIEND = "WXCLIENT_GATEWAY_DEMO_FRIEND_INTERVAL_SECONDS"
-    DEMO_MOMENTS = "WXCLIENT_GATEWAY_DEMO_MOMENTS_INTERVAL_SECONDS"
+    READ = "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS"
+    FRIEND_CHECK = "WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS"
 
     def _settings(self, **env: str):
         from unittest import mock
@@ -143,59 +142,59 @@ class DemoModeTests(unittest.TestCase):
             MIN_READ_INTERVAL_SECONDS,
         )
 
-        settings = self._settings(**{self.DEMO_READ: "5", self.DEMO_FRIEND: "5"})
+        settings = self._settings()
         self.assertFalse(settings.demo_mode)
-        self.assertEqual(settings.poll_interval_seconds, 180.0)
-        self.assertEqual(settings.active_poll_interval_seconds, 30.0)
-        self.assertEqual(settings.friend_interval_seconds, 300.0)
         self.assertEqual(settings.read_floor_seconds, MIN_READ_INTERVAL_SECONDS)
         self.assertEqual(settings.friend_floor_seconds, MIN_FRIEND_INTERVAL_SECONDS)
         self.assertEqual(settings.moments_floor_seconds, MIN_MOMENTS_POLL_SECONDS)
         self.assertEqual(settings.jitter_ratio, JITTER_RATIO)
+        self.assertIn(self.READ, validate({self.READ: "5"}))
 
-    def test_on_replaces_intervals_and_floors_with_the_demo_values(self) -> None:
-        settings = self._settings(
-            WXCLIENT_GATEWAY_DEMO_MODE="1",
-            **{self.DEMO_READ: "5", self.DEMO_FRIEND: "20", self.DEMO_MOMENTS: "40"},
-        )
-        self.assertEqual(settings.poll_interval_seconds, 5.0)
-        self.assertEqual(settings.active_poll_interval_seconds, 5.0)
-        self.assertEqual(settings.read_floor_seconds, 5.0)
-        self.assertEqual(settings.friend_check_interval_seconds, 20.0)
-        self.assertEqual(settings.friend_recheck_interval_seconds, 20.0)
-        self.assertEqual(settings.friend_interval_seconds, 20.0)
-        self.assertEqual(settings.friend_floor_seconds, 20.0)
-        self.assertEqual(settings.moment_like_interval_seconds, 40.0)
-        self.assertEqual(settings.moment_comment_interval_seconds, 40.0)
-        self.assertEqual(settings.moments_floor_seconds, 40.0)
-        self.assertEqual(settings.jitter_ratio, 0.0)
-
-    def test_on_does_not_switch_on_things_that_were_off(self) -> None:
-        settings = self._settings(
-            WXCLIENT_GATEWAY_DEMO_MODE="1",
-            WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS="0",
-            WXCLIENT_GATEWAY_MOMENTS_POLL_INTERVAL_SECONDS="0",
-        )
-        self.assertEqual(settings.friend_check_interval_seconds, 0.0)
-        self.assertEqual(settings.moments_poll_interval_seconds, 0.0)
-
-    def test_zero_is_not_a_busy_loop(self) -> None:
+    def test_on_lowers_the_floors_but_keeps_the_config_center_intervals(self) -> None:
+        """★ 用户 2026-09-30「和配置中心重复了」：间隔只在配置中心填，极速模式不再盖掉它。"""
         from wxclient.gateway.config import DEMO_MIN_SECONDS
 
-        settings = self._settings(WXCLIENT_GATEWAY_DEMO_MODE="1", **{self.DEMO_READ: "0"})
-        self.assertEqual(settings.poll_interval_seconds, DEMO_MIN_SECONDS)
+        settings = self._settings(WXCLIENT_GATEWAY_DEMO_MODE="1", **{self.READ: "5"})
+        self.assertEqual(settings.poll_interval_seconds, 5.0)
+        self.assertEqual(settings.friend_interval_seconds, 300.0)
+        self.assertEqual(settings.read_floor_seconds, DEMO_MIN_SECONDS)
+        self.assertEqual(settings.friend_floor_seconds, DEMO_MIN_SECONDS)
+        self.assertEqual(settings.moments_floor_seconds, DEMO_MIN_SECONDS)
+        self.assertEqual(settings.jitter_ratio, 0.0)
+
+    def test_save_check_follows_the_toggle(self) -> None:
+        on = {"WXCLIENT_GATEWAY_DEMO_MODE": "1"}
+        self.assertEqual(validate({**on, self.READ: "5", self.FRIEND_CHECK: "10"}), {})
+        self.assertIn(self.READ, validate({**on, self.READ: "0.5"}))
+        self.assertIn(self.FRIEND_CHECK, validate({self.FRIEND_CHECK: "10"}))
+
+    def test_ui_floor_matches_the_gateway_floor(self) -> None:
+        from wxclient.gateway.config import DEMO_MIN_SECONDS
+
+        self.assertEqual(settings_store.DEMO_MIN_SECONDS, DEMO_MIN_SECONDS)
+
+    def test_no_interval_is_stored_twice(self) -> None:
+        """极速页不许再出现配置中心已有的那几个间隔。"""
+        demo = [f for f in FIELDS if f.section in settings_store.DEMO_SECTIONS]
+        center_labels = {f.label for f in FIELDS if f.section in settings_store.SETTINGS_SECTIONS}
+        self.assertFalse({f.label for f in demo} & center_labels)
+        self.assertEqual(
+            [f.key for f in demo if f.section == "demo"],
+            ["WXCLIENT_GATEWAY_DEMO_MODE", "WXCLIENT_GATEWAY_DEMO_JITTER_PERCENT"],
+        )
 
     def test_guard_and_jitter_follow_the_demo_floors(self) -> None:
         from wxclient.gateway import pacing
+        from wxclient.gateway.config import DEMO_MIN_SECONDS
         from wxclient.gateway.guard import (
             READ_ACTION,
             READ_FRIENDS_ACTION,
             read_intervals_from,
         )
 
-        on = self._settings(WXCLIENT_GATEWAY_DEMO_MODE="1", **{self.DEMO_FRIEND: "10"})
-        self.assertEqual(read_intervals_from(on)[READ_FRIENDS_ACTION], 10.0)
-        self.assertEqual(read_intervals_from(on)[READ_ACTION], on.demo_poll_interval_seconds)
+        on = self._settings(WXCLIENT_GATEWAY_DEMO_MODE="1")
+        self.assertEqual(read_intervals_from(on)[READ_FRIENDS_ACTION], DEMO_MIN_SECONDS)
+        self.assertEqual(read_intervals_from(on)[READ_ACTION], DEMO_MIN_SECONDS)
         try:
             pacing.set_jitter_ratio(on.jitter_ratio)
             self.assertEqual(pacing.jittered(12.0), 12.0)
@@ -203,24 +202,8 @@ class DemoModeTests(unittest.TestCase):
             pacing.set_jitter_ratio(pacing.JITTER_RATIO)
         self.assertGreaterEqual(pacing.jittered(12.0), 12.0)
 
-    def test_demo_fields_live_in_their_own_section_and_lock_to_the_real_floors(self) -> None:
-        from wxclient.gateway.pacing import (
-            MIN_FRIEND_INTERVAL_SECONDS,
-            MIN_MOMENTS_POLL_SECONDS,
-            MIN_READ_INTERVAL_SECONDS,
-        )
-
+    def test_demo_sections_stay_off_the_config_center(self) -> None:
         self.assertFalse(set(settings_store.DEMO_SECTIONS) & set(settings_store.SETTINGS_SECTIONS))
-        locked = {f.key: f.locked_value for f in FIELDS if f.locked_value}
-        locked = {k: v for k, v in locked.items()
-                  if k in (self.DEMO_READ, self.DEMO_FRIEND, self.DEMO_MOMENTS)}
-        self.assertEqual(locked, {
-            self.DEMO_READ: f"{MIN_READ_INTERVAL_SECONDS:g}",
-            self.DEMO_FRIEND: f"{MIN_FRIEND_INTERVAL_SECONDS:g}",
-            self.DEMO_MOMENTS: f"{MIN_MOMENTS_POLL_SECONDS:g}",
-        })
-        self.assertEqual(validate({self.DEMO_READ: "5"}), {})
-        self.assertIn(self.DEMO_READ, validate({self.DEMO_READ: "0.5"}))
 
 
 class SpeedKnobTableTests(unittest.TestCase):

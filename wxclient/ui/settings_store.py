@@ -58,7 +58,7 @@ SECTIONS: tuple[Section, ...] = (
     Section("sched", "调度配置", "配置消息读取与任务调度规则", columns=2),
     Section("boot", "启动设置", "配置服务启动后的行为"),
     # 不在配置中心里渲染，单独一页「极速模式」（原名「演示」，用户 2026-09-30 要求改名）（`window._ensure_demo_page`）。
-    Section("demo", "节拍下限", "关闭时显示正在生效的下限，不能修改；开启后可自由填写"),
+    Section("demo", "极速开关", "开启后配置中心里的间隔最低可填 1 秒；下面各项关闭时只显示、不能改"),
     Section("demo_wait", "等待与排队", "原来写死在代码里的等待时间与每轮个数", columns=2),
     Section("demo_conn", "连接与超时", "心跳、超时与等待界面的时长", columns=2),
     Section("demo_keep", "保留期限", "本机数据与重报的保留时长", columns=2),
@@ -70,6 +70,8 @@ DEMO_SECTIONS: tuple[str, ...] = ("demo", "demo_wait", "demo_conn", "demo_keep")
 #: 配置中心渲染的分段；`demo` 那段在自己的菜单页里。
 SETTINGS_SECTIONS: tuple[str, ...] = ("conn", "sched", "boot")
 DEMO_TOGGLE_KEY = "WXCLIENT_GATEWAY_DEMO_MODE"
+#: 极速模式开着时配置中心间隔的地板；抄自 `gateway/config.py` 的 `DEMO_MIN_SECONDS`（同 default，不 import 网关包）。
+DEMO_MIN_SECONDS = 1.0
 
 
 #: 界面上只放**必须由这台机器的人来定**的参数（用户 2026-08-13：「配置简洁一点，不用搞一堆」）。
@@ -105,10 +107,10 @@ FIELDS: tuple[Field, ...] = (
     #   抄错了由 `tests/test_settings_validation.py` 判死。用户 2026-09-18：原来填低了网关
     #   悄悄抬回地板、只打一条日志，界面上还显示你填的数——「配置改了没反应」。现在保存时就拒。
     Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔",
-          "空闲时多久看一次未读；最低 30", section="sched", unit="秒",
+          "空闲时多久看一次未读；最低 30（极速 1）", section="sched", unit="秒",
           default="180", minimum=30),
     Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔",
-          "0=不查；最低 300", section="sched", unit="秒", default="900",
+          "0=不查；最低 300（极速 1）", section="sched", unit="秒", default="900",
           minimum=300, zero_means_off=True),
     # 用户 2026-09-07：说明太长把输入框挤坏了（调度配置一行两组），全部精简成半句。
     # 原来写在说明里的两条限定挪到这里：① 通过检测实际仍受「查好友」那档 ≥300 秒的
@@ -171,15 +173,8 @@ FIELDS: tuple[Field, ...] = (
     # 开着才能填。开启＝解除 30/300 秒地板并关掉随机抖动，只给演示号用（config.py `demo_mode`）。
     Field("WXCLIENT_GATEWAY_DEMO_MODE", "开启极速模式",
           "解除防风控下限、不加随机抖动；真实账号别开", kind="bool", section="demo", default="0"),
-    Field("WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS", "读消息间隔",
-          "空闲与正聊着都按它；关闭时下限 30", section="demo", unit="秒",
-          default="30", minimum=1, locked_value="30"),
-    Field("WXCLIENT_GATEWAY_DEMO_FRIEND_INTERVAL_SECONDS", "好友间隔",
-          "查新好友 / 查通过 / 加好友；关闭时下限 300", section="demo", unit="秒",
-          default="30", minimum=1, locked_value="300"),
-    Field("WXCLIENT_GATEWAY_DEMO_MOMENTS_INTERVAL_SECONDS", "朋友圈间隔",
-          "巡看 / 点赞 / 评论；关闭时巡看下限 300", section="demo", unit="秒",
-          default="60", minimum=1, locked_value="300"),
+    # 读消息 / 好友 / 朋友圈三个间隔原来这里也各有一格，和配置中心重复（用户 2026-09-30「和配置中心
+    # 重复了」）——删了。间隔只在配置中心填；这里的开关只决定配置中心那几格能填多低（`validate`）。
     Field("WXCLIENT_GATEWAY_DEMO_JITTER_PERCENT", "随机抖动",
           "每次在设定值上随机慢多少；关闭时 30", section="demo", unit="%",
           default="0", minimum=0, locked_value="30"),
@@ -210,9 +205,14 @@ def validate(values: dict[str, str]) -> dict[str, str]:
     不是数字的按「填错」报，别让它带着一个字符串进 env 再在网关启动那一刻炸。
     """
     errors: dict[str, str] = {}
+    # 极速模式开着：配置中心那几格的地板降到 1 秒，和网关 `GatewaySettings.read_floor_seconds` 等同步。
+    demo = str(values.get(DEMO_TOGGLE_KEY, "")).strip().lower() in _TRUE
     for field in FIELDS:
         if field.minimum is None:
             continue
+        minimum = field.minimum
+        if demo and field.section in SETTINGS_SECTIONS:
+            minimum = min(minimum, DEMO_MIN_SECONDS)
         raw = str(values.get(field.key, "")).strip()
         if raw == "":
             continue
@@ -223,8 +223,8 @@ def validate(values: dict[str, str]) -> dict[str, str]:
             continue
         if number == 0 and field.zero_means_off:
             continue
-        if number < field.minimum:
-            floor = f"{field.minimum:g}"
+        if number < minimum:
+            floor = f"{minimum:g}"
             errors[field.key] = (
                 f"「{field.label}」最低 {floor} {field.unit}，你填的是 {raw}"
                 + ("（0 表示关掉）" if field.zero_means_off else "")

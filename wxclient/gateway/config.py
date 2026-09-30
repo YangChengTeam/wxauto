@@ -85,24 +85,16 @@ class GatewaySettings(BaseSettings):
     hot_window_seconds: float = 600.0
     """对方最后一次说话之后，还按快档读多久。0 = 关掉自适应，永远用 ``poll_interval_seconds``。"""
 
-    # ── 演示模式（用户 2026-09-30：「把等待时间压到极限」「写死的值都能改」「只在演示模式下解除下限」）──
+    # ── 极速模式（用户 2026-09-30：「把等待时间压到极限」「只在演示模式下解除下限」「和配置中心重复了」）──
     demo_mode: bool = False
-    """演示用：**下限只在这里解除**。开着的时候，下面三个演示间隔盖掉对应的节拍，
-    而 30 秒 / 300 秒 / 朋友圈 300·600 秒这几道写死的地板换成演示间隔本身，随机抖动关掉
-    （填多少就是多少）。**默认关**，关着时一切照旧、地板照旧。
+    """演示用：**下限只在这里解除**。开着的时候，读消息 30 秒、好友 300 秒、朋友圈巡看 300 秒这几道
+    写死的地板降到 ``DEMO_MIN_SECONDS``，随机抖动按 ``demo_jitter_percent``（默认 0）。
+    **间隔本身仍在配置中心填**（读消息间隔、查新好友间隔、加好友最小间隔、朋友圈巡看间隔……），
+    极速模式只管「能填多低」，不再另存一份间隔（用户 2026-09-30：「和配置中心重复了」）。
+    **默认关**，关着时一切照旧、地板照旧。
 
     ★ 地板是 08-12 自动退登、08-27 弹安全验证倒推出来的；解除它是用户 2026-09-30 的明确裁决，
-    且只对演示号：真实账号别开。不改 gateway.env 里的正常值——关掉就原样回来。
-    工作时间窗、各类配额不受影响。"""
-
-    demo_poll_interval_seconds: float = MIN_READ_INTERVAL_SECONDS
-    """演示：读消息间隔（空闲巡检与正聊着两档都是它），也是 AI 端下发读指令的地板。"""
-
-    demo_friend_interval_seconds: float = MIN_READ_INTERVAL_SECONDS
-    """演示：查新好友、查好友通过、加好友最小间隔、自动补加好友，全用这一个数。"""
-
-    demo_moments_interval_seconds: float = 60.0
-    """演示：朋友圈点赞 / 评论最小间隔，以及巡看的地板（巡看本身仍由「朋友圈巡看间隔」开关）。"""
+    且只对演示号：真实账号别开。工作时间窗、各类配额不受影响。"""
 
     demo_jitter_percent: float = 0.0
     """极速：随机抖动（%）。平时 30%（`pacing.JITTER_RATIO`），极速默认 0＝填多少就是多少。"""
@@ -274,50 +266,28 @@ class GatewaySettings(BaseSettings):
 
     @model_validator(mode="after")
     def _apply_demo_mode(self) -> GatewaySettings:
-        """演示模式开着：各节拍换成演示间隔。
-
-        放在配置对象上而不是某个装配点：读这些数的地方（runner、factory、界面）拿到的就是
-        真正生效的值，不会出现「一处按演示跑、一处还按 180 算」。0 = 关掉的项（查好友 / 复查 /
-        巡看）保持关着，演示不替人打开。
-        """
+        """极速模式开着：写死的那批里落在本对象上的几项（回复前静默、热窗、一轮上限、换票超时）
+        换成极速值，见 `wxclient.tuning`。间隔不在这里改——配置中心填多少就是多少，只是地板降了。"""
         if not self.demo_mode:
             return self
-        read = max(float(self.demo_poll_interval_seconds), DEMO_MIN_SECONDS)
-        friend = max(float(self.demo_friend_interval_seconds), DEMO_MIN_SECONDS)
-        moments = max(float(self.demo_moments_interval_seconds), DEMO_MIN_SECONDS)
-        self.demo_poll_interval_seconds = read
-        self.demo_friend_interval_seconds = friend
-        self.demo_moments_interval_seconds = moments
-        self.poll_interval_seconds = read
-        self.active_poll_interval_seconds = read
-        if self.friend_check_interval_seconds > 0:
-            self.friend_check_interval_seconds = friend
-        if self.friend_recheck_interval_seconds > 0:
-            self.friend_recheck_interval_seconds = friend
-        self.friend_interval_seconds = friend
-        self.moment_like_interval_seconds = moments
-        self.moment_comment_interval_seconds = moments
-        if self.moments_poll_interval_seconds > 0:
-            self.moments_poll_interval_seconds = moments
-        # 写死的那批里落在本对象上的几项（回复前静默、热窗、一轮上限、换票超时），见 `wxclient.tuning`。
         for attr, value in tuning.settings_overrides().items():
             setattr(self, attr, float(value))
         return self
 
     @property
     def read_floor_seconds(self) -> float:
-        """读消息的地板：平时 30 秒红线，演示模式 = 演示读消息间隔。"""
-        return self.demo_poll_interval_seconds if self.demo_mode else MIN_READ_INTERVAL_SECONDS
+        """读消息的地板：平时 30 秒红线，极速模式 `DEMO_MIN_SECONDS`。"""
+        return DEMO_MIN_SECONDS if self.demo_mode else MIN_READ_INTERVAL_SECONDS
 
     @property
     def friend_floor_seconds(self) -> float:
-        """好友相关的地板：平时 300 秒红线，演示模式 = 演示好友间隔。"""
-        return self.demo_friend_interval_seconds if self.demo_mode else MIN_FRIEND_INTERVAL_SECONDS
+        """好友相关的地板：平时 300 秒红线，极速模式 `DEMO_MIN_SECONDS`。"""
+        return DEMO_MIN_SECONDS if self.demo_mode else MIN_FRIEND_INTERVAL_SECONDS
 
     @property
     def moments_floor_seconds(self) -> float:
-        """朋友圈巡看的地板：平时 300 秒，演示模式 = 演示朋友圈间隔。"""
-        return self.demo_moments_interval_seconds if self.demo_mode else MIN_MOMENTS_POLL_SECONDS
+        """朋友圈巡看的地板：平时 300 秒，极速模式 `DEMO_MIN_SECONDS`。"""
+        return DEMO_MIN_SECONDS if self.demo_mode else MIN_MOMENTS_POLL_SECONDS
 
     @property
     def jitter_ratio(self) -> float:
