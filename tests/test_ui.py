@@ -1116,6 +1116,8 @@ class SettingsDefaultsTests(unittest.TestCase):
             "WXCLIENT_GATEWAY_BUSINESS_API_URL": gateway.business_api_url,
             "WXCLIENT_GATEWAY_AI_WS_URL": gateway.ai_ws_url,
             "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": int(gateway.poll_interval_seconds),
+            "WXCLIENT_GATEWAY_DEMO_MODE": gateway.demo_mode,
+            "WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS": int(gateway.demo_poll_interval_seconds),
             "WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS":
                 int(gateway.friend_check_interval_seconds),
             "WXCLIENT_GATEWAY_FRIEND_RECHECK_INTERVAL_SECONDS":

@@ -7,10 +7,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ..endpoints import DEFAULT_AI_WS_URL, DEFAULT_BUSINESS_API_URL
-from .pacing import MIN_FRIEND_INTERVAL_SECONDS
+from .pacing import MIN_FRIEND_INTERVAL_SECONDS, MIN_READ_INTERVAL_SECONDS
 
 
 class GatewaySettings(BaseSettings):
@@ -74,6 +75,19 @@ class GatewaySettings(BaseSettings):
 
     hot_window_seconds: float = 600.0
     """对方最后一次说话之后，还按快档读多久。0 = 关掉自适应，永远用 ``poll_interval_seconds``。"""
+
+    # ── 演示模式（用户 2026-09-30：「加一个演示版模式，把等待时间压到极限」）──
+    demo_mode: bool = False
+    """演示用：读消息**不分快慢档**，空闲巡检和正聊着都按 ``demo_poll_interval_seconds`` 跑。
+
+    **默认关**。开着的时候 ``poll_interval_seconds`` / ``active_poll_interval_seconds`` 在装配时被
+    盖成演示间隔（见 ``_apply_demo_mode``），**不改 gateway.env 里填的那两个数**——关掉就回到原来的
+    180/30，不用谁记着改回去。只压读消息：查新好友、查好友通过、加好友最小间隔那几道 300 秒闸
+    是 08-27 真机弹安全验证倒推的，演示号一样会被风控，一动演示就演不下去了。
+    30 秒地板（``pacing.MIN_READ_INTERVAL_SECONDS``）、抖动（实际 30–39 秒）、工作时间窗照旧。"""
+
+    demo_poll_interval_seconds: float = MIN_READ_INTERVAL_SECONDS
+    """演示模式下多久读一次消息（秒）。默认就是地板 30 秒，填得更低会被抬回 30。"""
 
     friend_check_interval_seconds: float = 900.0
     """多久查一次新好友申请。加好友是风控最敏感的一类动作，节拍要比读消息慢一个量级。
@@ -239,6 +253,19 @@ class GatewaySettings(BaseSettings):
 
     allow_insecure_transport: bool = False
     """允许 ``http://`` / ``ws://`` 明文。默认拒绝——Bearer 凭证不得明文过网。"""
+
+    @model_validator(mode="after")
+    def _apply_demo_mode(self) -> GatewaySettings:
+        """演示模式开着：两档读消息间隔都换成演示间隔（不低于地板）。
+
+        放在配置对象上而不是某个装配点：读这两个数的地方（runner、界面状态）拿到的就是
+        真正生效的值，不会出现「一处按演示跑、一处还按 180 算」。
+        """
+        if self.demo_mode:
+            interval = max(float(self.demo_poll_interval_seconds), MIN_READ_INTERVAL_SECONDS)
+            self.poll_interval_seconds = interval
+            self.active_poll_interval_seconds = interval
+        return self
 
     def validate_for_start(self) -> None:
         if not self.ai_ws_url:

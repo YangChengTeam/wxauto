@@ -311,6 +311,13 @@ class GatewayRunner:
             is_active=self.is_active,
             clock=self._clock,
         )
+        if settings.demo_mode:
+            # 「改了没生效」是老问题——演示模式开没开，实时日志里要一眼看得见。
+            _wechat.warning(
+                "演示模式已开：读消息不分快慢档",
+                间隔秒=settings.poll_interval_seconds,
+                说明="实际带抖动；好友相关的节拍和工作时间窗不变",
+            )
         self.loop = InboundLoop(
             accounts=accounts,
             source=source,

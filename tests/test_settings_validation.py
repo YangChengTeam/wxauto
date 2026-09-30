@@ -38,14 +38,14 @@ class FloorsMatchTheGatewayTests(unittest.TestCase):
 
     def test_the_floor_is_written_in_the_help_text(self) -> None:
         """人得在填之前就看到那个数，而不是保存被拒了才知道。"""
-        for key in (POLL, FRIEND):
+        for key in (POLL, FRIEND, "WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS"):
             field = _field(key)
             self.assertIn(f"最低 {field.minimum:g}", field.help, field.label)
 
     def test_no_other_field_grew_a_floor_by_accident(self) -> None:
         """地板只给网关真会 clamp 的两格。加好友最小间隔刻意没有地板（config.py 里写明「调小自己清楚」）。"""
         floored = {f.key for f in FIELDS if f.minimum is not None}
-        self.assertEqual(floored, {POLL, FRIEND})
+        self.assertEqual(floored, {POLL, FRIEND, "WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS"})
 
 
 class ValidateTests(unittest.TestCase):
@@ -118,3 +118,57 @@ class LoadIntoEnvironTests(unittest.TestCase):
         settings_store.load_into_environ(self.data_dir, env)
         for key, value in saved.items():
             self.assertEqual(env[key], value, key)
+
+
+class DemoModeTests(unittest.TestCase):
+    """演示模式（用户 2026-09-30）：只压读消息两档，好友那几道闸不动，关掉就回原值。"""
+
+    DEMO = "WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS"
+
+    def _settings(self, **env: str):
+        from unittest import mock
+
+        from wxclient.gateway.config import GatewaySettings
+
+        with mock.patch.dict("os.environ", env, clear=True):
+            return GatewaySettings()
+
+    def test_off_by_default_keeps_the_two_tiers(self) -> None:
+        settings = self._settings()
+        self.assertFalse(settings.demo_mode)
+        self.assertEqual(settings.poll_interval_seconds, 180.0)
+        self.assertEqual(settings.active_poll_interval_seconds, 30.0)
+
+    def test_on_makes_both_tiers_the_demo_interval(self) -> None:
+        settings = self._settings(
+            WXCLIENT_GATEWAY_DEMO_MODE="1",
+            WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS="600",
+            **{self.DEMO: "45"},
+        )
+        self.assertEqual(settings.poll_interval_seconds, 45.0)
+        self.assertEqual(settings.active_poll_interval_seconds, 45.0)
+
+    def test_demo_interval_cannot_go_below_the_read_floor(self) -> None:
+        from wxclient.gateway.pacing import MIN_READ_INTERVAL_SECONDS
+
+        settings = self._settings(WXCLIENT_GATEWAY_DEMO_MODE="1", **{self.DEMO: "5"})
+        self.assertEqual(settings.poll_interval_seconds, MIN_READ_INTERVAL_SECONDS)
+        self.assertEqual(settings.active_poll_interval_seconds, MIN_READ_INTERVAL_SECONDS)
+
+    def test_friend_pacing_is_untouched(self) -> None:
+        off = self._settings()
+        on = self._settings(WXCLIENT_GATEWAY_DEMO_MODE="1")
+        for name in (
+            "friend_check_interval_seconds",
+            "friend_recheck_interval_seconds",
+            "friend_interval_seconds",
+            "active_hours",
+        ):
+            self.assertEqual(getattr(on, name), getattr(off, name), name)
+
+    def test_ui_floor_is_the_read_floor_and_refuses_lower(self) -> None:
+        from wxclient.gateway.pacing import MIN_READ_INTERVAL_SECONDS
+
+        self.assertEqual(_field(self.DEMO).minimum, MIN_READ_INTERVAL_SECONDS)
+        self.assertIn("最低 30", validate({self.DEMO: "10"})[self.DEMO])
+        self.assertEqual(validate({self.DEMO: "30"}), {})

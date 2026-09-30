@@ -152,6 +152,13 @@ FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_MOMENTS_COMMENT_MATERIAL", "朋友圈评论素材",
           "想传达什么、什么口吻，清空就不评", section="sched",
           default="岗位、招工、上班生活相关的动态可以接一句；语气自然、简短，不硬推销"),
+    # 用户 2026-09-30：演示版要「把等待时间压到极限」。开关 + 一个间隔，关掉就回到「读消息间隔」那格的数；
+    # 放在调度段最后，两格正好一行；只压读消息，好友那几道 300 秒闸不动（config.py `demo_mode` 写了为什么）。
+    Field("WXCLIENT_GATEWAY_DEMO_MODE", "演示模式",
+          "读消息不分快慢，都按演示间隔", kind="bool", section="sched", default="0"),
+    Field("WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS", "演示读消息间隔",
+          "开演示模式时生效；最低 30", section="sched", unit="秒",
+          default="30", minimum=30),
     Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动自动运行服务",
           kind="bool", section="boot", default="1"),
     Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", "启动后最小化到系统托盘",
