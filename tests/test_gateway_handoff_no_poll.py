@@ -158,3 +158,28 @@ class ForgetsTheCursorTests(_Base):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class RoundStartLogTests(_Base):
+    """用户 2026-09-30：「加一个日志来说明下一轮轮询开始，即使没有监控名单」。"""
+
+    async def test_名单空着也报一条轮询开始(self) -> None:
+        from structlog.testing import capture_logs
+
+        empty = QueueMessageSource(runtime=self.runtime, store=self.store, watchlist=Watchlist())
+        with capture_logs() as logs:
+            await empty.fetch(ACCOUNT)
+            await empty.fetch(ACCOUNT)
+        rounds = [e for e in logs if e["event"] == "开始新一轮轮询"]
+        self.assertEqual([e["轮次"] for e in rounds], [1, 2])
+        self.assertEqual(rounds[0]["名单"], 0)
+        self.assertEqual(self.runtime.read, [])
+
+    async def test_接管中的人数也报出来(self) -> None:
+        from structlog.testing import capture_logs
+
+        self.take_over("张三")
+        with capture_logs() as logs:
+            await self.source("张三", "李四").fetch(ACCOUNT)
+        start = next(e for e in logs if e["event"] == "开始新一轮轮询")
+        self.assertEqual((start["名单"], start["人工接管"]), (2, 1))

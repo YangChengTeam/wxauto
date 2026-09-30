@@ -656,6 +656,8 @@ class QueueMessageSource:
         self._paused_peers: set[str] = set()
         # (账号, 会话名) → 已经按「最后一条是对方的、欠一句回复」补派过的那个游标（见 `_owed_tail`）
         self._owed_sent: dict[tuple[str, str], str] = {}
+        # 第几轮轮询（只给「开始新一轮轮询」那条日志编号用）
+        self._round = 0
 
     async def fetch(self, account_id: str) -> list[InboundMessage]:
         """读名单里的会话，按游标切出新消息。
@@ -676,8 +678,19 @@ class QueueMessageSource:
         watched = self._drop_handed_off(account_id, listed) if listed else []
 
         now = self._clock()
+        quick = self._quick_round_due(now)
+        # 用户 2026-09-30：「加一个日志来说明下一轮轮询开始，即使没有监控名单」——
+        # 名单空着时下面一个窗口都不开，没有这一条，看日志分不清是「在轮询、只是没人可读」还是「卡住了」。
+        self._round += 1
+        _log.info(
+            "开始新一轮轮询",
+            轮次=self._round,
+            类型="在聊快读" if quick else "全量巡检",
+            名单=len(listed),
+            人工接管=len(listed) - len(watched),
+        )
         strangers: list[tuple[str, int]] = []
-        if self._quick_round_due(now):
+        if quick:
             peers = await self._quick_peers(account_id, watched, now) if watched else []
         else:
             self._last_full_at = now
