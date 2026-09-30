@@ -107,13 +107,18 @@ _SPINNER = ("◐", "◓", "◑", "◒")
 #:
 #: ★ 曾经还有一页「计划中心」，2026-08-15 用户裁决删掉：**计划归 AI 端**（几点做什么、
 #: 多久跟进一次由 AI 端排，指令经 WS 推下来），桌面端摆一页只会让人以为计划在这儿配。
-_PAGE_TITLES = {"log": "实时日志", "debug": "调试会话", "settings": "配置中心"}
+_PAGE_TITLES = {"log": "实时日志", "debug": "调试会话", "settings": "配置中心", "demo": "演示"}
 
 #: 标题底下那句话。空 = 这一页不摆副标题。
 _PAGE_SUBTITLES = {
     "settings": "管理连接、调度与启动设置",
     "debug": "直接和小智对话，指令会在本机执行",
+    # 用户 2026-09-30：原来写死的防风控地板单独一页，开了才能改（`settings_store` 的 demo 段）。
+    "demo": "解除防风控下限，仅限演示号使用",
 }
+
+#: 参数类的页：转场态（正在起/停服务）一律盖遮罩、导航变灰。
+_PARAM_PAGES = frozenset({"settings", "demo"})
 
 #: 左侧导航选中那根绿条的宽度（像素）。
 _NAV_MARK_W = 4
@@ -194,6 +199,8 @@ class MainWindow:
         self._settings_page: Any = None  # 懒建一次、复用；每次进页 reload() 重读磁盘上的值
         self._config_page: Any = None  # 配置中心的外壳（可滚动）：参数表 + 监听名单一节
         self._debug_page: Any = None   # 调试会话（`debug_page.py`），进那一页才建
+        self._demo_page: Any = None    # 「演示」页的外壳；里面是只管 demo 段的 SettingsPage
+        self._demo_settings: Any = None
         self._debug_actions: Any = None  # 它在标题栏右边那一组（● AI 已连接）
         self._watch_card: Any = None  # 监听名单那张卡片，跟着配置中心一起建
         # 名单那一节的说明标签，同上。**必须在这儿先占个 None**：`_note_watch` 会在
@@ -329,7 +336,8 @@ class MainWindow:
 
         self._nav: dict[str, tk.Label] = {}
         self._nav_marks: dict[str, tk.Frame] = {}
-        for page, text in (("log", "实时日志"), ("debug", "调试会话"), ("settings", "配置中心")):
+        for page, text in (("log", "实时日志"), ("debug", "调试会话"), ("settings", "配置中心"),
+                           ("demo", "演示")):
             # 选中的那一页在**最左边**立一根绿条（`docs/main.png`）。只靠深一档的底色
             # 在这张暗纹背景上几乎看不出来，绿条才是「我在这儿」的那个信号。
             row = tk.Frame(bar, bg=theme.SIDEBAR_BG)
@@ -843,7 +851,7 @@ class MainWindow:
     # ── 页面切换 ──────────────────────────────────────────────────
 
     def _show_page(self, page: str) -> None:
-        if page == "settings" and self._locked:
+        if page in _PARAM_PAGES and self._locked:
             return  # 转场态不给进参数页，见 _build_overlay
         if page not in _PAGE_TITLES:
             page = "log"  # 页删掉了（比如原来的计划中心），退回日志页，别把内容区留成一片白
@@ -875,6 +883,8 @@ class MainWindow:
             if page == "debug":
                 self._ensure_debug_page().pack(fill=tk.BOTH, expand=True)
                 self._debug_actions.pack(side=tk.RIGHT)
+            elif page == "demo":
+                self._ensure_demo_page().pack(fill=tk.BOTH, expand=True)
             else:
                 self._ensure_settings_page().pack(fill=tk.BOTH, expand=True)
                 self._render_watch_page()
@@ -935,6 +945,26 @@ class MainWindow:
             self._settings_page.reload()
         return self._config_page
 
+    def _ensure_demo_page(self) -> Any:
+        """「演示」页：同一套参数控件，只管 demo 那一段，存到同一个 gateway.env。
+
+        和配置中心分开建、分开 reload：两页任一页保存后，另一页下次进来会重读磁盘。
+        """
+        if self._demo_page is None:
+            from .settings_page import SettingsPage
+
+            self._demo_page = tk.Frame(self._pages, bg=theme.CONTENT_BG)
+            scroller, inner = self._build_scroller(self._demo_page)
+            self._demo_settings = SettingsPage(
+                inner, self.data_dir, on_saved=self._on_settings_saved, sections=("demo",),
+            )
+            self._demo_settings.build_action_bar(self._demo_page).pack(side=tk.BOTTOM, fill=tk.X)
+            scroller.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+            self._demo_settings.pack(fill=tk.X)
+        else:
+            self._demo_settings.reload()
+        return self._demo_page
+
     def _build_scroller(self, parent: tk.Misc) -> tuple[tk.Frame, tk.Frame]:
         """可滚动的壳。配置中心装得下十几行参数 + 一段名单，一屏是放不下的。
 
@@ -982,7 +1012,7 @@ class MainWindow:
     def _render_nav(self) -> None:
         """转场态里「配置中心」变灰、鼠标不再变手型——点不动这件事要看得出来。"""
         for key, item in self._nav.items():
-            disabled = self._locked and key == "settings"
+            disabled = self._locked and key in _PARAM_PAGES
             active = key == self._page and not disabled
             row_bg = theme.SIDEBAR_ACTIVE_BG if active else theme.SIDEBAR_BG
             item.configure(
@@ -995,7 +1025,7 @@ class MainWindow:
             self._nav_marks[key].configure(bg=theme.GREEN_BRIGHT if active else row_bg)
 
     def _render_overlay(self) -> None:
-        if self._locked and self._page == "settings":
+        if self._locked and self._page in _PARAM_PAGES:
             self._overlay_label.configure(text=self._busy_text or "正在切换服务状态，请稍候")
             self._overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
             self._overlay.lift()

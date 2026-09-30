@@ -38,7 +38,7 @@ import structlog
 from wxclient.queue import TaskType
 
 from .guard import ACTION_MOMENTS_LIKE, OutboundGuard, Reservation, within_active_hours
-from .pacing import jittered
+from .pacing import MIN_MOMENTS_POLL_SECONDS, jittered
 from .sessions import GatewayStore
 
 _log = structlog.get_logger(__name__)
@@ -48,7 +48,7 @@ READ_LIMIT = 10
 #: 一趟最多点几个赞。上限再由「朋友圈点赞」日配额减量。
 LIKE_LIMIT = 20
 #: 巡看间隔的地板（秒）。比它短就抬到它：朋友圈窗口开开关关比读消息显眼得多。
-MIN_POLL_INTERVAL_SECONDS = 300.0
+MIN_POLL_INTERVAL_SECONDS = MIN_MOMENTS_POLL_SECONDS
 
 
 class MomentsWatcher:
@@ -73,13 +73,14 @@ class MomentsWatcher:
         like_limit: int = LIKE_LIMIT,
         clock: Callable[[], datetime] | None = None,
         rng: random.Random | None = None,
+        min_interval_seconds: float = MIN_POLL_INTERVAL_SECONDS,
     ) -> None:
         self._accounts = list(accounts)
         self._runtime = runtime
         self._store = store
         self._guard = guard
         interval = float(interval_seconds)
-        self._interval = max(interval, MIN_POLL_INTERVAL_SECONDS) if interval > 0 else 0.0
+        self._interval = max(interval, float(min_interval_seconds)) if interval > 0 else 0.0
         self._auto_like = bool(auto_like)
         self._auto_comment = bool(auto_comment)
         self._material = str(comment_material or "").strip()

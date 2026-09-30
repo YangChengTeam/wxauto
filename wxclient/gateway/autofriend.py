@@ -49,7 +49,10 @@ class AutoFriendWatcher:
         on_added=None,    # async (command, result) -> None：加完照旧上报业务端
         clock=None,
         enabled: bool = True,
+        min_interval_seconds: float = MIN_FRIEND_INTERVAL_SECONDS,
     ) -> None:
+        #: 两次自动补加之间至少隔多久。平时就是 300 秒红线，只有演示模式会改小。
+        self._min_interval = float(min_interval_seconds)
         self._store = store
         self._runtime = runtime
         self._commands = commands
@@ -118,7 +121,7 @@ class AutoFriendWatcher:
             return True
         if at.tzinfo is None:
             at = at.replace(tzinfo=timezone.utc)
-        return self._clock() - at >= timedelta(seconds=MIN_FRIEND_INTERVAL_SECONDS)
+        return self._clock() - at >= timedelta(seconds=self._min_interval)
 
     async def _not_a_contact(self, session_name: str) -> bool | None:
         """在微信通讯录里搜这个名字。

@@ -36,6 +36,9 @@ MIN_READ_INTERVAL_SECONDS = 30.0
 #: 用户 2026-08-28）。这里是默认值，也是「低于它就该知道自己在做什么」的那条线。
 MIN_FRIEND_INTERVAL_SECONDS = 300.0
 
+#: 朋友圈巡看的最小间隔。每趟都要开一次朋友圈窗口（`moments.py` 用它当地板）。
+MIN_MOMENTS_POLL_SECONDS = 300.0
+
 # ★ 曾经还有一档「连续失败翻倍退避」（300→600→1200→2400，成功归零），2026-08-28 删了：
 #   用户实测嫌等太久（「这个加好友失败的间隔太长了，不要这么弄，给一个配置就行」）。
 #   现在只有一个固定间隔，多长由配置说了算。**别自作主张加回来**——想更慢就把配置调大。
@@ -68,12 +71,25 @@ def clamp_interval(seconds: float, minimum: float, *, what: str) -> float:
     return value
 
 
-def jittered(seconds: float, *, ratio: float = JITTER_RATIO, rng: random.Random | None = None) -> float:
+#: 这一进程实际用的抖动幅度。只有演示模式会改它（`set_jitter_ratio(0)`：填多少就是多少），
+#: 启动时由 `factory` 按配置设一次；其余时候就是 `JITTER_RATIO`。
+_jitter_ratio = JITTER_RATIO
+
+
+def set_jitter_ratio(ratio: float) -> None:
+    global _jitter_ratio
+    _jitter_ratio = max(0.0, float(ratio))
+
+
+def jittered(seconds: float, *, ratio: float | None = None, rng: random.Random | None = None) -> float:
     """给间隔加抖动，返回这一次实际要睡多久。**只会比基数慢，绝不会更快。**
 
     传进来的基数已经过 ``clamp_interval``（不低于红线），所以单向抖动 = 红线永远成立。
     """
     if seconds <= 0:
         return 0.0
+    r = _jitter_ratio if ratio is None else ratio
+    if r <= 0:
+        return seconds
     source = rng or random
-    return seconds * (1.0 + source.uniform(0.0, ratio))
+    return seconds * (1.0 + source.uniform(0.0, r))

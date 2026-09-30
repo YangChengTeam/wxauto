@@ -36,6 +36,7 @@ class SettingsPage(tk.Frame):
         on_saved: Callable[[bool], None] | None = None,
         version: str = "",
         on_check_update: Callable[[], None] | None = None,
+        sections: tuple[str, ...] = settings_store.SETTINGS_SECTIONS,
     ) -> None:
         super().__init__(parent, bg=theme.CONTENT_BG)
         self.data_dir = Path(data_dir)
@@ -52,13 +53,24 @@ class SettingsPage(tk.Frame):
         self._test_label: tk.Label | None = None
         self._state_text: tk.Label | None = None
         self._state_dot: tk.Label | None = None
+        #: 这一页管哪几段。配置中心和「演示」页是同一套控件的两份，各管各的键，存到同一个文件。
+        self._sections = tuple(sections)
+        self._fields = tuple(f for f in FIELDS if f.section in self._sections)
+        #: 带 `locked_value` 的格子：(输入框, 真值, 关着时显示的地板)。
+        self._lockable: dict[str, tuple[tk.Entry, tk.StringVar, tk.StringVar]] = {}
 
         # ★ 这里曾经有一行「参数由后端下发…」和一个「重新拉取」，2026-08-15 用户要求撤掉：
         # 后端那头还没有，摆着只会让人以为「点一下就能同步」。参数在哪儿生效看下面的
         # 「保存到：…」那行就够了。
         for section in SECTIONS:
-            self._build_section(section)
-        self._build_about()
+            if section.key in self._sections:
+                self._build_section(section)
+        if "conn" in self._sections:
+            self._build_about()
+        toggle = self._vars.get(settings_store.DEMO_TOGGLE_KEY)
+        if toggle is not None and self._lockable:
+            toggle.trace_add("write", lambda *_: self._render_locks())
+        self._render_locks()
 
         tk.Label(
             self,
@@ -146,7 +158,9 @@ class SettingsPage(tk.Frame):
             var = tk.StringVar(value=_MASK if field.secret and current else current)
             cell = tk.Frame(parent, bg=theme.CONTENT_BG)
             cell.grid(row=row, column=column + 1, sticky="we", pady=7)
-            self._field_box(cell, field, var)
+            entry = self._field_box(cell, field, var)
+            if field.locked_value:
+                self._lockable[field.key] = (entry, var, tk.StringVar(value=field.locked_value))
             mark = tk.Label(parent, text=field.help, font=theme.FONT_SMALL,
                             bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED, anchor="w")
             mark.grid(row=row, column=column + 2, sticky="w", padx=14)
@@ -183,6 +197,20 @@ class SettingsPage(tk.Frame):
         if field.placeholder and isinstance(var, tk.StringVar):
             widgets.attach_placeholder(entry, var, field.placeholder, font=theme.FONT_BODY)
         return entry
+
+    def _render_locks(self) -> None:
+        """演示页：开关关着 → 三格灰着显示**正在生效的地板**、不能改；开着 → 显示并编辑演示值。
+
+        换的是输入框挂的变量，不是变量的值：关着时存盘仍按真值（上次填的演示值）走，
+        不会把地板数字写进演示键里。
+        """
+        toggle = self._vars.get(settings_store.DEMO_TOGGLE_KEY)
+        on = bool(toggle.get()) if toggle is not None else False
+        for entry, real, floor in self._lockable.values():
+            entry.configure(textvariable=real if on else floor,
+                            state=tk.NORMAL if on else "readonly",
+                            fg=theme.TEXT if on else theme.TEXT_MUTED,
+                            readonlybackground=theme.FIELD_BG)
 
     def build_action_bar(self, parent: tk.Misc) -> tk.Frame:
         """底部动作条。**由外面 pack 在页面底部**，不进滚动区——参数一多，按钮就会跟着
@@ -234,7 +262,7 @@ class SettingsPage(tk.Frame):
             self._state_text.configure(text="所有更改均已保存")
 
     def _pending_changes(self) -> bool:
-        for field in FIELDS:
+        for field in self._fields:
             var = self._vars.get(field.key)
             if var is None:
                 continue
@@ -256,7 +284,7 @@ class SettingsPage(tk.Frame):
         打开时的快照——别人手工改过 settings 文件、或者刚保存过一轮，界面就和现实对不上。
         """
         self._values = settings_store.effective(self.data_dir)
-        for field in FIELDS:
+        for field in self._fields:
             var = self._vars.get(field.key)
             if var is None:
                 continue
@@ -269,6 +297,7 @@ class SettingsPage(tk.Frame):
                 var.set(_MASK if current else "")
                 continue
             var.set(current)
+        self._render_locks()
         self._render_dirty()
 
     def _mark_touched(self, key: str) -> None:
@@ -343,8 +372,9 @@ class SettingsPage(tk.Frame):
         self._show_test(text, color)
 
     def _collect(self) -> dict[str, str]:
-        values = dict(self._values)
-        for field in FIELDS:
+        # 从磁盘重读一遍打底：另一页（配置中心 / 演示）刚存过的键不能被这页的旧快照盖回去。
+        values = settings_store.effective(self.data_dir)
+        for field in self._fields:
             var = self._vars[field.key]
             if field.kind == "bool":
                 values[field.key] = "1" if bool(var.get()) else "0"

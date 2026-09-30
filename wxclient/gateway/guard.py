@@ -238,6 +238,14 @@ def write_intervals_from(settings) -> dict[str, float]:
     }
 
 
+def read_intervals_from(settings) -> dict[str, float]:
+    """读侧地板（AI 端下发的读指令）：平时就是两个常量，演示模式换成演示间隔。"""
+    return {
+        READ_ACTION: float(settings.read_floor_seconds),
+        READ_FRIENDS_ACTION: float(settings.friend_floor_seconds),
+    }
+
+
 @dataclass
 class Reservation:
     """一次**已经占住的**额度。做完按实际用量结算，没用上的还回去。
@@ -301,6 +309,7 @@ class OutboundGuard:
         active_hours: str = "09:00-21:00",
         action_limits: dict[str, RateLimit] | None = None,
         write_intervals: dict[str, float] | None = None,
+        read_intervals: dict[str, float] | None = None,
     ) -> None:
         self._store = store
         self._max_per_hour = max_sends_per_hour
@@ -312,6 +321,10 @@ class OutboundGuard:
         self._write_intervals = dict(WRITE_INTERVALS)
         if write_intervals:
             self._write_intervals.update(write_intervals)
+        # 读侧地板默认是 pacing 的两个常量；只有演示模式会换成配置里的数（`read_intervals_from`）。
+        self._read_intervals = dict(READ_INTERVALS)
+        if read_intervals:
+            self._read_intervals.update(read_intervals)
         parse_active_hours(active_hours)  # 提前校验，别等到要发消息才炸
 
     def check(
@@ -460,7 +473,7 @@ class OutboundGuard:
         """
         if not within_active_hours(now, self._active_hours):
             return GuardDecision.deny(f"不在允许动作的时间窗 {self._active_hours}")
-        floor = READ_INTERVALS.get(action)
+        floor = self._read_intervals.get(action)
         if floor is None:
             return GuardDecision.allow()
         wait = self._store.try_touch_read(account_id, action, now, floor)

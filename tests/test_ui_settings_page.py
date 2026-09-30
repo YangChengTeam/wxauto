@@ -119,9 +119,7 @@ class ConfigLookTests(unittest.TestCase):
                           "朋友圈评论上限", "朋友圈评论最小间隔",
                           # 用户 2026-09-08：本机自己巡看朋友圈，只碰新动态
                           "朋友圈巡看间隔", "巡看时自动点赞",
-                          "巡看时自动评论", "朋友圈评论素材",
-                          # 用户 2026-09-30：演示模式，开关 + 间隔摆一行
-                          "演示模式", "演示读消息间隔"])
+                          "巡看时自动评论", "朋友圈评论素材"])
         # 「来问陌生人」2026-09-24 已拆（监听名单只认同步来的），不许回来
         self.assertNotIn("来问陌生人", [field.label for field in settings_store.FIELDS])
         self.assertEqual(sched[0].unit, "秒", "单位贴在框里，不写进标签")

@@ -30,10 +30,15 @@ from .contacts import ContactDirectory
 from .download import FileFetcher
 from .friendcheck import PendingFriendWatcher
 from .friends import FriendWatcher
-from .guard import OutboundGuard, action_limits_from, write_intervals_from
+from .guard import (
+    OutboundGuard,
+    action_limits_from,
+    read_intervals_from,
+    write_intervals_from,
+)
 from .message_events import MessageEventReporter
 from .moments import MomentsWatcher
-from .pacing import MIN_FRIEND_INTERVAL_SECONDS, clamp_interval
+from .pacing import clamp_interval, set_jitter_ratio
 from .runner import GatewayRunner
 from .sessions import GatewayStore
 from .ticket import ClientTokenTicketProvider, LocalFileTicketProvider, TicketProvider
@@ -129,10 +134,12 @@ def build_gateway(
                 origin="上次 AI 端推送（本地留存）",
             )
         )
+    # 演示模式关抖动、换地板（`GatewaySettings._apply_demo_mode`）；平时这两样就是 pacing 的常量。
+    set_jitter_ratio(gateway_settings.jitter_ratio)
     friend_interval = gateway_settings.friend_check_interval_seconds
     if friend_interval > 0:
         friend_interval = clamp_interval(
-            friend_interval, MIN_FRIEND_INTERVAL_SECONDS, what="加好友检查间隔"
+            friend_interval, gateway_settings.friend_floor_seconds, what="加好友检查间隔"
         )
 
     ticket_provider = build_ticket_provider(gateway_settings, client_token)
@@ -202,6 +209,7 @@ def build_gateway(
         active_hours=gateway_settings.active_hours,
         action_limits=action_limits_from(gateway_settings),
         write_intervals=write_intervals_from(gateway_settings),
+        read_intervals=read_intervals_from(gateway_settings),
     )
     command_executor = CommandExecutor(
         runtime=runtime,
@@ -267,6 +275,7 @@ def build_gateway(
             runtime=runtime,
             commands=command_executor,
             enabled=gateway_settings.auto_add_friend,
+            min_interval_seconds=gateway_settings.friend_floor_seconds,
         ),
         # 2026-09-12：别人发来的申请默认自动通过（`auto_accept_friend`），走 `command_executor`——
         # 能力闸、加好友配额、时间窗、幂等一道不绕；dry-run 机器只数不点。
@@ -298,6 +307,7 @@ def build_gateway(
             store=store,
             guard=guard,
             interval_seconds=gateway_settings.moments_poll_interval_seconds,
+            min_interval_seconds=gateway_settings.moments_floor_seconds,
             auto_like=gateway_settings.moments_auto_like,
             auto_comment=gateway_settings.moments_auto_comment,
             comment_material=gateway_settings.moments_comment_material,

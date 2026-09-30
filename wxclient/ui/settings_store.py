@@ -36,6 +36,7 @@ class Field:
     default: str = ""       # 没配过时**真正生效**的值（和 placeholder 不是一回事）
     minimum: float | None = None  # 网关那边的硬地板；填得比它低保存时当场拒绝，见 `validate`
     zero_means_off: bool = False  # 0 是「关掉」不是「0 秒」，不跟地板比
+    locked_value: str = ""  # 非空＝只在演示模式开着时能改；关着时灰着显示这个数（正在生效的地板）
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,13 @@ SECTIONS: tuple[Section, ...] = (
     Section("conn", "连接配置", "配置与 AI 端及业务端的连接信息"),
     Section("sched", "调度配置", "配置消息读取与任务调度规则", columns=2),
     Section("boot", "启动设置", "配置服务启动后的行为"),
+    # 不在配置中心里渲染，单独一页「演示」（`window._ensure_demo_page`）。
+    Section("demo", "演示模式", "关闭时显示正在生效的下限，不能修改；开启后可自由填写"),
 )
+
+#: 配置中心渲染的分段；`demo` 那段在自己的菜单页里。
+SETTINGS_SECTIONS: tuple[str, ...] = ("conn", "sched", "boot")
+DEMO_TOGGLE_KEY = "WXCLIENT_GATEWAY_DEMO_MODE"
 
 
 #: 界面上只放**必须由这台机器的人来定**的参数（用户 2026-08-13：「配置简洁一点，不用搞一堆」）。
@@ -152,13 +159,20 @@ FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_MOMENTS_COMMENT_MATERIAL", "朋友圈评论素材",
           "想传达什么、什么口吻，清空就不评", section="sched",
           default="岗位、招工、上班生活相关的动态可以接一句；语气自然、简短，不硬推销"),
-    # 用户 2026-09-30：演示版要「把等待时间压到极限」。开关 + 一个间隔，关掉就回到「读消息间隔」那格的数；
-    # 放在调度段最后，两格正好一行；只压读消息，好友那几道 300 秒闸不动（config.py `demo_mode` 写了为什么）。
-    Field("WXCLIENT_GATEWAY_DEMO_MODE", "演示模式",
-          "读消息不分快慢，都按演示间隔", kind="bool", section="sched", default="0"),
-    Field("WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS", "演示读消息间隔",
-          "开演示模式时生效；最低 30", section="sched", unit="秒",
-          default="30", minimum=30),
+    # 用户 2026-09-30：「这些原来写死的地板值搞一个专门菜单 演示，开启后就可以无视规则」。
+    # 左侧单独一页（不和调度配置混在一起）；关着时三格显示正在生效的地板、不能改（`locked_value`），
+    # 开着才能填。开启＝解除 30/300 秒地板并关掉随机抖动，只给演示号用（config.py `demo_mode`）。
+    Field("WXCLIENT_GATEWAY_DEMO_MODE", "开启演示模式",
+          "解除防风控下限、不加随机抖动；真实账号别开", kind="bool", section="demo", default="0"),
+    Field("WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS", "读消息间隔",
+          "空闲与正聊着都按它；关闭时下限 30", section="demo", unit="秒",
+          default="30", minimum=1, locked_value="30"),
+    Field("WXCLIENT_GATEWAY_DEMO_FRIEND_INTERVAL_SECONDS", "好友间隔",
+          "查新好友 / 查通过 / 加好友；关闭时下限 300", section="demo", unit="秒",
+          default="30", minimum=1, locked_value="300"),
+    Field("WXCLIENT_GATEWAY_DEMO_MOMENTS_INTERVAL_SECONDS", "朋友圈间隔",
+          "巡看 / 点赞 / 评论；关闭时巡看下限 300", section="demo", unit="秒",
+          default="60", minimum=1, locked_value="300"),
     Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动自动运行服务",
           kind="bool", section="boot", default="1"),
     Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", "启动后最小化到系统托盘",

@@ -63,7 +63,7 @@ from .inbound import (
 from .message_events import DIRECTION_INBOUND, MessageEventReporter, local_message_id
 from .moments import MomentsWatcher
 from .outbound import DeliveryResult, MessageSink, OutboundSender
-from .pacing import MIN_READ_INTERVAL_SECONDS, PACING_EVENT, clamp_interval
+from .pacing import PACING_EVENT, clamp_interval
 from .schedule import ScheduleLoop, parse_schedule_at
 from .sessions import CANDIDATE_MODES, GatewayStore
 from .ticket import TicketProvider
@@ -314,9 +314,11 @@ class GatewayRunner:
         if settings.demo_mode:
             # 「改了没生效」是老问题——演示模式开没开，实时日志里要一眼看得见。
             _wechat.warning(
-                "演示模式已开：读消息不分快慢档",
-                间隔秒=settings.poll_interval_seconds,
-                说明="实际带抖动；好友相关的节拍和工作时间窗不变",
+                "演示模式已开：下限已解除、不加随机抖动（仅限演示号）",
+                读消息秒=settings.demo_poll_interval_seconds,
+                好友秒=settings.demo_friend_interval_seconds,
+                朋友圈秒=settings.demo_moments_interval_seconds,
+                说明="工作时间窗与配额不变",
             )
         self.loop = InboundLoop(
             accounts=accounts,
@@ -325,11 +327,11 @@ class GatewayRunner:
             handler=self.handle_turn,
             debounce_seconds=settings.debounce_seconds,
             poll_interval_seconds=clamp_interval(
-                settings.poll_interval_seconds, MIN_READ_INTERVAL_SECONDS, what="读消息间隔"
+                settings.poll_interval_seconds, settings.read_floor_seconds, what="读消息间隔"
             ),
             active_poll_interval_seconds=clamp_interval(
                 settings.active_poll_interval_seconds,
-                MIN_READ_INTERVAL_SECONDS,
+                settings.read_floor_seconds,
                 what="聊着时的读消息间隔",
             ),
             hot_window_seconds=settings.hot_window_seconds,
@@ -435,7 +437,7 @@ class GatewayRunner:
             idle_seconds=number("idle_seconds"),
             active_seconds=number("active_seconds"),
             hot_window_seconds=number("hot_window_seconds"),
-            floor=MIN_READ_INTERVAL_SECONDS,
+            floor=self._settings.read_floor_seconds,
         )
 
     def _dispatch_commands(self, account_id: str, data: dict[str, Any]) -> None:

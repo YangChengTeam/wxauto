@@ -11,7 +11,15 @@ from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ..endpoints import DEFAULT_AI_WS_URL, DEFAULT_BUSINESS_API_URL
-from .pacing import MIN_FRIEND_INTERVAL_SECONDS, MIN_READ_INTERVAL_SECONDS
+from .pacing import (
+    JITTER_RATIO,
+    MIN_FRIEND_INTERVAL_SECONDS,
+    MIN_MOMENTS_POLL_SECONDS,
+    MIN_READ_INTERVAL_SECONDS,
+)
+
+#: 演示模式下间隔的最小值：只防「填 0 变成死循环狂转」，不是防风控的地板。
+DEMO_MIN_SECONDS = 1.0
 
 
 class GatewaySettings(BaseSettings):
@@ -76,18 +84,24 @@ class GatewaySettings(BaseSettings):
     hot_window_seconds: float = 600.0
     """对方最后一次说话之后，还按快档读多久。0 = 关掉自适应，永远用 ``poll_interval_seconds``。"""
 
-    # ── 演示模式（用户 2026-09-30：「加一个演示版模式，把等待时间压到极限」）──
+    # ── 演示模式（用户 2026-09-30：「把等待时间压到极限」「写死的值都能改」「只在演示模式下解除下限」）──
     demo_mode: bool = False
-    """演示用：读消息**不分快慢档**，空闲巡检和正聊着都按 ``demo_poll_interval_seconds`` 跑。
+    """演示用：**下限只在这里解除**。开着的时候，下面三个演示间隔盖掉对应的节拍，
+    而 30 秒 / 300 秒 / 朋友圈 300·600 秒这几道写死的地板换成演示间隔本身，随机抖动关掉
+    （填多少就是多少）。**默认关**，关着时一切照旧、地板照旧。
 
-    **默认关**。开着的时候 ``poll_interval_seconds`` / ``active_poll_interval_seconds`` 在装配时被
-    盖成演示间隔（见 ``_apply_demo_mode``），**不改 gateway.env 里填的那两个数**——关掉就回到原来的
-    180/30，不用谁记着改回去。只压读消息：查新好友、查好友通过、加好友最小间隔那几道 300 秒闸
-    是 08-27 真机弹安全验证倒推的，演示号一样会被风控，一动演示就演不下去了。
-    30 秒地板（``pacing.MIN_READ_INTERVAL_SECONDS``）、抖动（实际 30–39 秒）、工作时间窗照旧。"""
+    ★ 地板是 08-12 自动退登、08-27 弹安全验证倒推出来的；解除它是用户 2026-09-30 的明确裁决，
+    且只对演示号：真实账号别开。不改 gateway.env 里的正常值——关掉就原样回来。
+    工作时间窗、各类配额不受影响。"""
 
     demo_poll_interval_seconds: float = MIN_READ_INTERVAL_SECONDS
-    """演示模式下多久读一次消息（秒）。默认就是地板 30 秒，填得更低会被抬回 30。"""
+    """演示：读消息间隔（空闲巡检与正聊着两档都是它），也是 AI 端下发读指令的地板。"""
+
+    demo_friend_interval_seconds: float = MIN_READ_INTERVAL_SECONDS
+    """演示：查新好友、查好友通过、加好友最小间隔、自动补加好友，全用这一个数。"""
+
+    demo_moments_interval_seconds: float = 60.0
+    """演示：朋友圈点赞 / 评论最小间隔，以及巡看的地板（巡看本身仍由「朋友圈巡看间隔」开关）。"""
 
     friend_check_interval_seconds: float = 900.0
     """多久查一次新好友申请。加好友是风控最敏感的一类动作，节拍要比读消息慢一个量级。
@@ -256,16 +270,52 @@ class GatewaySettings(BaseSettings):
 
     @model_validator(mode="after")
     def _apply_demo_mode(self) -> GatewaySettings:
-        """演示模式开着：两档读消息间隔都换成演示间隔（不低于地板）。
+        """演示模式开着：各节拍换成演示间隔。
 
-        放在配置对象上而不是某个装配点：读这两个数的地方（runner、界面状态）拿到的就是
-        真正生效的值，不会出现「一处按演示跑、一处还按 180 算」。
+        放在配置对象上而不是某个装配点：读这些数的地方（runner、factory、界面）拿到的就是
+        真正生效的值，不会出现「一处按演示跑、一处还按 180 算」。0 = 关掉的项（查好友 / 复查 /
+        巡看）保持关着，演示不替人打开。
         """
-        if self.demo_mode:
-            interval = max(float(self.demo_poll_interval_seconds), MIN_READ_INTERVAL_SECONDS)
-            self.poll_interval_seconds = interval
-            self.active_poll_interval_seconds = interval
+        if not self.demo_mode:
+            return self
+        read = max(float(self.demo_poll_interval_seconds), DEMO_MIN_SECONDS)
+        friend = max(float(self.demo_friend_interval_seconds), DEMO_MIN_SECONDS)
+        moments = max(float(self.demo_moments_interval_seconds), DEMO_MIN_SECONDS)
+        self.demo_poll_interval_seconds = read
+        self.demo_friend_interval_seconds = friend
+        self.demo_moments_interval_seconds = moments
+        self.poll_interval_seconds = read
+        self.active_poll_interval_seconds = read
+        if self.friend_check_interval_seconds > 0:
+            self.friend_check_interval_seconds = friend
+        if self.friend_recheck_interval_seconds > 0:
+            self.friend_recheck_interval_seconds = friend
+        self.friend_interval_seconds = friend
+        self.moment_like_interval_seconds = moments
+        self.moment_comment_interval_seconds = moments
+        if self.moments_poll_interval_seconds > 0:
+            self.moments_poll_interval_seconds = moments
         return self
+
+    @property
+    def read_floor_seconds(self) -> float:
+        """读消息的地板：平时 30 秒红线，演示模式 = 演示读消息间隔。"""
+        return self.demo_poll_interval_seconds if self.demo_mode else MIN_READ_INTERVAL_SECONDS
+
+    @property
+    def friend_floor_seconds(self) -> float:
+        """好友相关的地板：平时 300 秒红线，演示模式 = 演示好友间隔。"""
+        return self.demo_friend_interval_seconds if self.demo_mode else MIN_FRIEND_INTERVAL_SECONDS
+
+    @property
+    def moments_floor_seconds(self) -> float:
+        """朋友圈巡看的地板：平时 300 秒，演示模式 = 演示朋友圈间隔。"""
+        return self.demo_moments_interval_seconds if self.demo_mode else MIN_MOMENTS_POLL_SECONDS
+
+    @property
+    def jitter_ratio(self) -> float:
+        """演示模式不抖（填多少就是多少）；平时 `pacing.JITTER_RATIO`。"""
+        return 0.0 if self.demo_mode else JITTER_RATIO
 
     def validate_for_start(self) -> None:
         if not self.ai_ws_url:

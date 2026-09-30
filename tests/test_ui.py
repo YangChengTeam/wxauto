@@ -1118,6 +1118,10 @@ class SettingsDefaultsTests(unittest.TestCase):
             "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": int(gateway.poll_interval_seconds),
             "WXCLIENT_GATEWAY_DEMO_MODE": gateway.demo_mode,
             "WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS": int(gateway.demo_poll_interval_seconds),
+            "WXCLIENT_GATEWAY_DEMO_FRIEND_INTERVAL_SECONDS":
+                int(gateway.demo_friend_interval_seconds),
+            "WXCLIENT_GATEWAY_DEMO_MOMENTS_INTERVAL_SECONDS":
+                int(gateway.demo_moments_interval_seconds),
             "WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS":
                 int(gateway.friend_check_interval_seconds),
             "WXCLIENT_GATEWAY_FRIEND_RECHECK_INTERVAL_SECONDS":
