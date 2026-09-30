@@ -142,7 +142,8 @@ class ConfigLookTests(unittest.TestCase):
         walk(self.page)
         # ★ 数目对着**布尔字段**数，别写死一个数字：加一个开关就要来改一次测试，
         #   而改的人多半只会把 2 改成 3，顺手把下面那条「点的是哪一个」也改错。
-        bool_keys = [f.key for f in settings_store.FIELDS if f.kind == "bool"]
+        #   只数本页的：极速模式开关在另一页（「极速模式」），不归配置中心。
+        bool_keys = [f.key for f in self.page._fields if f.kind == "bool"]
         self.assertEqual(len(switches), len(bool_keys), "每个布尔参数一枚胶囊开关")
 
         autostart = switches[bool_keys.index("WXCLIENT_UI_AUTOSTART")]
