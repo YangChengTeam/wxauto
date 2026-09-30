@@ -133,14 +133,15 @@ class AgentWsClient:
         *,
         turn_timeout_seconds: float = 180.0,
         op_timeout_seconds: float = 30.0,
-        ping_timeout_seconds: float = PING_TIMEOUT_SECONDS,
+        ping_timeout_seconds: float | None = None,
         connect_factory: Callable[..., Any] | None = None,
         on_push: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._url = ws_url
         self._turn_timeout = turn_timeout_seconds
         self._op_timeout = op_timeout_seconds
-        self._ping_timeout = ping_timeout_seconds
+        # 没给就读模块的 `PING_TIMEOUT_SECONDS`（建对象时读，极速模式改得到）。
+        self._ping_timeout = PING_TIMEOUT_SECONDS if ping_timeout_seconds is None else ping_timeout_seconds
         self._connect = connect_factory or _connect_with_limits
         self._on_push = on_push
 

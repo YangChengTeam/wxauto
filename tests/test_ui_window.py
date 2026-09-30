@@ -253,7 +253,7 @@ class WindowAdversarialTests(unittest.TestCase):
         调试会话是 2026-08-17 加的：直接跟 AI 端说话，验这台电脑到底动不动得了微信。
         """
         self.assertEqual([item.cget("text") for item in self.window._nav.values()],
-                         ["实时日志", "调试会话", "配置中心", "演示"])
+                         ["实时日志", "调试会话", "配置中心", "极速模式"])
         self.assertNotIn("plans", self.window._nav, "计划中心已删")
         self.assertNotIn("watch", self.window._nav, "监听名单不再是单独一项")
         self.assertFalse(hasattr(self.window, "_watch_label"), "侧栏不该再铺名单")

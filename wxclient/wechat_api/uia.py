@@ -12,6 +12,7 @@ from typing import Any, ClassVar
 
 import structlog
 
+from wxclient import tuning
 from wxclient.heavy_import import import_wechat_driver
 from wxclient.uia_probe import probe_wechat_uia
 from wxclient.uia_probe.constants import (
@@ -29,7 +30,8 @@ _ESC_CLOSE_FALLBACK_DISABLED = False
 #: 输入框「还没 enabled」时，最多等它几秒再重来一次。
 #: 3 秒是按真机现象给的：切完聊天窗口到输入框可用通常在半秒内，卡住的那次也只是差一拍。
 #: 给太长会把一次本该快速失败的调用拖成十几秒，给太短等于没等。
-EDIT_ENABLE_WAIT_SECONDS = 3.0
+#: 实际读 `tuning.EDIT_ENABLE_WAIT_SECONDS`（极速模式可改）；这里留同值给旧引用。
+EDIT_ENABLE_WAIT_SECONDS = tuning.EDIT_ENABLE_WAIT_SECONDS
 EDIT_ENABLE_POLL_SECONDS = 0.2
 
 
@@ -566,7 +568,7 @@ class UiaWeChatDriver:
         """
         add_criteria = getattr(getattr(Uielements, "Buttons", None), "AddToContactsButton", None)
         send_criteria = getattr(getattr(Uielements, "Buttons", None), "SendMessageButton", None)
-        deadline = time.monotonic() + _PROFILE_WAIT_SECONDS
+        deadline = time.monotonic() + tuning.PROFILE_WAIT_SECONDS
         rendered = False
         while True:
             roots = self._contact_profile_roots(pane, Uielements)
@@ -1441,7 +1443,7 @@ class UiaWeChatDriver:
         等不到就不重试是错的：``is_enabled()`` 自己也可能查不到（控件树正好在重建），
         那时候直接放弃等于把一次本来会成功的发送判死。宁可再试一次让它自己抛。
         """
-        deadline = time.monotonic() + EDIT_ENABLE_WAIT_SECONDS
+        deadline = time.monotonic() + tuning.EDIT_ENABLE_WAIT_SECONDS
         while time.monotonic() < deadline:
             with suppress(Exception):   # 探测本身失败就当没等到，接着轮询
                 edit = self._chat_input_area(friend)
@@ -4165,9 +4167,10 @@ _KEYSTROKE_PAUSE = (0.05, 0.18)
 def _human_pause(what: str) -> None:
     """按 `_PAUSES` / `_MOMENTS_PAUSES` 里那一档随机停一会儿。表里没有的名字不停（不静默乱猜一个值）。"""
     span = _PAUSES.get(what) or _MOMENTS_PAUSES.get(what)
-    if span is None:
+    scale = tuning.PAUSE_SCALE  # 极速模式可改；平时 1，0＝不停
+    if span is None or scale <= 0:
         return
-    time.sleep(random.uniform(*span))
+    time.sleep(random.uniform(*span) * scale)
 
 
 def _type_like_human(edit: Any, text: str) -> None:
@@ -4180,8 +4183,9 @@ def _type_like_human(edit: Any, text: str) -> None:
     老 pywinauto 的 `type_keys` 不一定认 `pause=`，认不出就退回整串输入——
     输不进去比慢一点严重得多，这一层不该有能让加好友失败的新失败点。
     """
+    pause = random.uniform(*_KEYSTROKE_PAUSE) * max(0.0, tuning.PAUSE_SCALE)
     try:
-        edit.type_keys(text, with_spaces=True, pause=random.uniform(*_KEYSTROKE_PAUSE))
+        edit.type_keys(text, with_spaces=True, pause=pause)
     except TypeError:
         edit.type_keys(text, with_spaces=True)
 
@@ -4192,7 +4196,8 @@ class _AddFriendNotStarted(Exception):
 
 #: 搜一个陌生号是**一次网络查找**，慢的时候名片好几秒才渲染出来。等不到就当查无此号，
 #: 是把「慢」误判成「没有」——等久一点只是这条指令多花几秒，判错却让整条计划项记成失败。
-_PROFILE_WAIT_SECONDS = 12.0
+#: 实际读 `tuning.PROFILE_WAIT_SECONDS`（极速模式可改）；这里留同值给旧引用。
+_PROFILE_WAIT_SECONDS = tuning.PROFILE_WAIT_SECONDS
 
 #: 名片那层 Group 在 vendor 的表里是**跟微信版本走的**（见 `_await_contact_profile` 的注释）。
 #: 已知的两个都试一遍，别赌当前这台跑的是表里覆盖到的那个版本。

@@ -14,6 +14,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .. import tuning
 from ..endpoints import DEFAULT_AI_WS_URL, DEFAULT_BUSINESS_API_URL
 
 FILE_NAME = "gateway.env"
@@ -56,9 +57,15 @@ SECTIONS: tuple[Section, ...] = (
     Section("conn", "连接配置", "配置与 AI 端及业务端的连接信息"),
     Section("sched", "调度配置", "配置消息读取与任务调度规则", columns=2),
     Section("boot", "启动设置", "配置服务启动后的行为"),
-    # 不在配置中心里渲染，单独一页「演示」（`window._ensure_demo_page`）。
-    Section("demo", "演示模式", "关闭时显示正在生效的下限，不能修改；开启后可自由填写"),
+    # 不在配置中心里渲染，单独一页「极速模式」（原名「演示」，用户 2026-09-30 要求改名）（`window._ensure_demo_page`）。
+    Section("demo", "节拍下限", "关闭时显示正在生效的下限，不能修改；开启后可自由填写"),
+    Section("demo_wait", "等待与排队", "原来写死在代码里的等待时间与每轮个数", columns=2),
+    Section("demo_conn", "连接与超时", "心跳、超时与等待界面的时长", columns=2),
+    Section("demo_keep", "保留期限", "本机数据与重报的保留时长", columns=2),
 )
+
+#: 「极速模式」那一页渲染的分段（`window._ensure_demo_page`）。
+DEMO_SECTIONS: tuple[str, ...] = ("demo", "demo_wait", "demo_conn", "demo_keep")
 
 #: 配置中心渲染的分段；`demo` 那段在自己的菜单页里。
 SETTINGS_SECTIONS: tuple[str, ...] = ("conn", "sched", "boot")
@@ -162,7 +169,7 @@ FIELDS: tuple[Field, ...] = (
     # 用户 2026-09-30：「这些原来写死的地板值搞一个专门菜单 演示，开启后就可以无视规则」。
     # 左侧单独一页（不和调度配置混在一起）；关着时三格显示正在生效的地板、不能改（`locked_value`），
     # 开着才能填。开启＝解除 30/300 秒地板并关掉随机抖动，只给演示号用（config.py `demo_mode`）。
-    Field("WXCLIENT_GATEWAY_DEMO_MODE", "开启演示模式",
+    Field("WXCLIENT_GATEWAY_DEMO_MODE", "开启极速模式",
           "解除防风控下限、不加随机抖动；真实账号别开", kind="bool", section="demo", default="0"),
     Field("WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS", "读消息间隔",
           "空闲与正聊着都按它；关闭时下限 30", section="demo", unit="秒",
@@ -173,6 +180,12 @@ FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_DEMO_MOMENTS_INTERVAL_SECONDS", "朋友圈间隔",
           "巡看 / 点赞 / 评论；关闭时巡看下限 300", section="demo", unit="秒",
           default="60", minimum=1, locked_value="300"),
+    Field("WXCLIENT_GATEWAY_DEMO_JITTER_PERCENT", "随机抖动",
+          "每次在设定值上随机慢多少；关闭时 30", section="demo", unit="%",
+          default="0", minimum=0, locked_value="30"),
+    # 其余写死的时间项：一张表在 `wxclient/tuning.py`，这里照表生成，不再抄一份。
+    *(Field(k.key, k.label, k.help, section=k.section, unit=k.unit, default=k.default,
+            minimum=k.minimum, locked_value=k.locked) for k in tuning.KNOBS),
     Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动自动运行服务",
           kind="bool", section="boot", default="1"),
     Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", "启动后最小化到系统托盘",

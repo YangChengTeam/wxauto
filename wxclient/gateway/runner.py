@@ -314,7 +314,7 @@ class GatewayRunner:
         if settings.demo_mode:
             # 「改了没生效」是老问题——演示模式开没开，实时日志里要一眼看得见。
             _wechat.warning(
-                "演示模式已开：下限已解除、不加随机抖动（仅限演示号）",
+                "极速模式已开：下限已解除、不加随机抖动（仅限演示号）",
                 读消息秒=settings.demo_poll_interval_seconds,
                 好友秒=settings.demo_friend_interval_seconds,
                 朋友圈秒=settings.demo_moments_interval_seconds,

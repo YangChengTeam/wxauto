@@ -63,14 +63,15 @@ class ScheduleLoop:
         run_command: Callable[[str, dict], Awaitable[None]],
         is_active: Callable[[datetime], bool] | None = None,
         clock: Callable[[], datetime] | None = None,
-        interval_seconds: float = CHECK_INTERVAL_SECONDS,
+        interval_seconds: float | None = None,
     ) -> None:
         self._accounts = list(accounts)
         self._store = store
         self._run_command = run_command
         self._is_active = is_active or (lambda _now: True)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._interval = interval_seconds
+        # 没给就用模块的 `CHECK_INTERVAL_SECONDS`——**建对象时才读**，极速模式（`tuning`）改得到它。
+        self._interval = CHECK_INTERVAL_SECONDS if interval_seconds is None else interval_seconds
         self._stopped = asyncio.Event()
 
     async def tick(self) -> int:

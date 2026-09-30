@@ -17,7 +17,7 @@ from wxclient.config import load_settings
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
 
-from .. import logrole
+from .. import logrole, tuning
 from .agent_files import AgentFileUploader, http_base_from_ws
 from .attachments import AttachmentFetcher
 from .autofriend import AutoFriendWatcher
@@ -136,6 +136,10 @@ def build_gateway(
         )
     # 演示模式关抖动、换地板（`GatewaySettings._apply_demo_mode`）；平时这两样就是 pacing 的常量。
     set_jitter_ratio(gateway_settings.jitter_ratio)
+    # 写死在各模块里的时间项（`wxclient.tuning`）：极速开着换成填的值，关着恢复原值。
+    tuned = tuning.apply()
+    if tuned:
+        _log.warning("极速模式：写死的时间项已按配置替换", **tuned)
     friend_interval = gateway_settings.friend_check_interval_seconds
     if friend_interval > 0:
         friend_interval = clamp_interval(

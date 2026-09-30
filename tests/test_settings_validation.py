@@ -44,7 +44,7 @@ class FloorsMatchTheGatewayTests(unittest.TestCase):
 
     def test_no_other_field_grew_a_floor_by_accident(self) -> None:
         """地板只给网关真会 clamp 的两格。加好友最小间隔刻意没有地板（config.py 里写明「调小自己清楚」）。"""
-        floored = {f.key for f in FIELDS if f.minimum is not None and f.section != "demo"}
+        floored = {f.key for f in FIELDS if f.minimum is not None and not f.section.startswith("demo")}
         self.assertEqual(floored, {POLL, FRIEND})
 
 
@@ -210,8 +210,10 @@ class DemoModeTests(unittest.TestCase):
             MIN_READ_INTERVAL_SECONDS,
         )
 
-        self.assertNotIn("demo", settings_store.SETTINGS_SECTIONS)
+        self.assertFalse(set(settings_store.DEMO_SECTIONS) & set(settings_store.SETTINGS_SECTIONS))
         locked = {f.key: f.locked_value for f in FIELDS if f.locked_value}
+        locked = {k: v for k, v in locked.items()
+                  if k in (self.DEMO_READ, self.DEMO_FRIEND, self.DEMO_MOMENTS)}
         self.assertEqual(locked, {
             self.DEMO_READ: f"{MIN_READ_INTERVAL_SECONDS:g}",
             self.DEMO_FRIEND: f"{MIN_FRIEND_INTERVAL_SECONDS:g}",
@@ -219,3 +221,77 @@ class DemoModeTests(unittest.TestCase):
         })
         self.assertEqual(validate({self.DEMO_READ: "5"}), {})
         self.assertIn(self.DEMO_READ, validate({self.DEMO_READ: "0.5"}))
+
+
+class SpeedKnobTableTests(unittest.TestCase):
+    """极速模式那张表（`wxclient/tuning.py`）：灰着显示的数必须就是源码里真在用的那个。"""
+
+    def test_every_locked_value_is_the_real_hard_coded_value(self) -> None:
+        import importlib
+        from unittest import mock
+
+        from wxclient import tuning
+        from wxclient.gateway.config import GatewaySettings
+
+        with mock.patch.dict("os.environ", {}, clear=True):
+            gateway = GatewaySettings()
+        for knob in tuning.KNOBS:
+            where, attr = knob.target.split(":", 1)
+            actual = getattr(gateway, attr) if where == "settings" else getattr(
+                importlib.import_module(where), attr)
+            self.assertEqual(float(actual), float(knob.locked), knob.name)
+
+    def test_every_knob_has_a_field_on_the_speed_page(self) -> None:
+        from wxclient import tuning
+
+        keys = {f.key for f in FIELDS if f.section in settings_store.DEMO_SECTIONS}
+        for knob in tuning.KNOBS:
+            self.assertIn(knob.key, keys)
+            self.assertIn(knob.section, settings_store.DEMO_SECTIONS)
+        self.assertTrue(all(f.locked_value for f in FIELDS
+                            if f.section in settings_store.DEMO_SECTIONS and f.kind != "bool"))
+
+    def test_apply_on_then_off_restores_the_originals(self) -> None:
+        from wxclient import tuning
+        from wxclient.gateway import runner, schedule, wechat_io
+
+        on = {tuning.TOGGLE_KEY: "1",
+              "WXCLIENT_GATEWAY_DEMO_MAX_PEERS_PER_POLL": "15",
+              "WXCLIENT_GATEWAY_DEMO_CONTACTS_SYNC_INTERVAL_SECONDS": "7",
+              "WXCLIENT_GATEWAY_DEMO_PAUSE_SCALE": "0"}
+        try:
+            changed = tuning.apply(on)
+            self.assertEqual(wechat_io.MAX_PEERS_PER_POLL, 15)
+            self.assertEqual(runner.CONTACTS_SYNC_INTERVAL_SECONDS, 7.0)
+            self.assertEqual(tuning.PAUSE_SCALE, 0.0)
+            self.assertEqual(schedule.CHECK_INTERVAL_SECONDS, 5.0, "没填的用极速默认值")
+            self.assertIn("MAX_PEERS_PER_POLL", changed)
+        finally:
+            self.assertEqual(tuning.apply({}), {})
+        self.assertEqual(wechat_io.MAX_PEERS_PER_POLL, 8)
+        self.assertEqual(runner.CONTACTS_SYNC_INTERVAL_SECONDS, 120.0)
+        self.assertEqual(tuning.PAUSE_SCALE, 1.0)
+        self.assertEqual(schedule.CHECK_INTERVAL_SECONDS, 30.0)
+
+    def test_settings_level_knobs_follow_the_toggle(self) -> None:
+        from unittest import mock
+
+        from wxclient.gateway.config import GatewaySettings
+
+        env = {"WXCLIENT_GATEWAY_DEMO_DEBOUNCE_SECONDS": "0",
+               "WXCLIENT_GATEWAY_DEMO_TURN_TIMEOUT_SECONDS": "60"}
+        with mock.patch.dict("os.environ", env, clear=True):
+            off = GatewaySettings()
+        with mock.patch.dict("os.environ", {**env, "WXCLIENT_GATEWAY_DEMO_MODE": "1"}, clear=True):
+            on = GatewaySettings()
+        self.assertEqual((off.debounce_seconds, off.turn_timeout_seconds), (3.0, 180.0))
+        self.assertEqual((on.debounce_seconds, on.turn_timeout_seconds), (0.0, 60.0))
+
+    def test_jitter_percent_is_editable_in_speed_mode(self) -> None:
+        from unittest import mock
+
+        from wxclient.gateway.config import GatewaySettings
+
+        env = {"WXCLIENT_GATEWAY_DEMO_MODE": "1", "WXCLIENT_GATEWAY_DEMO_JITTER_PERCENT": "10"}
+        with mock.patch.dict("os.environ", env, clear=True):
+            self.assertAlmostEqual(GatewaySettings().jitter_ratio, 0.1)

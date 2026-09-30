@@ -220,7 +220,7 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
         # 这里测的是**判据**，不是耐心。
         from unittest import mock
 
-        patcher = mock.patch("wxclient.wechat_api.uia._PROFILE_WAIT_SECONDS", 0.05)
+        patcher = mock.patch("wxclient.tuning.PROFILE_WAIT_SECONDS", 0.05)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -415,7 +415,7 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
         add_button.exists = renders_on_the_third_poll   # type: ignore[method-assign]
         profile = _FakeControl("名片", text="张三", children={"add": add_button}, log=log)
 
-        with mock.patch("wxclient.wechat_api.uia._PROFILE_WAIT_SECONDS", 3.0):
+        with mock.patch("wxclient.tuning.PROFILE_WAIT_SECONDS", 3.0):
             driver._contact_profile_roots = lambda pane, ui: [profile, pane]  # type: ignore[assignment]
             driver.add_friend("13800138000", "你好")
 

@@ -1107,6 +1107,7 @@ class SettingsDefaultsTests(unittest.TestCase):
         两处各写一份，对不上的后果特别阴：界面显示 60 秒，实际按 300 秒跑，
         而两边都「没配置错」。这里去比对 `GatewaySettings` / `UiSettings` 本尊。
         """
+        from wxclient import tuning
         from wxclient.gateway.config import GatewaySettings
         from wxclient.ui.config import UiSettings
 
@@ -1122,6 +1123,9 @@ class SettingsDefaultsTests(unittest.TestCase):
                 int(gateway.demo_friend_interval_seconds),
             "WXCLIENT_GATEWAY_DEMO_MOMENTS_INTERVAL_SECONDS":
                 int(gateway.demo_moments_interval_seconds),
+            "WXCLIENT_GATEWAY_DEMO_JITTER_PERCENT": int(gateway.demo_jitter_percent),
+            # 其余极速项照 `wxclient.tuning.KNOBS` 生成；locked 值对得上源码由 test_settings_validation 管
+            **{knob.key: knob.default for knob in tuning.KNOBS},
             "WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS":
                 int(gateway.friend_check_interval_seconds),
             "WXCLIENT_GATEWAY_FRIEND_RECHECK_INTERVAL_SECONDS":

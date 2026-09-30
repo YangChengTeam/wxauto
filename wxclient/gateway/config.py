@@ -10,6 +10,7 @@ from pathlib import Path
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .. import tuning
 from ..endpoints import DEFAULT_AI_WS_URL, DEFAULT_BUSINESS_API_URL
 from .pacing import (
     JITTER_RATIO,
@@ -102,6 +103,9 @@ class GatewaySettings(BaseSettings):
 
     demo_moments_interval_seconds: float = 60.0
     """演示：朋友圈点赞 / 评论最小间隔，以及巡看的地板（巡看本身仍由「朋友圈巡看间隔」开关）。"""
+
+    demo_jitter_percent: float = 0.0
+    """极速：随机抖动（%）。平时 30%（`pacing.JITTER_RATIO`），极速默认 0＝填多少就是多少。"""
 
     friend_check_interval_seconds: float = 900.0
     """多久查一次新好友申请。加好友是风控最敏感的一类动作，节拍要比读消息慢一个量级。
@@ -295,6 +299,9 @@ class GatewaySettings(BaseSettings):
         self.moment_comment_interval_seconds = moments
         if self.moments_poll_interval_seconds > 0:
             self.moments_poll_interval_seconds = moments
+        # 写死的那批里落在本对象上的几项（回复前静默、热窗、一轮上限、换票超时），见 `wxclient.tuning`。
+        for attr, value in tuning.settings_overrides().items():
+            setattr(self, attr, float(value))
         return self
 
     @property
@@ -314,8 +321,8 @@ class GatewaySettings(BaseSettings):
 
     @property
     def jitter_ratio(self) -> float:
-        """演示模式不抖（填多少就是多少）；平时 `pacing.JITTER_RATIO`。"""
-        return 0.0 if self.demo_mode else JITTER_RATIO
+        """极速模式按 `demo_jitter_percent`（默认 0，填多少就是多少）；平时 `pacing.JITTER_RATIO`。"""
+        return max(0.0, self.demo_jitter_percent) / 100.0 if self.demo_mode else JITTER_RATIO
 
     def validate_for_start(self) -> None:
         if not self.ai_ws_url:

@@ -107,7 +107,7 @@ _SPINNER = ("◐", "◓", "◑", "◒")
 #:
 #: ★ 曾经还有一页「计划中心」，2026-08-15 用户裁决删掉：**计划归 AI 端**（几点做什么、
 #: 多久跟进一次由 AI 端排，指令经 WS 推下来），桌面端摆一页只会让人以为计划在这儿配。
-_PAGE_TITLES = {"log": "实时日志", "debug": "调试会话", "settings": "配置中心", "demo": "演示"}
+_PAGE_TITLES = {"log": "实时日志", "debug": "调试会话", "settings": "配置中心", "demo": "极速模式"}
 
 #: 标题底下那句话。空 = 这一页不摆副标题。
 _PAGE_SUBTITLES = {
@@ -337,7 +337,7 @@ class MainWindow:
         self._nav: dict[str, tk.Label] = {}
         self._nav_marks: dict[str, tk.Frame] = {}
         for page, text in (("log", "实时日志"), ("debug", "调试会话"), ("settings", "配置中心"),
-                           ("demo", "演示")):
+                           ("demo", "极速模式")):
             # 选中的那一页在**最左边**立一根绿条（`docs/main.png`）。只靠深一档的底色
             # 在这张暗纹背景上几乎看不出来，绿条才是「我在这儿」的那个信号。
             row = tk.Frame(bar, bg=theme.SIDEBAR_BG)
@@ -946,7 +946,7 @@ class MainWindow:
         return self._config_page
 
     def _ensure_demo_page(self) -> Any:
-        """「演示」页：同一套参数控件，只管 demo 那一段，存到同一个 gateway.env。
+        """「极速模式」页：同一套参数控件，只管 demo 那一段，存到同一个 gateway.env。
 
         和配置中心分开建、分开 reload：两页任一页保存后，另一页下次进来会重读磁盘。
         """
@@ -956,7 +956,7 @@ class MainWindow:
             self._demo_page = tk.Frame(self._pages, bg=theme.CONTENT_BG)
             scroller, inner = self._build_scroller(self._demo_page)
             self._demo_settings = SettingsPage(
-                inner, self.data_dir, on_saved=self._on_settings_saved, sections=("demo",),
+                inner, self.data_dir, on_saved=self._on_settings_saved, sections=settings_store.DEMO_SECTIONS,
             )
             self._demo_settings.build_action_bar(self._demo_page).pack(side=tk.BOTTOM, fill=tk.X)
             scroller.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
