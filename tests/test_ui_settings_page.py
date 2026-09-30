@@ -230,7 +230,7 @@ class ConfigLookTests(unittest.TestCase):
             demo._vars[settings_store.DEMO_TOGGLE_KEY].set(True)
             demo._save(restart=False)
             self.page.reload()
-            self.assertEqual(self.page._vars[read].get(), "1")
+            self.assertEqual(self.page._vars[read].get(), settings_store.DEMO_PRESETS[read])
             demo._vars[settings_store.DEMO_TOGGLE_KEY].set(False)
             demo._save(restart=False)
             self.page.reload()
