@@ -65,12 +65,24 @@ def looks_like_rejection(text: str) -> bool:
     return any(pattern.search(normalized) for pattern in _REJECT_PATTERNS)
 
 
+def _parse_clock(raw: str, *, allow_end_of_day: bool) -> time:
+    """``HH:MM``；结束时刻另认 ``24:00`` = 一天的末尾（``time`` 本身表示不了 24 点）。"""
+    raw = raw.strip()
+    if allow_end_of_day and raw in ("24:00", "24:00:00"):
+        return time.max
+    return time.fromisoformat(raw)
+
+
 def parse_active_hours(window: str) -> tuple[time, time]:
-    """解析 ``"09:00-21:00"``。格式不对直接抛——配置错了就别启动。"""
+    """解析 ``"09:00-21:00"``。格式不对直接抛——配置错了就别启动。
+
+    ``00:00-24:00`` = 全天不停（用户 2026-10-01）。原来只能写 ``00:00-23:59``，
+    23:59:xx 那一分钟比 23:59:00 大，反倒落在窗外。
+    """
     try:
         start_raw, end_raw = window.split("-", 1)
-        start = time.fromisoformat(start_raw.strip())
-        end = time.fromisoformat(end_raw.strip())
+        start = _parse_clock(start_raw, allow_end_of_day=False)
+        end = _parse_clock(end_raw, allow_end_of_day=True)
     except Exception as exc:
         raise ValueError(f"active_hours 格式应为 HH:MM-HH:MM，收到 {window!r}") from exc
     return start, end

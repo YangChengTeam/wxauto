@@ -122,14 +122,14 @@ FIELDS: tuple[Field, ...] = (
     # 用户 2026-09-07：说明太长把输入框挤坏了（调度配置一行两组），全部精简成半句。
     # 原来写在说明里的两条限定挪到这里：① 通过检测实际仍受「查好友」那档 ≥300 秒的
     # 整机节拍约束，填更小也不会更快；② 期限到了只是别让他占住名额，不代表判定对方
-    # 不会通过。工作时间窗格式形如 09:00-21:00（placeholder/default 已经示范了）。
+    # 不会通过。工作时间窗格式形如 09:00-21:00（placeholder/default 已经示范了），全天写 00:00-24:00。
     Field("WXCLIENT_GATEWAY_FRIEND_RECHECK_INTERVAL_SECONDS", "查好友通过间隔",
           "多久搜一次是否通过；0=不搜",
           section="sched", unit="秒", default="900"),
     Field("WXCLIENT_GATEWAY_FRIEND_RECHECK_DEADLINE_HOURS", "查好友通过期限",
           "超过就不再搜；0=一直搜",
           section="sched", unit="小时", default="72"),
-    Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "窗外不动微信",
+    Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "窗外不动微信；全天填 00:00-24:00",
           section="sched", default="09:00-21:00"),
     # 用户 2026-09-15：私聊那档（20/时）也要能在配置中心改。原来界面上只有总闸一格，
     # 标题却叫「每小时发送上限」——专员把它调高，私聊照样被 20 那档拦住，而两边都

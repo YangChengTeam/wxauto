@@ -253,6 +253,18 @@ class ActiveHoursTests(unittest.TestCase):
         self.assertTrue(within_active_hours(datetime(2026, 8, 10, 1, 0), window))
         self.assertFalse(within_active_hours(datetime(2026, 8, 10, 12, 0), window))
 
+    def test_all_day_window(self) -> None:
+        window = "00:00-24:00"
+        self.assertTrue(within_active_hours(datetime(2026, 8, 10, 0, 0), window))
+        self.assertTrue(within_active_hours(datetime(2026, 8, 10, 3, 0), window))
+        self.assertTrue(within_active_hours(datetime(2026, 8, 10, 23, 59, 59), window))
+
+    def test_end_of_day_only_for_end(self) -> None:
+        self.assertTrue(within_active_hours(datetime(2026, 8, 10, 23, 30), "21:00-24:00"))
+        self.assertFalse(within_active_hours(datetime(2026, 8, 10, 12, 0), "21:00-24:00"))
+        with self.assertRaises(ValueError):
+            within_active_hours(datetime(2026, 8, 10, 12, 0), "24:00-09:00")
+
     def test_bad_format_rejected(self) -> None:
         with self.assertRaises(ValueError):
             within_active_hours(datetime(2026, 8, 10, 12, 0), "早上到晚上")
