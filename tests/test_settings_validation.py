@@ -165,6 +165,28 @@ class DemoModeTests(unittest.TestCase):
         self.assertEqual(settings.moments_floor_seconds, DEMO_MIN_SECONDS)
         self.assertEqual(settings.jitter_ratio, 0.0)
 
+    def test_on_lifts_the_total_send_cap(self) -> None:
+        """用户 2026-10-07：极速模式下发送总上限自动不限；关着时填多少就是多少。"""
+        total = "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR"
+        self.assertEqual(self._settings(**{total: "30"}).max_sends_per_hour, 30)
+        on = self._settings(WXCLIENT_GATEWAY_DEMO_MODE="1", **{total: "30"})
+        self.assertEqual(on.max_sends_per_hour, 0)
+        self.assertEqual(on.max_friend_actions_per_hour, 5, "加好友上限不跟着放开")
+
+    def test_turning_on_sets_the_total_box_to_0_and_turning_off_puts_it_back(self) -> None:
+        total = "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR"
+        toggle = settings_store.DEMO_TOGGLE_KEY
+        on = settings_store.apply_demo_presets({toggle: "1", total: "30"})
+        self.assertEqual(on[total], "0")
+        self.assertEqual(settings_store.apply_demo_presets({**on, toggle: "0"})[total], "30")
+        # 已经开着、只备份过读消息间隔的老文件：总上限这格照样补上备份并改 0。
+        old = {toggle: "1", self.READ: "5", settings_store.DEMO_SAVED_PREFIX + "POLL_INTERVAL_SECONDS": "180",
+               total: "30"}
+        synced = settings_store.apply_demo_presets(old)
+        self.assertEqual(synced[total], "0")
+        back = settings_store.apply_demo_presets({**synced, toggle: "0"})
+        self.assertEqual((back[self.READ], back[total]), ("180", "30"))
+
     def test_save_check_follows_the_toggle(self) -> None:
         on = {"WXCLIENT_GATEWAY_DEMO_MODE": "1"}
         self.assertEqual(validate({**on, self.READ: "5"}), {})

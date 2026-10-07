@@ -58,7 +58,7 @@ SECTIONS: tuple[Section, ...] = (
     Section("sched", "调度配置", "配置消息读取与任务调度规则", columns=2),
     Section("boot", "启动设置", "配置服务启动后的行为"),
     # 不在配置中心里渲染，单独一页「极速模式」（原名「演示」，用户 2026-09-30 要求改名）（`window._ensure_demo_page`）。
-    Section("demo", "极速开关", "开启后读消息间隔改为 5 秒，关闭后恢复原值"),
+    Section("demo", "极速开关", "开启后读消息间隔改为 5 秒、发送总上限改为不限，关闭后恢复原值"),
     Section("demo_wait", "等待与排队", "", columns=2),
     Section("demo_conn", "连接与超时", "", columns=2),
     Section("demo_keep", "保留期限", "", columns=2),
@@ -74,7 +74,12 @@ DEMO_TOGGLE_KEY = "WXCLIENT_GATEWAY_DEMO_MODE"
 DEMO_MIN_SECONDS = 1.0
 #: 开启极速模式时配置中心里跟着改掉的格子 → 开启后的值；关掉时恢复开启前的原值（`apply_demo_presets`）。
 #: 用户 2026-09-30：「开启极速模式读消息间隔变为 1，框框中的参数也要变」，随后改口「配置 5 秒吧，1 秒太快了」。
-DEMO_PRESETS: dict[str, str] = {"WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": "5"}
+#: 用户 2026-10-07：极速模式下「发送总上限」自动不限（真机撞「该账号一小时内已做 29 次，达到上限 30」）。
+#: 只放开总闸；加好友 / 朋友圈 / 点赞这些事故倒推或用户定过的分档上限不动。
+DEMO_PRESETS: dict[str, str] = {
+    "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": "5",
+    "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": "0",
+}
 #: 极速模式开着时保存检查降到 `DEMO_MIN_SECONDS` 的格子。查新好友那格不在里面（用户 2026-09-30：「查好友不能太快」）。
 DEMO_UNLOCKED: frozenset[str] = frozenset({"WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS"})
 #: 开启前原值的备份键前缀（存在同一个 gateway.env 里，不上界面）。

@@ -267,9 +267,11 @@ class GatewaySettings(BaseSettings):
     @model_validator(mode="after")
     def _apply_demo_mode(self) -> GatewaySettings:
         """极速模式开着：写死的那批里落在本对象上的几项（回复前静默、热窗、一轮上限、换票超时）
-        换成极速值，见 `wxclient.tuning`。间隔不在这里改——配置中心填多少就是多少，只是地板降了。"""
+        换成极速值，见 `wxclient.tuning`。间隔不在这里改——配置中心填多少就是多少，只是地板降了。
+        发送总上限恒为不限（用户 2026-10-07）：配置中心那格由 `DEMO_PRESETS` 改成 0，这里兜住只设了环境变量没走配置中心的路。"""
         if not self.demo_mode:
             return self
+        self.max_sends_per_hour = 0
         for attr, value in tuning.settings_overrides().items():
             setattr(self, attr, float(value))
         return self
