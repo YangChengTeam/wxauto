@@ -669,6 +669,7 @@ class GatewayRunner:
         if self._contacts is None:
             return False
         complete = full and bool(self._accounts)
+        synced: list[dict[str, Any]] = []
         for account_id in self._accounts:
             if full:
                 rows = await self._contacts.pull_all()
@@ -678,12 +679,23 @@ class GatewayRunner:
                     continue
                 dropped = self._store.replace_accepted_contacts(account_id, rows)
                 _backend.info("候选人会话名已全量同步", account=account_id, saved=len(rows), 移除=dropped)
+                synced.extend(rows)
                 continue
             since = self._store.contacts_synced_until(account_id)
             rows = await self._contacts.pull(updated_since=since)
             if rows:
                 saved = self._store.save_contacts(account_id, rows)
                 _backend.info("候选人会话名已同步", account=account_id, saved=saved, incremental=bool(since))
+                synced.extend(rows)
+        # ★ 这次同步带回来的 accepted 会话，本机移出过也放回来（用户 2026-10-07）。
+        #   只认**这一趟拉到的行**，不认本机整张表：增量只回业务端动过的行，否则查无此人被
+        #   自动移出的人每 120 秒就被放回一次、再白读 3 轮。点「同步名单」是全量，等于全部放回。
+        if self._watchlist is not None:
+            self._watchlist.include_synced(
+                str(row.get("session_name") or "")
+                for row in synced
+                if row.get("contact_status") == "accepted"
+            )
         self._apply_derived_watchlist(authoritative=complete)
         return complete
 
@@ -976,9 +988,9 @@ class GatewayRunner:
     async def _on_contact_not_found(self, account_id: str, peer_id: str) -> None:
         """名单里这个会话连续几轮都「查无此人」→ 在本机移出监听名单，之后不再去读它（用户 2026-09-24）。
 
-        落在本机「不管」里（同配置中心的「移出」，`Watchlist.exclude`）：业务端同步只换「只管」，
-        不会把他带回来；每轮白开一次搜不到的会话，既浪费读名额，又在日志里刷一遍查无此人。
-        唯一放回来的路：093 复查确认他通过了好友（`_on_friend_accepted` → `Watchlist.include`）。
+        落在本机「不管」里（同配置中心的「移出」，`Watchlist.exclude`）：每轮白开一次搜不到的会话，
+        既浪费读名额，又在日志里刷一遍查无此人。放回来的路：093 复查确认他通过了好友
+        （`_on_friend_accepted` → `Watchlist.include`），或业务端同步再带回他（`include_synced`）。
         """
         if self._watchlist is None:
             return
@@ -1393,7 +1405,8 @@ class GatewayRunner:
 
         ★ 删在**本机**（`Watchlist.exclude`，用户 2026-09-24）。原来走 WS 请 AI 端删，可名单权威
           0.1.83 起在业务后端，AI 端手上没有这份名单，永远回「本来就不在」，界面那一行删不掉。
-          业务后端没有「移出」接口，本机「不管」就是这里唯一能落地的地方，同步也不会把人带回来。
+          业务后端没有「移出」接口，本机「不管」就是这里唯一能落地的地方。业务端同步再带回这个人
+          就放回来（用户 2026-10-07），所以要长期不回他得在业务端把人移走。
         """
         if self._watchlist is None:
             raise AgentWsError("监听名单还没准备好")

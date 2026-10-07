@@ -601,7 +601,8 @@ class FullResyncTests(unittest.IsolatedAsyncioTestCase):
         await runner._sync_contacts_once()
         self.assertEqual(watchlist.watched(), ["张三"], "不是业务端明说的空，fail-closed 不接管")
 
-    async def test_x_本机移出的人_点同步名单也不回来(self) -> None:
+    async def test_x_本机移出的人_点同步名单业务端还有就回来(self) -> None:
+        """★ 用户 2026-10-07：「只要同步名单有就同步过来」——推翻 0.1.85 的「移出了同步也不回来」。"""
         d = FakeDirectory([self._row("1", "张三"), self._row("2", "大月")])
         runner, watchlist = self._runner(d)
         await runner._sync_contacts_once()
@@ -610,8 +611,44 @@ class FullResyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["removed"], ["大月"])
         self.assertEqual(watchlist.watched(), ["张三"])
 
+        result = await runner.sync_watched()
+        self.assertEqual(watchlist.watched(), ["大月", "张三"], "★ 业务端还给着却进不来 = 同步不生效")
+        self.assertEqual(result["blocked"], 0)
+
+    async def test_x_本机移出的人_业务端不给了_点同步不回来(self) -> None:
+        d = FakeDirectory([self._row("1", "张三"), self._row("2", "大月")])
+        runner, watchlist = self._runner(d)
+        await runner._sync_contacts_once()
+        await runner.remove_watched("大月")
+
+        d._rows = [self._row("1", "张三")]
         await runner.sync_watched()
-        self.assertEqual(watchlist.watched(), ["张三"], "★ 移出了又被同步带回来 = 删不掉")
+        self.assertEqual(watchlist.watched(), ["张三"])
+
+    async def test_x_后台增量拉到这个人_也放回来(self) -> None:
+        d = FakeDirectory([self._row("1", "张三"), self._row("2", "大月")])
+        runner, watchlist = self._runner(d)
+        await runner._sync_contacts_once()
+        await runner.remove_watched("大月")
+
+        d._rows = [self._row("2", "大月")]  # 业务端动了他那一行，增量带回来
+        await runner._sync_contacts_once()
+        self.assertEqual(watchlist.watched(), ["大月", "张三"])
+
+    async def test_x_查无此人移出的_后台增量没拉到就不反复放回(self) -> None:
+        d = FakeDirectory([self._row("1", "张三"), self._row("2", "大月")])
+        runner, watchlist = self._runner(d)
+        await runner._sync_contacts_once()
+        await runner._on_contact_not_found("acct-1", "大月")
+        self.assertEqual(watchlist.watched(), ["张三"])
+
+        d._rows = []  # 增量这一趟业务端没动任何行
+        await runner._sync_contacts_once()
+        self.assertEqual(watchlist.watched(), ["张三"], "★ 每 120 秒放回一次 = 每轮白读查无此人")
+
+        d._rows = [self._row("1", "张三"), self._row("2", "大月")]
+        await runner.sync_watched()  # 点「同步名单」：业务端还给着 → 放回，查无此人再由轮询移出
+        self.assertEqual(watchlist.watched(), ["大月", "张三"])
 
     async def test_x_全量没拉全_一个都不删(self) -> None:
         d = FakeDirectory([self._row("1", "张三"), self._row("2", "李四")])

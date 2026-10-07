@@ -138,8 +138,8 @@ class Watchlist:
         ★ 移出发生在**本机**（用户 2026-09-24：「删除报不在其白名单内，应该把界面上删除」）。
           名单权威 0.1.83 起在业务后端，AI 端手上已经没有这份名单，原来请 AI 端删
           永远回「本来就不在」，界面上那一行怎么点都还在。业务后端又没有「移出」的接口，
-          所以落进 ``never``：后端同步只换 ``only``（`_merge`）、重启会读回来，
-          下一次同步也不会把这个人带回来。
+          所以落进 ``never``，重启会读回来。
+        ★ 2026-10-07 起移出**不是永久的**：业务端同步再带回这个人就放回来（`include_synced`）。
         """
         name = str(peer_id or "").strip()
         if not name or name not in self.watched():
@@ -164,6 +164,22 @@ class Watchlist:
             self._persist(self._scope)
         _log.info("已把这个会话放回监听名单", 会话=name, 只管=len(self._scope.only), 不管=len(self._scope.never))
         return True
+
+    def include_synced(self, names: Iterable[str]) -> int:
+        """业务端这次同步带回来的人，从本机「不管」里拿出来，落盘一次。返回放回了几个。
+
+        ★ 用户 2026-10-07：「只要同步名单有就同步过来，如果后面轮询查无此人就再删除。」
+          推翻 0.1.85「本机移出的人，同步也不带回来」——那样移出过的人业务端再怎么给也进不来。
+          放回来的人如果真查无此人，`runner._on_contact_not_found` 会照旧连续 3 轮后再移出。
+        """
+        back = self._scope.never & _clean(names)
+        if not back:
+            return 0
+        self._scope = replace(self._scope, never=self._scope.never - back)
+        if self._persist is not None:
+            self._persist(self._scope)
+        _log.info("同步带回了本机移出过的会话", 放回=len(back), 不管=len(self._scope.never))
+        return len(back)
 
     def apply_scope(self, scope: WatchScope) -> None:
         """直接装一份名单（从库里读回来时用），不落盘、不打日志。"""

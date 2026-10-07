@@ -684,7 +684,8 @@ class MainWindow:
         """「移出」：先问一句，再在本机移出（`GatewayRunner.remove_watched`）。
 
         ★ 问的这一句要说清后果：删掉之后**他再来消息不会被自动回复**。移出落在本机「不管」里，
-        同步名单不会把他带回来（用户 2026-09-24：原来请 AI 端删，永远回「本来就不在」，删不掉）。
+        业务端同步再带回他就重新加回来（用户 2026-10-07：「只要同步名单有就同步过来」；
+        2026-09-24 改本机移出是因为原来请 AI 端删，永远回「本来就不在」，删不掉）。
 
         ★ 弹框的 parent 必须是**真控件**（`self.root`）：`MainWindow` 不是 tk 控件，
         传 `self` 会在 `winfo_toplevel()` 上抛 AttributeError——而 tk 回调里的异常在
@@ -697,7 +698,7 @@ class MainWindow:
         if not dialog.ask(
             self.root, "移出监听名单",
             f"移出「{name}」之后，他再发消息就不会被自动回复了。\n\n"
-            "只在这台电脑上移出，之后同步名单也不会把他加回来。",
+            "只在这台电脑上移出。业务端同步名单里还有他的话，同步后会重新加回来。",
             confirm="移出", cancel="取消",
         ):
             return
@@ -804,7 +805,7 @@ class MainWindow:
             return
 
         # ★「移出」放在最右：名单是白名单，删掉 = 从此不再自动回他，是有后果的动作，
-        # 所以点了先问一句（`_ask_remove_watched`）；落在本机「不管」里，同步不会把人带回来。
+        # 所以点了先问一句（`_ask_remove_watched`）；落在本机「不管」里，业务端同步再带回来就放回。
         remove = tk.Label(row, text="移出", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
                           fg=theme.TEXT_MUTED, cursor="hand2")
         remove.pack(side=tk.RIGHT, padx=(0, 16))

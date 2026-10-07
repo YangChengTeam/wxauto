@@ -95,7 +95,7 @@ class RunnerExclusionTests(unittest.IsolatedAsyncioTestCase):
         runner = self._runner()
         await GatewayRunner._on_contact_not_found(runner, ACCOUNT, NAME)  # type: ignore[arg-type]
         self.assertEqual(runner._watchlist.watched(), ["李四"])
-        # 业务端同步只换「只管」，不会把他带回来。
+        # 光换「只管」不放回；放回只在 runner 同步拉到他那一行时（`include_synced`）。
         runner._watchlist.apply_backend({"only": [NAME, "李四"]})
         self.assertEqual(runner._watchlist.watched(), ["李四"])
 
