@@ -33,6 +33,9 @@ CAP_DELIVERY_RECEIPT = "delivery_receipt"
 #: AI 端 123 节前祝福：认得回复卡上的 `holiday_greeting`（过截止时间剥掉那句、带祝福那段的出站事件挂业务端指令号）。
 #: AI 端没见到这一项就不向业务端占位、不拼祝福——老助手不认这个槽位，发了也对不上账（0.1.89 起）。
 CAP_HOLIDAY_GREETING = "holiday_greeting_v1"
+#: AI 端 138 开场发送协调：逐条报来源 + 好友建立事件，开场指令带名额凭据、回执报发了/没发/不知道。
+#: 前提是认得出本机登录的是哪个微信（`accountRef`）——AI 端拿它把同一个号的两条开场路并成一个名额。
+CAP_DELIVERY_COORDINATION = "delivery_coordination_v1"
 
 #: 网关 → AI 端上报能力用的 op。
 CAPABILITIES_OP = "wechat.capabilities"
@@ -49,6 +52,7 @@ CAPABILITY_LABELS: dict[str, str] = {
     CAP_READ: "查看联系人/聊天记录/朋友圈",
     CAP_DELIVERY_RECEIPT: "回报消息发送凭据",
     CAP_HOLIDAY_GREETING: "节前祝福对账",
+    CAP_DELIVERY_COORDINATION: "开场发送协调",
 }
 
 #: op → 能力键。没登记的 op 一律按「读」处理（读类不改变外部世界）。
@@ -115,6 +119,7 @@ def probe_capabilities(
     allow_real_actions: bool,
     has_file_channel: bool,
     supported_ops: set[str] | None = None,
+    account_ref: str = "",
 ) -> dict[str, Capability]:
     """按当下的真实条件算出能力表。
 
@@ -145,6 +150,8 @@ def probe_capabilities(
         CAP_DELIVERY_RECEIPT,
         # 指令号只挂在真发出去的那一段上：只走流程不真发 = 业务端永远确认不了，不如别让 AI 端占位。
         CAP_HOLIDAY_GREETING,
+        # 协调只管「发出去的开场」：只走流程不真发 = 没有开场可协调、也报不出凭据。
+        CAP_DELIVERY_COORDINATION,
     )
     if not allow_real_actions:
         for key in write_keys:
@@ -155,6 +162,11 @@ def probe_capabilities(
         caps[CAP_SEND_FILES] = Capability(
             CAP_SEND_FILES, False, "这台电脑没有配取文件的通道，发不了系统生成的图片和文件"
         )
+
+    if not account_ref:
+        # 认不出这台电脑登录的是哪个微信号：不声明这项，AI 端照旧流程走，消息照样发——
+        # 报成「不可用」会把企业端状态拉成「受限」，可这台机器什么都没少。
+        caps.pop(CAP_DELIVERY_COORDINATION)
 
     # 白名单里没有的 op = 这个版本的网关压根不支持。
     for op, key in CAPABILITY_OF_OP.items():
@@ -177,6 +189,11 @@ def _wechat_blocker(uia: dict[str, Any] | None) -> str:
     return ""
 
 
-def capabilities_frame(caps: dict[str, Capability]) -> dict[str, Any]:
-    """上报给 AI 端的形状。"""
-    return {"capabilities": {key: cap.to_dict() for key, cap in caps.items()}}
+def capabilities_frame(caps: dict[str, Capability], account_ref: str = "") -> dict[str, Any]:
+    """上报给 AI 端的形状。开场协调可用时一并报**是哪个微信号**（138）：AI 端只认这一条连接
+    替这个号结算开场；报了能力却不报号，AI 端会整条拒掉，所以两者必须一起出现。"""
+    frame: dict[str, Any] = {"capabilities": {key: cap.to_dict() for key, cap in caps.items()}}
+    coordination = caps.get(CAP_DELIVERY_COORDINATION)
+    if coordination is not None and coordination.available and account_ref:
+        frame["delivery_identity"] = {"account_id": account_ref}
+    return frame

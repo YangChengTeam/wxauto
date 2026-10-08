@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import structlog
 
@@ -153,6 +155,25 @@ def build_gateway(
     #: 074：能力表按**当下**算，不是启动时拍一张快照——微信随时可能被关掉、掉线、
     #: 缩回托盘。探测本身要跟重型 import 串行（Windows 加载器锁，见 heavy_import.py），
     #: 探不出来就当「还没探到微信」处理，宁可说做不了也不要假装能做。
+    #: 138：本机登录的是哪个微信（`accountRef`，和状态上报给业务端的同一个值）。按进程打开的账号目录算，
+    #: 不碰界面；但要枚举进程打开的文件，保活每轮、每条开场指令都问一遍不划算，缓存一分钟。
+    #: 认不出 = 空串（不猜）：开场协调随之报做不了，回到原来的流程。
+    account_cache: dict[str, Any] = {"ref": "", "at": 0.0}
+
+    def current_account_ref() -> str:
+        now = time.monotonic()
+        if account_cache["at"] and now - account_cache["at"] < 60:
+            return account_cache["ref"]
+        try:
+            with HEAVY_IMPORT_LOCK:
+                from wxclient.uia_probe.account import probe_account
+            account = probe_account()
+        except Exception as exc:  # noqa: BLE001 —— 认不出就当认不出，不影响别的
+            _wechat.warning("认微信账号失败", error=str(exc))
+            account = None
+        account_cache.update(ref=account.account_ref if account else "", at=now)
+        return account_cache["ref"]
+
     def current_capabilities() -> dict[str, Capability]:
         try:
             with HEAVY_IMPORT_LOCK:
@@ -166,6 +187,7 @@ def build_gateway(
             allow_real_actions=allow_real_actions,
             has_file_channel=file_fetcher is not None,
             supported_ops=set(COMMANDS),
+            account_ref=current_account_ref(),
         )
 
     # 候选人会话名两条路（api2 §4）。和换票共用同一个 Client Token 取值函数——
@@ -226,6 +248,7 @@ def build_gateway(
         capabilities=current_capabilities,
         candidates=candidates,
         message_events=message_events,
+        account_ref=current_account_ref,
     )
 
     runner = GatewayRunner(
@@ -257,6 +280,7 @@ def build_gateway(
         accounts=list(resolved_accounts),
         watchlist=watchlist,
         capabilities=current_capabilities,
+        account_ref=current_account_ref,
         candidate_mode=candidate_mode,
         contacts=contacts,
         candidates=candidates,

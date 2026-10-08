@@ -86,6 +86,10 @@ class InboundMessage:
     first_contact: bool = False
     """True = 这个会话**不在监听名单里**，是看到红点数才去读的（`wechat_io._unread_strangers`，
     用户 2026-09-28）。这一轮要带 `first_contact` 给 AI 端：判不出在找工作就一条都不发（spec 090）。"""
+    system_tip: bool = False
+    """True = 微信自己插在聊天里的**系统提示行**（居中灰字，「你已添加了 XX，现在可以开始聊天了」这类，
+    控件类型 `mmui::ChatItemView` 且不是时间分隔行）。不是谁说的话，发送协调（138）时按 `system` 来源报，
+    不当成候选人开口。按控件类型认，不按正文认。"""
 
     @property
     def key(self) -> PeerKey:
@@ -106,6 +110,7 @@ def message_to_row(message: InboundMessage) -> dict:
         "attachments": [dict(entry) for entry in message.attachments],
         "raw_text": message.raw_text,
         "first_contact": message.first_contact,
+        "system_tip": message.system_tip,
     }
 
 
@@ -131,6 +136,7 @@ def message_from_row(account_id: str, peer_id: str, row: dict) -> InboundMessage
         ),
         raw_text=str(row.get("raw_text") or ""),
         first_contact=bool(row.get("first_contact")),
+        system_tip=bool(row.get("system_tip")),
     )
 
 

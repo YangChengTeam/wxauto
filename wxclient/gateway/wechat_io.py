@@ -97,6 +97,15 @@ VOICE_TRANSCRIPT_STRIKES = 3
 VOICE_UNTRANSCRIBED_TEXT = "[语音消息，微信没能转成文字]"
 
 
+#: 微信 4.x 聊天区里「不是任何人的气泡」那一类行的控件类型：时间分隔行和居中灰字的系统提示都是它。
+SYSTEM_ROW_CLASS = "mmui::ChatItemView"
+
+
+def is_system_tip(raw: dict[str, Any]) -> bool:
+    """居中灰字的系统提示（「你已添加了 XX，现在可以开始聊天了」）。时间分隔行另有判据、更早就被滤掉。"""
+    return str(raw.get("class_name") or "") == SYSTEM_ROW_CLASS and not is_timestamp_row(raw)
+
+
 def is_pending_voice(raw: dict[str, Any]) -> bool:
     """语音气泡、转写正文还没出来（`uia._annotate_voice_row` 标的）。"""
     return bool(raw.get("transcript_pending"))
@@ -592,6 +601,7 @@ def to_inbound(
         attachments=(attachment,) if attachment else (),
         raw_text=str(raw.get("text") or ""),
         first_contact=first_contact,
+        system_tip=is_system_tip(raw),
     )
 
 

@@ -50,6 +50,7 @@ from .config import GatewaySettings
 from .contacts import STATUS_ACCEPTED as CONTACT_ACCEPTED
 from .contacts import STATUS_REQUESTED as CONTACT_REQUESTED
 from .contacts import ContactDirectory
+from .coordination import DELIVERY_COORDINATION, build_delivery_context
 from .friendcheck import PendingFriendWatcher
 from .friends import FriendWatcher
 from .guard import OutboundGuard, action_limits_from, within_active_hours
@@ -245,6 +246,7 @@ class GatewayRunner:
         client_factory: Callable[..., AgentWsClient] | None = None,
         clock: Callable[[], datetime] | None = None,
         capabilities: Callable[[], dict[str, Capability]] | None = None,
+        account_ref: Callable[[], str] | None = None,
         candidate_mode: CandidateModeClient | None = None,
         auto_friend: AutoFriendWatcher | None = None,
         friend_checker: PendingFriendWatcher | None = None,
@@ -272,6 +274,8 @@ class GatewayRunner:
         self._candidates = candidates
         self._message_events = message_events
         self._capabilities = capabilities
+        # 138：本机微信号的稳定标识（`accountRef`）。开场协调要它，认不出就不开协调。
+        self._account_ref = account_ref or (lambda: "")
         # 091：候选人级接管同步业务后端的那条路。没配（没登录/没接口地址）也照常跑——
         # 本机那道闸不依赖它，同步不上去只是「外面还不知道」。
         self._candidate_mode = candidate_mode
@@ -877,6 +881,10 @@ class GatewayRunner:
         # 本机那一格照旧记（管的是「别把同一个人重复当成待通过」），台账销掉＝不再复查他。
         self._store.mark_contact_status(account_id, number, CONTACT_ACCEPTED)
         self._store.drop_friend_request(account_id, number)
+        # 138：这一刻就是「刚加上好友」——本机确定的事实。第一次把这个会话交给 AI 端时会带上
+        # 好友建立事件，AI 端据此和计划那条开场路共用一个名额。报不成功不走到这里，也就不重复开。
+        if remark:
+            self._store.open_relationship(account_id, remark, at=self._clock())
         _backend.info("好友通过已上报", 会话=remark)
 
     def _account(self) -> str:
@@ -1165,17 +1173,28 @@ class GatewayRunner:
                 client = await self._pool.acquire(account_id)
                 session_id = await self._ensure_session(client, account_id, peer_id)
                 extra_turn = await self._turn_files(account_id, peer_id, session_id, attachments, uploaded)
+                meta = self._turn_meta(peer_id, messages)
+                text = transcript
+                relationship = None
+                if self._coordinated(account_id, client):
+                    # 138：AI 端按逐条来源自己拼正文（只拼对方说的），顶层 text 必须留空，
+                    # 不然两份对不上它会整轮拒掉。
+                    relationship = self._store.pending_relationship(account_id, peer_id, now=self._clock())
+                    meta["delivery_context"] = build_delivery_context(messages, relationship=relationship)
+                    text = ""
                 result = await client.send_message(
                     session_id,
-                    transcript,
+                    text,
                     refs=refs,
                     extra={
-                        "wechat": self._turn_meta(peer_id, messages),
+                        "wechat": meta,
                         "history": history,
                         **extra_turn,
                     },
                     on_stage=lambda stage: self._note_stage(peer_id, stage),
                 )
+                if relationship is not None:
+                    self._store.mark_relationship_announced(account_id, peer_id, relationship[0])
             except Unauthorized as exc:
                 # 票据/归属出问题：会话多半已经不属于我们了，清掉重来。
                 _ai.warning(
@@ -1459,6 +1478,18 @@ class GatewayRunner:
         worker_id = self._store.contact_worker_id(account_id, peer_id)
         return [{"type": "worker", "id": worker_id}] if worker_id else []
 
+    def _coordinated(self, account_id: str, client: Any) -> bool:
+        """这条连接上**已经**向 AI 端报过开场协调可用（138）。
+
+        必须看「报给了这条连接」而不是「本机现在能不能」：AI 端只在收到能力表的那条连接上记号、
+        并从此要求每轮都带来源。没报过就带 → 它认不出号整轮拒；报过却不带 → 同样整轮拒。
+        """
+        reported = self._reported_capabilities.get(account_id)
+        if not reported or reported[0] is not client:
+            return False
+        cap = reported[1].get(DELIVERY_COORDINATION)
+        return bool(isinstance(cap, dict) and cap.get("available") and reported[1].get("_identity"))
+
     def _turn_meta(self, peer_id: str, messages: Sequence[InboundMessage]) -> dict[str, Any]:
         """给 AI 端的这一轮元信息（064 design §2）。
 
@@ -1673,7 +1704,7 @@ class GatewayRunner:
         if self._capabilities is None:
             return
         try:
-            frame = capabilities_frame(self._capabilities())
+            frame = capabilities_frame(self._capabilities(), self._account_ref())
         except Exception as exc:  # noqa: BLE001 —— 探测失败不该把保活带停
             _wechat.warning("能力探测失败", error=str(exc))
             return
@@ -1686,14 +1717,16 @@ class GatewayRunner:
         # （连接一关就注销），而自报能力表正是这台机器入册的唯一途径。断线重连后是一条
         # 新连接、册子里没有它——此时若因为「内容一样」就不报，这台机器再也不入册，
         # 之后每条微信指令都死在 no gateway，而两边日志都显示「已连接」。
-        if self._reported_capabilities.get(account_id) == (client, frame["capabilities"]):
+        # 报的号也算内容：换了微信、能力表一样也得重报，AI 端那边认的号才会跟着换（138）。
+        reported = {**frame["capabilities"], "_identity": frame.get("delivery_identity")}
+        if self._reported_capabilities.get(account_id) == (client, reported):
             return
         try:
             await client.notify(CAPABILITIES_OP, frame)
         except Exception as exc:  # noqa: BLE001
             _ai.warning("能力上报失败", error=str(exc))
             return
-        self._reported_capabilities[account_id] = (client, frame["capabilities"])
+        self._reported_capabilities[account_id] = (client, reported)
         unavailable = [
             cap["label"] for cap in frame["capabilities"].values() if not cap["available"]
         ]

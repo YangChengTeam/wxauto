@@ -14,7 +14,9 @@ from collections.abc import Iterable, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from hashlib import sha256
 from pathlib import Path
+from uuid import uuid4
 
 import structlog
 
@@ -235,6 +237,16 @@ CREATE TABLE IF NOT EXISTS gateway_sent_echo (
 );
 CREATE INDEX IF NOT EXISTS idx_sent_echo_peer
   ON gateway_sent_echo (account_id, peer_id, text_key);
+-- 138：好友关系周期。一个会话只留**当前**这一次加上好友的记录；删了又加才换新的 id。
+-- AI 端拿 id 当「这次加好友」的开场名额键的一部分，所以重读、重连、重启都必须是同一个值。
+CREATE TABLE IF NOT EXISTS gateway_relationships (
+  account_id      TEXT NOT NULL,
+  peer_id         TEXT NOT NULL,
+  relationship_id TEXT NOT NULL,
+  established_at  TEXT NOT NULL,
+  announced       INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (account_id, peer_id)
+);
 """
 
 
@@ -367,6 +379,8 @@ class GatewayStore:
             # 2026-09-23：记下每条消息在微信里读到的**原始文字**的键，游标丢了时按它认「这段早就处理过」
             # （见 `recent_text_keys`）。老行留空，查询时退回按 `text` 算。
             _ensure_column(conn, "gateway_messages", "raw_key", "TEXT NOT NULL DEFAULT ''")
+            # 138：微信系统提示行（不是谁说的话）。开场指令执行前判「对方开口没有」要把它们排除。
+            _ensure_column(conn, "gateway_messages", "system_tip", "INTEGER NOT NULL DEFAULT 0")
             # ★ 补列之后还要**回填**：老库里这两列是空的，而复查按 `session_name` 搜、
             #   按 `requested_at` 算期限——不回填，升级那一刻**所有在途的人当场消失**，
             #   一个都不会再被查（正是这次要治的病，不能靠升级又制造一遍）。
@@ -1153,6 +1167,83 @@ class GatewayStore:
             )
             conn.commit()
 
+    # ────────────────────────── 好友关系周期（138）──────────────────────────
+    #
+    # 「这个人刚加上好友」是本机自己确定的事实（我们发的申请被通过 / 我们通过了他的申请），
+    # 不是从聊天正文里猜的。AI 端据此把「好友建立」当系统事件，和计划里的主动开场共用一个名额。
+
+    def open_relationship(self, account_id: str, peer_id: str, *, at: datetime | None = None) -> str:
+        """记下一次新加上的好友关系，返回它的 id。**每调一次就是新的一次**——只在真加上时调。"""
+        when = (at or _utcnow()).isoformat()
+        relationship_id = "rel-" + sha256(f"{account_id}\x00{peer_id}\x00{when}\x00{uuid4().hex}".encode()).hexdigest()[:32]
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT INTO gateway_relationships (account_id, peer_id, relationship_id, established_at, announced)
+                   VALUES (?, ?, ?, ?, 0)
+                   ON CONFLICT(account_id, peer_id) DO UPDATE SET
+                     relationship_id = excluded.relationship_id,
+                     established_at  = excluded.established_at,
+                     announced       = 0""",
+                (account_id, peer_id, relationship_id, when),
+            )
+            conn.commit()
+        return relationship_id
+
+    def pending_relationship(
+        self, account_id: str, peer_id: str, *, now: datetime | None = None, within: timedelta = timedelta(days=3),
+    ) -> tuple[str, datetime] | None:
+        """还没告诉过 AI 端的那次加好友（太久以前的不算——那早就不是「刚加上」了）。"""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                """SELECT relationship_id, established_at FROM gateway_relationships
+                   WHERE account_id=? AND peer_id=? AND announced=0""",
+                (account_id, peer_id),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            established = datetime.fromisoformat(row[1])
+        except ValueError:
+            return None
+        if established.tzinfo is None:
+            established = established.replace(tzinfo=timezone.utc)
+        if (now or _utcnow()) - established > within:
+            return None
+        return str(row[0]), established
+
+    def mark_relationship_announced(self, account_id: str, peer_id: str, relationship_id: str) -> None:
+        """AI 端已收到这次加好友的事件。只认同一个 id——中间又删了重加的那次不能被顺手销掉。"""
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "UPDATE gateway_relationships SET announced=1 WHERE account_id=? AND peer_id=? AND relationship_id=?",
+                (account_id, peer_id, relationship_id),
+            )
+            conn.commit()
+
+    def last_inbound_at(
+        self, account_id: str, peer_id: str, *, ignore_texts: Iterable[str] = (),
+    ) -> datetime | None:
+        """对方最近一条消息被本机读到的时刻。开场指令执行前拿它判「他是不是已经开口了」。
+
+        不算的：专员和分身自己的、微信系统提示行、以及 ``ignore_texts``（对方通过申请时微信替他发的
+        那句固定话——那不是他开口，算进去会把刚派下来的开场误撤掉）。
+        """
+        ignored = sorted({text_key(t) for t in ignore_texts})
+        marks = ",".join("?" for _ in ignored)
+        clause = f" AND raw_key NOT IN ({marks})" if ignored else ""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT MAX(at) FROM gateway_messages WHERE account_id=? AND peer_id=? AND from_self=0 AND system_tip=0" + clause,
+                (account_id, peer_id, *ignored),
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            value = datetime.fromisoformat(row[0])
+        except ValueError:
+            return None
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
     # ────────────────────────── 指令幂等（066）──────────────────────────
     #
     # AI 端重推同一条指令（网络重试、网关重连后补推）**不能再发一遍消息**。
@@ -1600,6 +1691,7 @@ class GatewayStore:
                 1 if row.get("from_gateway") else 0,
                 str(row.get("text") or ""),
                 text_key(row.get("raw_text") or row.get("text") or ""),
+                1 if row.get("system_tip") else 0,
             )
             for row in rows
             if row.get("msg_id")
@@ -1610,8 +1702,8 @@ class GatewayStore:
             before = conn.total_changes
             conn.executemany(
                 """INSERT OR IGNORE INTO gateway_messages
-                       (account_id, peer_id, msg_id, at, at_text, from_self, from_gateway, text, raw_key)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       (account_id, peer_id, msg_id, at, at_text, from_self, from_gateway, text, raw_key, system_tip)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 values,
             )
             conn.commit()

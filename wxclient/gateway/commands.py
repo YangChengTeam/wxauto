@@ -25,6 +25,7 @@ from wxclient.queue import TaskType
 from .. import logrole
 from .candidates import CandidateDirectory, CandidateUpdateError
 from .capabilities import capability_of
+from .coordination import ACCEPT_NOTICE_TEXTS
 from .download import DownloadError, FileRef
 from .guard import (
     ACTION_FRIEND,
@@ -382,6 +383,7 @@ class CommandExecutor:
         capabilities: Callable[[], dict] | None = None,
         candidates: CandidateDirectory | None = None,
         message_events: MessageEventReporter | None = None,
+        account_ref: Callable[[], str] | None = None,
     ) -> None:
         """``capabilities`` 是个**取当下能力表**的函数（074），不是一份快照——
         微信随时可能被关掉、掉线，执行前这一刻算的才作数。"""
@@ -396,6 +398,7 @@ class CommandExecutor:
         self._capabilities = capabilities
         self._candidates = candidates
         self._message_events = message_events
+        self._account_ref = account_ref or (lambda: "")
 
     async def execute(
         self,
@@ -415,12 +418,75 @@ class CommandExecutor:
             return CommandResult(command_id, str(cached.get("status") or "done"),
                                  str(cached.get("reason") or ""), cached.get("result"))
 
+        delivery = _delivery_context(data)
+        if delivery is not None:
+            return await self._execute_delivery(command_id, op, data, delivery, on_stage)
         result = await self._run(command_id, op, data, on_stage)
         self._store.put_command_result(
             self._account, command_id,
             {"status": result.status, "reason": result.reason, "result": result.result},
         )
         return result
+
+    async def _execute_delivery(
+        self,
+        command_id: str,
+        op: str,
+        data: dict[str, Any],
+        delivery: dict[str, Any],
+        on_stage: Callable[[str], Awaitable[None]] | None,
+    ) -> CommandResult:
+        """开场协调派来的那一条（AI 端 138）。和普通指令三处不同：
+
+        ① **执行前再核一遍**：派发它的号必须还是本机登录的这个号；派发之后对方已经开口了，
+           这条开场就不发了（他的问题由正常回复那条路答，再补一句自我介绍就是重复开场）。
+        ② **先落「在执行」再动微信**：发到一半进程没了，重推同一条时只能如实说「不知道发没发」，
+           绝不再发一遍（普通指令的幂等结果是执行完才落库，那段空窗对开场不够）。
+        ③ **回执三分**：真发出去 = ``sent`` + 消息凭据；动微信之前就停下 = ``not_sent`` + 原因码；
+           其余（超时、半路失败）= 不带结论，AI 端记「未知」、不重发。
+        """
+        args = data.get("args") if isinstance(data.get("args"), dict) else {}
+        peer = str(args.get("to") or "").strip()
+        if op != "send_message" or not peer:
+            return self._settle_delivery(command_id, CommandResult(command_id, "rejected", "开场协调只接受发给单个联系人的文字"), "INVALID_COMMAND")
+        if str(delivery.get("account_id") or "") != self._account_ref():
+            _local.info("开场指令指向的微信号不是本机现在登录的这个，不发", op=op)
+            return self._settle_delivery(command_id, CommandResult(command_id, "rejected", "这条开场指向的微信号不是本机现在登录的这个号，没有发"), "ACCOUNT_MISMATCH")
+        issued = _parse_time(data.get("issued_at"))
+        last_inbound = self._store.last_inbound_at(self._account, peer, ignore_texts=ACCEPT_NOTICE_TEXTS)
+        if issued is not None and last_inbound is not None and last_inbound >= issued:
+            _local.info("开场派发之后对方已经说话了，这条开场不发", op=op)
+            return self._settle_delivery(command_id, CommandResult(command_id, "rejected", "对方已经先开口了，开场不再发，由正常回复接上"), "PEER_REPLIED")
+        self._store.put_command_result(self._account, command_id, {
+            "status": "failed", "reason": "上次执行到一半中断，不知道发没发出去，不再重发", "result": None,
+        })
+        result = await self._run(command_id, op, data, on_stage)
+        if result.status == "done":
+            if not isinstance(result.result, dict) or result.result.get("delivery_status") != "sent":
+                # 跑完了却拿不出凭据（只走流程不真发等）：不能说发了，也不能说没发。
+                result = CommandResult(command_id, "failed", "执行完了但拿不到发送凭据，结果按未知处理",
+                                       {k: v for k, v in (result.result or {}).items() if k not in ("delivery_status", "message_id")})
+            self._store.put_command_result(self._account, command_id,
+                                           {"status": result.status, "reason": result.reason, "result": result.result})
+            return result
+        if result.status == "rejected":
+            # `_run` 里所有 rejected 都在动微信之前（参数、能力、守门、节拍、接管）——确定没发。
+            return self._settle_delivery(command_id, result, "BLOCKED_BEFORE_SEND")
+        code = str((result.result or {}).get("reason_code") or "") if isinstance(result.result, dict) else ""
+        if code in DEFINITELY_NOT_SENT_CODES:
+            return self._settle_delivery(command_id, result, code)
+        # 其余失败：可能已经发出去了，只如实报「不知道」。
+        self._store.put_command_result(self._account, command_id,
+                                       {"status": result.status, "reason": result.reason, "result": result.result})
+        return result
+
+    def _settle_delivery(self, command_id: str, result: CommandResult, code: str) -> CommandResult:
+        """确定没发：带上 ``not_sent`` + 稳定原因码，落库后同号重推照样回这一份。"""
+        body = {**(result.result or {}), "delivery_status": "not_sent", "reason_code": code}
+        settled = CommandResult(command_id, result.status, result.reason, body)
+        self._store.put_command_result(self._account, command_id,
+                                       {"status": settled.status, "reason": settled.reason, "result": settled.result})
+        return settled
 
     async def _run(
         self,
@@ -818,6 +884,25 @@ class CommandExecutor:
             return ACTION_GROUP
         return spec.action
 
+
+
+#: 队列给出的、能确定「微信里一个字都没发出去」的失败码。没列进来的失败一律按未知报。
+DEFINITELY_NOT_SENT_CODES = frozenset({"CONTACT_NOT_FOUND"})
+
+
+def _delivery_context(data: dict[str, Any]) -> dict[str, Any] | None:
+    """开场协调派来的指令带 ``args.delivery_context``（AI 端 138）。没有 = 普通指令。"""
+    args = (data or {}).get("args")
+    context = args.get("delivery_context") if isinstance(args, dict) else None
+    return context if isinstance(context, dict) else None
+
+
+def _parse_time(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def parse_commands(data: dict[str, Any]) -> Sequence[dict[str, Any]]:
