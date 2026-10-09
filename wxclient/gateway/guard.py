@@ -4,7 +4,8 @@
 
 ★ `looks_like_rejection` 曾是第三件（入站关键词命中 → 网关本地拉黑、一轮都不派发）。
 用户 2026-09-19 裁决拆除那道闸：候选人发来的每条新消息都要派给 AI 端回一句，闲聊也回；
-拒绝与否由 AI 端看过原话再判，它提案 `blacklist` 时网关才拉黑（`outbound`）。
+拒绝与否由 AI 端看过原话再判。2026-10-09 起本机拉黑也整个拆了（用户：「不应该有拉黑的情况」）：
+AI 端判对方拒绝 / 不再找工作 → 提案人工接管，网关走招聘老师那个按钮的同一条路（`outbound`）。
 这个函数留作纯规则助手，`InboundLoop._ingest` 不再调用它。
 """
 
@@ -271,7 +272,7 @@ class Reservation:
     granted: int = 0
     reason: str = ""
     temporary: bool = False
-    """这次拒绝会不会自己过去。时间窗、配额用完 = 会（等一等就行）；黑名单 = 不会。
+    """这次拒绝会不会自己过去。时间窗、配额用完、人工接管 = 会（等一等 / 交回分身就行）。
     上层据此决定**这批消息是留着重投还是就此销账**——留错了会在额度恢复的那一刻
     把攒了一天的话一次性喷出去，正是风控要看的东西（审计 P0-4）。"""
     _store: object | None = None
@@ -351,8 +352,6 @@ class OutboundGuard:
         held = self._takeover_denial(account_id, peer_id)
         if held is not None:
             return GuardDecision.deny(held)
-        if self._store.is_blacklisted(account_id, peer_id):
-            return GuardDecision.deny("该联系人已在黑名单")
         if not within_active_hours(now, self._active_hours):
             return GuardDecision.deny(f"不在允许发送的时间窗 {self._active_hours}")
 
@@ -389,7 +388,7 @@ class OutboundGuard:
         `clamp=True`：额度不够就减量放行（`accept_new_friends` 的「最多 N 个」）。
         默认全有或全无——一段回复拆成三条，发出两条比一条不发更糟。
 
-        黑名单与时间窗是纯判断、不涉及计数，先在事务外判掉，理由也更具体。
+        人工接管与时间窗是纯判断、不涉及计数，先在事务外判掉，理由也更具体。
         """
         # ★★ 091 候选人级接管闸，排在**所有**判断之前。人在自己跟这个候选人时，
         #   一条都不许自动发给他。
@@ -398,8 +397,6 @@ class OutboundGuard:
         held = self._takeover_denial(account_id, peer_id)
         if held is not None:
             return Reservation(reason=held, temporary=True)
-        if self._store.is_blacklisted(account_id, peer_id):
-            return Reservation(reason="该联系人已在黑名单")
         if not within_active_hours(now, self._active_hours):
             return Reservation(reason=f"不在允许发送的时间窗 {self._active_hours}", temporary=True)
 
@@ -479,7 +476,7 @@ class OutboundGuard:
     def allow_read(self, account_id: str, action: str, *, now: datetime) -> GuardDecision:
         """读类动作的节拍闸：够慢才放行，放行的同时把这一次记下（原子）。
 
-        读不受配额与黑名单约束（它不打扰任何人），但**受时间窗和最小间隔约束**——
+        读不受配额与人工接管约束（它不打扰任何人），但**受时间窗和最小间隔约束**——
         原来读类只要理由里没有「时间窗」就一律放行，于是串行 50 条 `check_new_friends`
         全部通过，≥300s 查好友那条红线在指令路径上等于不存在。
         """

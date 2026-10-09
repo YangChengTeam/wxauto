@@ -223,12 +223,12 @@ class InboundActionTests(unittest.IsolatedAsyncioTestCase):
         self._seed("张三·普工", "w-77")
         await self._sender(directory(handler)).deliver(
             "acc", "张三·普工",
-            self._card([{"type": "set_ai_status", "reason": "要真人确认社保",
-                         "payload": {"status": "human_takeover"}}]),
+            self._card([{"type": "set_ai_status", "reason": "触发平台红线",
+                         "payload": {"status": "blocked"}}]),
         )
         self.assertTrue(seen["url"].endswith("/candidates/w-77"))
-        self.assertEqual(seen["body"], {"aiRecruitment": {"status": "human_takeover",
-                                                          "reason": "要真人确认社保"}})
+        self.assertEqual(seen["body"], {"aiRecruitment": {"status": "blocked",
+                                                          "reason": "触发平台红线"}})
 
     async def test_unknown_peer_is_skipped_not_guessed(self) -> None:
         """反查不到 = 这个人还没上报过会话名。如实跳过，绝不拿别人的 ID 顶上。"""
@@ -254,6 +254,22 @@ class InboundActionTests(unittest.IsolatedAsyncioTestCase):
         self._seed("张三·普工", "w-77")
         await self._sender(directory(handler)).deliver(
             "acc", "张三·普工", self._card([{"type": "blacklist", "reason": "骚扰"}]),
+        )
+        self.assertEqual(called, [])
+
+    async def test_takeover_status_is_not_patched(self) -> None:
+        """★ `human_takeover` 走候选人级接管（conversation-mode 那条路），不 PATCH 计划状态：
+        那条要求他在有效计划里，直聊来的人多半不在，409 之后什么都没停下（2026-10-09）。"""
+        called: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            called.append(str(request.url))
+            return httpx.Response(200, json={})
+
+        self._seed("张三·普工", "w-77")
+        await self._sender(directory(handler)).deliver(
+            "acc", "张三·普工",
+            self._card([{"type": "set_ai_status", "reason": "不找工作了", "payload": {"status": "human_takeover"}}]),
         )
         self.assertEqual(called, [])
 

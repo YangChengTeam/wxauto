@@ -422,11 +422,6 @@ class InboundLoop:
         messages: Sequence[InboundMessage],
         now: datetime,
     ) -> None:
-        # 黑名单的人连收都不收——不处理、不留缓冲。
-        if self._store.is_blacklisted(account_id, peer_id):
-            self._store.mark_seen(account_id, peer_id, [m.msg_id for m in messages])
-            return
-
         # 幂等：RPA 重复推同一条消息不能触发第二轮。
         unseen_ids = set(self._store.filter_unseen(account_id, peer_id, [m.msg_id for m in messages]))
         fresh = [m for m in messages if m.msg_id in unseen_ids]
@@ -450,8 +445,8 @@ class InboundLoop:
 
         # ★ 这里曾经有一道确定性拒绝闸（命中「别联系我」类词表 → 本地拉黑、一轮都不派发）。
         #   用户 2026-09-19 裁决拆除：候选人发来的每条新消息都要派给 AI 端回一句，闲聊也回。
-        #   拒绝与否由 AI 端看过原话再判；它提案 `blacklist` 时网关才拉黑（`outbound`）。
-        #   黑名单本身还在（上面 `is_blacklisted`），只是不再由网关凭一个关键词自己写。
+        #   拒绝与否由 AI 端看过原话再判；2026-10-09 起它判拒绝 / 不找工作时提案的是**人工接管**，
+        #   不再拉黑（本机拉黑整个拆了）。接管中的人在 `wechat_io` 那一层就不读了，走不到这里。
 
         # ★ 落盘再入缓冲（070）：游标在读到消息那一刻就推进了，从这里到「AI 端跑完一轮」
         # 之间断掉任何一环，这批消息就同时满足「游标翻过去了」和「谁也没处理」。

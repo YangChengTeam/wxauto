@@ -37,7 +37,9 @@ from wxclient.gateway.guard import (
     ACTION_MESSAGE,
     ACTION_MOMENTS,
 )
-from wxclient.gateway.inbound import PENDING_MAX_AGE_HOURS, PENDING_MAX_ATTEMPTS, message_to_row
+from wxclient.gateway.inbound import FOLLOW_UP_DEFER, PENDING_MAX_AGE_HOURS, PENDING_MAX_ATTEMPTS, message_to_row
+from wxclient.gateway.outbound import AUTO_TAKEOVER_REASON
+from wxclient.gateway.sessions import HUMAN_TAKEOVER
 from wxclient.gateway.wechat_io import (
     FIRST_SEEN_TAIL,
     MAX_PEERS_PER_POLL,
@@ -277,11 +279,11 @@ class GuardTests(StoreTestCase):
     async def test_allows_normal(self) -> None:
         self.assertTrue(self._guard().check("a", "p", now=datetime(2026, 8, 10, 14, 0)).allowed)
 
-    async def test_blocks_blacklisted(self) -> None:
-        self.store.blacklist("a", "p", "说了别联系")
+    async def test_blocks_taken_over(self) -> None:
+        self.store.set_candidate_mode("a", "p", HUMAN_TAKEOVER, reason="说了别联系")
         decision = self._guard().check("a", "p", now=datetime(2026, 8, 10, 14, 0))
         self.assertFalse(decision.allowed)
-        self.assertIn("黑名单", decision.reason)
+        self.assertIn("人工接管", decision.reason)
 
     async def test_blocks_outside_active_hours(self) -> None:
         decision = self._guard().check("a", "p", now=datetime(2026, 8, 10, 3, 0))
@@ -421,7 +423,7 @@ class ExtractReplyTests(unittest.TestCase):
 
 
 class OutboundSenderTests(StoreTestCase):
-    def _sender(self, sink: FakeSink, **guard_kwargs: Any) -> OutboundSender:
+    def _sender(self, sink: FakeSink, *, takeover=None, **guard_kwargs: Any) -> OutboundSender:
         now = datetime(2026, 8, 10, 14, 0, tzinfo=timezone.utc)
         # 时间窗默认给满：这些用例测的是出站本身，T0 换算到本机是几点不该左右结论。
         guard_kwargs.setdefault("active_hours", "00:00-23:59")
@@ -430,6 +432,7 @@ class OutboundSenderTests(StoreTestCase):
             guard=OutboundGuard(self.store, **guard_kwargs),
             store=self.store,
             clock=lambda: now,
+            takeover=takeover,
         )
 
     async def test_sends_each_segment_as_one_message(self) -> None:
@@ -448,18 +451,79 @@ class OutboundSenderTests(StoreTestCase):
         self.assertEqual(sink.sent, [])
         self.assertEqual(result.skipped_reason, "对方只发了表情")
 
-    async def test_blacklist_action_applied_even_when_not_replying(self) -> None:
-        """AI 端判定拒绝 → 即使这一轮不发消息，拉黑也必须立刻生效。"""
+    # ── 不找工作 / 别联系 → 转人工接管（2026-10-09，替代本机拉黑）──
+
+    async def test_takeover_applied_even_when_not_replying(self) -> None:
+        """AI 端判定转人工 → 即使这一轮不发消息，接管也必须立刻生效。"""
         sink = FakeSink()
-        await self._sender(sink).deliver(
-            "a", "p",
-            reply_card([], no_reply_reason="对方拒绝", actions=[{"type": "blacklist", "reason": "明确拒绝"}]),
+        await self._sender(sink).deliver("a", "p", reply_card([], no_reply_reason="对方拒绝", actions=[{"type": "set_ai_status", "reason": "对方说不想找工作了", "payload": {"status": "human_takeover"}}]))
+        row = self.store.candidate_mode("a", "p")
+        self.assertEqual(row.mode, HUMAN_TAKEOVER)
+        self.assertEqual(row.reason, "对方说不想找工作了")
+
+    async def test_closing_line_goes_out_before_takeover(self) -> None:
+        """★ 收尾那句先发出去再接管——反过来它会被守门当「接管中」挡下，攒到交回分身时才冒出去。"""
+        sink = FakeSink()
+        result = await self._sender(sink).deliver("a", "p", reply_card(["好的，不打扰了"], actions=[{"type": "set_ai_status", "reason": "对方说不想找工作了", "payload": {"status": "human_takeover"}}]))
+        self.assertTrue(result.delivered)
+        self.assertEqual([text for _, _, text in sink.sent], ["好的，不打扰了"])
+        self.assertEqual(self.store.candidate_mode("a", "p").mode, HUMAN_TAKEOVER)
+
+    async def test_denied_turn_with_takeover_is_settled_not_deferred(self) -> None:
+        sink = FakeSink()
+        self.store.record_send("a", "p", datetime(2026, 8, 10, 13, 30, tzinfo=timezone.utc))
+        result = await self._sender(sink, max_sends_per_hour=1).deliver(
+            "a", "p", reply_card(["好的，不打扰了"], actions=[{"type": "set_ai_status", "reason": "对方说不想找工作了", "payload": {"status": "human_takeover"}}]),
         )
-        self.assertTrue(self.store.is_blacklisted("a", "p"))
+        self.assertFalse(result.delivered)
+        self.assertEqual(result.follow_up, "", "留着的收尾话会在交回分身时重投出去")
+        self.assertEqual(self.store.candidate_mode("a", "p").mode, HUMAN_TAKEOVER)
+        # 对照：没有接管提案的同一种拦截照旧留着重投。
+        self.store.record_send("a", "q", datetime(2026, 8, 10, 13, 30, tzinfo=timezone.utc))
+        plain = await self._sender(sink, max_sends_per_hour=1).deliver("a", "q", reply_card(["你好"]))
+        self.assertEqual(plain.follow_up, FOLLOW_UP_DEFER)
+
+    async def test_existing_takeover_reason_is_kept(self) -> None:
+        self.store.set_candidate_mode("a", "p", HUMAN_TAKEOVER, reason="招聘老师自己在聊")
+        await self._sender(FakeSink()).deliver("a", "p", reply_card([], actions=[{"type": "set_ai_status", "reason": "对方说不想找工作了", "payload": {"status": "human_takeover"}}]))
+        self.assertEqual(self.store.candidate_mode("a", "p").reason, "招聘老师自己在聊")
+
+    async def test_legacy_blacklist_action_becomes_takeover(self) -> None:
+        """老 AI 端还会发 `blacklist`：按接管处置，绝不再本机拉黑。"""
+        await self._sender(FakeSink()).deliver(
+            "a", "p", reply_card([], actions=[{"type": "blacklist"}]),
+        )
+        row = self.store.candidate_mode("a", "p")
+        self.assertEqual((row.mode, row.reason), (HUMAN_TAKEOVER, AUTO_TAKEOVER_REASON))
+        self.assertEqual(self.store.legacy_blacklist("a"), [])
+
+    async def test_takeover_goes_through_the_injected_path(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        async def takeover(peer: str, reason: str) -> None:
+            calls.append((peer, reason))
+
+        await self._sender(FakeSink(), takeover=takeover).deliver("a", "p", reply_card(["好"], actions=[{"type": "set_ai_status", "reason": "对方说不想找工作了", "payload": {"status": "human_takeover"}}]))
+        self.assertEqual(calls, [("p", "对方说不想找工作了")])
+
+    async def test_takeover_failure_does_not_break_delivery(self) -> None:
+        async def takeover(_peer: str, _reason: str) -> None:
+            raise RuntimeError("业务端 500")
+
+        result = await self._sender(FakeSink(), takeover=takeover).deliver(
+            "a", "p", reply_card(["好的，不打扰了"], actions=[{"type": "set_ai_status", "reason": "对方说不想找工作了", "payload": {"status": "human_takeover"}}]),
+        )
+        self.assertTrue(result.delivered)
+
+    async def test_non_takeover_status_does_not_take_over(self) -> None:
+        await self._sender(FakeSink()).deliver(
+            "a", "p", reply_card(["在的"], actions=[{"type": "set_ai_status", "payload": {"status": "ai_managed"}}]),
+        )
+        self.assertFalse(self.store.candidate_mode("a", "p").known)
 
     async def test_guard_blocks_send(self) -> None:
         sink = FakeSink()
-        self.store.blacklist("a", "p", "先前已拒绝")
+        self.store.set_candidate_mode("a", "p", HUMAN_TAKEOVER, reason="先前已拒绝")
         result = await self._sender(sink).deliver("a", "p", reply_card(["你好"]))
         self.assertFalse(result.delivered)
         self.assertEqual(sink.sent, [])
@@ -605,10 +669,10 @@ class InboundLoopTests(StoreTestCase):
         self.assertEqual(len(calls), 1)
 
     async def test_rejection_wording_is_dispatched_not_blacklisted_locally(self) -> None:
-        """★ 网关不再凭关键词自己拉黑（用户 2026-09-19 裁决：候选人每条新消息都要回）。
+        """★ 网关不再凭关键词自己处置（用户 2026-09-19 裁决：候选人每条新消息都要回）。
 
         「别再联系我了」照样派给 AI 端一轮；是不是拒绝由它看过原话再判，
-        它提案 `blacklist` 时网关才拉黑（`outbound._apply_blacklist_actions`）。
+        它提案接管时网关才转人工（`outbound._hand_over`，2026-10-09 起不再拉黑）。
         """
         calls: list[str] = []
 
@@ -624,22 +688,7 @@ class InboundLoopTests(StoreTestCase):
 
         self.assertEqual(len(calls), 1)
         self.assertIn("别再联系我了", calls[0])
-        self.assertFalse(self.store.is_blacklisted("acct-1", "peer-1"))
-
-    async def test_blacklisted_peer_is_never_processed(self) -> None:
-        calls: list[str] = []
-
-        async def handler(_a: str, _p: str, transcript: str, _m) -> None:
-            calls.append(transcript)
-
-        self.store.blacklist("acct-1", "peer-1", "先前已拒绝")
-        source = FakeSource([[msg("还招人吗", msg_id="m1")], []])
-        loop = self._loop(source, handler, now=T0)
-        await loop.tick()
-        self._now = T0 + timedelta(seconds=10)
-        await loop.tick()
-        await loop.drain()
-        self.assertEqual(calls, [])
+        self.assertEqual(self.store.candidate_modes("acct-1"), {})
 
     async def test_same_peer_is_strictly_serial(self) -> None:
         """一轮没收口，第二批必须等着——AI 端同 session 也只允许一轮。"""

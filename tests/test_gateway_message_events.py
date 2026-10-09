@@ -318,16 +318,17 @@ class InboundReportingTests(StoreTestCase):
         """★ 「别再联系我了」也是一次回复，而那正是最不该再追一条的时刻。
 
         网关关键词拉黑闸 2026-09-19 已拆（候选人每条新消息都要回）；上报这条不受影响，
-        而且这个人**不再**由网关自己拉黑。
+        而且网关不凭这句话自己处置这个人（接不接管由 AI 端判）。
         """
         seen: list[str] = []
         loop = self._loop(
             [[msg("别再联系我了", msg_id="m1")]],
             lambda _a, _p, messages: seen.extend(m.text for m in messages),
         )
+        before = self.store.candidate_modes(ACCOUNT)
         await loop.tick()
         self.assertEqual(seen, ["别再联系我了"])
-        self.assertFalse(self.store.is_blacklisted(ACCOUNT, PEER))
+        self.assertEqual(self.store.candidate_modes(ACCOUNT), before)
 
     async def test_listener_failure_never_stops_the_read_loop(self) -> None:
         def boom(*_args: Any) -> None:

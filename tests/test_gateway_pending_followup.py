@@ -46,6 +46,7 @@ from wxclient.gateway.inbound import (
     InboundMessage,
 )
 from wxclient.gateway.outbound import DeliveryResult
+from wxclient.gateway.sessions import HUMAN_TAKEOVER
 
 ACCOUNT = "acct-1"
 PEER = "peer-1"
@@ -136,14 +137,15 @@ class GuardDenialKeepsTheBatchTests(FollowUpLoopTestCase):
         self.assertEqual([text for _a, _p, text in sink.sent][-1], "您好")
         self.assertEqual(self._pending(), [], "发出去了才销账")
 
-    async def test_blacklisted_peer_is_settled_not_retried(self) -> None:
-        """★ 拉黑是**结论**，不是暂时挡一下：留着只会每趟重投到过期，白占队列。"""
+    async def test_takeover_turn_is_settled_not_retried(self) -> None:
+        """★ 这一轮要转人工的不留：留着的那句收尾话会在交回分身时重投出去（2026-10-09）。"""
         self._now = T0
         sender, _sink = self._sender()
-        self.store.blacklist(ACCOUNT, PEER, reason="明确拒绝")
+        self.store.set_candidate_mode(ACCOUNT, PEER, HUMAN_TAKEOVER, reason="招聘老师在跟")
+        takeover = {"type": "set_ai_status", "reason": "明确拒绝", "payload": {"status": HUMAN_TAKEOVER}}
 
         async def handler(account_id: str, peer_id: str, _t: str, _m) -> DeliveryResult:
-            return await sender.deliver(account_id, peer_id, reply_card(["您好"]))
+            return await sender.deliver(account_id, peer_id, reply_card(["好的，不打扰了"], actions=[takeover]))
 
         loop = self._loop(FakeSource([[msg("别烦我", msg_id="m1")], []]), handler, now=T0)
         await self._dispatch_once(loop)

@@ -25,7 +25,7 @@ Laoxiaozhi recruiting product. It is the **only side-effecting end of the whole 
 that actually drives the WeChat window.
 
 > **Translator + gatekeeper**: translate an inbound WeChat message into one AI dialog turn, translate the
-> AI's reply back into WeChat messages and send them; meanwhile hold the line on rate, blacklist and
+> AI's reply back into WeChat messages and send them; meanwhile hold the line on rate, human takeover and
 > real-action confirmation using deterministic rules.
 
 **What it does not do** (red lines, §5): no dialog understanding, no reply generation, no LLM. All of that
@@ -100,7 +100,7 @@ docs/gateway-plan.md             # gateway implementation checklist
   same type is never enqueued twice.
 - **`gateway` implements no wording logic.** What to reply and how to say it comes entirely from the AI
   service; the gateway only makes deterministic orchestration decisions — whether to send, to whom, and when
-  (dedupe, debounce, serialization, rate, blacklist).
+  (dedupe, debounce, serialization, rate, human takeover).
 - **Any future entry point shares the same `WeChatRuntime`.** No second copy of the queue or the API wrapper,
   and absolutely no side path around `_authorize_payload()`. Wiring (ticket source, account, real-action
   switch) lives in `gateway/factory.py` alone; entry points only parse arguments.
@@ -188,12 +188,16 @@ This long-lived polling loop is **settled architecture**. It is not the "schedul
   own on inbound text** any more — the deterministic "don't contact me / I'll report you → blacklist locally,
   dispatch nothing" gate that used to sit in `InboundLoop._ingest` was removed that day. Whether the peer is
   refusing is judged by the AI service after it has read the actual words; small talk gets a reply too.
-- **Blacklisting still exists, but only on the AI service's proposal.** A hard refusal is detected there
-  (rules ∪ model), answered with one closing line, and comes back as a `blacklist` action which the gateway
-  applies (`outbound._apply_blacklist_actions`); a blacklisted peer is then never read again. A soft close
-  ("I already found a job", "not interested right now") closes politely, marks the funnel `closed`, and
-  **proposes no blacklisting** — we will want to reach these people again, and a permanent blacklist is
-  disproportionate. `guard.looks_like_rejection` remains as a pure helper, no longer wired into the read loop.
+- **There is no local blacklist any more** (user ruling 2026-10-09: "不应该有拉黑的情况…明确不想找工作了，
+  自动切成人工接管"). The old local blacklist was permanent, invisible and impossible to undo — one "不想找工作了"
+  and the peer was never read again. When the AI service decides the peer refuses contact or is no longer
+  looking for work, it answers with one closing line and proposes `set_ai_status` → `human_takeover`; the
+  gateway applies it as a **candidate-level takeover** through the same path as the recruiter's button
+  (`outbound._hand_over` → `GatewayRunner.set_candidate_mode`: local first, then conversation-mode sync),
+  **after** that card's segments are sent, and never defers that turn. A legacy `blacklist` action is treated
+  the same way. Legacy `gateway_blacklist` rows are migrated to takeovers at start-up and deleted. Never add a
+  write path back to a permanent, unrecoverable block. `guard.looks_like_rejection` remains as a pure helper,
+  no longer wired into the read loop.
 - **Rate limits are enforced on the gateway side**: friend requests, broadcasts and direct messages are
   guarded by the gateway's deterministic counters, never by the AI service's good behaviour.
 - **Silence is the AI service's call, not the gateway's**: when a card carries no `reply_segments`, send
@@ -411,7 +415,7 @@ Nothing on this machine adds to it.** User ruling 2026-09-24: 「监听逻辑是
   `get_unread_messages` (no window opened) lists sessions with a badge; unlisted one-to-one chats are opened —
   at most `MAX_UNREAD_STRANGERS_PER_POLL` — and at most that many trailing messages go to the AI service with
   `first_contact`, which stays silent unless the peer is job-seeking (spec 090). Excluded without opening:
-  anything on the list or in local `never`, blacklisted, under human takeover, a known group,
+  anything on the list or in local `never`, under human takeover, a known group,
   `SYSTEM_SESSION_NAMES` (service/official accounts, WeChat feature entries). A group found on opening is
   remembered and dropped. **Nobody enters the watchlist this way**, and an unlisted read failure never feeds
   the unreachable / not-found strike counters (those add friends and remove list entries). Known cost the user

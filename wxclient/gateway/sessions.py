@@ -1,4 +1,4 @@
-"""网关本地状态：会话映射、消息去重游标、黑名单、发送计数。
+"""网关本地状态：会话映射、消息去重游标、候选人接管档位、发送计数。
 
 **必须持久化**：Windows 机重启、进程崩溃之后，如果 (专员微信号 × 对方 wxid) → session_id
 这张表没了，所有候选人的对话上下文就断了——AI 会把聊了三天的人当陌生人重新打招呼。
@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS gateway_seen_messages (
   seen_at    TEXT NOT NULL,
   PRIMARY KEY (account_id, peer_id, msg_id)
 );
+-- 旧本机黑名单：2026-10-09 起只读不写，启动时迁成人工接管后删行（见 `legacy_blacklist`）。
 CREATE TABLE IF NOT EXISTS gateway_blacklist (
   account_id TEXT NOT NULL,
   peer_id    TEXT NOT NULL,
@@ -1148,22 +1149,30 @@ class GatewayStore:
             )
             conn.commit()
 
-    # ────────────────────────── 黑名单 ──────────────────────────
+    # ────────────────────────── 旧黑名单（只剩迁移）──────────────────────────
+    #
+    # ★ 本机拉黑 2026-10-09 整个拆掉（用户：「不应该有拉黑的情况」）。原来 AI 端判对方拒绝 →
+    #   这里永久记一行 → 此后他的消息连收都不收、界面上也看不见、没有任何按钮能解开。
+    #   于是一句「不想找工作了」就让这个人从此石沉大海。现在同一件事改成**候选人级人工接管**
+    #   （`outbound` 收到提案走招聘老师那个按钮的同一条路），看得见、交回分身就能恢复。
+    #   表留着只为把老版本写下的那几行迁成接管（`GatewayRunner._migrate_legacy_blacklist`），
+    #   迁一行删一行；不再有任何写入方。
 
-    def is_blacklisted(self, account_id: str, peer_id: str) -> bool:
+    def legacy_blacklist(self, account_id: str) -> list[tuple[str, str]]:
+        """老版本本机拉黑的那几行：``[(会话名, 当时的原因)]``。"""
         with closing(self._connect()) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM gateway_blacklist WHERE account_id=? AND peer_id=?",
-                (account_id, peer_id),
-            ).fetchone()
-        return row is not None
+            rows = conn.execute(
+                "SELECT peer_id, reason FROM gateway_blacklist WHERE account_id=? ORDER BY created_at",
+                (account_id,),
+            ).fetchall()
+        return [(str(r[0]), str(r[1] or "")) for r in rows]
 
-    def blacklist(self, account_id: str, peer_id: str, reason: str = "") -> None:
+    def drop_legacy_blacklist(self, account_id: str, peer_id: str) -> None:
+        """迁完一行删一行。"""
         with closing(self._connect()) as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO gateway_blacklist "
-                "(account_id, peer_id, reason, created_at) VALUES (?,?,?,?)",
-                (account_id, peer_id, reason, _utcnow().isoformat()),
+                "DELETE FROM gateway_blacklist WHERE account_id=? AND peer_id=?",
+                (account_id, peer_id),
             )
             conn.commit()
 
@@ -1289,7 +1298,7 @@ class GatewayStore:
     # `schedule_at` 早就在契约里透传到网关了，但一直没人落表执行——于是需求文档 §6.19
     # 的定时/周期/条件触发全都不可用，面试前提醒、未回复跟进、内容日历都无从谈起。
     #
-    # 到点执行仍走 `CommandExecutor`，幂等（gateway_commands）和守门（频次/时间窗/黑名单）
+    # 到点执行仍走 `CommandExecutor`，幂等（gateway_commands）和守门（频次/时间窗/人工接管）
     # 一并复用，不另开一套。
 
     def put_scheduled_command(

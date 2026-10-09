@@ -473,10 +473,10 @@ class CommandGuardTests(CommandTestCase):
         self.assertEqual(result.status, "rejected")
         self.assertEqual(runtime.calls, [])
 
-    async def test_read_ignores_blacklist_and_rate_limit(self) -> None:
-        """读不打扰任何人：对方在黑名单里、发送额度用光了，都不该挡住「查一下资料」。"""
+    async def test_read_ignores_takeover_and_rate_limit(self) -> None:
+        """读不打扰任何人：对方在人工接管中、发送额度用光了，都不该挡住「查一下资料」。"""
         runtime = FakeRuntime()
-        self.store.blacklist(ACCOUNT, "张三", "说了别联系")
+        self.store.set_candidate_mode(ACCOUNT, "张三", "human_takeover", reason="说了别联系")
         for _ in range(30):
             self.store.record_send(ACCOUNT, "张三", self.now - timedelta(minutes=1))
         result = await self._executor(runtime).execute({
@@ -484,14 +484,14 @@ class CommandGuardTests(CommandTestCase):
         })
         self.assertEqual(result.status, "done", result.reason)
 
-    async def test_write_to_blacklisted_peer_is_rejected(self) -> None:
+    async def test_write_to_taken_over_peer_is_rejected(self) -> None:
         runtime = FakeRuntime()
-        self.store.blacklist(ACCOUNT, "张三", "说了别联系")
+        self.store.set_candidate_mode(ACCOUNT, "张三", "human_takeover", reason="说了别联系")
         result = await self._executor(runtime).execute({
             "command_id": "c1", "op": "send_message", "args": {"to": "张三", "text": "在吗"},
         })
         self.assertEqual(result.status, "rejected")
-        self.assertIn("黑名单", result.reason)
+        self.assertIn("人工接管", result.reason)
         self.assertEqual(runtime.calls, [])
 
     async def test_active_send_counts_toward_the_hourly_limit(self) -> None:

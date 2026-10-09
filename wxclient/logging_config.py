@@ -402,8 +402,10 @@ def _render_gateway_line(event: str, payload: dict[str, Any]) -> str | None:
         return f"出站被守门拦下：「{peer}」，原因：{payload.get('reason') or '-'}"
     if event == "已投递回复":
         return f"已投递回复：「{peer}」，共 {payload.get('segments', 0)} 条消息"
-    if event == "按 AI 端提案拉黑":
-        return "按 AI 端提案拉黑该联系人（AI 判定对方明确拒绝）"
+    if event == "按 AI 端提案转人工接管":
+        return f"「{peer}」已转人工接管（AI 判定对方不再找工作或不希望被联系），在名单里点「交回分身」可恢复"
+    if event == "自动转人工接管没落成":
+        return f"「{peer}」本该转人工接管，但没落成：{payload.get('error') or '-'}"
     if event == "状态回写跳过：本机不知道这个会话对应哪个候选人":
         return f"状态回写跳过：本机不知道会话「{peer}」对应哪个候选人（等他的会话名归位后才写得回去）"
 

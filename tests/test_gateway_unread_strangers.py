@@ -1,6 +1,6 @@
 """名单外挂红点的单聊也读一下，交 AI 端判断（用户 2026-09-28）。
 
-重点是**不该读的都没读**：名单里的人（走老路）、群、服务号/公众号、本机拉黑的、人工接管中的；
+重点是**不该读的都没读**：名单里的人（走老路）、群、服务号/公众号、人工接管中的；
 以及**不该触发的都没触发**——读不到时不能进「连续读不到 → 加好友 / 移出名单」那两条计数，
 也不能往监听名单里加任何人（名单只认同步，AGENTS.md §10）。
 """
@@ -111,7 +111,6 @@ class UnreadStrangerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m.text for m in got if m.peer_id == "李四"], ["新的一句"])
 
     async def test_excluded_sessions_are_never_opened(self) -> None:
-        self.store.blacklist(ACCOUNT, "拉黑的")
         self.store.mark_peer_kind(ACCOUNT, "某群", is_group=True)
         self.store.set_candidate_mode(ACCOUNT, "接管中", HUMAN_TAKEOVER)
         self.watchlist.apply_backend({"only": [WATCHED, "不管的"]})
@@ -119,7 +118,7 @@ class UnreadStrangerTests(unittest.IsolatedAsyncioTestCase):
         rt = _Rt(
             unread(
                 (WATCHED, 3), ("微信支付", 1), ("腾讯新闻", 2), ("服务号", 4), ("文件传输助手", 1),
-                ("拉黑的", 1), ("某群", 5), ("接管中", 1), ("不管的", 1),
+                ("某群", 5), ("接管中", 1), ("不管的", 1),
             ),
             {},
         )

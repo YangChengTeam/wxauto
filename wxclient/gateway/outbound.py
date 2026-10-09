@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -20,6 +20,7 @@ from .candidates import CandidateDirectory, CandidateUpdateError
 from .guard import ACTION_GROUP, ACTION_MESSAGE, OutboundGuard
 from .inbound import FOLLOW_UP_DEFER
 from .message_events import DIRECTION_OUTBOUND, MessageEventReporter, local_message_id
+from .sessions import HUMAN_TAKEOVER
 
 _log = structlog.get_logger(__name__)
 
@@ -27,6 +28,33 @@ _log = structlog.get_logger(__name__)
 _backend = _log.bind(**{logrole.ROLE_KEY: logrole.BACKEND})
 #: 这台电脑自己的事，不涉及任何对端。
 _local = _log.bind(**{logrole.ROLE_KEY: logrole.LOCAL})
+
+
+#: AI 端提案接管却没写原因时用的那句（业务端 v1.5 §4.1：接管必须带原因）。
+AUTO_TAKEOVER_REASON = "候选人表示不再找工作或不希望被联系，已自动转人工接管"
+
+#: 自动接管的落地口：``(会话名, 原因) -> …``。生产里是 `GatewayRunner.set_candidate_mode`
+#: （先落本机、再同步业务端，和招聘老师按按钮同一条路）；没给就只落本机。
+TakeoverFn = Callable[[str, str], Awaitable[Any]]
+
+
+def takeover_reason(actions: Sequence[dict[str, Any]]) -> str | None:
+    """卡上有没有「把这个人转给人工」的提案。有 → 原因（缺了用默认那句）；没有 → None。
+
+    认两种形状：
+
+    - ``set_ai_status`` 且 ``payload.status == human_takeover``——AI 端 2026-10-09 起对
+      「明确拒绝联系 / 不再找工作」出的就是这个（用户：「不应该有拉黑的情况」）。
+    - ``blacklist``——老 AI 端的拉黑提案。本机拉黑已经拆了，**按接管处置**，绝不再拉黑。
+    """
+    for action in actions:
+        kind = action.get("type")
+        payload = action.get("payload")
+        status = payload.get("status") if isinstance(payload, dict) else None
+        if kind == "blacklist" or (kind == "set_ai_status" and status == HUMAN_TAKEOVER):
+            reason = action.get("reason")
+            return reason.strip() if isinstance(reason, str) and reason.strip() else AUTO_TAKEOVER_REASON
+    return None
 
 
 class MessageSink(Protocol):
@@ -169,8 +197,10 @@ class OutboundSender:
         clock=None,
         candidates: CandidateDirectory | None = None,
         message_events: MessageEventReporter | None = None,
+        takeover: TakeoverFn | None = None,
     ) -> None:
         self._sink = sink
+        self._takeover = takeover
         self._guard = guard
         self._store = store
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -190,14 +220,19 @@ class OutboundSender:
                     break
             _local.info("节前祝福没有指令号，剥掉照发正文", account=account_id, 会话=peer_id)
 
-        # 卡片里的拉黑提案先落地——即使这一轮不发消息，拉黑也要生效。
-        self._apply_blacklist_actions(account_id, peer_id, actions)
-        # 同理，状态回写也不等「这一轮发没发消息」：判定转人工的那一轮恰恰**一条都不发**
+        # 状态回写不等「这一轮发没发消息」：判定转人工的那一轮恰恰**一条都不发**
         # （v7 §10.4：微信侧不发「已转人工」），而 HR 正是要在那一刻看到状态变了。
+        # （`human_takeover` 不走这条，见下面的 `handover`。）
         await self._apply_ai_status_actions(account_id, peer_id, actions)
+        # ★ 对方拒绝联系 / 不再找工作 → 转人工接管（2026-10-09，替代原来的本机拉黑）。
+        #   **排在这张卡的回复发完之后**：接管一落地，守门就一条都不放了——
+        #   那句「好的，不打扰了」得先出门，不然它会被当成「接管中暂缓」攒着，
+        #   等招聘老师交回分身的那一刻再冒出去，牛头不对马嘴。
+        handover = takeover_reason(actions)
 
         if not segments:
             _local.info("本轮不回复", account=account_id, 会话=peer_id, reason=no_reply_reason)
+            await self._hand_over(account_id, peer_id, handover)
             return DeliveryResult(skipped_reason=no_reply_reason, actions=actions)
 
         now = self._clock()
@@ -211,12 +246,14 @@ class OutboundSender:
         )
         if not reservation.allowed:
             _local.info("出站被守门拦下", account=account_id, 会话=peer_id, reason=reservation.reason)
-            # 配额用完 / 不在时间窗 = 等一等就能发，**别把候选人的话丢了**；黑名单、
+            await self._hand_over(account_id, peer_id, handover)
+            # 配额用完 / 不在时间窗 = 等一等就能发，**别把候选人的话丢了**；
             # 本机关掉了这类动作则是明确结论，销账（审计 P0-4）。
+            # ★ 这一轮要转人工的不留：留着的那句收尾话会在交回分身时重投出去。
             return DeliveryResult(
                 skipped_reason=reservation.reason,
                 actions=actions,
-                follow_up=FOLLOW_UP_DEFER if reservation.temporary else "",
+                follow_up=FOLLOW_UP_DEFER if reservation.temporary and handover is None else "",
             )
 
         task_ids: list[str] = []
@@ -245,6 +282,8 @@ class OutboundSender:
             reservation.settle(len(task_ids))
             # 同理，真发出去的那几段照样要上报——「多久没回」是从**发出的那一刻**起算的。
             self._note_outbound(account_id, peer_id, task_ids, sent_texts, command_ids)
+            # 发到一半炸了也要接管：他说了不找 / 别联系，这件事不因一条没发出去就不算数。
+            await self._hand_over(account_id, peer_id, handover)
         _log.info("已投递回复", account=account_id, 会话=peer_id, segments=len(task_ids))
         return DeliveryResult(sent=task_ids, actions=actions)
 
@@ -298,7 +337,12 @@ class OutboundSender:
         关联全程不经它（081 裁决 2）。反查不到就如实跳过——那是「这个人还没上报过会话名 /
         后端没归到位」，不是错，更不该拿别人的 ID 顶上。
         """
-        entries = [a for a in actions if a.get("type") == "set_ai_status"]
+        # `human_takeover` 走候选人级接管（`_hand_over`），不在这里 PATCH 计划状态：
+        # 那条要求他在有效计划里，直聊来的人多半不在，409 之后什么都没停下。
+        entries = [
+            a for a in actions
+            if a.get("type") == "set_ai_status" and takeover_reason([a]) is None
+        ]
         if not entries or self._candidates is None or not self._candidates.configured:
             return
         candidate_id = self._store.contact_worker_id(account_id, peer_id)
@@ -319,17 +363,26 @@ class OutboundSender:
         except CandidateUpdateError as exc:
             _backend.warning("状态回写请求不成立", error=str(exc))
 
-    def _apply_blacklist_actions(
-        self, account_id: str, peer_id: str, actions: Sequence[dict[str, Any]]
-    ) -> None:
-        """AI 端判定拒绝 → 本地立即拉黑（第二道闸；第一道是入站关键词）。"""
-        for action in actions:
-            if action.get("type") == "blacklist":
-                reason = action.get("reason")
-                self._store.blacklist(
-                    account_id,
-                    peer_id,
-                    reason=reason if isinstance(reason, str) else "AI 端判定对方拒绝联系",
-                )
-                _local.info("按 AI 端提案拉黑", account=account_id)
+    async def _hand_over(self, account_id: str, peer_id: str, reason: str | None) -> None:
+        """把这个人转给人工（候选人级接管，091 那条路）。``reason`` 为 None = 这张卡没要求。
+
+        ★ 已经是接管中就**不动**：那是招聘老师按的，原因也是老师写的，别拿一句自动的盖掉。
+        ★ **永不往上抛**：同步失败本机照样生效（`set_candidate_mode` 的铁律），
+          连本机都落不下也只记一笔——这一轮的消息已经发完了，不能因为这一步把整轮判失败。
+        """
+        if reason is None:
+            return
+        try:
+            if self._store.candidate_mode(account_id, peer_id).mode == HUMAN_TAKEOVER:
                 return
+            if self._takeover is not None:
+                await self._takeover(peer_id, reason)
+            else:
+                # 没接上 runner（单测 / 最小装配）：只落本机，闸照样成立。
+                self._store.set_candidate_mode(
+                    account_id, peer_id, HUMAN_TAKEOVER,
+                    candidate_id=self._store.contact_worker_id(account_id, peer_id) or "", reason=reason,
+                )
+            _local.info("按 AI 端提案转人工接管", account=account_id, 会话=peer_id)
+        except Exception as exc:  # noqa: BLE001 —— 理由见 docstring
+            _local.warning("自动转人工接管没落成", account=account_id, 会话=peer_id, error=str(exc))

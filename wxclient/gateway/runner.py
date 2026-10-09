@@ -66,7 +66,7 @@ from .moments import MomentsWatcher
 from .outbound import DeliveryResult, MessageSink, OutboundSender
 from .pacing import PACING_EVENT, clamp_interval
 from .schedule import ScheduleLoop, parse_schedule_at
-from .sessions import CANDIDATE_MODES, GatewayStore
+from .sessions import CANDIDATE_MODES, HUMAN_TAKEOVER, GatewayStore
 from .ticket import TicketProvider
 from .watchlist import PUSH_EVENT, Watchlist
 from .wsclient import AgentWsClient, AgentWsError, TurnResult, Unauthorized
@@ -305,6 +305,8 @@ class GatewayRunner:
             clock=self._clock,
             candidates=candidates,
             message_events=message_events,
+            # AI 端判对方拒绝联系 / 不再找工作 → 和招聘老师按按钮同一条路接管（2026-10-09）。
+            takeover=lambda peer, reason: self.set_candidate_mode(peer, HUMAN_TAKEOVER, reason=reason),
         )
         # 077：定时指令自己一条循环。它压根不动微信（只翻自己的表），所以节拍跟
         # 读消息/查好友无关；到点之后的执行仍走 _run_command，幂等与守门一并复用。
@@ -1664,6 +1666,8 @@ class GatewayRunner:
         # 四条常驻循环各走各的节拍：保活 30s、读消息 ~1min、查好友申请 ~15min、
         # 定时指令 30s（它不动微信，只翻自己的表）。
         # 谁也不等谁——把它们串成一个循环就等于让最慢的那件事决定所有事的频率。
+        # 老版本本机拉黑的人先落成接管，**再**开始读消息：拉黑闸已经拆了，晚一步就会被当普通会话读进来。
+        migrated = self._migrate_legacy_blacklist()
         side_tasks = [
             asyncio.create_task(self._keepalive_loop(), name="gw-keepalive"),
             asyncio.create_task(self.schedule.run(), name="gw-schedule"),
@@ -1691,6 +1695,10 @@ class GatewayRunner:
         # 回执补发：终态回执是 AI 端唯一的销账凭据，发不出去的那些要一直补到送达
         # （`docs/17 §5`）。**无条件起**——它不依赖任何可选组件。
         side_tasks.append(asyncio.create_task(self._flush_receipts(), name="gw-receipts"))
+        if migrated:
+            side_tasks.append(
+                asyncio.create_task(self._sync_migrated_takeovers(migrated), name="gw-legacy-blacklist")
+            )
         try:
             await self.loop.run()
         finally:
@@ -1699,6 +1707,51 @@ class GatewayRunner:
             for task in side_tasks:
                 with suppress(asyncio.CancelledError):
                     await task
+
+    def _migrate_legacy_blacklist(self) -> list[tuple[str, str, str]]:
+        """老版本本机拉黑的人 → 候选人级人工接管（2026-10-09，用户：「不应该有拉黑的情况」）。
+
+        原来的拉黑永久、看不见、解不开：一句「不想找工作了」就让这个人从此收不到也读不到。
+        现在落成接管——名单里看得见原因，「交回分身」一下就恢复。
+
+        **只做本机这一半**，同步步骤交给后台（`_sync_migrated_takeovers`）：要在开始读消息之前
+        落定，又不能让业务端慢把网关起不来。迁一行删一行；已经是接管中的不改原因，只删行。
+        返回要同步的 ``[(账号, 会话名, 原因)]``。出任何错都只记一笔——迁移不该挡住网关启动。
+        """
+        todo: list[tuple[str, str, str]] = []
+        for account in self._accounts:
+            try:
+                rows = self._store.legacy_blacklist(account)
+            except Exception as exc:  # noqa: BLE001 —— 读不到旧表就当没有
+                _log.warning("读旧黑名单失败，跳过迁移", error=str(exc))
+                continue
+            for peer, old_reason in rows:
+                try:
+                    current = self._store.candidate_mode(account, peer)
+                    if current.mode != HUMAN_TAKEOVER:
+                        reason = f"原自动拉黑已改为人工接管：{old_reason or '对方曾明确拒绝联系'}"
+                        self._store.set_candidate_mode(
+                            account, peer, HUMAN_TAKEOVER,
+                            candidate_id=current.candidate_id or self._store.contact_worker_id(account, peer) or "",
+                            reason=reason, version=current.version,
+                        )
+                        todo.append((account, peer, reason))
+                    self._store.drop_legacy_blacklist(account, peer)
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("旧黑名单迁成接管失败", error=str(exc))
+        if todo:
+            _log.info("老版本本机拉黑的人已改为人工接管", count=len(todo))
+        return todo
+
+    async def _sync_migrated_takeovers(self, todo: list[tuple[str, str, str]]) -> None:
+        """把迁过来的接管同步给业务端。失败只记一笔：本机已经生效了（同 `set_candidate_mode`）。"""
+        for account, peer, reason in todo:
+            try:
+                note = await self._sync_candidate_mode(account, peer, HUMAN_TAKEOVER, reason=reason)
+            except Exception as exc:  # noqa: BLE001
+                note = str(exc)
+            if note:
+                _backend.info("迁来的接管没同步上业务端，本机照样生效", note=note)
 
     async def _report_capabilities(self, account_id: str) -> None:
         """把「这台机器现在能做哪几件事」报给 AI 端（074）。**变了才报**。

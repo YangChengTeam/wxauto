@@ -13,6 +13,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -238,7 +239,7 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await runner.stop()
 
-    # ────────────────────────── 不回复与拉黑 ──────────────────────────
+    # ────────────────────────── 不回复与转人工 ──────────────────────────
 
     async def test_no_reply_card_sends_nothing(self) -> None:
         card = wechat_card([], no_reply_reason="对方只发了表情", intent="smalltalk")
@@ -257,8 +258,8 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
     async def test_inbound_rejection_wording_still_reaches_the_ai(self) -> None:
         """★ 网关关键词拉黑闸已拆（用户 2026-09-19：候选人每条新消息都要回，闲聊也回）。
 
-        「别再联系我了」和别的消息一样派给 AI 端一轮；网关自己不拉黑。
-        拒绝与否由 AI 端判，它提案 `blacklist` 才拉黑（见下一条用例）。
+        「别再联系我了」和别的消息一样派给 AI 端一轮；网关自己不处置。
+        拒绝与否由 AI 端判，它提案接管才转人工（见下一条用例；2026-10-09 起不再拉黑）。
         """
         async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
             sink = RecordingSink()
@@ -269,24 +270,28 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 await runner.tick()
                 await self._advance_and_tick(runner, 10)
 
-                self.assertFalse(self.store.is_blacklisted(ACCOUNT, PEER))
+                self.assertEqual(self.store.candidate_modes(ACCOUNT), {})
                 sends = [f for f in server.received if f.get("op") == "message.send"]
                 self.assertEqual(len(sends), 1, "这条消息该照常派给 AI 端一轮")
             finally:
                 await runner.stop()
 
-    async def test_ai_blacklist_action_blocks_later_turns(self) -> None:
-        """AI 端判定拒绝 → 拉黑生效，后续消息一律不再处理。"""
+    async def test_ai_takeover_action_hands_the_peer_over(self) -> None:
+        """AI 端判定「不找工作了」→ 收尾那句照发，然后转人工接管；之后分身一条都不再发给他。
+
+        ★ 2026-10-09 之前这里是本机拉黑：永久、看不见、解不开（用户：「不应该有拉黑的情况」）。
+        """
         card = wechat_card(
-            [], no_reply_reason="对方拒绝", intent="reject", funnel_stage="closed",
-            actions=[{"type": "blacklist", "reason": "对方明确表示不要再联系"}],
+            ["好的，不打扰了"], intent="reject", funnel_stage="closed",
+            actions=[{"type": "set_ai_status", "reason": "对方说不想找工作了",
+                      "payload": {"status": "human_takeover"}}],
         )
         async with FakeAgentServer(
             valid_tickets={"tkt-ok"}, turn_script=TurnScript(cards=[card])
         ) as server:
             sink = RecordingSink()
             source = ScriptedSource([
-                [inbound("我考虑一下吧不用了", msg_id="m1", at=T0)],
+                [inbound("我不想找工作了", msg_id="m1", at=T0)],
                 [],
                 [inbound("再问一句", msg_id="m2", at=T0 + timedelta(minutes=5))],
                 [],
@@ -295,17 +300,35 @@ class GatewayEndToEndTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await runner.tick()
                 await self._advance_and_tick(runner, 10)
-                self.assertTrue(self.store.is_blacklisted(ACCOUNT, PEER))
+                self.assertEqual([text for _a, _p, text in sink.sent], ["好的，不打扰了"])
+                row = self.store.candidate_mode(ACCOUNT, PEER)
+                self.assertEqual((row.mode, row.reason), ("human_takeover", "对方说不想找工作了"))
 
-                sends_before = len([f for f in server.received if f.get("op") == "message.send"])
                 await self._advance_and_tick(runner, 10)
                 await self._advance_and_tick(runner, 10)
-                sends_after = len([f for f in server.received if f.get("op") == "message.send"])
-
-                self.assertEqual(sends_before, sends_after, "已拉黑的人不该再触发一轮")
-                self.assertEqual(sink.sent, [])
+                self.assertEqual([text for _a, _p, text in sink.sent], ["好的，不打扰了"], "接管中一条都不该再发")
             finally:
                 await runner.stop()
+
+    async def test_legacy_blacklist_rows_become_takeovers(self) -> None:
+        """老版本本机拉黑的那几行，启动时迁成人工接管、删掉原行；已接管的不改原因。"""
+        with closing(self.store._connect()) as conn:
+            conn.executemany(
+                "INSERT INTO gateway_blacklist (account_id, peer_id, reason, created_at) VALUES (?,?,?,?)",
+                [(ACCOUNT, "老张", "对方明确表示不要再联系", "2026-10-01T00:00:00+00:00"),
+                 (ACCOUNT, "老李", "", "2026-10-02T00:00:00+00:00")],
+            )
+            conn.commit()
+        self.store.set_candidate_mode(ACCOUNT, "老李", "human_takeover", reason="招聘老师自己在聊")
+        async with FakeAgentServer(valid_tickets={"tkt-ok"}) as server:
+            runner = self._runner(server, ScriptedSource([[]]), RecordingSink())
+            todo = runner._migrate_legacy_blacklist()
+            await runner._sync_migrated_takeovers(todo)  # 没接业务端：只记一笔，本机照样生效
+        self.assertEqual([peer for _a, peer, _r in todo], ["老张"])
+        self.assertEqual(self.store.legacy_blacklist(ACCOUNT), [])
+        self.assertEqual(self.store.candidate_mode(ACCOUNT, "老张").mode, "human_takeover")
+        self.assertIn("对方明确表示不要再联系", self.store.candidate_mode(ACCOUNT, "老张").reason)
+        self.assertEqual(self.store.candidate_mode(ACCOUNT, "老李").reason, "招聘老师自己在聊")
 
     # ────────────────────────── 韧性 ──────────────────────────
 

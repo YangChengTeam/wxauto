@@ -727,7 +727,7 @@ class QueueMessageSource:
           建了档、业务端写进 contacts 之后，同步自然把他带进名单。
         ★ 读红点数本身不开窗（`get_unread_messages`，vendor 先看左上角总数，是 0 就立刻回来）。
           开窗读会把他的红点清掉——这是用户选「开窗读全」时认下的代价。
-        排除：名单里的（含人工接管中、本机「不管」的）、本机拉黑的、判过是群的、服务号/功能入口。
+        排除：名单里的（含人工接管中、本机「不管」的）、判过是群的、服务号/功能入口。
         """
         if not self._read_unread or not self._allow_real:
             return []
@@ -745,7 +745,6 @@ class QueueMessageSource:
             if (
                 name in skip
                 or name in SYSTEM_SESSION_NAMES
-                or self._store.is_blacklisted(account_id, name)
                 or self._store.is_known_group(account_id, name)
                 or self._store.candidate_mode(account_id, name).mode == HUMAN_TAKEOVER
             ):
