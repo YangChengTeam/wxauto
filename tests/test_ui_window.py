@@ -2220,16 +2220,16 @@ class CandidateTakeoverButtonTests(unittest.TestCase):
         self.assertTrue([t for t in shown if "业务端" in t], "得说清是没同步上去，而不是没接管")
 
     def test_a_conflict_says_what_happened_without_guessing_a_mode(self) -> None:
-        """★ 409：企业端刚改过 → 说出来，让人去刷名单；**不猜**他现在到底哪一档。"""
+        """★ 409：业务端状态刚变过 → 说出来，让人等同步后再点；**不猜**他现在到底哪一档。"""
         self.future = _DoneFuture({
             "mode": "human_takeover", "synced": False,
-            "note": "这个候选人的状态已被企业端改过，请刷新名单后重试",
+            "note": "没同步上：业务端的状态刚变过，等名单同步后再点一次",
         })
         with mock.patch.object(window_module.dialog, "ask_text", return_value="我来"):
             self.window._toggle_candidate_mode("张三")
 
         self.window._poll_candidate_modes()
-        self.assertTrue([t for t in self._texts() if "企业端" in t])
+        self.assertTrue([t for t in self._texts() if "再点一次" in t])
 
     # ── 状态还不知道 ──────────────────────────────────────────
 

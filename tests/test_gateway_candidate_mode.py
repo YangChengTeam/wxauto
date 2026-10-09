@@ -20,7 +20,12 @@ from typing import Any
 
 import httpx
 
-from wxclient.gateway import GatewayStore
+from wxclient.gateway import (
+    GatewayRunner,
+    GatewaySettings,
+    GatewayStore,
+    LocalFileTicketProvider,
+)
 from wxclient.gateway.candidate_mode import (
     AI_MANAGED,
     HUMAN_TAKEOVER,
@@ -191,6 +196,60 @@ class NeverRollBackTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(outcome.should_retry)
         self.assertEqual(outcome.conflict_version, 1)
+
+
+    async def test_a_plan_that_does_not_take_handoffs_is_not_a_version_conflict(self) -> None:
+        """409 不全是版本冲突：计划类型不收接管，重试多少次都一样，也别说「状态变过」。"""
+        outcome = await _Backend(httpx.Response(409, json={"error": {
+            "code": "PLAN_TYPE_NOT_SUPPORTED", "message": "只有招聘任务支持候选人接管/托管",
+        }})).client().request(CANDIDATE, AI_MANAGED)
+        self.assertTrue(outcome.local_reject)
+        self.assertEqual(outcome.conflict_version, 0)
+        self.assertFalse(outcome.should_retry)
+
+
+class RunnerSyncTests(unittest.IsolatedAsyncioTestCase):
+    """★ 2026-10-09 现场：助手里「交回分身」恢复不了——PUT 带着本机记的旧版本号被 409 打回。
+
+    同步名单不带版本，本机那一列只在本机自己按成功那一次写，之后业务端一动就过期。
+    所以 runner 发出去的请求**一律不带** `expectedVersion`。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.store = GatewayStore(root / "gateway.db")
+        tickets = root / "tickets.json"
+        tickets.write_text(json.dumps({ACCOUNT: "tkt-ok"}), encoding="utf-8")
+        self.backend = _Backend(httpx.Response(200, json=_ok(
+            aiRecruitment={"status": AI_MANAGED, "version": 9, "modeVersion": 2})))
+        self.runner = GatewayRunner(
+            settings=GatewaySettings(ai_ws_url="ws://127.0.0.1:9/v1/ws", local_ticket_file=tickets),
+            ticket_provider=LocalFileTicketProvider(tickets),
+            store=self.store,
+            source=None,
+            sink=None,
+            accounts=[ACCOUNT],
+            clock=lambda: T0,
+            candidate_mode=self.backend.client(),
+        )
+
+    async def asyncTearDown(self) -> None:
+        self._tmp.cleanup()
+
+    async def test_handing_back_never_sends_a_stale_expected_version(self) -> None:
+        # 本机上回自己按接管时记下的版本 3；之后业务端早推进到别的版本了。
+        self.store.set_candidate_mode(ACCOUNT, "张三", HUMAN_TAKEOVER, candidate_id=CANDIDATE,
+                                      reason="我自己跟", version=3)
+
+        result = await self.runner.set_candidate_mode("张三", AI_MANAGED)
+
+        self.assertEqual(len(self.backend.calls), 1)
+        body = self.backend.calls[0][1]
+        self.assertEqual(body["mode"], AI_MANAGED)
+        self.assertNotIn("expectedVersion", body, "★ 本机的版本号靠不住，带上去只会撞假冲突")
+        self.assertTrue(result["synced"])
+        self.assertEqual(result["mode"], AI_MANAGED)
 
 
 class ReportTests(unittest.IsolatedAsyncioTestCase):

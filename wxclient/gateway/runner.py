@@ -1599,8 +1599,14 @@ class GatewayRunner:
         if not row.candidate_id:
             # 同步名单里还没有他（陌生人、刚加上还没归位）。本机闸照样成立。
             return "这个会话还没对上劳小智里的候选人，这台电脑先自己生效了"
+        # ★ **不带 `expectedVersion`**（0.1.113，2026-10-09 现场：助手里「交回分身」恢复不了）。
+        #   本机手上没有可靠的版本号：同步名单 `GET /client/contacts` 不带版本，
+        #   `_absorb_conversation_mode` 也就从不更新它，本机这一列只在**本机自己按成功那一次**写。
+        #   之后企业端改一次、或业务端别的流程推进一次 `aiStatusVersion`，它就过期了，
+        #   下一次按按钮必然 409 → 本机先变托管、下一轮同步又被业务端的接管盖回去。
+        #   该字段是选填；招聘老师按下的那一下就是最新意图，后到的为准。
         asked = await self._candidate_mode.request(
-            row.candidate_id, mode, reason=reason or row.reason, expected_version=row.version,
+            row.candidate_id, mode, reason=reason or row.reason,
         )
         if not asked.accepted:
             if asked.conflict_version:

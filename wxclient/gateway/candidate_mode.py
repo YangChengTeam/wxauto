@@ -7,8 +7,9 @@
 
 - **即时执行权在这台电脑上。** 接管的意思是「现在立刻别再发给他了」。它必须在断网、
   业务端 500、接口还没上线的时候照样成立——那道闸在 ``guard.py``，纯本地、按会话名判。
-- **定序权威在业务端。** 谁先谁后由 ``aiRecruitment.version`` 说了算，本机不自己编版本号，
-  只把上次读到的那个当 ``expectedVersion`` 带上去。
+- **定序权威在业务端。** 谁先谁后由业务端的落库顺序说了算，本机不自己编版本号。
+  ★ 0.1.113 起 ``runner`` **不再带** ``expectedVersion``：同步名单不带版本，本机记的那个
+  必然过期，带上去只会撞出假的版本冲突（见 ``runner._sync_candidate_mode``）。
 
 所以这里只有一条铁律：**同步失败绝不回滚本机状态**，唯独 ``409`` 例外——
 那是业务端说「你手上那份过期了」，才以它为准重来。
@@ -240,13 +241,24 @@ class CandidateModeClient(BackendEndpoint):
             details = (response.json() or {}).get("error", {}).get("details", {})
         except Exception:  # noqa: BLE001
             details = {}
+        code = self._error_code(response)
+        if code == "PLAN_TYPE_NOT_SUPPORTED":
+            # 不是「状态变了」，是这个人所在的计划根本不收接管/托管。重试多少次都一样。
+            _log.warning("候选人所在计划不支持接管", what=what, code=code)
+            return ModeOutcome(
+                False,
+                local_reject=True,
+                reason="只有招聘任务支持接管/托管，业务端不收；这台电脑先自己生效了",
+            )
         version = _int((details or {}).get("currentVersion"))
-        _log.warning("候选人接管状态已被改过", what=what, current_version=version or None)
+        _log.warning("候选人接管状态已被改过", what=what, code=code or None,
+                     current_version=version or None)
         return ModeOutcome(
             False,
             # 冲突版本至少是 1：0 会被 `should_retry` 当成「还没送到」，欠账越攒越多。
             conflict_version=version or 1,
-            reason="这个候选人的状态已被企业端改过，请刷新名单后重试",
+            # ★ 别说「被企业端改过」：业务端别的流程也会推进版本，现场没人改过却这么说，是误导。
+            reason="没同步上：业务端的状态刚变过，等名单同步后再点一次",
         )
 
 

@@ -141,7 +141,7 @@ CREATE TABLE IF NOT EXISTS gateway_candidate_mode (
   -- human_takeover | ai_managed —— **直接用业务端 v1.5 的词**，本机不再翻译一遍
   mode         TEXT NOT NULL,
   reason       TEXT NOT NULL DEFAULT '',
-  -- 服务端 aiRecruitment.version（乐观锁用，下次 PUT 当 expectedVersion）
+  -- 服务端 aiRecruitment.version（只记录；0.1.113 起 PUT 不再带 expectedVersion，见 runner）
   version      INTEGER NOT NULL DEFAULT 0,
   -- 服务端 modeVersion + triggerId：`action=report` 要原样回传，客户端不解析
   mode_version INTEGER NOT NULL DEFAULT 0,
