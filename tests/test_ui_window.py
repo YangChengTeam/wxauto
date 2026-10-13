@@ -1534,6 +1534,120 @@ class WatchRemovalTests(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_TK, "没有 Tk")
+class WatchEraseTests(unittest.TestCase):
+    """名单上的「清除」（用户 2026-10-13：「整个的清除在名单列表上加一个按钮」）。
+
+    ★ 不许破：① 先问一句，问的话说清删什么、不删什么；② 点了取消什么都不发；
+      ③ 回话之前这一行停在「正在清除…」；④ 失败照原样说失败；⑤ 清除不是移出，那一行留在名单上。
+    """
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp())
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.service = GatewayService(lambda: None)
+        self.window = MainWindow(self.root, LogBuffer(), self.service,
+                                 data_dir=self.dir, probe_wechat=False)
+        self.window._build_watch_section(self.root)
+        self.calls: list[str] = []
+        self.future: Any = _DoneFuture({"sessions": 1, "messages": 3, "erasure": {"memories": 2}})
+        self.service.erase_peer = self._erase  # type: ignore[method-assign]
+        self.addCleanup(self._teardown)
+
+    def _erase(self, name: str):
+        self.calls.append(name)
+        return self.future
+
+    def _dialogs(self, answer: bool):
+        """同 `WatchRemovalTests._dialogs`：只挡住「弹出来」这一下，弹框本身照真建。"""
+        made: list[tuple[Any, str, str]] = []
+        real_init = window_module.dialog._Dialog.__init__
+
+        def spy_init(inner, parent, title, message, **kw):
+            real_init(inner, parent, title, message, **kw)
+            made.append((parent, title, message))
+            self.addCleanup(_destroy, inner)
+
+        patches = (
+            mock.patch.object(window_module.dialog._Dialog, "__init__", spy_init),
+            mock.patch.object(window_module.dialog._Dialog, "show",
+                              lambda _inner: answer),
+        )
+        return made, patches
+
+    def _teardown(self) -> None:
+        _KEEP_ALIVE.append(self.window)
+        try:
+            self.window.destroy()
+        except tk.TclError:
+            pass
+
+    def test_the_confirm_box_says_what_goes_and_what_stays(self) -> None:
+        made, patches = self._dialogs(False)
+        with patches[0], patches[1]:
+            self.window._ask_erase_peer("候选人-王建国")
+
+        self.assertEqual(len(made), 1, "确认框没弹出来")
+        parent, title, message = made[0]
+        self.assertIsInstance(parent, tk.Misc, "★ 弹框的 parent 必须是真控件")
+        self.assertIn("清除", title)
+        self.assertIn("候选人-王建国", message)
+        self.assertIn("无法恢复", message)
+        self.assertIn("仍会被自动回复", message, "★ 得说清这不是移出")
+        self.assertEqual(self.calls, [], "点了取消还去删，那这个框就是个摆设")
+
+    def test_confirming_erases_and_waits_for_the_answer(self) -> None:
+        self.future = _PendingFuture()
+        _made, patches = self._dialogs(True)
+        with patches[0], patches[1]:
+            self.window._ask_erase_peer("候选人-王建国")
+            self.window._ask_erase_peer("候选人-王建国")
+
+        self.assertEqual(self.calls, ["候选人-王建国"], "★ 没回话之前不排第二条")
+        self.assertIn("候选人-王建国", self.window._watch_erasing)
+
+    def test_success_is_said_and_the_row_stays(self) -> None:
+        _made, patches = self._dialogs(True)
+        with patches[0], patches[1]:
+            self.window._ask_erase_peer("候选人-王建国")
+            self.window._poll_watch_erasures()
+
+        self.assertEqual(self.window._watch_erasing, {})
+        self.assertNotIn("候选人-王建国", self.window._watch_gone, "★ 清除不是移出，人还在名单上")
+        self.assertIn("已清除", self.window._watch_note[0])
+
+    def test_nothing_on_the_ai_side_is_not_called_erased(self) -> None:
+        self.future = _DoneFuture({"sessions": 0, "messages": 0, "erasure": {}})
+        _made, patches = self._dialogs(True)
+        with patches[0], patches[1]:
+            self.window._ask_erase_peer("候选人-王建国")
+            self.window._poll_watch_erasures()
+
+        self.assertIn("还没有和 AI 聊过", self.window._watch_note[0])
+
+    def test_a_failure_is_told_as_a_failure(self) -> None:
+        self.future = _FailedFuture(RuntimeError("AI 端不让删：这个会话不归当前登录的账号"))
+        made, patches = self._dialogs(True)
+        with patches[0], patches[1]:
+            self.window._ask_erase_peer("候选人-王建国")
+            self.window._poll_watch_erasures()
+
+        self.assertEqual(self.window._watch_erasing, {}, "失败了也要把这一条收掉")
+        self.assertIn("不归当前登录的账号", made[-1][2])
+
+    def test_the_service_being_down_says_so_instead_of_throwing(self) -> None:
+        def boom(_name: str):
+            raise ServiceNotRunning("服务没在运行，清除不了")
+
+        self.service.erase_peer = boom  # type: ignore[method-assign]
+        made, patches = self._dialogs(True)
+        with patches[0], patches[1]:
+            self.window._ask_erase_peer("候选人-王建国")
+
+        self.assertIn("清除不了", made[-1][2])
+
+
+@unittest.skipUnless(HAS_TK, "没有 Tk")
 class WatchSyncTests(unittest.TestCase):
     """配置中心的「同步名单」（用户 2026-08-19：「接口没有对接，改成真实的接口」）。
 

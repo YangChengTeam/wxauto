@@ -209,6 +209,8 @@ class MainWindow:
         self._watch_hint: Any = None
         #: 正在移出的会话名 → 那次请求的 Future（tk 线程读，别在别处改）。
         self._watch_removing: dict[str, Any] = {}
+        #: 正在「清除」的会话名 → 那次请求的 Future（同上，tk 线程独占）。
+        self._watch_erasing: dict[str, Any] = {}
         #: 刚移出完、状态快照（每秒一拍）还没跟上的会话名——先从界面上拿掉，别让那一行闪回来。
         self._watch_gone: set[str] = set()
         #: 「同步名单」那一次请求的 Future；None = 现在没有在同步的。
@@ -733,6 +735,54 @@ class MainWindow:
             else:
                 _log.info("移出监听名单：本来就不在名单里，界面上一并拿掉", 会话=name)
 
+    def _ask_erase_peer(self, name: str) -> None:
+        """「清除」：先问一句，再删掉这个联系人在 AI 端的会话与记忆（`GatewayRunner.erase_peer`）。
+
+        用户 2026-10-13：「整个的清除在名单列表上加一个按钮」——演示账号重置用，删完 AI 按全新的人对待。
+        ★ 问的这一句要说清**删什么、不删什么**：删了找不回来；人还在名单上、照样自动回复，
+          微信里的聊天记录和业务端候选人都不动。弹框 parent 用 `self.root`，理由同 `_ask_remove_watched`。
+        """
+        if name in self._watch_erasing:
+            return  # 上一次还没有回话，别排第二条
+        _log.info("请求清除联系人的会话与记忆", 会话=name)
+        if not dialog.ask(
+            self.root, "清除会话与记忆",
+            f"清除「{name}」在劳小智里的全部会话与记忆？清除后无法恢复。\n\n"
+            "会删掉：AI 端和他的对话、记下的关系信息、开场记录，以及这台电脑上记的聊天记录。\n"
+            "不会动：自动回复名单（他仍会被自动回复，按新联系人重新开始）、微信里的聊天记录、业务端的候选人。",
+            confirm="清除", cancel="取消",
+        ):
+            return
+        try:
+            future = self.service.erase_peer(name)
+        except Exception as exc:  # noqa: BLE001 - 服务没起/连不上都要说人话
+            _log.warning("清除联系人失败", 会话=name, error=str(exc))
+            dialog.tell(self.root, "没能清除", str(exc), tone="error")
+            return
+        self._watch_erasing[name] = future
+        self._watch_shown = None  # 逼下一拍重画，让这一行显示「正在清除…」
+
+    def _poll_watch_erasures(self) -> None:
+        """看看那几条「清除」有没有回话。**跑在 tk 线程的心跳里**。"""
+        for name, future in list(self._watch_erasing.items()):
+            if not future.done():
+                continue
+            del self._watch_erasing[name]
+            self._watch_shown = None
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001 - 超时/断线/AI 端拒绝，照原样说出来
+                _log.warning("清除联系人失败", 会话=name, error=str(exc))
+                dialog.tell(self.root, "没能清除", f"{name}：{exc}", tone="error")
+                continue
+            sessions = int(result.get("sessions") or 0) if isinstance(result, dict) else 0
+            if sessions:
+                self._note_watch(f"已清除「{name}」的会话与记忆，下一条消息按新联系人开始。", theme.GREEN)
+            else:
+                # 本机没有他的会话：AI 端没有可删的，不谎报「已清除 AI 端」。
+                self._note_watch(f"「{name}」还没有和 AI 聊过，只清了本机记录。", theme.TEXT_MUTED)
+            _log.info("已清除联系人的会话与记忆", 会话=name, AI端会话=sessions)
+
     def _render_watch_page(self) -> None:
         """把名单铺到页面上。停在配置中心时每秒刷一次——名单是 AI 端随时会改的。"""
         if self._page != "settings" or self._watch_card is None:
@@ -765,7 +815,8 @@ class MainWindow:
         # ★ 重画的判据要把**档位**也算进去（091）：只看名字的话，按下接管之后
         #   那一行会一直画着旧样子，直到名单本身变了为止。
         shown = (watched, tuple(sorted(snapshot.candidate_modes.items())),
-                 tuple(sorted(self._mode_pending)), tuple(sorted(self._mode_notes.items())))
+                 tuple(sorted(self._mode_pending)), tuple(sorted(self._mode_notes.items())),
+                 tuple(sorted(self._watch_erasing)))
         if shown == self._watch_shown:
             return  # 没变就别重画：每秒重建一次控件既费又会把滚动位置抖没
         self._watch_shown = shown
@@ -812,6 +863,19 @@ class MainWindow:
         remove.bind("<Button-1>", lambda _e, n=name: self._ask_remove_watched(n))
         remove.bind("<Enter>", lambda _e, w=remove: w.configure(fg=theme.RED))
         remove.bind("<Leave>", lambda _e, w=remove: w.configure(fg=theme.TEXT_MUTED))
+
+        # ★「清除」挨着「移出」：两个都是不可撤回的，所以同样先问一句、同样悬停变红。
+        #   它删的是聊过什么（AI 端会话与记忆），人留在名单上——和「移出」正好互补。
+        if name in self._watch_erasing:
+            tk.Label(row, text="正在清除…", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                     fg=theme.ORANGE).pack(side=tk.RIGHT, padx=(0, 16))
+        else:
+            erase = tk.Label(row, text="清除", font=theme.FONT_SMALL, bg=theme.CONTENT_BG,
+                             fg=theme.TEXT_MUTED, cursor="hand2")
+            erase.pack(side=tk.RIGHT, padx=(0, 16))
+            erase.bind("<Button-1>", lambda _e, n=name: self._ask_erase_peer(n))
+            erase.bind("<Enter>", lambda _e, w=erase: w.configure(fg=theme.RED))
+            erase.bind("<Leave>", lambda _e, w=erase: w.configure(fg=theme.TEXT_MUTED))
 
         # ★★ 091 · 一人一个小按钮：接管 ⇄ 交回分身。放在「移出」左边——它是可逆的日常动作，
         #   而「移出」是从此不再自动回他。两者挨着，但轻重不同，颜色也不同。
@@ -1585,6 +1649,7 @@ class MainWindow:
             self._rows["watch"].configure(text=f"{len(watched)} 个会话", fg=theme.GREEN)
         self._poll_candidate_modes()
         self._poll_watch_removals()
+        self._poll_watch_erasures()
         self._poll_watch_sync()
         self._render_watch_page()  # 停在配置中心时跟着刷；不在那页是个空操作
 

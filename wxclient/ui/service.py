@@ -289,6 +289,17 @@ class GatewayService:
             raise ServiceNotRunning("服务没在运行，名单改不了")
         return asyncio.run_coroutine_threadsafe(gateway.runner.remove_watched(name), loop)
 
+    def erase_peer(self, name: str) -> Future[Any]:
+        """名单上的「清除」：删掉这个联系人在 AI 端的会话与记忆、本机的聊天记录。返回还没完成的 Future。
+
+        要连着 AI 端才删得了，所以服务没在跑就直接说，不排队等它起来。
+        """
+        with self._lock:
+            loop, gateway = self._loop, self._gateway
+        if loop is None or gateway is None or self.state is not ServiceState.RUNNING:
+            raise ServiceNotRunning("服务没在运行，清除不了")
+        return asyncio.run_coroutine_threadsafe(gateway.runner.erase_peer(name), loop)
+
     def set_candidate_mode(self, session_name: str, mode: str, *, reason: str = "") -> Future[Any]:
         """按下某个候选人后面那个小按钮（091）。返回还没完成的 Future（界面在心跳里问它）。
 

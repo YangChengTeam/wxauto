@@ -920,6 +920,27 @@ class GatewayStore:
             )
             conn.commit()
 
+    def forget_peer(self, account_id: str, peer_id: str) -> int:
+        """名单上的「清除」在本机这一半：丢掉会话映射和本机记下的聊天记录，返回删了几条记录。
+
+        聊天记录（``gateway_messages``）每轮当 ``history`` 送给 AI 端——AI 端那边删干净了、这里留着，
+        下一轮照样把旧事讲回去，等于没清。
+
+        ★ **不动**的：已读去重（``gateway_seen_messages``）和读取游标——动了，微信里那些旧消息
+          会被当成新消息再读一遍、再回一遍；名单、接管档、好友账本——那是配置，不是会话。
+        """
+        with closing(self._connect()) as conn:
+            conn.execute(
+                "DELETE FROM gateway_sessions WHERE account_id=? AND peer_id=?",
+                (account_id, peer_id),
+            )
+            cur = conn.execute(
+                "DELETE FROM gateway_messages WHERE account_id=? AND peer_id=?",
+                (account_id, peer_id),
+            )
+            conn.commit()
+            return cur.rowcount
+
     # ────────────────────────── 消息去重 ──────────────────────────
 
     def filter_unseen(

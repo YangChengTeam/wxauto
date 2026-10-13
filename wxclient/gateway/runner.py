@@ -23,6 +23,7 @@ import structlog
 
 from .. import logrole
 from .agent_files import AgentFileUploader
+from .agent_sessions import PEER_ERASED_EVENT, AgentSessionEraser
 from .attachments import (
     LEFT_BEHIND_TEXT,
     MATERIAL_TYPE_TEXT,
@@ -216,6 +217,10 @@ class ConnectionPool:
     def mark_resumed(self, account_id: str, session_id: str) -> None:
         self._resumed.setdefault(account_id, set()).add(session_id)
 
+    def forget_session(self, account_id: str, session_id: str) -> None:
+        """这个会话在 AI 端已经删了：别再当它「本连接上接过」。"""
+        self._resumed.get(account_id, set()).discard(session_id)
+
     def needs_resume(self, account_id: str, session_id: str) -> bool:
         """本连接上还没接过这个会话 → 需要 resume（顺带触发 AI 端重投影）。"""
         return session_id not in self._resumed.get(account_id, set())
@@ -252,10 +257,13 @@ class GatewayRunner:
         friend_checker: PendingFriendWatcher | None = None,
         moments_watcher: MomentsWatcher | None = None,
         file_uploader: AgentFileUploader | None = None,
+        session_eraser: AgentSessionEraser | None = None,
     ) -> None:
         self._settings = settings
         # 2026-09-28：对方发来的图片/文件先直接传到 AI 端的会话拿 file_id，传不上去才随消息内联。
         self._uploader = file_uploader
+        # 2026-10-13：名单上的「清除」——删 AI 端这个联系人的会话与记忆（`erase_peer`）。
+        self._eraser = session_eraser
         self._store = store
         self._accounts = tuple(accounts)
         self._connect_error: str | None = None
@@ -386,7 +394,28 @@ class GatewayRunner:
         if ev == NOTICE_EVENT:
             self._on_notice(data)
             return
+        if ev == PEER_ERASED_EVENT:
+            self._on_peer_erased(account_id, data)
+            return
         _ai.debug("收到未处理的推送事件", ev=ev)
+
+    def _on_peer_erased(self, account_id: str, data: dict[str, Any]) -> None:
+        """AI 端说「这个联系人的会话被删了」（别处删的：网页、业务端删候选人，或本机「清除」的回声）。
+
+        只丢本机这一半（会话映射 + 聊天记录），**不发任何微信消息、不改名单**（147 handoff §2）。
+        ★ 只认 ``session_ids`` 里点到的那个会话：本机映射已经换成新会话了（比如刚清过又聊上了），
+          一条迟到的旧通知不许把新会话也抹掉。``session_ids`` 为空才按会话名认。
+        """
+        peer = str(data.get("peer") or "").strip()
+        if not peer:
+            return
+        ids = {str(s) for s in data.get("session_ids") or [] if s}
+        current = self._store.get_session(account_id, peer)
+        if current is None or (ids and current not in ids):
+            return
+        forgotten = self._store.forget_peer(account_id, peer)
+        self._pool.forget_session(account_id, current)
+        _ai.info("AI 端删除了这个联系人的会话，本机记录一并清掉", 会话=peer, 聊天记录=forgotten)
 
     def _on_notice(self, data: dict[str, Any]) -> None:
         """AI 端说「这一轮发生了什么」（``wechat.notice``）——**只写日志，不做任何事**。
@@ -1437,6 +1466,37 @@ class GatewayRunner:
             "watching": len(self._watchlist.watched()),
             "blocked": len(self._watchlist.scope.never),
         }
+
+    async def erase_peer(self, name: str) -> dict[str, Any]:
+        """名单上的「清除」：把这个联系人在 AI 端和本机留下的会话痕迹整个删掉（用户 2026-10-13）。
+
+        返回 ``{"sessions": 删了几段 AI 端会话, "messages": 本机删了几条聊天记录, "erasure": AI 端回执}``。
+
+        ★ **先删 AI 端、成功了才动本机**：反过来的话，AI 端没删成，本机已经忘了 session_id，
+          那段会话就再也找不回来删了。
+        ★ 人还在名单上、接管档不变：清的是「聊过什么」，不是「回不回他」。下一条消息按新联系人开新会话。
+        ★ 本机没有这个人的会话（从没聊过，或映射早丢了）就只清本机记录，AI 端没有 session_id 可删。
+        """
+        name = name.strip()
+        if not name:
+            raise AgentWsError("会话名是空的")
+        sessions = 0
+        messages = 0
+        erasure: dict[str, Any] = {}
+        for account_id in self._accounts:
+            session_id = self._store.get_session(account_id, name)
+            if session_id:
+                if self._eraser is None:
+                    raise AgentWsError("没配 AI 端地址，清除不了")
+                receipt = await self._eraser.erase(account_id, name, session_id)
+                for key, value in receipt.items():
+                    if isinstance(value, int):
+                        erasure[key] = erasure.get(key, 0) + value
+                sessions += 1
+                self._pool.forget_session(account_id, session_id)
+            messages += self._store.forget_peer(account_id, name)
+        _ai.info("已清除这个联系人的会话与记忆", 会话=name, AI端会话=sessions, 本机聊天记录=messages)
+        return {"sessions": sessions, "messages": messages, "erasure": erasure}
 
     def set_command_listener(
         self, listener: Callable[[dict[str, Any]], None] | None

@@ -21,6 +21,7 @@ from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRu
 
 from .. import logrole, tuning
 from .agent_files import AgentFileUploader, http_base_from_ws
+from .agent_sessions import AgentSessionEraser
 from .attachments import AttachmentFetcher
 from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
@@ -295,6 +296,11 @@ def build_gateway(
             )
             if gateway_settings.inbound_attachments
             else None
+        ),
+        # 名单上的「清除」（2026-10-13）：同一个 REST 基址、同一种票，删 AI 端这个联系人的会话与记忆。
+        session_eraser=AgentSessionEraser(
+            base_url=http_base_from_ws(gateway_settings.ai_ws_url),
+            ticket_provider=ticket_provider,
         ),
         # 092：名单里还不是好友的人自动补加。加好友本身仍走 `command_executor`——
         # 能力闸、频控闸、时间窗、幂等一道不绕。

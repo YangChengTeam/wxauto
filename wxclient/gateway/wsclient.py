@@ -58,6 +58,14 @@ class Unauthorized(AgentWsError):
     """鉴权失败——票据无效、过期或已被撤销。调用方应重新换票再连。"""
 
 
+class SessionGone(Unauthorized):
+    """AI 端说这个会话不存在了（``not_found``）：被名单上的「清除」删掉，或过期回收了。
+
+    归成 ``Unauthorized`` 的一种，好让每个调用点原有的那条「丢掉本地映射、开新会话」直接接住它。
+    在这之前它是普通的 ``AgentWsError``：调用方只会拿同一个旧会话重试，这个联系人从此每轮都失败。
+    """
+
+
 class TurnTimeout(AgentWsError):
     """一轮对话超时。"""
 
@@ -183,14 +191,14 @@ class AgentWsClient:
             _log.info("正在断开 AI 端连接")
             try:
                 await self._ws.close()
-            except Exception:  # noqa: BLE001 —— 关闭失败不影响调用方
+            except Exception:  # noqa: BLE001, S110 —— 关闭失败不影响调用方
                 pass
         self._closed.set()
         if self._reader is not None:
             self._reader.cancel()
             try:
                 await self._reader
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001, S110
                 pass
             self._reader = None
         self._fail_all(AgentWsError("连接已关闭"))
@@ -493,6 +501,8 @@ class AgentWsClient:
         message = data.get("message") or ""
         if code in {"unauthorized", "forbidden"}:
             return Unauthorized(f"{code}: {message}")
+        if code == "not_found":
+            return SessionGone(f"{code}: {message}")
         return AgentWsError(f"{code}: {message}")
 
     def _fail_all(self, exc: Exception) -> None:

@@ -316,6 +316,19 @@ WXCLIENT_GATEWAY_MOMENTS_COMMENT_MATERIAL       自动评论的素材（想传�
 `sync` 什么都不改，所以在 AI 端**不进在线授权复核**那张清单（和回执、能力表同类）；
 `remove` 会留下后果，照样复核。
 
+### 4.2.1 名单上的「清除」：删这个人的会话与记忆（2026-10-13）
+
+用户：「在微信自动化客户端把清除的实现，加在设置的名单上，整个的清除在名单列表上加一个按钮」——演示账号重置用。
+契约是 AI 服务仓 spec 147 的 `handoff-gateway.md`（`DELETE /v1/sessions/{id}?include_memory=true&peer=<会话名>`，票同上传文件）。
+
+- 名单每一行「移出」左边一个「清除」，点了先问一句（删了找不回来）。`GatewayRunner.erase_peer`：
+  **先删 AI 端、成功了才动本机**，再丢本机会话映射和 `gateway_messages`（每轮当 `history` 送上去，留着等于没清）。
+- **不动**：名单与接管档（清的是聊过什么，不是回不回他）、已读去重与游标（动了旧消息会被再回一遍）、
+  微信里的聊天记录、业务端候选人。
+- AI 端推 `wechat.peer_erased`（别处删的）→ 只在本机映射正是被删的那个会话时才清，迟到的旧通知不抹新会话。
+- AI 端对 `session.resume` / `message.send` 回 `not_found` 现在是 `SessionGone`（`Unauthorized` 的子类），
+  走原有「丢映射、开新会话」那条路；之前它是普通错误，这个联系人会拿旧会话一直重试失败。
+
 
 启动：
 
