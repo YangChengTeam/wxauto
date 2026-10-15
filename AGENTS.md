@@ -235,6 +235,9 @@ Every line here was learned on a real machine. Read the reason before changing o
   The gate is registered **by command name** (`guard.WRITE_PACING`), not by action: accepting a request
   somebody sent us needs no search and must not be blocked by this gate. Both numbers live in the scheduling
   config (`max_friend_actions_per_hour` / `friend_interval_seconds`).
+  ★ **Speed mode (demo accounts only) lowers the friend floor from 300s to 10s** (user ruling 2026-10-15,
+  reversing 09-30) — `GatewaySettings.friend_floor_seconds`; the presets also set the add-friend interval
+  and the accept re-check interval to 10s and restore them when speed mode is turned off. Quotas are untouched.
   ★ There used to be a third tier, "double the backoff after consecutive failures". It was removed on
   2026-08-28 at the user's request (waits too long). **Do not add it back**: if you want it slower, raise the
   interval — a number you can see and change beats a number that grows on its own.

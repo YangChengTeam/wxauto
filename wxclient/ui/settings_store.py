@@ -58,7 +58,7 @@ SECTIONS: tuple[Section, ...] = (
     Section("sched", "调度配置", "配置消息读取与任务调度规则", columns=2),
     Section("boot", "启动设置", "配置服务启动后的行为"),
     # 不在配置中心里渲染，单独一页「极速模式」（原名「演示」，用户 2026-09-30 要求改名）（`window._ensure_demo_page`）。
-    Section("demo", "极速开关", "开启后读消息间隔改为 5 秒、发送总上限改为不限，关闭后恢复原值"),
+    Section("demo", "极速开关", "开启后读消息间隔改为 5 秒、加好友与查好友通过改为 10 秒、发送总上限改为不限，关闭后恢复原值"),
     Section("demo_wait", "等待与排队", "", columns=2),
     Section("demo_conn", "连接与超时", "", columns=2),
     Section("demo_keep", "保留期限", "", columns=2),
@@ -72,6 +72,8 @@ SETTINGS_SECTIONS: tuple[str, ...] = ("conn", "sched", "boot")
 DEMO_TOGGLE_KEY = "WXCLIENT_GATEWAY_DEMO_MODE"
 #: 极速模式开着时配置中心间隔的地板；抄自 `gateway/config.py` 的 `DEMO_MIN_SECONDS`（同 default，不 import 网关包）。
 DEMO_MIN_SECONDS = 1.0
+#: 极速模式下好友那几格的地板；抄自 `gateway/config.py` 的 `DEMO_FRIEND_FLOOR_SECONDS`（理由同上）。
+DEMO_FRIEND_FLOOR_SECONDS = 10.0
 #: 开启极速模式时配置中心里跟着改掉的格子 → 开启后的值；关掉时恢复开启前的原值（`apply_demo_presets`）。
 #: 用户 2026-09-30：「开启极速模式读消息间隔变为 1，框框中的参数也要变」，随后改口「配置 5 秒吧，1 秒太快了」。
 #: 用户 2026-10-07：极速模式下「发送总上限」自动不限（真机撞「该账号一小时内已做 29 次，达到上限 30」）。
@@ -79,9 +81,15 @@ DEMO_MIN_SECONDS = 1.0
 DEMO_PRESETS: dict[str, str] = {
     "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": "5",
     "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": "0",
+    # 用户 2026-10-15：极速模式下首次触达等了 4~5 分钟——加好友撞 300 秒节拍、对方通过后要等复查才发现。
+    "WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS": "10",
+    "WXCLIENT_GATEWAY_FRIEND_RECHECK_INTERVAL_SECONDS": "10",
 }
-#: 极速模式开着时保存检查降到 `DEMO_MIN_SECONDS` 的格子。查新好友那格不在里面（用户 2026-09-30：「查好友不能太快」）。
-DEMO_UNLOCKED: frozenset[str] = frozenset({"WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS"})
+#: 极速模式开着时保存检查降低地板的格子 → 降到多少。好友那格只降到 10 秒（用户 2026-10-15）。
+DEMO_UNLOCKED: dict[str, float] = {
+    "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": DEMO_MIN_SECONDS,
+    "WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS": DEMO_FRIEND_FLOOR_SECONDS,
+}
 #: 开启前原值的备份键前缀（存在同一个 gateway.env 里，不上界面）。
 DEMO_SAVED_PREFIX = "WXCLIENT_GATEWAY_DEMO_SAVED_"
 
@@ -217,14 +225,14 @@ def validate(values: dict[str, str]) -> dict[str, str]:
     不是数字的按「填错」报，别让它带着一个字符串进 env 再在网关启动那一刻炸。
     """
     errors: dict[str, str] = {}
-    # 极速模式开着：配置中心那几格的地板降到 1 秒，和网关 `GatewaySettings.read_floor_seconds` 等同步。
+    # 极速模式开着：配置中心那几格的地板按 `DEMO_UNLOCKED` 降低，和网关 `read_floor_seconds` / `friend_floor_seconds` 同步。
     demo = str(values.get(DEMO_TOGGLE_KEY, "")).strip().lower() in _TRUE
     for field in FIELDS:
         if field.minimum is None:
             continue
         minimum = field.minimum
         if demo and field.key in DEMO_UNLOCKED:
-            minimum = min(minimum, DEMO_MIN_SECONDS)
+            minimum = min(minimum, DEMO_UNLOCKED[field.key])
         raw = str(values.get(field.key, "")).strip()
         if raw == "":
             continue

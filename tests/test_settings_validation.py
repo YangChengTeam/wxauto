@@ -154,14 +154,14 @@ class DemoModeTests(unittest.TestCase):
 
     def test_on_lowers_the_floors_but_keeps_the_config_center_intervals(self) -> None:
         """★ 用户 2026-09-30「和配置中心重复了」：间隔只在配置中心填，极速模式不再盖掉它。"""
-        from wxclient.gateway.config import DEMO_MIN_SECONDS
-        from wxclient.gateway.pacing import MIN_FRIEND_INTERVAL_SECONDS
+        from wxclient.gateway.config import DEMO_FRIEND_FLOOR_SECONDS, DEMO_MIN_SECONDS
 
         settings = self._settings(WXCLIENT_GATEWAY_DEMO_MODE="1", **{self.READ: "5"})
         self.assertEqual(settings.poll_interval_seconds, 5.0)
         self.assertEqual(settings.friend_interval_seconds, 300.0)
         self.assertEqual(settings.read_floor_seconds, DEMO_MIN_SECONDS)
-        self.assertEqual(settings.friend_floor_seconds, MIN_FRIEND_INTERVAL_SECONDS, "查好友不能太快")
+        self.assertEqual(settings.friend_floor_seconds, DEMO_FRIEND_FLOOR_SECONDS, "用户 2026-10-15：极速下好友地板 10 秒")
+        self.assertEqual(DEMO_FRIEND_FLOOR_SECONDS, 10.0)
         self.assertEqual(settings.moments_floor_seconds, DEMO_MIN_SECONDS)
         self.assertEqual(settings.jitter_ratio, 0.0)
 
@@ -191,13 +191,25 @@ class DemoModeTests(unittest.TestCase):
         on = {"WXCLIENT_GATEWAY_DEMO_MODE": "1"}
         self.assertEqual(validate({**on, self.READ: "5"}), {})
         self.assertIn(self.READ, validate({**on, self.READ: "0.5"}))
-        self.assertIn(self.FRIEND_CHECK, validate({**on, self.FRIEND_CHECK: "10"}), "查好友不能太快")
+        self.assertEqual(validate({**on, self.FRIEND_CHECK: "10"}), {}, "极速下查新好友最低 10 秒")
+        self.assertIn(self.FRIEND_CHECK, validate({**on, self.FRIEND_CHECK: "5"}))
         self.assertIn(self.FRIEND_CHECK, validate({self.FRIEND_CHECK: "10"}))
 
+    def test_turning_on_sets_the_friend_boxes_to_10_and_turning_off_puts_them_back(self) -> None:
+        """用户 2026-10-15：加好友最小间隔、查好友通过间隔在极速下改成 10，关掉恢复原值。"""
+        toggle = settings_store.DEMO_TOGGLE_KEY
+        add = "WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS"
+        recheck = "WXCLIENT_GATEWAY_FRIEND_RECHECK_INTERVAL_SECONDS"
+        on = settings_store.apply_demo_presets({toggle: "1", add: "300", recheck: "900"})
+        self.assertEqual((on[add], on[recheck]), ("10", "10"))
+        back = settings_store.apply_demo_presets({**on, toggle: "0"})
+        self.assertEqual((back[add], back[recheck]), ("300", "900"))
+
     def test_ui_floor_matches_the_gateway_floor(self) -> None:
-        from wxclient.gateway.config import DEMO_MIN_SECONDS
+        from wxclient.gateway.config import DEMO_FRIEND_FLOOR_SECONDS, DEMO_MIN_SECONDS
 
         self.assertEqual(settings_store.DEMO_MIN_SECONDS, DEMO_MIN_SECONDS)
+        self.assertEqual(settings_store.DEMO_FRIEND_FLOOR_SECONDS, DEMO_FRIEND_FLOOR_SECONDS)
 
     def test_no_interval_is_stored_twice(self) -> None:
         """极速页不许再出现配置中心已有的那几个间隔。"""
@@ -252,7 +264,7 @@ class DemoModeTests(unittest.TestCase):
 
     def test_guard_and_jitter_follow_the_demo_floors(self) -> None:
         from wxclient.gateway import pacing
-        from wxclient.gateway.config import DEMO_MIN_SECONDS
+        from wxclient.gateway.config import DEMO_FRIEND_FLOOR_SECONDS, DEMO_MIN_SECONDS
         from wxclient.gateway.guard import (
             READ_ACTION,
             READ_FRIENDS_ACTION,
@@ -260,8 +272,9 @@ class DemoModeTests(unittest.TestCase):
         )
         from wxclient.gateway.pacing import MIN_FRIEND_INTERVAL_SECONDS
 
+        self.assertEqual(read_intervals_from(self._settings())[READ_FRIENDS_ACTION], MIN_FRIEND_INTERVAL_SECONDS)
         on = self._settings(WXCLIENT_GATEWAY_DEMO_MODE="1")
-        self.assertEqual(read_intervals_from(on)[READ_FRIENDS_ACTION], MIN_FRIEND_INTERVAL_SECONDS)
+        self.assertEqual(read_intervals_from(on)[READ_FRIENDS_ACTION], DEMO_FRIEND_FLOOR_SECONDS)
         self.assertEqual(read_intervals_from(on)[READ_ACTION], DEMO_MIN_SECONDS)
         try:
             pacing.set_jitter_ratio(on.jitter_ratio)
