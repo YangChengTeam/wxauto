@@ -205,6 +205,17 @@ class DemoModeTests(unittest.TestCase):
         back = settings_store.apply_demo_presets({**on, toggle: "0"})
         self.assertEqual((back[add], back[recheck]), ("300", "900"))
 
+    def test_lowered_friend_check_is_restored_before_turning_demo_off(self) -> None:
+        toggle = settings_store.DEMO_TOGGLE_KEY
+        for original in ("900", "0"):
+            on = settings_store.apply_demo_presets({toggle: "1", self.FRIEND_CHECK: original})
+            self.assertEqual(on[self.FRIEND_CHECK], original, "开关不自动改查新好友间隔")
+            edited = settings_store.apply_demo_presets({**on, self.FRIEND_CHECK: "10"})
+            self.assertEqual(validate(edited), {})
+            back = settings_store.apply_demo_presets({**edited, toggle: "0"})
+            self.assertEqual(back[self.FRIEND_CHECK], original)
+            self.assertEqual(validate(back), {}, "关闭极速前先恢复普通模式合法值")
+
     def test_ui_floor_matches_the_gateway_floor(self) -> None:
         from wxclient.gateway.config import DEMO_FRIEND_FLOOR_SECONDS, DEMO_MIN_SECONDS
 

@@ -265,7 +265,7 @@ _RETIRED_DEMO_KEYS = frozenset({
 
 
 def apply_demo_presets(values: dict[str, str]) -> dict[str, str]:
-    """按极速开关的**当前状态**对齐 `DEMO_PRESETS` 那几格，返回新的一份（不改入参）。
+    """按极速开关的**当前状态**对齐预设并备份放宽下限的格子，返回新的一份（不改入参）。
 
     - 开着、还没备份过 → 备份原值，那一格改成预设值；
     - 关着、有备份 → 恢复备份（备份是空的就回默认），删掉备份；
@@ -277,11 +277,12 @@ def apply_demo_presets(values: dict[str, str]) -> dict[str, str]:
     out = {key: value for key, value in values.items() if key not in _RETIRED_DEMO_KEYS}
     on = as_bool(out.get(DEMO_TOGGLE_KEY, ""))
     defaults = {field.key: field.default for field in FIELDS}
-    for key, preset in DEMO_PRESETS.items():
+    for key in DEMO_PRESETS.keys() | DEMO_UNLOCKED.keys():
         saved = _saved_key(key)
         if on and saved not in out:
             out[saved] = out.get(key) or defaults.get(key, "")
-            out[key] = preset
+            if key in DEMO_PRESETS:
+                out[key] = DEMO_PRESETS[key]
         elif not on and saved in out:
             out[key] = out.pop(saved) or defaults.get(key, "")
     return out
