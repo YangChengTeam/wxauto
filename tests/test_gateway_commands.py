@@ -291,17 +291,18 @@ class SentEchoRecordTests(CommandTestCase):
         self.assertTrue(self.store.claim_sent_echo(ACCOUNT, "张三-仓库工", "张三-仓库工"),
                         "记账跟着填进去的那句走")
 
-    async def test_the_known_session_name_is_what_goes_into_the_request_box(self) -> None:
+    async def test_business_label_is_sent_and_echo_is_recorded_under_the_actual_session_name(self) -> None:
         self.store.save_contacts(ACCOUNT, [
             {"number": "13800000001", "session_name": "候选人-张建国", "updated_at": "2026-08-18T09:00:00.000Z"},
         ])
-        runtime = FakeRuntime()
+        runtime = FakeRuntime(result={"already_friend": False, "session_name": "实际昵称"})
         await self._executor(runtime).execute({
             "command_id": "c1", "op": "add_friend",
             "args": {"number": "13800000001", "greetings": "你好", "remark": "张先生"},
         })
         _, payload, _ = runtime.calls[-1]
-        self.assertEqual(payload["greetings"], "候选人-张建国")
+        self.assertEqual(payload["greetings"], "张先生")
+        self.assertTrue(self.store.claim_sent_echo(ACCOUNT, "实际昵称", "张先生"))
 
     async def test_without_a_label_the_greeting_stays(self) -> None:
         runtime = FakeRuntime()
@@ -607,12 +608,8 @@ class FriendStateTests(CommandTestCase):
         })
         self.assertIsNone((result.result or {}).get("friend_state"))
 
-    async def test_a_known_session_name_wins_over_the_one_the_ai_made_up(self) -> None:
-        """★ 换机后不给同一个人起第二个备注名（api2 §4.2）：后端记着的那个说了算。
-
-        名字一变，按会话名存的关系记忆（078）就断了，而且现场看不出来——
-        微信里会多出一个「新人」，聊过的东西全不认。
-        """
+    async def test_business_label_wins_even_when_an_old_session_name_is_known(self) -> None:
+        """用户 2026-10-15：新备注来自业务端 label，旧会话名不再覆盖它。"""
         self.store.save_contacts(ACCOUNT, [
             {"number": "wxid_zhang", "session_name": "候选人-张建国", "updated_at": "2026-08-18T09:00:00.000Z"},
         ])
@@ -623,7 +620,22 @@ class FriendStateTests(CommandTestCase):
         })
         self.assertEqual(result.status, "done", result.reason)
         _, payload, _ = runtime.calls[-1]
-        self.assertEqual(payload["remark"], "候选人-张建国")
+        self.assertEqual(payload["remark"], "张先生")
+        self.assertEqual(payload["greetings"], "张先生")
+
+    async def test_missing_business_label_is_not_filled_with_an_old_session_name(self) -> None:
+        self.store.save_contacts(ACCOUNT, [
+            {"number": "wxid_zhang", "session_name": "旧昵称", "updated_at": "2026-08-18T09:00:00.000Z"},
+        ])
+        runtime = FakeRuntime()
+        result = await self._executor(runtime).execute({
+            "command_id": "c1", "op": "add_friend",
+            "args": {"number": "wxid_zhang", "greetings": "业务端验证语"},
+        })
+        self.assertEqual(result.status, "done", result.reason)
+        _, payload, _ = runtime.calls[-1]
+        self.assertIsNone(payload["remark"])
+        self.assertEqual(payload["greetings"], "业务端验证语")
 
     async def test_the_ai_remark_stands_when_this_machine_knows_nothing(self) -> None:
         """本机没有这个号的记录 —— 那 AI 端给的备注名就是唯一一份，照用。"""

@@ -839,11 +839,8 @@ class GatewayRunner:
         #   ① `already_friend`：这一轮没点添加、也没设过备注，微信里他现在叫什么才是实情。
         #      报我们提议的那个 remark = 给后端一个微信里根本不存在的会话名，
         #      后端照着它派下一条指令，逐字寻址随即找不到窗口。
-        #   ② `commands.py` 按**后端已知的会话名**补过备注（api2 §4.2：换机不给同一个人
-        #      起第二个名字）。那次补写进的是给微信的 `payload`，**原指令的 args 仍是空的**。
-        #   2026-08-27 真机就栽在②上：AI 端下发的指令没带 remark，本机补上了、微信里
-        #   备注也设对了，可上报读的是 args → 判成「缺 remark」整条跳过，
-        #   于是后端始终不知道这个人在微信里叫什么，名单里也就永远没有他。
+        #   ② 找不到备注输入框时，本次备注没有写入微信，回执会如实返回昵称；
+        #      不能把下发的 label 当成已经设置成功的会话名。
         remark = str(payload.get("session_name") or "") or str(args.get("remark") or "")
         if state == CONTACT_REQUESTED and number and remark:
             # 先落本机再上报：上报可能失败，而「以后要认出对方通过了」这件事不能跟着失败。
