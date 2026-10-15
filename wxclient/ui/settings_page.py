@@ -7,8 +7,8 @@
 `docs/招聘分身_客户端认证与状态接口_v1.1.md` 的接口清单），所以原来那层「后端下发 +
 本机覆盖」连同标注一起删了——两份配置就会有两个答案，而人只会相信自己看见的那个。
 
-版式（设计稿）：参数按「连接 / 调度 / 启动」分三段，每段一个标题 + 一句说明 + 一条横线；
-每行是「右对齐标签 + 输入框 + 灰字说明」；底部一条固定的动作条（保存状态 + 仅保存 +
+参数按「连接 / 调度 / 启动」分三段。标签、输入框、说明纵向成组；空间充足时两组并排，
+窄窗口或大字号时改为单列，说明换行，不挤占输入宽度。底部一条固定的动作条（保存状态 + 仅保存 +
 保存并重启服务），**不跟着滚**——一屏放不下的时候，按钮不能跟着滚出视野。
 """
 
@@ -17,14 +17,12 @@ from __future__ import annotations
 import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
+from tkinter import font as tkfont
 
 from . import dialog, settings_store, theme, widgets
 from .settings_store import FIELDS, SECTIONS, Field, Section
 
 _MASK = "········"
-
-#: 标签列宽（字符）。三段共用同一个宽度，各段的输入框才会左边对齐成一条线。
-_LABEL_WIDTH = 12
 
 
 class SettingsPage(tk.Frame):
@@ -58,6 +56,9 @@ class SettingsPage(tk.Frame):
         self._fields = tuple(f for f in FIELDS if f.section in self._sections)
         #: 带 `locked_value` 的格子：(输入框, 真值, 关着时显示的地板)。
         self._lockable: dict[str, tuple[tk.Entry, tk.StringVar, tk.StringVar]] = {}
+        self._field_frames: dict[str, tk.Frame] = {}
+        self._layout_columns: dict[tk.Frame, int] = {}
+        self._field_font = tkfont.Font(self, font=theme.FONT_BODY)
 
         # ★ 这里曾经有一行「参数由后端下发…」和一个「重新拉取」，2026-08-15 用户要求撤掉：
         # 后端那头还没有，摆着只会让人以为「点一下就能同步」。参数在哪儿生效看下面的
@@ -119,9 +120,6 @@ class SettingsPage(tk.Frame):
         head.pack(fill=tk.X)
         tk.Label(head, text=section.title, font=theme.FONT_HEADING,
                  bg=theme.CONTENT_BG, fg=theme.TEXT).pack(side=tk.LEFT)
-        if section.desc:
-            tk.Label(head, text=section.desc, font=theme.FONT_SMALL,
-                     bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED).pack(side=tk.LEFT, padx=(14, 0))
         if section.key == "conn":
             # 「测到端口通不通」是这台机器唯一能自证的事，鉴权对不对只有真连上才知道，
             # 所以结果文案里必须把这层边界说清楚（见 `_run_test`）。
@@ -130,41 +128,71 @@ class SettingsPage(tk.Frame):
                                         bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
             self._test_label.pack(side=tk.RIGHT, padx=(0, 12))
 
+        if section.desc:
+            desc = tk.Label(wrap, text=section.desc, font=theme.FONT_SMALL,
+                            bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED, anchor="w", justify=tk.LEFT)
+            desc.pack(fill=tk.X, pady=(4, 0))
+            desc.bind("<Configure>", lambda e: desc.configure(wraplength=max(1, e.width)))
+
         tk.Frame(wrap, bg=theme.ROW_LINE, height=1).pack(fill=tk.X, pady=(10, 6))
 
         body = tk.Frame(wrap, bg=theme.CONTENT_BG)
         body.pack(fill=tk.X)
         fields = settings_store.fields_of(section.key)
-        for index, field in enumerate(fields):
-            row, slot = divmod(index, section.columns)
-            self._add_row(body, row, slot * 3, field)
-        for slot in range(section.columns):
-            body.columnconfigure(slot * 3 + 1, weight=1, uniform="field")
+        for field in fields:
+            self._add_field(body, field)
+        body.bind("<Configure>", lambda _e: self._layout_fields(body, fields, section.columns))
+        self._layout_fields(body, fields, section.columns)
 
-    def _add_row(self, parent: tk.Misc, row: int, column: int, field: Field) -> None:
-        tk.Label(parent, text=field.label, font=theme.FONT_BODY, bg=theme.CONTENT_BG,
-                 fg=theme.TEXT, anchor="e", width=_LABEL_WIDTH,
-                 ).grid(row=row, column=column, sticky="e", pady=7, padx=(0, 14))
+    def _layout_fields(self, body: tk.Frame, fields: tuple[Field, ...], max_columns: int) -> None:
+        # 按实际字体量宽：Windows 高缩放下不能仍用固定像素阈值硬塞两列。
+        min_width = self._field_font.measure("0" * 32) + 32
+        columns = max_columns if body.winfo_width() >= min_width * max_columns + 24 else 1
+        if self._layout_columns.get(body) == columns:
+            return
+        self._layout_columns[body] = columns
+        for slot in range(max_columns):
+            body.columnconfigure(slot, weight=1 if slot < columns else 0,
+                                 uniform="field" if slot < columns else "")
+        for index, field in enumerate(fields):
+            row, slot = divmod(index, columns)
+            padding = (12 if slot else 0, 12 if slot < columns - 1 else 0)
+            self._field_frames[field.key].grid(row=row, column=slot, sticky="new",
+                                              padx=padding, pady=8)
+
+    def _add_field(self, parent: tk.Misc, field: Field) -> None:
+        group = tk.Frame(parent, bg=theme.CONTENT_BG)
+        group.columnconfigure(0, weight=1)
+        self._field_frames[field.key] = group
+        label = tk.Label(group, text=field.label, font=theme.FONT_BODY, bg=theme.CONTENT_BG,
+                         fg=theme.TEXT, anchor="w", justify=tk.LEFT)
+        label.grid(row=0, column=0, sticky="we")
 
         current = self._values.get(field.key, "")
         if field.kind == "bool":
             var: tk.Variable = tk.BooleanVar(value=settings_store.as_bool(current))
-            cell = tk.Frame(parent, bg=theme.CONTENT_BG)
-            cell.grid(row=row, column=column + 1, columnspan=2, sticky="w", pady=7)
+            cell = tk.Frame(group, bg=theme.CONTENT_BG)
+            cell.grid(row=1, column=0, sticky="we", pady=(8, 0))
             widgets.ToggleSwitch(cell, var).pack(side=tk.LEFT)
-            mark = tk.Label(cell, text=field.help, font=theme.FONT_SMALL,
-                            bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED, anchor="w")
-            mark.pack(side=tk.LEFT, padx=(12, 0))
         else:
             var = tk.StringVar(value=_MASK if field.secret and current else current)
-            cell = tk.Frame(parent, bg=theme.CONTENT_BG)
-            cell.grid(row=row, column=column + 1, sticky="we", pady=7)
+            cell = tk.Frame(group, bg=theme.CONTENT_BG)
+            cell.grid(row=1, column=0, sticky="we", pady=(4, 0))
             entry = self._field_box(cell, field, var)
             if field.locked_value:
                 self._lockable[field.key] = (entry, var, tk.StringVar(value=field.locked_value))
-            mark = tk.Label(parent, text=field.help, font=theme.FONT_SMALL,
-                            bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED, anchor="w")
-            mark.grid(row=row, column=column + 2, sticky="w", padx=14)
+
+        mark = tk.Label(group, text=field.help, font=theme.FONT_SMALL,
+                        bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED, anchor="w", justify=tk.LEFT)
+        mark.grid(row=2, column=0, sticky="we", pady=(4, 0))
+
+        def wrap_text(event: tk.Event) -> None:
+            width = max(1, event.width)
+            if int(mark.cget("wraplength")) != width:
+                mark.configure(wraplength=width)
+                label.configure(wraplength=width)
+
+        group.bind("<Configure>", wrap_text)
 
         self._marks[field.key] = mark
         self._vars[field.key] = var
@@ -181,7 +209,7 @@ class SettingsPage(tk.Frame):
                      fg=theme.TEXT_MUTED, padx=10).pack(side=tk.RIGHT, fill=tk.Y)
             tk.Frame(box, bg=theme.FIELD_LINE, width=1).pack(side=tk.RIGHT, fill=tk.Y)
 
-        entry = tk.Entry(box, textvariable=var, font=theme.FONT_BODY, relief=tk.FLAT, bd=0,
+        entry = tk.Entry(box, textvariable=var, font=theme.FONT_BODY, width=1, relief=tk.FLAT, bd=0,
                          bg=theme.FIELD_BG, fg=theme.TEXT, insertbackground=theme.TEXT,
                          highlightthickness=0, show="*" if field.secret else "")
         if field.secret:
@@ -221,25 +249,25 @@ class SettingsPage(tk.Frame):
         tk.Frame(bar, bg=theme.ROW_LINE, height=1).pack(fill=tk.X)
         inner = tk.Frame(bar, bg=theme.CONTENT_BG)
         inner.pack(fill=tk.X, padx=24, pady=12)
+        state = tk.Frame(inner, bg=theme.CONTENT_BG)
+        state.pack(fill=tk.X)
 
-        self._state_dot = tk.Label(inner, text="✓", font=theme.FONT_BODY,
+        self._state_dot = tk.Label(state, text="✓", font=theme.FONT_BODY,
                                    bg=theme.CONTENT_BG, fg=theme.GREEN)
         self._state_dot.pack(side=tk.LEFT)
-        self._state_text = tk.Label(inner, text="", font=theme.FONT_SMALL,
+        self._state_text = tk.Label(state, text="", font=theme.FONT_SMALL,
                                     bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED)
         self._state_text.pack(side=tk.LEFT, padx=(8, 0))
 
-        primary = tk.Label(inner, text="保存并重启服务", font=theme.FONT_SMALL,
+        actions = tk.Frame(inner, bg=theme.CONTENT_BG)
+        actions.pack(fill=tk.X, pady=(8, 0))
+        primary = tk.Label(actions, text="保存并重启服务", font=theme.FONT_SMALL,
                            bg=theme.GREEN_DEEP, fg="#ffffff", padx=22, pady=8, cursor="hand2")
         primary.pack(side=tk.RIGHT)
         primary.bind("<Button-1>", lambda _e: self._save(restart=True))
 
-        widgets.ghost_button(inner, "仅保存", lambda: self._save(restart=False)).pack(
+        widgets.ghost_button(actions, "仅保存", lambda: self._save(restart=False)).pack(
             side=tk.RIGHT, padx=(0, 12), ipady=1)
-        # 这句摆在按钮外面（`docs/setting2.png`）：它是「点下去会发生什么」的提醒，
-        # 不是按钮的一部分——重启会断开微信/AI 端连接几秒，点之前就该知道。
-        tk.Label(inner, text="重启时连接将短暂中断", font=theme.FONT_SMALL,
-                 bg=theme.CONTENT_BG, fg=theme.TEXT_MUTED).pack(side=tk.RIGHT, padx=(0, 16))
 
         self._render_dirty()
         return bar

@@ -118,75 +118,75 @@ DEMO_SAVED_PREFIX = "WXCLIENT_GATEWAY_DEMO_SAVED_"
 #: 抄漏了由 `tests/test_ui.py::SettingsDefaultsTests` 当场判死——它会去比对两边。
 FIELDS: tuple[Field, ...] = (
     Field("WXCLIENT_GATEWAY_BUSINESS_API_URL", "业务端地址",
-          "默认已填好正式地址",
+          "已填正式地址",
           default=DEFAULT_BUSINESS_API_URL),
-    Field("WXCLIENT_GATEWAY_AI_WS_URL", "AI 端地址", "默认已填好正式地址",
+    Field("WXCLIENT_GATEWAY_AI_WS_URL", "AI 端地址", "已填正式地址",
           default=DEFAULT_AI_WS_URL),
     # ★ `minimum` 抄自 `gateway/pacing.py` 的 MIN_READ / MIN_FRIEND 两个常量，**不在这里 import**
     #   （同 default 的理由：`wxclient.gateway` 包一进来就是 structlog + pydantic）。
     #   抄错了由 `tests/test_settings_validation.py` 判死。用户 2026-09-18：原来填低了网关
     #   悄悄抬回地板、只打一条日志，界面上还显示你填的数——「配置改了没反应」。现在保存时就拒。
     Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔",
-          "空闲时多久看一次未读；最低 30", section="sched", unit="秒",
+          "空闲轮询；最低 30 秒", section="sched", unit="秒",
           default="180", minimum=30),
     Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔",
-          "0=不查；最低 300", section="sched", unit="秒", default="900",
+          "0=关闭；最低 300 秒", section="sched", unit="秒", default="900",
           minimum=300, zero_means_off=True),
     # 用户 2026-09-07：说明太长把输入框挤坏了（调度配置一行两组），全部精简成半句。
     # 原来写在说明里的两条限定挪到这里：① 通过检测实际仍受「查好友」那档 ≥300 秒的
     # 整机节拍约束，填更小也不会更快；② 期限到了只是别让他占住名额，不代表判定对方
     # 不会通过。工作时间窗格式形如 09:00-21:00（placeholder/default 已经示范了），全天写 00:00-24:00。
     Field("WXCLIENT_GATEWAY_FRIEND_RECHECK_INTERVAL_SECONDS", "查好友通过间隔",
-          "多久搜一次是否通过；0=不搜",
+          "0=不搜；受加好友间隔限制",
           section="sched", unit="秒", default="900"),
     Field("WXCLIENT_GATEWAY_FRIEND_RECHECK_DEADLINE_HOURS", "查好友通过期限",
-          "超过就不再搜；0=一直搜",
+          "到期停止检查；0=不限期",
           section="sched", unit="小时", default="72"),
-    Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "窗外不动微信；全天填 00:00-24:00",
+    Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "全天：00:00-24:00",
           section="sched", default="09:00-21:00"),
     # 用户 2026-09-15：私聊那档（20/时）也要能在配置中心改。原来界面上只有总闸一格，
     # 标题却叫「每小时发送上限」——专员把它调高，私聊照样被 20 那档拦住，而两边都
     # 「没配错」。总闸改名「发送总上限」，私聊档单独一格，两个数各管各的：
     # 总闸管所有写动作合计，私聊档只管私聊；两道都要过。
-    Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "发送总上限", "所有动作合计，每小时；0=不限",
+    Field("WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR", "发送总上限", "所有动作/小时；0=不限",
           section="sched", default="0"),
-    Field("WXCLIENT_GATEWAY_MAX_MESSAGES_PER_HOUR", "私聊上限", "每小时最多发几条私聊；0=不限",
+    Field("WXCLIENT_GATEWAY_MAX_MESSAGES_PER_HOUR", "私聊上限", "私聊/小时；0=不限",
           section="sched", default="0"),
     # 用户 2026-08-28：加好友的上限和间隔都要能在界面上改（不同账号的承受力不一样）。
     # 两个数管两件事：上限管**一小时总共几个**，间隔管**两次之间隔多久**。
     # 只有上限的话，5 个全挤进一分钟也照样放行——2026-08-27 弹安全验证就是这么来的。
     Field("WXCLIENT_GATEWAY_MAX_FRIEND_ACTIONS_PER_HOUR", "加好友上限",
-          "每小时最多加几个；0=不限", section="sched", default="5"),
+          "加好友/小时；0=不限", section="sched", default="5"),
     Field("WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS", "加好友最小间隔",
-          "两次之间至少隔多久", section="sched", unit="秒",
+          "两次操作的最短间隔", section="sched", unit="秒",
           default="300"),
     # 用户 2026-08-30：「朋友圈在过去 24 小时只能发 3 个呀」——这个数原来只在代码里，
     # 界面上看不见也改不了。它和上面两条不同，管的是**一天**不是一小时（一小时 3 条和
     # 一天 3 条完全是两回事），所以周期写在说明里，别让人按「每小时」去理解。
     Field("WXCLIENT_GATEWAY_MAX_MOMENTS_PER_DAY", "朋友圈上限",
-          "每天最多几条", section="sched", default="3"),
+          "发布/天", section="sched", default="3"),
     # 用户 2026-09-07：朋友圈自动点赞，一天上限 20。同样按**天**算；间隔管两趟之间隔多久。
     Field("WXCLIENT_GATEWAY_MAX_MOMENT_LIKES_PER_DAY", "朋友圈点赞上限",
-          "每天最多点几个赞", section="sched", default="20"),
+          "点赞/天", section="sched", default="20"),
     Field("WXCLIENT_GATEWAY_MOMENT_LIKE_INTERVAL_SECONDS", "朋友圈点赞最小间隔",
-          "两趟之间至少隔多久", section="sched", unit="秒",
+          "两次操作的最短间隔", section="sched", unit="秒",
           default="600"),
     # 用户 2026-09-07：朋友圈评论由业务端计划触发，一天几条「做成可配置」。评论是公开文字，默认 5。
     Field("WXCLIENT_GATEWAY_MAX_MOMENT_COMMENTS_PER_DAY", "朋友圈评论上限",
-          "每天最多评几条", section="sched", default="5"),
+          "评论/天", section="sched", default="5"),
     Field("WXCLIENT_GATEWAY_MOMENT_COMMENT_INTERVAL_SECONDS", "朋友圈评论最小间隔",
-          "两趟之间至少隔多久", section="sched", unit="秒",
+          "两次操作的最短间隔", section="sched", unit="秒",
           default="600"),
     # 用户 2026-09-08：本机自己巡看朋友圈，只碰新动态。默认关（每趟开一次朋友圈窗口）。
     Field("WXCLIENT_GATEWAY_MOMENTS_POLL_INTERVAL_SECONDS", "朋友圈巡看间隔",
-          "多久开一趟看新动态，0 = 不巡看", section="sched", unit="秒",
+          "查看新动态；0=关闭", section="sched", unit="秒",
           default="0"),
     Field("WXCLIENT_GATEWAY_MOMENTS_AUTO_LIKE", "巡看时自动点赞",
-          "只给新动态点，走点赞上限与间隔", kind="bool", section="sched", default="0"),
+          "仅新动态，遵守点赞限额", kind="bool", section="sched", default="0"),
     Field("WXCLIENT_GATEWAY_MOMENTS_AUTO_COMMENT", "巡看时自动评论",
-          "新动态交给劳小智按素材写评论", kind="bool", section="sched", default="0"),
+          "仅新动态，按素材生成", kind="bool", section="sched", default="0"),
     Field("WXCLIENT_GATEWAY_MOMENTS_COMMENT_MATERIAL", "朋友圈评论素材",
-          "想传达什么、什么口吻，清空就不评", section="sched",
+          "内容与口吻；留空不评论", section="sched",
           default="岗位、招工、上班生活相关的动态可以接一句；语气自然、简短，不硬推销"),
     # 用户 2026-09-30：「这些原来写死的地板值搞一个专门菜单 演示，开启后就可以无视规则」。
     # 左侧单独一页（不和调度配置混在一起）；关着时三格显示正在生效的地板、不能改（`locked_value`），
@@ -201,11 +201,11 @@ FIELDS: tuple[Field, ...] = (
     # 其余写死的时间项：一张表在 `wxclient/tuning.py`，这里照表生成，不再抄一份。
     *(Field(k.key, k.label, k.help, section=k.section, unit=k.unit, default=k.default,
             minimum=k.minimum, locked_value=k.locked) for k in tuning.KNOBS),
-    Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动自动运行服务",
+    Field("WXCLIENT_UI_AUTOSTART", "开机即启动服务", "随系统启动",
           kind="bool", section="boot", default="1"),
-    Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", "启动后最小化到系统托盘",
+    Field("WXCLIENT_UI_START_HIDDEN", "启动后缩到托盘", "后台运行",
           kind="bool", section="boot", default="1"),
-    Field("WXCLIENT_UI_AUTO_UPDATE", "自动检查更新", "有新版本时在左侧提示，点击即可安装",
+    Field("WXCLIENT_UI_AUTO_UPDATE", "自动检查更新", "有新版时提示更新",
           kind="bool", section="boot", default="1"),
 )
 

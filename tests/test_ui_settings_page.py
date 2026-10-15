@@ -44,6 +44,73 @@ if HAS_TK:
 
 
 @unittest.skipUnless(HAS_TK, "没有 tkinter / 显示环境，配置中心测不了")
+class ConfigResponsiveTests(unittest.TestCase):
+    """真实 Tk 布局：窄窗口与大字号不能再让说明把输入框挤掉。"""
+
+    def _window(self, zoom: float, width: int):
+        root = tk.Tk()
+        previous_scaling = root.tk.call("tk", "scaling")
+        root.tk.call("tk", "scaling", zoom * 96 / 72)
+        directory = tempfile.TemporaryDirectory()
+        window = MainWindow(root, LogBuffer(), GatewayService(lambda: None),
+                            data_dir=Path(directory.name), probe_wechat=False)
+        window.show()
+        window._show_page("settings")
+        root.geometry(f"{width}x820+0+0")
+        root.update()
+        root.update_idletasks()
+
+        def cleanup():
+            _KEEP_ALIVE.extend([root, window])
+            root.tk.call("tk", "scaling", previous_scaling)
+            window.destroy()
+            directory.cleanup()
+
+        self.addCleanup(cleanup)
+        return root, window
+
+    @staticmethod
+    def _entries(widget):
+        for child in widget.winfo_children():
+            if isinstance(child, tk.Entry):
+                yield child
+            yield from ConfigResponsiveTests._entries(child)
+
+    def test_all_config_inputs_keep_room_for_a_time_window_at_200_percent(self):
+        from tkinter import font as tkfont
+
+        root, window = self._window(2, 900)
+        minimum = tkfont.Font(root, font=theme.FONT_BODY).measure("00:00-24:00")
+        page = window._settings_page
+        entries = list(self._entries(page))
+        self.assertTrue(entries)
+        for entry in entries:
+            with self.subTest(variable=entry.cget("textvariable")):
+                self.assertGreaterEqual(entry.winfo_width(), minimum)
+                self.assertEqual(str(entry.cget("state")), "normal")
+                self.assertGreaterEqual(entry.winfo_rootx(), page.winfo_rootx())
+                self.assertLessEqual(entry.winfo_rootx() + entry.winfo_width(),
+                                     page.winfo_rootx() + page.winfo_width())
+
+    def test_resize_preserves_unsaved_time_window_and_saves_the_new_value(self):
+        from unittest import mock
+
+        root, window = self._window(1.25, 1200)
+        page = window._settings_page
+        key = "WXCLIENT_GATEWAY_ACTIVE_HOURS"
+        page._vars[key].set("00:00-24:00")
+        for width in (900, 1600, 1200):
+            root.geometry(f"{width}x820+0+0")
+            root.update()
+            self.assertEqual(page._vars[key].get(), "00:00-24:00")
+            self.assertTrue(page._dirty)
+        with mock.patch("wxclient.ui.dialog.tell"):
+            page._save(restart=False)
+        self.assertEqual(settings_store.load(page.data_dir)[key], "00:00-24:00")
+        self.assertFalse(page._dirty)
+
+
+@unittest.skipUnless(HAS_TK, "没有 tkinter / 显示环境，配置中心测不了")
 class ConfigLookTests(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp())
