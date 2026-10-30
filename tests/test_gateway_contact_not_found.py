@@ -84,7 +84,7 @@ class NotFoundStrikesTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RunnerExclusionTests(unittest.IsolatedAsyncioTestCase):
-    """runner 收到喊话 → 本机「不管」；093 确认通过了好友 → 放回来。"""
+    """runner 收到喊话 → 本机「不管」；同步带回来才放回。"""
 
     def _runner(self) -> SimpleNamespace:
         watchlist = Watchlist()
@@ -99,13 +99,22 @@ class RunnerExclusionTests(unittest.IsolatedAsyncioTestCase):
         runner._watchlist.apply_backend({"only": [NAME, "李四"]})
         self.assertEqual(runner._watchlist.watched(), ["李四"])
 
-    async def test_confirmed_friend_comes_back(self) -> None:
+    async def test_confirmed_friend_is_not_put_back_locally(self) -> None:
+        """093 确认通过了只上报，不自己放回监听（用户 2026-10-29：一切以业务端的同步为准）。"""
         runner = self._runner()
-        runner._watchlist.exclude(NAME)
-        self.assertTrue(runner._watchlist.include(NAME))
-        self.assertEqual(runner._watchlist.watched(), ["张三", "李四"])
-        self.assertFalse(runner._watchlist.include("王五"), "本来就不在「不管」里的，什么都不做")
+        reported: list[str] = []
 
+        async def note(account_id: str, peer_id: str) -> None:
+            reported.append(peer_id)
+
+        runner._note_friend_accepted = note
+        await GatewayRunner._on_contact_not_found(runner, ACCOUNT, NAME)  # type: ignore[arg-type]
+        await GatewayRunner._on_friend_accepted(runner, ACCOUNT, NAME)  # type: ignore[arg-type]
+        self.assertEqual(reported, [NAME], "照旧上报")
+        self.assertEqual(runner._watchlist.watched(), ["李四"], "不自己放回")
+        # 业务端同步带回他那一行，才放回来。
+        self.assertEqual(runner._watchlist.include_synced([NAME]), 1)
+        self.assertEqual(runner._watchlist.watched(), ["张三", "李四"])
 
 if __name__ == "__main__":
     unittest.main()

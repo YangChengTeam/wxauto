@@ -875,18 +875,6 @@ class GatewayStore:
             ).fetchone()
         return str(row[0]) if row and row[0] else ""
 
-    def mark_contact_status(self, account_id: str, number: str, status: str) -> None:
-        """把本机记的好友状态推进一格（只动状态，不碰会话名，也不动同步水位）。"""
-        number, status = (number or "").strip(), (status or "").strip()
-        if not number or not status:
-            return
-        with closing(self._connect()) as conn:
-            conn.execute(
-                "UPDATE gateway_contacts SET status = ? WHERE account_id = ? AND number = ?",
-                (status, account_id, number),
-            )
-            conn.commit()
-
     # ────────────────────────── 会话映射 ──────────────────────────
 
     def get_session(self, account_id: str, peer_id: str) -> str | None:

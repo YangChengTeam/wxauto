@@ -845,13 +845,13 @@ class GatewayRunner:
         if state == CONTACT_REQUESTED and number and remark:
             # 先落本机再上报：上报可能失败，而「以后要认出对方通过了」这件事不能跟着失败。
             self._store.note_friend_request(self._account(), number, remark)
+        # ★ 报完**不在本机把他记成 accepted**（用户 2026-10-29：「一切以业务端的同步为准」）：
+        #   名单就是从 `gateway_contacts` 的 accepted 行派生的，本机一记他就自己进了监听。
+        #   等业务端同步把 accepted 带回来。去重靠本机台账（`gateway_friend_checks`），不靠这一格。
         await self._contacts.report(
             number=number, remark=remark, status=state,
             profile_name=profile_name, command_id=command_id,
         )
-        if state == CONTACT_ACCEPTED and number:
-            # 本机也记一格，和另外两条 accepted 路径同口径（否则同一个人下次还会被当成待通过）。
-            self._store.mark_contact_status(self._account(), number, CONTACT_ACCEPTED)
 
     async def _note_sent_to_pending_friend(
         self, account_id: str, command: dict[str, Any], result: CommandResult | None,
@@ -906,8 +906,8 @@ class GatewayRunner:
         if result is None:
             # `report()` 自己已经记过为什么（缺字段 / 请求失败），这里不重复喊。
             return
-        # 本机那一格照旧记（管的是「别把同一个人重复当成待通过」），台账销掉＝不再复查他。
-        self._store.mark_contact_status(account_id, number, CONTACT_ACCEPTED)
+        # 台账销掉＝不再复查他。**不在本机把他记成 accepted**——那会让他绕过同步自己进监听
+        # （用户 2026-10-29：「一切以业务端的同步为准」），等业务端同步带回来。
         self._store.drop_friend_request(account_id, number)
         # 138：这一刻就是「刚加上好友」——本机确定的事实。第一次把这个会话交给 AI 端时会带上
         # 好友建立事件，AI 端据此和计划那条开场路共用一个名额。报不成功不走到这里，也就不重复开。
@@ -1025,8 +1025,7 @@ class GatewayRunner:
         """名单里这个会话连续几轮都「查无此人」→ 在本机移出监听名单，之后不再去读它（用户 2026-09-24）。
 
         落在本机「不管」里（同配置中心的「移出」，`Watchlist.exclude`）：每轮白开一次搜不到的会话，
-        既浪费读名额，又在日志里刷一遍查无此人。放回来的路：093 复查确认他通过了好友
-        （`_on_friend_accepted` → `Watchlist.include`），或业务端同步再带回他（`include_synced`）。
+        既浪费读名额，又在日志里刷一遍查无此人。放回来只有一条路：业务端同步再带回他（`include_synced`）。
         """
         if self._watchlist is None:
             return
@@ -1038,15 +1037,16 @@ class GatewayRunner:
             )
 
     async def _on_friend_accepted(self, account_id: str, session_name: str) -> None:
-        """复查确认对方通过了（093）→ 走**既有**那条上报路，并让他立刻进监听名单。
+        """复查确认对方通过了（093）→ 走**既有**那条上报路，只上报。
 
         这里一个字的上报逻辑都不重写：`_note_friend_accepted` 本来就是干这个的
-        （查号 → 排队等着报 `accepted` → 本机记一格），只是原来唯一的触发点是
+        （查号 → 报 `accepted` → 销台账），只是原来唯一的触发点是
         「收到他的消息」，而没进名单的人根本不会被读到消息——那段代码等的调用永远不来。
         复查补的就是这个调用。
 
-        **立刻重算名单**：他现在就该被读、被回复（不然复查白做了）。不重算的话，
-        他要等下一次 `_sync_contacts`（默认几分钟一轮）才进得来，中间他说的话仍然没人读。
+        ★ **不让他自己进监听名单**（用户 2026-10-29：「自动添加到监听的功能要去掉，
+          一切以业务端的同步为准」）。原来这里会把他从本机「不管」里拿出来、立刻重算名单；
+          现在他进不进、什么时候进，只看业务端同步带不带回他的 accepted 行。
 
         ★ **报不出去就留着台账**（上报口没配、后端不可达）：下一轮复查会再确认一次、
           再报一次。代价是后端不可达时会重复搜同一个人——受 15 分钟间隔和 ≥300s 共享闸
@@ -1055,10 +1055,6 @@ class GatewayRunner:
           销账只发生在 `_report_accepted_now` 里真报成功那一刻。
         """
         await self._note_friend_accepted(account_id, session_name)
-        # 之前因「查无此人」被自动移出过的，名字现在找得到了 → 放回来，不然他永远不会被回。
-        if self._watchlist is not None:
-            self._watchlist.include(session_name)
-        self._apply_derived_watchlist()
 
     # ────────────────────────── 一轮 ──────────────────────────
 

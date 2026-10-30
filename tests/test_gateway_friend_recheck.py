@@ -208,7 +208,7 @@ class TestPacing(_Base):
         """
         self.requested()
         runtime = _Runtime({"exact_count": 1})
-        self.now = datetime(2026, 8, 27, 23, 30)  # noqa: DTZ001 —— 故意 naive，见 docstring
+        self.now = datetime(2026, 8, 27, 23, 30)  # 故意 naive，见 docstring
         watcher = self.watcher(runtime, active_hours="09:00-18:00")
         self.assertEqual(await watcher.tick(), [])
         self.assertEqual(runtime.calls, [])
@@ -322,7 +322,7 @@ class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
             clock=lambda: self.now,      # 好友通过的上报要等半小时，测试得能拨表
         )
 
-    async def test_确认通过_报给后端并立刻进名单(self) -> None:
+    async def test_确认通过_报给后端但不自己进名单(self) -> None:
         self.store.note_friend_request(ACCOUNT, NUMBER, NAME)
         self.assertEqual(self.store.watched_session_names(ACCOUNT), [])  # 还没通过，不在名单
 
@@ -336,8 +336,10 @@ class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
         runner = self._runner(checker)          # 装配那一下会把 on_accepted 挂上
         self.assertEqual(await checker.tick(), [NAME])
 
-        # ① 立刻进监听名单——不等下一次会话名同步，否则中间他说的话仍然没人读
-        self.assertEqual(self.watchlist.watched(), [NAME])
+        # ① **不**自己进监听名单（用户 2026-10-29：「一切以业务端的同步为准」）——
+        #   本机也不把他记成 accepted，否则下一次派生名单他就混进来了。
+        self.assertEqual(self.watchlist.watched(), [])
+        self.assertEqual(self.store.watched_session_names(ACCOUNT), [])
         # ② **当场就报**（用户 2026-09-01 去掉了原来那半小时的延迟队列）
         self.assertEqual(len(self.contacts.reported), 1)
         report = self.contacts.reported[0]
@@ -349,7 +351,13 @@ class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.store.next_friend_check(ACCOUNT, not_before=self.not_before()), ("", "")
         )
-        _ = runner
+        # ④ 业务端同步把 accepted 带回来，他才进名单。
+        self.store.save_contacts(ACCOUNT, [
+            {"number": NUMBER, "session_name": NAME, "contact_status": "accepted",
+             "updated_at": T0.isoformat()},
+        ])
+        runner._apply_derived_watchlist()
+        self.assertEqual(self.watchlist.watched(), [NAME])
 
     async def test_没通过_什么都不报(self) -> None:
         self.store.note_friend_request(ACCOUNT, NUMBER, NAME)
