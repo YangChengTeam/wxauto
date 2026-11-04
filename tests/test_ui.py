@@ -1116,7 +1116,6 @@ class SettingsDefaultsTests(unittest.TestCase):
         expected = {
             "WXCLIENT_GATEWAY_BUSINESS_API_URL": gateway.business_api_url,
             "WXCLIENT_GATEWAY_AI_WS_URL": gateway.ai_ws_url,
-            "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": int(gateway.poll_interval_seconds),
             "WXCLIENT_GATEWAY_DEMO_MODE": gateway.demo_mode,
             "WXCLIENT_GATEWAY_DEMO_JITTER_PERCENT": int(gateway.demo_jitter_percent),
             # 其余极速项照 `wxclient.tuning.KNOBS` 生成；locked 值对得上源码由 test_settings_validation 管

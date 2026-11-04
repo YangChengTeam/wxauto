@@ -1,7 +1,7 @@
 """极速模式：原来写死在各模块里的时间项，集中到一张表（用户 2026-09-30）。
 
 「这些原来写死的地板值搞一个专门菜单」「这些时间都弄到里面去，配置中心的不要」——
-配置中心里已经有格子的（读消息间隔、工作时间窗、各类上限、查好友通过期限……）不进这张表，
+配置中心里已经有格子的（工作时间窗、各类上限、查好友通过期限……）不进这张表，
 这里只收**代码里写死、界面上原来改不了**的那些。
 
 ★ 只在极速模式开着时生效。关着时各模块用的就是它们自己写死的那个数，界面上灰着显示、改不了。
@@ -50,12 +50,8 @@ KNOBS: tuple[Knob, ...] = (
     # ── 等待与排队：演示时最直接让人干等的几项 ──
     Knob("DEBOUNCE_SECONDS", "回复前静默", "对方停下多久才开始回", "秒", "demo_wait",
          "3", "1", "settings:debounce_seconds", minimum=0),
-    Knob("HOT_WINDOW_SECONDS", "正聊着的时长", "对方说话后按快档读多久", "秒", "demo_wait",
-         "600", "600", "settings:hot_window_seconds", minimum=0),
-    Knob("MAX_PEERS_PER_POLL", "每轮读几个会话", "全量巡检一轮最多开几个窗口", "个", "demo_wait",
-         "8", "20", "wxclient.gateway.wechat_io:MAX_PEERS_PER_POLL", kind="int"),
-    Knob("MAX_PEERS_PER_QUICK_POLL", "正聊着每轮几个", "快读一轮最多开几个窗口", "个", "demo_wait",
-         "3", "8", "wxclient.gateway.wechat_io:MAX_PEERS_PER_QUICK_POLL", kind="int"),
+    # 「正聊着的时长 / 每轮读几个会话 / 正聊着每轮几个」0.1.128 删了：入站改本地库监听，
+    # 不再按名单开窗轮询，这三格只管 UIA 开窗那条路（`settings_store._RETIRED_KEYS` 清老键）。
     Knob("MAX_UNREAD_STRANGERS_PER_POLL", "每轮看几个陌生人", "名单外有红点的单聊", "个", "demo_wait",
          "3", "8", "wxclient.gateway.wechat_io:MAX_UNREAD_STRANGERS_PER_POLL", kind="int"),
     Knob("AUTO_ACCEPT_LIMIT", "一趟通过几个申请", "自动通过好友申请", "个", "demo_wait",

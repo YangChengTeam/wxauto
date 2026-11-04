@@ -1,8 +1,9 @@
 """配置中心保存前的地板检查（用户 2026-09-18：「配置中心不是有对应的配置吗」）。
 
-`读消息间隔` / `查新好友间隔` 两格在界面上能填，但网关那边有硬地板（`pacing.py`）：
+`查新好友间隔` 在界面上能填，但网关那边有硬地板（`pacing.py`）：
 填低了 `clamp_interval` 会悄悄抬回去、只打一条日志，界面上仍显示你填的数——
 「配置改了没反应」。现在保存时就拒，并把地板写在说明里。
+（`读消息间隔` 0.1.128 删了：入站改本地库监听，固定 3 秒看一次库。）
 
 这份不依赖 tkinter，Linux 上也跑。
 """
@@ -16,7 +17,6 @@ from pathlib import Path
 from wxclient.ui import settings_store
 from wxclient.ui.settings_store import FIELDS, validate
 
-POLL = "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS"
 FRIEND = "WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS"
 
 
@@ -27,50 +27,44 @@ def _field(key: str) -> settings_store.Field:
 class FloorsMatchTheGatewayTests(unittest.TestCase):
     """★ 界面上写的地板必须就是网关真正用的那个数——抄错了这里判死。"""
 
-    def test_the_two_floors_are_the_pacing_constants(self) -> None:
-        from wxclient.gateway.pacing import (
-            MIN_FRIEND_INTERVAL_SECONDS,
-            MIN_READ_INTERVAL_SECONDS,
-        )
+    def test_the_floor_is_the_pacing_constant(self) -> None:
+        from wxclient.gateway.pacing import MIN_FRIEND_INTERVAL_SECONDS
 
-        self.assertEqual(_field(POLL).minimum, MIN_READ_INTERVAL_SECONDS)
         self.assertEqual(_field(FRIEND).minimum, MIN_FRIEND_INTERVAL_SECONDS)
 
     def test_the_floor_is_written_in_the_help_text(self) -> None:
         """人得在填之前就看到那个数，而不是保存被拒了才知道。"""
-        for key in (POLL, FRIEND):
-            field = _field(key)
-            self.assertIn(f"最低 {field.minimum:g}", field.help, field.label)
+        field = _field(FRIEND)
+        self.assertIn(f"最低 {field.minimum:g}", field.help, field.label)
 
     def test_no_other_field_grew_a_floor_by_accident(self) -> None:
-        """地板只给网关真会 clamp 的两格。加好友最小间隔刻意没有地板（config.py 里写明「调小自己清楚」）。"""
+        """地板只给网关真会 clamp 的那格。加好友最小间隔刻意没有地板（config.py 里写明「调小自己清楚」）。"""
         floored = {f.key for f in FIELDS if f.minimum is not None and not f.section.startswith("demo")}
-        self.assertEqual(floored, {POLL, FRIEND})
+        self.assertEqual(floored, {FRIEND})
 
 
 class ValidateTests(unittest.TestCase):
     def test_below_the_floor_is_refused_with_the_floor_in_the_sentence(self) -> None:
-        problems = validate({POLL: "10"})
-        self.assertEqual(set(problems), {POLL})
-        self.assertIn("最低 30", problems[POLL])
-        self.assertIn("10", problems[POLL])
+        problems = validate({FRIEND: "10"})
+        self.assertEqual(set(problems), {FRIEND})
+        self.assertIn("最低 300", problems[FRIEND])
+        self.assertIn("10", problems[FRIEND])
 
     def test_at_or_above_the_floor_passes(self) -> None:
-        self.assertEqual(validate({POLL: "30", FRIEND: "300"}), {})
-        self.assertEqual(validate({POLL: "180", FRIEND: "900"}), {})
+        self.assertEqual(validate({FRIEND: "300"}), {})
+        self.assertEqual(validate({FRIEND: "900"}), {})
 
-    def test_zero_is_off_for_friend_check_but_not_for_reading(self) -> None:
+    def test_zero_is_off_for_friend_check(self) -> None:
         self.assertEqual(validate({FRIEND: "0"}), {})
-        self.assertIn(POLL, validate({POLL: "0"}))
 
     def test_blank_means_default_and_is_fine(self) -> None:
-        self.assertEqual(validate({POLL: "", FRIEND: "   "}), {})
+        self.assertEqual(validate({FRIEND: "   "}), {})
         self.assertEqual(validate({}), {})
 
     def test_garbage_is_refused_instead_of_crashing_the_gateway_later(self) -> None:
-        problems = validate({POLL: "三十"})
-        self.assertIn(POLL, problems)
-        self.assertIn("数字", problems[POLL])
+        problems = validate({FRIEND: "三十"})
+        self.assertIn(FRIEND, problems)
+        self.assertIn("数字", problems[FRIEND])
 
     def test_fields_without_a_floor_are_never_judged(self) -> None:
         """加好友最小间隔填 10 也放行——那格的取舍写在 config.py 里，不归这里管。"""
@@ -113,7 +107,7 @@ class LoadIntoEnvironTests(unittest.TestCase):
     def test_every_field_saved_in_the_file_reaches_the_environ(self) -> None:
         """「保证所有的配置修改都能生效」（用户 2026-09-22）：不只总上限，每一格都一样。"""
         saved = {f.key: ("1" if f.kind == "bool" else "7") for f in FIELDS if not f.secret}
-        # 极速开关开着会按设计把读消息间隔改成 1（`apply_demo_presets`，另有用例守），这条只看「存了就生效」。
+        # 极速开关开着会按设计改掉几格（`apply_demo_presets`，另有用例守），这条只看「存了就生效」。
         saved[settings_store.DEMO_TOGGLE_KEY] = "0"
         settings_store.save(self.data_dir, saved)
         env = {f.key: "stale" for f in FIELDS}
@@ -150,7 +144,7 @@ class DemoModeTests(unittest.TestCase):
         self.assertEqual(settings.friend_floor_seconds, MIN_FRIEND_INTERVAL_SECONDS)
         self.assertEqual(settings.moments_floor_seconds, MIN_MOMENTS_POLL_SECONDS)
         self.assertEqual(settings.jitter_ratio, JITTER_RATIO)
-        self.assertIn(self.READ, validate({self.READ: "5"}))
+        self.assertIn(self.FRIEND_CHECK, validate({self.FRIEND_CHECK: "10"}))
 
     def test_on_lowers_the_floors_but_keeps_the_config_center_intervals(self) -> None:
         """★ 用户 2026-09-30「和配置中心重复了」：间隔只在配置中心填，极速模式不再盖掉它。"""
@@ -179,18 +173,17 @@ class DemoModeTests(unittest.TestCase):
         on = settings_store.apply_demo_presets({toggle: "1", total: "30"})
         self.assertEqual(on[total], "0")
         self.assertEqual(settings_store.apply_demo_presets({**on, toggle: "0"})[total], "30")
-        # 已经开着、只备份过读消息间隔的老文件：总上限这格照样补上备份并改 0。
+        # 已经开着、只备份过读消息间隔的老文件：总上限这格照样补上备份并改 0，读消息间隔连同备份清掉。
         old = {toggle: "1", self.READ: "5", settings_store.DEMO_SAVED_PREFIX + "POLL_INTERVAL_SECONDS": "180",
                total: "30"}
         synced = settings_store.apply_demo_presets(old)
         self.assertEqual(synced[total], "0")
         back = settings_store.apply_demo_presets({**synced, toggle: "0"})
-        self.assertEqual((back[self.READ], back[total]), ("180", "30"))
+        self.assertEqual(back[total], "30")
+        self.assertFalse([k for k in back if k.endswith("POLL_INTERVAL_SECONDS")])
 
     def test_save_check_follows_the_toggle(self) -> None:
         on = {"WXCLIENT_GATEWAY_DEMO_MODE": "1"}
-        self.assertEqual(validate({**on, self.READ: "5"}), {})
-        self.assertIn(self.READ, validate({**on, self.READ: "0.5"}))
         self.assertEqual(validate({**on, self.FRIEND_CHECK: "10"}), {}, "极速下查新好友最低 10 秒")
         self.assertIn(self.FRIEND_CHECK, validate({**on, self.FRIEND_CHECK: "5"}))
         self.assertIn(self.FRIEND_CHECK, validate({self.FRIEND_CHECK: "10"}))
@@ -219,7 +212,6 @@ class DemoModeTests(unittest.TestCase):
     def test_ui_floor_matches_the_gateway_floor(self) -> None:
         from wxclient.gateway.config import DEMO_FRIEND_FLOOR_SECONDS, DEMO_MIN_SECONDS
 
-        self.assertEqual(settings_store.DEMO_MIN_SECONDS, DEMO_MIN_SECONDS)
         self.assertEqual(settings_store.DEMO_FRIEND_FLOOR_SECONDS, DEMO_FRIEND_FLOOR_SECONDS)
 
     def test_no_interval_is_stored_twice(self) -> None:
@@ -232,46 +224,29 @@ class DemoModeTests(unittest.TestCase):
             ["WXCLIENT_GATEWAY_DEMO_MODE", "WXCLIENT_GATEWAY_DEMO_JITTER_PERCENT"],
         )
 
-    def test_turning_on_sets_the_read_box_to_1_and_turning_off_puts_it_back(self) -> None:
-        """用户 2026-09-30：「开启极速模式读消息间隔变为 1，框框中的参数也要变」。"""
-        toggle = settings_store.DEMO_TOGGLE_KEY
-        on = settings_store.apply_demo_presets({toggle: "1", self.READ: "120"})
-        self.assertEqual(on[self.READ], "5")
-        self.assertEqual(validate(on), {})
-        back = settings_store.apply_demo_presets({**on, toggle: "0"})
-        self.assertEqual(back[self.READ], "120")
-        self.assertFalse([k for k in back if k.startswith(settings_store.DEMO_SAVED_PREFIX)])
-
-    def test_an_old_file_with_the_toggle_already_on_still_gets_1(self) -> None:
-        """★ 09-30 真机：0.1.103 存的文件开关早是开的，按「翻面」判就永远停在 180。"""
-        toggle = settings_store.DEMO_TOGGLE_KEY
-        old = {toggle: "1", self.READ: "180", "WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS": "5"}
-        synced = settings_store.apply_demo_presets(old)
-        self.assertEqual(synced[self.READ], "5")
-        self.assertNotIn("WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS", synced)
-        self.assertEqual(settings_store.apply_demo_presets({**synced, toggle: "0"})[self.READ], "180")
-
-    def test_editing_the_box_while_on_is_kept(self) -> None:
-        toggle = settings_store.DEMO_TOGGLE_KEY
-        on = settings_store.apply_demo_presets({toggle: "1", self.READ: "120"})
-        edited = settings_store.apply_demo_presets({**on, self.READ: "8"})
-        self.assertEqual(edited[self.READ], "8")
-        self.assertEqual(settings_store.apply_demo_presets({**edited, toggle: "0"})[self.READ], "120")
-
     def test_turning_off_without_a_backup_keeps_the_value(self) -> None:
         toggle = settings_store.DEMO_TOGGLE_KEY
-        values = {toggle: "0", self.READ: "60"}
+        values = {toggle: "0", self.FRIEND_CHECK: "600"}
         self.assertEqual(settings_store.apply_demo_presets(values), values)
 
-    def test_startup_fixes_the_file_on_disk(self) -> None:
-        """启动灌环境变量时顺手对齐并落盘：配置中心进页重读磁盘就是 1。"""
+    def test_startup_drops_the_retired_polling_keys_from_disk(self) -> None:
+        """0.1.128：入站改本地库监听，只管开窗轮询的几格删了；老文件里的键启动时清掉并落盘。"""
+        retired = {
+            self.READ: "5",
+            settings_store.DEMO_SAVED_PREFIX + "POLL_INTERVAL_SECONDS": "180",
+            "WXCLIENT_GATEWAY_DEMO_HOT_WINDOW_SECONDS": "600",
+            "WXCLIENT_GATEWAY_DEMO_MAX_PEERS_PER_POLL": "20",
+            "WXCLIENT_GATEWAY_DEMO_MAX_PEERS_PER_QUICK_POLL": "8",
+        }
         with tempfile.TemporaryDirectory() as tmp:
-            toggle = settings_store.DEMO_TOGGLE_KEY
-            settings_store.save(Path(tmp), {toggle: "1", self.READ: "180"})
+            settings_store.save(Path(tmp), {settings_store.DEMO_TOGGLE_KEY: "1", **retired})
             env: dict[str, str] = {}
             settings_store.load_into_environ(Path(tmp), env)
-            self.assertEqual(env[self.READ], "5")
-            self.assertEqual(settings_store.load(Path(tmp))[self.READ], "5")
+            on_disk = settings_store.load(Path(tmp))
+            for key in retired:
+                self.assertNotIn(key, env)
+                self.assertNotIn(key, on_disk)
+        self.assertFalse({f.key for f in FIELDS} & set(retired), "删了的格子不能又出现在界面上")
 
     def test_guard_and_jitter_follow_the_demo_floors(self) -> None:
         from wxclient.gateway import pacing
@@ -331,19 +306,19 @@ class SpeedKnobTableTests(unittest.TestCase):
         from wxclient.gateway import runner, schedule, wechat_io
 
         on = {tuning.TOGGLE_KEY: "1",
-              "WXCLIENT_GATEWAY_DEMO_MAX_PEERS_PER_POLL": "15",
+              "WXCLIENT_GATEWAY_DEMO_MAX_UNREAD_STRANGERS_PER_POLL": "15",
               "WXCLIENT_GATEWAY_DEMO_CONTACTS_SYNC_INTERVAL_SECONDS": "7",
               "WXCLIENT_GATEWAY_DEMO_PAUSE_SCALE": "0"}
         try:
             changed = tuning.apply(on)
-            self.assertEqual(wechat_io.MAX_PEERS_PER_POLL, 15)
+            self.assertEqual(wechat_io.MAX_UNREAD_STRANGERS_PER_POLL, 15)
             self.assertEqual(runner.CONTACTS_SYNC_INTERVAL_SECONDS, 7.0)
             self.assertEqual(tuning.PAUSE_SCALE, 0.0)
             self.assertEqual(schedule.CHECK_INTERVAL_SECONDS, 5.0, "没填的用极速默认值")
-            self.assertIn("MAX_PEERS_PER_POLL", changed)
+            self.assertIn("MAX_UNREAD_STRANGERS_PER_POLL", changed)
         finally:
             self.assertEqual(tuning.apply({}), {})
-        self.assertEqual(wechat_io.MAX_PEERS_PER_POLL, 8)
+        self.assertEqual(wechat_io.MAX_UNREAD_STRANGERS_PER_POLL, 3)
         self.assertEqual(runner.CONTACTS_SYNC_INTERVAL_SECONDS, 120.0)
         self.assertEqual(tuning.PAUSE_SCALE, 1.0)
         self.assertEqual(schedule.CHECK_INTERVAL_SECONDS, 30.0)

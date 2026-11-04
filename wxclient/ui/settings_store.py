@@ -58,7 +58,7 @@ SECTIONS: tuple[Section, ...] = (
     Section("sched", "调度配置", "配置消息读取与任务调度规则", columns=2),
     Section("boot", "启动设置", "配置服务启动后的行为"),
     # 不在配置中心里渲染，单独一页「极速模式」（原名「演示」，用户 2026-09-30 要求改名）（`window._ensure_demo_page`）。
-    Section("demo", "极速开关", "开启后读消息间隔改为 5 秒、加好友与查好友通过改为 10 秒、发送总上限改为不限，关闭后恢复原值"),
+    Section("demo", "极速开关", "开启后加好友与查好友通过改为 10 秒、发送总上限改为不限，关闭后恢复原值"),
     Section("demo_wait", "等待与排队", "", columns=2),
     Section("demo_conn", "连接与超时", "", columns=2),
     Section("demo_keep", "保留期限", "", columns=2),
@@ -70,16 +70,13 @@ DEMO_SECTIONS: tuple[str, ...] = ("demo", "demo_wait", "demo_conn", "demo_keep")
 #: 配置中心渲染的分段；`demo` 那段在自己的菜单页里。
 SETTINGS_SECTIONS: tuple[str, ...] = ("conn", "sched", "boot")
 DEMO_TOGGLE_KEY = "WXCLIENT_GATEWAY_DEMO_MODE"
-#: 极速模式开着时配置中心间隔的地板；抄自 `gateway/config.py` 的 `DEMO_MIN_SECONDS`（同 default，不 import 网关包）。
-DEMO_MIN_SECONDS = 1.0
-#: 极速模式下好友那几格的地板；抄自 `gateway/config.py` 的 `DEMO_FRIEND_FLOOR_SECONDS`（理由同上）。
+#: 极速模式下好友那几格的地板；抄自 `gateway/config.py` 的 `DEMO_FRIEND_FLOOR_SECONDS`（同 default，不 import 网关包）。
 DEMO_FRIEND_FLOOR_SECONDS = 10.0
 #: 开启极速模式时配置中心里跟着改掉的格子 → 开启后的值；关掉时恢复开启前的原值（`apply_demo_presets`）。
 #: 用户 2026-09-30：「开启极速模式读消息间隔变为 1，框框中的参数也要变」，随后改口「配置 5 秒吧，1 秒太快了」。
 #: 用户 2026-10-07：极速模式下「发送总上限」自动不限（真机撞「该账号一小时内已做 29 次，达到上限 30」）。
 #: 只放开总闸；加好友 / 朋友圈 / 点赞这些事故倒推或用户定过的分档上限不动。
 DEMO_PRESETS: dict[str, str] = {
-    "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": "5",
     "WXCLIENT_GATEWAY_MAX_SENDS_PER_HOUR": "0",
     # 用户 2026-10-15：极速模式下首次触达等了 4~5 分钟——加好友撞 300 秒节拍、对方通过后要等复查才发现。
     "WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS": "10",
@@ -87,7 +84,6 @@ DEMO_PRESETS: dict[str, str] = {
 }
 #: 极速模式开着时保存检查降低地板的格子 → 降到多少。好友那格只降到 10 秒（用户 2026-10-15）。
 DEMO_UNLOCKED: dict[str, float] = {
-    "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS": DEMO_MIN_SECONDS,
     "WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS": DEMO_FRIEND_FLOOR_SECONDS,
 }
 #: 开启前原值的备份键前缀（存在同一个 gateway.env 里，不上界面）。
@@ -122,13 +118,12 @@ FIELDS: tuple[Field, ...] = (
           default=DEFAULT_BUSINESS_API_URL),
     Field("WXCLIENT_GATEWAY_AI_WS_URL", "AI 端地址", "已填正式地址",
           default=DEFAULT_AI_WS_URL),
-    # ★ `minimum` 抄自 `gateway/pacing.py` 的 MIN_READ / MIN_FRIEND 两个常量，**不在这里 import**
+    # 「读消息间隔」0.1.128 删了：入站改本地库监听，固定 3 秒看一次库（`db_source.DB_POLL_INTERVAL_SECONDS`），
+    # 读库微信看不见，30 秒地板是给开窗轮询定的；库读不了回退 UIA 时用代码里的默认 180 秒。
+    # ★ `minimum` 抄自 `gateway/pacing.py` 的 MIN_FRIEND 常量，**不在这里 import**
     #   （同 default 的理由：`wxclient.gateway` 包一进来就是 structlog + pydantic）。
     #   抄错了由 `tests/test_settings_validation.py` 判死。用户 2026-09-18：原来填低了网关
     #   悄悄抬回地板、只打一条日志，界面上还显示你填的数——「配置改了没反应」。现在保存时就拒。
-    Field("WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS", "读消息间隔",
-          "空闲轮询；最低 30 秒", section="sched", unit="秒",
-          default="180", minimum=30),
     Field("WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS", "查新好友间隔",
           "0=关闭；最低 300 秒", section="sched", unit="秒", default="900",
           minimum=300, zero_means_off=True),
@@ -256,11 +251,19 @@ def _saved_key(key: str) -> str:
     return DEMO_SAVED_PREFIX + key.removeprefix("WXCLIENT_GATEWAY_")
 
 
-#: 0.1.103 及以前极速页上那三格的键（和配置中心重复，0.1.104 删了）。老机器文件里还留着，读到就清掉。
-_RETIRED_DEMO_KEYS = frozenset({
+#: 界面上删掉了的格子的键。老机器文件里还留着，读到就清掉（启动时 `load_into_environ` 顺手落盘）。
+_RETIRED_KEYS = frozenset({
+    # 0.1.103 及以前极速页上那三格（和配置中心重复，0.1.104 删了）。
     "WXCLIENT_GATEWAY_DEMO_POLL_INTERVAL_SECONDS",
     "WXCLIENT_GATEWAY_DEMO_FRIEND_INTERVAL_SECONDS",
     "WXCLIENT_GATEWAY_DEMO_MOMENTS_INTERVAL_SECONDS",
+    # 0.1.128：入站改本地库监听，只管开窗轮询的几格删了（读消息间隔连同它的极速备份、
+    # 正聊着的时长、每轮读几个会话、正聊着每轮几个）。
+    "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS",
+    DEMO_SAVED_PREFIX + "POLL_INTERVAL_SECONDS",
+    "WXCLIENT_GATEWAY_DEMO_HOT_WINDOW_SECONDS",
+    "WXCLIENT_GATEWAY_DEMO_MAX_PEERS_PER_POLL",
+    "WXCLIENT_GATEWAY_DEMO_MAX_PEERS_PER_QUICK_POLL",
 })
 
 
@@ -272,9 +275,9 @@ def apply_demo_presets(values: dict[str, str]) -> dict[str, str]:
     - 其余原样（开着期间在配置中心再改那一格，改多少算多少）。
 
     ★ 按状态判、不按「这次保存有没有翻面」判（09-30 真机：0.1.103 存下的文件里开关早就是开的，
-      升级后保存不翻面，读消息间隔一直停在 180）。改的是配置中心那一格本身，界面上看到的就是生效值。
+      升级后保存不翻面，那一格一直停在原值）。改的是配置中心那一格本身，界面上看到的就是生效值。
     """
-    out = {key: value for key, value in values.items() if key not in _RETIRED_DEMO_KEYS}
+    out = {key: value for key, value in values.items() if key not in _RETIRED_KEYS}
     on = as_bool(out.get(DEMO_TOGGLE_KEY, ""))
     defaults = {field.key: field.default for field in FIELDS}
     for key in DEMO_PRESETS.keys() | DEMO_UNLOCKED.keys():
@@ -391,7 +394,7 @@ def load_into_environ(data_dir: Path, environ: dict[str, str] | None = None) -> 
     返回实际灌进去的那份，便于日志/测试核对。
     """
     values = effective(data_dir, environ)
-    # 极速开关和读消息间隔对齐后落盘：升级上来的老文件（开关开着、间隔还是 180）启动一次就对上，
+    # 极速开关和它管的格子对齐后落盘（也顺手清掉删了的老键）：升级上来的老文件启动一次就对上，
     # 配置中心进页重读磁盘看到的也是这个数。
     synced = apply_demo_presets(values)
     if synced != values and settings_path(data_dir).exists():

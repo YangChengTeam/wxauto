@@ -170,7 +170,8 @@ class ConfigLookTests(unittest.TestCase):
         sched = settings_store.fields_of("sched")
 
         self.assertEqual([field.label for field in sched],
-                         ["读消息间隔", "查新好友间隔",
+                         # 「读消息间隔」0.1.128 删了：入站改本地库监听，固定 3 秒看一次库。
+                         ["查新好友间隔",
                           # 093（2026-09-01）：我们加的人通过了没有——多久搜一次、搜多久。
                           # 和上面「查新好友间隔」不是一回事：那条是**别人申请加我们**。
                           "查好友通过间隔", "查好友通过期限",
@@ -267,30 +268,30 @@ class ConfigLookTests(unittest.TestCase):
         self.assertIn("所有更改均已保存", self._labels(self.bar))
 
     def test_a_number_below_the_gateway_floor_is_refused_and_not_saved(self) -> None:
-        """读消息间隔填 10：不写文件、弹一句带地板的话（用户 2026-09-18 「配置改了没反应」）。"""
+        """查新好友间隔填 10：不写文件、弹一句带地板的话（用户 2026-09-18 「配置改了没反应」）。"""
         from unittest import mock
 
         from wxclient.ui import dialog
 
-        self.page._vars["WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS"].set("10")
+        self.page._vars["WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS"].set("10")
         with mock.patch.object(dialog, "tell") as tell:
             self.page._save(restart=False)
         self.assertFalse(settings_store.settings_path(self.dir).exists(), "拒了就不该落盘")
         title, message = tell.call_args.args[1], tell.call_args.args[2]
         self.assertIn("不能这么填", title)
-        self.assertIn("最低 30", message)
+        self.assertIn("最低 300", message)
         self.assertEqual(tell.call_args.kwargs.get("tone"), "error")
 
-    def test_turning_speed_mode_on_shows_1_in_the_config_center_read_box(self) -> None:
-        """用户 2026-09-30：「开启极速模式读消息间隔变为 1，框框中的参数也要变」；关掉恢复原值。"""
+    def test_turning_speed_mode_on_shows_the_preset_in_the_config_center_box(self) -> None:
+        """用户 2026-09-30：「框框中的参数也要变」；关掉恢复原值。读消息间隔 0.1.128 删了，拿加好友最小间隔验。"""
         from unittest import mock
 
         from wxclient.ui import dialog
 
-        read = "WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS"
+        read = "WXCLIENT_GATEWAY_FRIEND_INTERVAL_SECONDS"
         demo = SettingsPage(self.root, self.dir, sections=settings_store.DEMO_SECTIONS)
         _KEEP_ALIVE.append(demo)
-        self.page._vars[read].set("120")
+        self.page._vars[read].set("600")
         with mock.patch.object(dialog, "tell"):
             self.page._save(restart=False)
             demo.reload()
@@ -301,7 +302,7 @@ class ConfigLookTests(unittest.TestCase):
             demo._vars[settings_store.DEMO_TOGGLE_KEY].set(False)
             demo._save(restart=False)
             self.page.reload()
-        self.assertEqual(self.page._vars[read].get(), "120")
+        self.assertEqual(self.page._vars[read].get(), "600")
 
     def test_a_placeholder_never_becomes_a_value(self) -> None:
         """★ 占位文字要是塞进变量，那一格就会被存成提示语本身。

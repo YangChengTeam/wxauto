@@ -210,6 +210,46 @@ class MediaTests(_Base):
         self.assertEqual([m.text for m in out], ["[语音]"])
         self.assertEqual(self.store.db_cursor(ACCOUNT, NAME), _UI_OWNED)  # 仍持有
 
+    async def test_UI持有_库里没新东西就不再开窗(self) -> None:
+        self.store.set_db_cursor(ACCOUNT, NAME, 2)
+        self.reader.set_session(4, "image")
+        self.reader.set_rows([_row(3, "看这个"), _row(4, "", message_type="image")])
+        self.ui.returns = [_ui_msg("[图片]")]
+        await self.fetch()                                   # 委回一次
+        self.ui.returns = []
+        for _ in range(5):                                   # 3 秒一轮：停在图片上也不能每轮开窗
+            await self.fetch()
+        self.assertEqual(self.ui.calls, [NAME])
+
+    async def test_UI持有_来了文本新消息读一次就交回本地库(self) -> None:
+        self.store.set_db_cursor(ACCOUNT, NAME, 2)
+        self.reader.set_session(4, "image")
+        self.reader.set_rows([_row(4, "", message_type="image")])
+        await self.fetch()
+        self.reader.set_session(5, "text")
+        self.ui.returns = [_ui_msg("收到了吗")]
+        out = await self.fetch()
+        self.assertEqual([m.text for m in out], ["收到了吗"])
+        self.assertEqual(self.store.db_cursor(ACCOUNT, NAME), 5)
+        self.reader.set_session(6, "text")
+        self.reader.set_rows([_row(6, "在吗")])
+        out = await self.fetch()                             # 之后归本地库，不再开窗
+        self.assertEqual([m.text for m in out], ["在吗"])
+        self.assertEqual(self.ui.calls, [NAME, NAME])
+
+    def test_本地库按固定节拍跑_不走快慢档(self) -> None:
+        from wxclient.gateway.inbound import InboundLoop
+
+        async def handler(*_args, **_kwargs):
+            return None
+
+        loop = InboundLoop(
+            accounts=[ACCOUNT], source=self.source, store=self.store, handler=handler,
+            poll_interval_seconds=180.0, active_poll_interval_seconds=30.0,
+        )
+        loop.set_pace(idle_seconds=600.0, active_seconds=120.0, floor=30.0)  # AI 端下发也不管它
+        self.assertEqual(loop._interval_for(AT), 3.0)
+
 
 class TakeoverTests(_Base):
     async def test_人工接管这轮不读_并把游标推到最新(self) -> None:

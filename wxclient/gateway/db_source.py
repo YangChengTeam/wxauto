@@ -41,6 +41,10 @@ from .wechat_io import FIRST_SEEN_TAIL, QueueMessageSource, to_inbound
 _log = structlog.get_logger(__name__)
 _local = _log.bind(**{logrole.ROLE_KEY: logrole.LOCAL})
 
+#: 多久看一次本地库（秒）。读库微信看不见，不受开窗轮询的 30/180 秒地板管；界面上的「读消息
+#: 间隔」0.1.128 起删了。库没变时 `sessions()` 复用上次的连接，一轮只是 stat 几个文件。
+DB_POLL_INTERVAL_SECONDS = 3.0
+
 #: `gateway_db_cursors` 里的哨兵：这个会话当前归 UIA 读（有未消化的语音/图片/文件等），
 #: 本地库这一侧先不碰它，每轮委回 UIA；等它最后一条又变回文本、UIA 也追平了，再交回本地库。
 _UI_OWNED = -1
@@ -48,6 +52,9 @@ _UI_OWNED = -1
 
 class DbMessageSource:
     """按本地库判新消息的入站来源，接口与 `QueueMessageSource` 一致（`MessageSource`）。"""
+
+    #: `InboundLoop` 认这个：有它就按固定节拍跑，不走快慢档和 AI 端下发的节拍。
+    fixed_poll_interval_seconds = DB_POLL_INTERVAL_SECONDS
 
     def __init__(
         self,
@@ -70,6 +77,9 @@ class DbMessageSource:
         self._paused_peers: set[str] = set()
         # 上一轮各会话最后一条的 local_id；名单外单聊涨了才去 UIA 扫红点（None = 还没建基线）。
         self._seen_sessions: dict[str, int] | None = None
+        # 归 UIA 的会话上次委回时库里最后一条的 local_id：没涨就不再开窗（3 秒一轮，
+        # 不能为一个停在图片上的会话每轮开一次窗）。只在内存里，重启后至多多委回一次。
+        self._ui_owned_seen: dict[str, int] = {}
 
     # MessageSource 里 runner 会装的两个回调，直接透传给 UIA 替身（查无此人 / 读不到要去加好友）。
     def set_unreachable_handler(self, handler) -> None:
@@ -178,11 +188,16 @@ class DbMessageSource:
         # 这个会话当前归 UIA（有没消化的媒体）：每轮委回 UIA；最后一条又变回文本、
         # 且 UIA 这轮没再吐出东西 = 追平了，交回本地库（基线推到最新，不回溯）。
         if cursor == _UI_OWNED:
-            results = await self._ui.read_peer(account_id, peer_id)
             username = self._resolve(peer_id, sessions)
-            newest_type = sessions.get(username, (0, None))[1] if username else None
-            if not results and newest_type == "text" and username in sessions:
-                self._store.set_db_cursor(account_id, peer_id, sessions[username][0])
+            latest, newest_type = sessions.get(username, (0, None)) if username else (0, None)
+            if username in sessions and latest <= self._ui_owned_seen.get(peer_id, -1):
+                return []  # 委回之后库里没新东西：不开窗
+            results = await self._ui.read_peer(account_id, peer_id)
+            self._ui_owned_seen[peer_id] = latest
+            if newest_type == "text" and username in sessions:
+                # UIA 已经读到最后一条，而它是文本：交回本地库，基线推到最新。
+                self._store.set_db_cursor(account_id, peer_id, latest)
+                self._ui_owned_seen.pop(peer_id, None)
             return results
 
         username = self._resolve(peer_id, sessions)
@@ -231,6 +246,7 @@ class DbMessageSource:
             # 基线推到这批就绪的最后一条，之后每轮委回直到它追平。
             self._store.clear_cursor(account_id, peer_id)  # 让 UIA 走首见、只读尾部今天，别回放
             self._store.set_db_cursor(account_id, peer_id, _UI_OWNED)
+            self._ui_owned_seen[peer_id] = session_max
             return await self._ui.read_peer(account_id, peer_id)
 
         # 全是文本：直接从库里出，游标推到这批最后一条 local_id。

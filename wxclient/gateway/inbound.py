@@ -653,7 +653,12 @@ class InboundLoop:
         ⚠️ **快也只快到下限为止**：`_active_interval` 在装配处已经被 `clamp_interval` 抬到
         `MIN_READ_INTERVAL_SECONDS`（30 秒）以上，抖动、工作时间窗、发送频次上限一个没动。
         这不是把节拍整体调快，是「热的时候借用已经允许的那一档」。
+
+        本地库监听（`db_source.DbMessageSource`）不开窗，按它自己的固定节拍跑，以上都不管。
         """
+        fixed = getattr(self._source, "fixed_poll_interval_seconds", None)
+        if fixed:
+            return float(fixed)
         if self._last_activity is None or self._hot_window <= 0:
             return self._poll_interval
         if (now - self._last_activity).total_seconds() <= self._hot_window:

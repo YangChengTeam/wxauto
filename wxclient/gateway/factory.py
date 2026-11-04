@@ -258,7 +258,6 @@ def build_gateway(
         store=store,
         watchlist=watchlist,
         hot_window_seconds=gateway_settings.hot_window_seconds,
-        prefilter_by_session_list=gateway_settings.prefilter_by_session_list,
         read_unread_strangers=gateway_settings.read_unread_strangers,
         allow_real_actions=allow_real_actions,
         confirmation=REAL_ACTION_CONFIRMATION,
@@ -270,25 +269,24 @@ def build_gateway(
             else None
         ),
     )
-    # 入站优先走本地库（`wechat_db`）：省掉「为了看有没有新消息而开窗」。扫不到密钥 / 非
-    # Windows / 账号目录都对不上当前微信时 `build_reader` 返回 None，自动回退到上面那条 UIA 轮询（AGENTS.md §4.3）。
+    # 入站走本地库（`wechat_db`）监听：省掉「为了看有没有新消息而开窗」。扫不到密钥 / 非
+    # Windows / 账号目录都对不上当前微信时 `build_reader` 返回 None，回退到上面那条 UIA 轮询（AGENTS.md §4.3）。
     source = ui_source
-    if gateway_settings.use_local_db:
-        try:
-            # 用到时才 import：wechat_db 顶层要 cryptography，包里缺了也只回退 UIA，不拦启动。
-            from wxclient.wechat_db import build_reader
-        except ImportError as exc:
-            _log.info("本地库入站不可用，回退到 UIA 轮询", 原因=str(exc)[:160])
-            build_reader = lambda: None  # noqa: E731
-        reader = build_reader()
-        if reader is not None:
-            source = DbMessageSource(
-                reader=reader,
-                store=store,
-                ui_source=ui_source,
-                watchlist=watchlist,
-                read_unread_strangers=gateway_settings.read_unread_strangers,
-            )
+    try:
+        # 用到时才 import：wechat_db 顶层要 cryptography，包里缺了也只回退 UIA，不拦启动。
+        from wxclient.wechat_db import build_reader
+    except ImportError as exc:
+        _log.info("本地库入站不可用，回退到 UIA 轮询", 原因=str(exc)[:160])
+        build_reader = lambda: None  # noqa: E731
+    reader = build_reader()
+    if reader is not None:
+        source = DbMessageSource(
+            reader=reader,
+            store=store,
+            ui_source=ui_source,
+            watchlist=watchlist,
+            read_unread_strangers=gateway_settings.read_unread_strangers,
+        )
 
     runner = GatewayRunner(
         settings=gateway_settings,
