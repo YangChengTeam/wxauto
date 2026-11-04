@@ -50,6 +50,10 @@ DB_POLL_INTERVAL_SECONDS = 3.0
 #: 2026-11-04 21:32：单跑 4 秒，客户端里超了 60 秒），一次失败不能整场都退回 UIA。
 ATTACH_RETRY_SECONDS = 60.0
 
+#: 第一轮等本地库连上最多多久（秒）。子进程扫钥一般十几秒；先等一等，别一启动就让 UIA
+#: 顶一轮「汇总未读消息」——那一轮要开窗、拉前台、跑一分钟（真机 2026-11-04 22:04）。
+FIRST_ATTACH_WAIT_SECONDS = 30.0
+
 #: 一个会话一轮最多往日志里打几条新消息（突然冒出一大段时别把日志刷爆）。
 LOG_MESSAGES_PER_SESSION = 10
 
@@ -137,6 +141,12 @@ class DbMessageSource:
         self._attach_task = asyncio.get_running_loop().create_task(keep_trying())
 
     async def fetch(self, account_id: str) -> list[InboundMessage]:
+        if self._reader is None and self._attach_task is None and self._attach is not None:
+            self._ensure_attaching()
+            try:
+                await asyncio.wait_for(asyncio.shield(self._attach_task), FIRST_ATTACH_WAIT_SECONDS)
+            except (TimeoutError, asyncio.TimeoutError):
+                pass  # 还没连上：这一轮照旧由 UIA 顶，后台继续试
         if self._reader is None:
             self._ensure_attaching()
             self._ui_rounds_before_attach = True

@@ -407,7 +407,8 @@ class AttachLaterTests(unittest.IsolatedAsyncioTestCase):
 
         from wxclient.gateway import db_source
 
-        with mock.patch.object(db_source, "ATTACH_RETRY_SECONDS", 0.01):
+        with mock.patch.object(db_source, "ATTACH_RETRY_SECONDS", 0.01), \
+                mock.patch.object(db_source, "FIRST_ATTACH_WAIT_SECONDS", 0.02):
             self.ui.returns = [_ui_msg("你好")]
             out = await self.source.fetch(ACCOUNT)
             self.assertEqual([m.text for m in out], ["你好"])
@@ -422,7 +423,8 @@ class AttachLaterTests(unittest.IsolatedAsyncioTestCase):
 
         from wxclient.gateway import db_source
 
-        with mock.patch.object(db_source, "ATTACH_RETRY_SECONDS", 0.01):
+        with mock.patch.object(db_source, "ATTACH_RETRY_SECONDS", 0.01), \
+                mock.patch.object(db_source, "FIRST_ATTACH_WAIT_SECONDS", 0.02):
             await self.source.fetch(ACCOUNT)                 # UIA 顶了一轮
             self.ready = True
             await asyncio.sleep(0.05)
@@ -439,3 +441,25 @@ class AttachLaterTests(unittest.IsolatedAsyncioTestCase):
         self.reader.set_session(6)
         self.reader.set_rows([_row(6, "新的", at=now)])
         self.assertEqual([m.text for m in await self.source.fetch(ACCOUNT)], ["新的"])
+
+
+class FirstAttachWaitTests(unittest.IsolatedAsyncioTestCase):
+    """第一轮先等本地库连上（子进程扫钥十几秒），连上了就直接读库，不让 UIA 先顶一轮开窗。"""
+
+    async def test_第一轮等到连上_不走UIA(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GatewayStore(Path(tmp) / "gateway.db")
+            reader, ui = _FakeReader(), _FakeUi()
+            reader.set_session(5)
+
+            def attach():
+                time.sleep(0.05)                             # 子进程扫钥要一会儿
+                return reader
+
+            watchlist = Watchlist()
+            watchlist.apply_backend({"only": [NAME]})
+            source = DbMessageSource(attach=attach, store=store, ui_source=ui, watchlist=watchlist,
+                                     clock=lambda: AT, read_unread_strangers=False)
+            await source.fetch(ACCOUNT)
+            self.assertEqual(ui.polls, 0)
+            self.assertEqual(source.fixed_poll_interval_seconds, 3.0)

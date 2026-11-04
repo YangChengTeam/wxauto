@@ -48,7 +48,10 @@ def serve() -> int:
     proto_in = sys.stdin.buffer if sys.stdin else os.fdopen(0, "rb")
     proto_out = sys.stdout.buffer if sys.stdout else os.fdopen(1, "wb")
     # 协议独占 stdout：日志（structlog 默认打 stdout）全改去 stderr，别把协议行搅乱。
-    sys.stdout = sys.stderr if sys.stderr else open(os.devnull, "w")
+    # stderr 固定 UTF-8：管道默认走系统代码页（GBK），父进程按 UTF-8 解出来全是乱码。
+    if sys.stderr:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout = sys.stderr if sys.stderr else open(os.devnull, "w", encoding="utf-8")
     structlog.configure(logger_factory=structlog.PrintLoggerFactory(sys.stdout))
 
     def send(payload: dict) -> None:
