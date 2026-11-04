@@ -177,7 +177,7 @@ its cadence and every gate are unchanged — only *how a round discovers new mes
   the §10 stranger window).
 - **The DB access is read-only** (see §5.1/§5.3): `ReadProcessMemory` on `Weixin.exe` for the key, page-HMAC
   verify + AES decrypt into an **in-memory** SQLite image. No key or chat text is ever written to disk or a log.
-- **It fails safe**: no key / unsupported WeChat version / more than one logged-in account → `build_reader`
+- **It fails safe**: no key / unsupported WeChat version / no account dir whose keys match the running WeChat → `build_reader`
   returns `None` and the gateway runs the UIA loop exactly as before (`GatewaySettings.use_local_db` also
   turns it off). Debounce, work-hours window, send-rate limits and jitter are untouched.
 

@@ -53,7 +53,7 @@
 ```
 
 **选哪条**在 `gateway/factory.py`：`GatewaySettings.use_local_db` 开着（默认）且
-`wechat_db.build_reader()` 扫到密钥、认出单账号 → DB 路线；否则 `build_reader()` 返回 `None`，
+`wechat_db.build_reader()` 扫到密钥、认出当前登录的那个账号目录（换过号留下的旧目录按活跃度排后、密钥对不上自动跳过）→ DB 路线；否则 `build_reader()` 返回 `None`，
 **自动回退** UIA 路线，行为与 0.1.120 完全一致。**任何一步失败都安全回退，不拦启动。**
 
 ---
@@ -133,7 +133,7 @@ DB 只换「怎么**发现**新消息」。产出同一种 `InboundMessage`，�
 ## 6. 配置与回退
 
 - `GatewaySettings.use_local_db`（默认 `True`）：关掉＝永远走 UIA 轮询（0.1.120 及以前）。
-- 回退触发：非 Windows / 扫不到密钥（微信没登录、版本不支持）/ 多账号 →
+- 回退触发：非 Windows / 扫不到密钥（微信没登录、版本不支持）/ 所有账号目录都对不上当前微信 →
   `build_reader()` 返回 `None` 并记一条 `info`，走 UIA。
 
 ---
@@ -229,7 +229,7 @@ stranger · ticket_info · stranger_ticket_info · room_verify_application
 ```
 wxclient/wechat_db/              ← 新：本地库只读
   crypto.py    扫密钥(ReadProcessMemory) + 页HMAC校验 + AES解密到内存；counts-only 日志
-  reader.py    会话变化探测 / local_id 取新消息 / 名字映射 / locate_storage+attach+build_reader(回退)
+  reader.py    会话变化探测 / local_id 取新消息 / 名字映射 / locate_storages+attach+build_reader(回退)
 gateway/
   db_source.py 新：DbMessageSource（归属判定、委回、游标），实现 MessageSource
   wechat_io.py 老 UIA 源；新增 read_peer / read_unread_strangers 两个公开口给委回
@@ -246,7 +246,8 @@ gateway/
 
 离线测试不等于真机可用（AGENTS §12）。真机上要确认：
 
-- [ ] `scan_keys` 在当前微信版本上扫得到密钥；`decrypt_database_bytes` 解出的库能通过完整性检查。
+- [x] `scan_keys` 在当前微信版本上扫得到密钥；`decrypt_database_bytes` 解出的库能通过完整性检查（真机 2026-11-04：22/22 库验证通过，263 个会话，文本与自己/对方认定正确；attach 约 40 秒）。
+- [x] 换过号的机器（一旧一新两个账号目录）不再整条回退 UIA，挑密钥对得上的那个（0.1.123）。
 - [ ] 文本消息：`local_id` 游标推进正确，连发/去抖表现与 UIA 路线一致。
 - [ ] 媒体委回：语音转写、图片/文件另存走通；文本→媒体切换不重发今天尾部。
 - [ ] 回退：微信退登 / 多账号时确实回退 UIA 且有日志。
