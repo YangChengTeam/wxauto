@@ -182,7 +182,9 @@ its cadence and every gate are unchanged — only *how a round discovers new mes
   included, official accounts not) is logged as 「本地库读到新消息」 with a 40-char `wechat_io.preview`, the same
   rule as the UIA path — logging never decides whether to reply; the watchlist does (user 2026-11-04).
 - **It fails safe**: no key / unsupported WeChat version / no account dir whose keys match the running WeChat → `build_reader`
-  returns `None` and the gateway runs the UIA loop on its built-in defaults. There is **no switch** to turn the
+  returns `None`; the UIA loop stands in on its built-in cadence while `DbMessageSource` keeps re-attaching in a
+  background thread every 60s and switches to the DB as soon as it connects (0.1.130 — one slow key scan must
+  not leave a whole session on window polling). There is **no switch** to turn the
   DB path off (0.1.128 removed `use_local_db`, `prefilter_by_session_list` and the polling-only UI fields:
   读消息间隔, 正聊着的时长, 每轮读几个会话, 正聊着每轮几个). The DB is checked every
   `db_source.DB_POLL_INTERVAL_SECONDS` (3s, jittered) — reading the DB is invisible to WeChat, the 30s floor is
