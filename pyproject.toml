@@ -37,6 +37,9 @@ dependencies = [
   "websockets>=13",
   # 本地库入站（wxclient/wechat_db/）：群消息正文是 zstd 压的，解它要用。
   "zstandard>=0.22",
+  # 本地库入站解密：SQLCipher 页校验/解密（PBKDF2-HMAC-SHA512 + AES-CBC）靠它。
+  # wechat_db 顶层就 import，漏装会让入站 attach 直接失败、静默回退 UIA——干净机器上必现。
+  "cryptography>=42",
 ]
 
 [tool.setuptools.dynamic]
