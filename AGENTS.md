@@ -185,7 +185,10 @@ its cadence and every gate are unchanged — only *how a round discovers new mes
   returns `None`. All DB work (key scan, decrypt, queries) runs in a **separate worker process**
   (`wechat_db/worker.py`, same exe with `--db-worker`); in-process it starved the Tk thread of the GIL and the window
   hung on drag (0.1.131). Keys never leave the worker. Each worker call times out after 15s; a stuck worker is
-  killed and re-attached in the background (0.1.133). UIA window enumeration skips the client's own windows. Until the worker connects, the UIA loop stands in on its built-in cadence while `DbMessageSource` keeps re-attaching in a
+  killed and re-attached in the background (0.1.133). UIA window enumeration skips the client's own windows.
+  Periodic WeChat probes (UI every 15s, keepalive every 30s) count at most `PERIODIC_PROBE_MAX_NODES` (120) UIA
+  nodes, not 5000 — every node is a cross-process call WeChat's UI thread must answer, and dragging WeChat's window
+  froze both (0.1.134). The account lookup (walks all WeChat handles, ~2s) is cached per WeChat PID set. Until the worker connects, the UIA loop stands in on its built-in cadence while `DbMessageSource` keeps re-attaching in a
   background thread every 60s and switches to the DB as soon as it connects (0.1.130 — one slow key scan must
   not leave a whole session on window polling). There is **no switch** to turn the
   DB path off (0.1.128 removed `use_local_db`, `prefilter_by_session_list` and the polling-only UI fields:
