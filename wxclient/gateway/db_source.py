@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
@@ -45,6 +46,10 @@ _local = _log.bind(**{logrole.ROLE_KEY: logrole.LOCAL})
 #: 间隔」0.1.128 起删了。库没变时 `sessions()` 复用上次的连接，一轮只是 stat 几个文件。
 DB_POLL_INTERVAL_SECONDS = 3.0
 
+#: 本地库没连上时多久再试一次（秒）。扫钥在客户端里偶尔会被别的启动线程拖过时限（真机
+#: 2026-11-04 21:32：单跑 4 秒，客户端里超了 60 秒），一次失败不能整场都退回 UIA。
+ATTACH_RETRY_SECONDS = 60.0
+
 #: 一个会话一轮最多往日志里打几条新消息（突然冒出一大段时别把日志刷爆）。
 LOG_MESSAGES_PER_SESSION = 10
 
@@ -58,13 +63,11 @@ _UI_OWNED = -1
 class DbMessageSource:
     """按本地库判新消息的入站来源，接口与 `QueueMessageSource` 一致（`MessageSource`）。"""
 
-    #: `InboundLoop` 认这个：有它就按固定节拍跑，不走快慢档和 AI 端下发的节拍。
-    fixed_poll_interval_seconds = DB_POLL_INTERVAL_SECONDS
-
     def __init__(
         self,
         *,
-        reader,  # wechat_db.WeChatDbReader（鸭子类型，避免在非 Windows 上导入 ctypes 路径）
+        reader=None,  # wechat_db.WeChatDbReader（鸭子类型，避免在非 Windows 上导入 ctypes 路径）
+        attach=None,  # () -> reader | None，阻塞（扫钥几秒到几十秒），放线程里跑；reader 为 None 时用
         store: GatewayStore,
         ui_source: QueueMessageSource,
         watchlist: Watchlist | None = None,
@@ -72,6 +75,11 @@ class DbMessageSource:
         read_unread_strangers: bool = True,
     ) -> None:
         self._reader = reader
+        self._attach = attach
+        self._attach_task: asyncio.Task | None = None
+        # 本地库连上之前 UIA 已经替它跑过几轮：连上后第一轮把名单里各会话的游标直接基线到
+        # 最新，不走首见切尾部——那几条 UIA 已经读过、可能也回过了，再出一遍就是重复回复。
+        self._ui_rounds_before_attach = False
         self._store = store
         # UIA 替身：首次读、含媒体那一轮、名字对不上、名单外红点都委给它。
         self._ui = ui_source
@@ -99,7 +107,43 @@ class DbMessageSource:
     def set_full_interval(self, seconds: float) -> None:
         self._ui.set_full_interval(seconds)
 
+    @property
+    def fixed_poll_interval_seconds(self) -> float | None:
+        """`InboundLoop` 认这个：连上本地库就按固定节拍跑，不走快慢档和 AI 端下发的节拍；
+        还没连上（暂由 UIA 顶着）就返回 None，走 UIA 的节拍——别让开窗轮询跟着 3 秒一轮。"""
+        return DB_POLL_INTERVAL_SECONDS if self._reader is not None else None
+
+    def _ensure_attaching(self) -> None:
+        """后台一直试着连本地库，连上为止（每 `ATTACH_RETRY_SECONDS` 一次，扫钥在线程里跑）。"""
+        if self._attach is None or (self._attach_task is not None and not self._attach_task.done()):
+            return
+
+        async def keep_trying() -> None:
+            attempt = 0
+            while self._reader is None:
+                attempt += 1
+                try:
+                    reader = await asyncio.to_thread(self._attach)
+                except Exception as exc:  # noqa: BLE001
+                    reader = None
+                    _local.warning("连本地微信库出错", error=str(exc)[:160])
+                if reader is not None:
+                    self._reader = reader
+                    _local.info("本地库已连上，入站切到本地库监听", 第几次=attempt)
+                    return
+                _local.info("本地库还没连上，暂由 UIA 轮询顶着，稍后再试", 第几次=attempt, 秒后重试=ATTACH_RETRY_SECONDS)
+                await asyncio.sleep(ATTACH_RETRY_SECONDS)
+
+        self._attach_task = asyncio.get_running_loop().create_task(keep_trying())
+
     async def fetch(self, account_id: str) -> list[InboundMessage]:
+        if self._reader is None:
+            self._ensure_attaching()
+            self._ui_rounds_before_attach = True
+            return await self._ui.fetch(account_id)
+        return await self._fetch_db(account_id)
+
+    async def _fetch_db(self, account_id: str) -> list[InboundMessage]:
         self._watchlist.warn_if_idle()
         listed = self._watchlist.watched()
         self._round += 1
@@ -110,6 +154,13 @@ class DbMessageSource:
         except Exception as exc:  # noqa: BLE001 —— 本地库这一趟读不了就这轮空手，别拖垮循环
             _local.warning("读本地微信库会话表失败，这一轮不出新消息", error=str(exc))
             return []
+
+        if self._ui_rounds_before_attach:
+            self._ui_rounds_before_attach = False
+            for peer_id in listed:
+                username = self._resolve(peer_id, sessions)
+                if username in sessions and self._store.db_cursor(account_id, peer_id) is None:
+                    self._store.set_db_cursor(account_id, peer_id, sessions[username][0])
 
         watched = self._drop_handed_off(account_id, listed, sessions)
         _local.info(

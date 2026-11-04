@@ -277,11 +277,11 @@ def build_gateway(
         from wxclient.wechat_db import build_reader
     except ImportError as exc:
         _log.info("本地库入站不可用，回退到 UIA 轮询", 原因=str(exc)[:160])
-        build_reader = lambda: None  # noqa: E731
-    reader = build_reader()
-    if reader is not None:
+    else:
+        # 扫钥不在这里同步做：放到 DbMessageSource 的后台线程里，连上之前 UIA 顶着，
+        # 连不上就每分钟再试（一次没扫到不能整场都退回开窗轮询）。也不再拖慢网关启动。
         source = DbMessageSource(
-            reader=reader,
+            attach=build_reader,
             store=store,
             ui_source=ui_source,
             watchlist=watchlist,

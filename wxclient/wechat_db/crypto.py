@@ -205,14 +205,19 @@ def scan_keys(pages, timeout=60):
                 if base + size <= address:
                     break
                 address = base + size
-            def read_runtime(address, length, handle=handle):  # bind handle: closure outlives the loop var
-                if time.monotonic() >= deadline:
+            # 读运行时配置这一步每个进程单独计时，不吃后面暴力扫的总时限：真机 2026-11-04 客户端里
+            # 主进程这一步被别的启动线程拖过了 60 秒，后面几个进程一读就空，整次扫钥失败。
+            runtime_deadline = time.monotonic() + timeout
+            def read_runtime(address, length, handle=handle, runtime_deadline=runtime_deadline):  # bind: closure outlives the loop vars
+                if time.monotonic() >= runtime_deadline:
                     return b''
                 buffer, count = ctypes.create_string_buffer(length), ctypes.c_size_t()
                 if api.ReadProcessMemory(handle, address, buffer, length, ctypes.byref(count)):
                     return buffer.raw[:count.value]
                 return b''
             found.update(scan_runtime_cipher(runtime_regions, read_runtime, pages))
+            if len(found) >= len(pages):
+                break  # 全部验证通过（常见：主进程的运行时配置一次就齐），后面的进程不用再开
             address = 0
             while time.monotonic() < deadline and len(found) < len(pages):
                 if not api.VirtualQueryEx(handle, address, ctypes.byref(info), ctypes.sizeof(info)):

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import time
 import unittest
@@ -62,9 +63,14 @@ class _FakeUi:
         self.calls: list[str] = []
         self.returns: list[InboundMessage] = []
         self.stranger_scans = 0
+        self.polls = 0
 
     async def read_peer(self, account_id, peer_id, *, unread=None):
         self.calls.append(peer_id)
+        return list(self.returns)
+
+    async def fetch(self, account_id):
+        self.polls += 1
         return list(self.returns)
 
     async def read_unread_strangers(self, account_id, listed):
@@ -364,3 +370,72 @@ class NewMessageLogTests(_Base):
             ("李四", "否", "对方", "图片", "[图片]"),
             ("123@chatroom", "否", "王五", "文字", "大家好"),
         ])
+
+
+class AttachLaterTests(unittest.IsolatedAsyncioTestCase):
+    """扫钥失败不能整场退回 UIA：连上之前 UIA 顶着、按 UIA 节拍，后台每分钟再试，连上就切本地库。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store = GatewayStore(Path(self._tmp.name) / "gateway.db")
+        self.reader = _FakeReader()
+        self.ui = _FakeUi()
+        self.attempts = 0
+        self.ready = False
+        watchlist = Watchlist()
+        watchlist.apply_backend({"only": [NAME]})
+
+        def attach():
+            self.attempts += 1
+            return self.reader if self.ready else None
+
+        self.source = DbMessageSource(
+            attach=attach, store=self.store, ui_source=self.ui, watchlist=watchlist,
+            clock=lambda: AT, read_unread_strangers=False,
+        )
+
+    async def _settle(self) -> None:
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if self.source._attach_task is None or self.source._attach_task.done():
+                break
+            await asyncio.sleep(0.01)
+
+    async def test_没连上_UIA顶着_按UIA节拍(self) -> None:
+        from unittest import mock
+
+        from wxclient.gateway import db_source
+
+        with mock.patch.object(db_source, "ATTACH_RETRY_SECONDS", 0.01):
+            self.ui.returns = [_ui_msg("你好")]
+            out = await self.source.fetch(ACCOUNT)
+            self.assertEqual([m.text for m in out], ["你好"])
+            self.assertEqual(self.ui.polls, 1)
+            self.assertIsNone(self.source.fixed_poll_interval_seconds)
+            await asyncio.sleep(0.05)
+            self.assertGreater(self.attempts, 1, "连不上要一直重试")
+            self.source._attach_task.cancel()
+
+    async def test_后来连上_切本地库_名单游标直接基线不重放(self) -> None:
+        from unittest import mock
+
+        from wxclient.gateway import db_source
+
+        with mock.patch.object(db_source, "ATTACH_RETRY_SECONDS", 0.01):
+            await self.source.fetch(ACCOUNT)                 # UIA 顶了一轮
+            self.ready = True
+            await asyncio.sleep(0.05)
+            await self._settle()
+        self.assertEqual(self.source.fixed_poll_interval_seconds, 3.0)
+        now = int(time.time())
+        self.reader.set_session(5)
+        self.reader.set_rows([_row(5, "UIA 已经读过的", at=now)])
+        self.ui.polls = 0
+        out = await self.source.fetch(ACCOUNT)
+        self.assertEqual(out, [])                            # 不走首见、不重放
+        self.assertEqual(self.ui.polls, 0)
+        self.assertEqual(self.store.db_cursor(ACCOUNT, NAME), 5)
+        self.reader.set_session(6)
+        self.reader.set_rows([_row(6, "新的", at=now)])
+        self.assertEqual([m.text for m in await self.source.fetch(ACCOUNT)], ["新的"])
