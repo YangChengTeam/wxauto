@@ -33,6 +33,10 @@ wxclient/gateway/
 
 **依赖方向**：`gateway → runtime → queue → wechat_api`，单向不回头。
 
+> **入站自 0.1.121 默认改读本地微信库判新消息**（`wxclient/wechat_db/` + `gateway/db_source.py`），
+> 不再开窗轮询；扫不到密钥等情况自动回退到 `inbound.py`/`wechat_io.py` 这条 UIA 轮询。
+> 机制、会话归属、加好友 DB 化规划见 [`本地库入站_wechat_db.md`](本地库入站_wechat_db.md)。
+
 ## 2. 阶段与任务
 
 ### Phase A · 协议层（Linux 全可测）✅ 完成 2026-08-10
