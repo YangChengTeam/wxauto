@@ -173,8 +173,10 @@ its cadence and every gate are unchanged — only *how a round discovers new mes
   for that round is handed back to `QueueMessageSource.read_peer` (UIA) — voice transcription, attachment
   save and not-found→add-friend all stay on the one tested path. A peer is DB-owned or UIA-owned, never
   both in the same round; the `local_id` cursor baselines forward across the handoff.
-- **First contact / name mismatch / unlisted red-dot strangers** stay on UIA (first-seen tail, add-friend,
-  the §10 stranger window).
+- **First contact is read from the DB too** (same rule as `first_seen_fresh`: trailing, today's, peer-sent,
+  at most `FIRST_SEEN_TAIL`); only a media row in that tail hands it to UIA. **Name mismatch** stays on UIA
+  (not-found→add-friend). **Unlisted strangers** go to the §10 UIA window only when `session.db` shows an
+  unlisted 1:1 chat with `unread_count > 0` whose `local_id` moved — never as a per-round sweep.
 - **The DB access is read-only** (see §5.1/§5.3): `ReadProcessMemory` on `Weixin.exe` for the key, page-HMAC
   verify + AES decrypt into an **in-memory** SQLite image. No key or chat text is ever written to disk or a log.
 - **It fails safe**: no key / unsupported WeChat version / no account dir whose keys match the running WeChat → `build_reader`
