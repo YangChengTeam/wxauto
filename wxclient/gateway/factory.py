@@ -274,14 +274,15 @@ def build_gateway(
     source = ui_source
     try:
         # 用到时才 import：wechat_db 顶层要 cryptography，包里缺了也只回退 UIA，不拦启动。
-        from wxclient.wechat_db import build_reader
+        from wxclient.wechat_db.worker import build_worker_reader
     except ImportError as exc:
         _log.info("本地库入站不可用，回退到 UIA 轮询", 原因=str(exc)[:160])
     else:
-        # 扫钥不在这里同步做：放到 DbMessageSource 的后台线程里，连上之前 UIA 顶着，
-        # 连不上就每分钟再试（一次没扫到不能整场都退回开窗轮询）。也不再拖慢网关启动。
+        # 扫钥、解密、查询全在子进程里（`wechat_db.worker`）：同进程跑会和界面抢 GIL，
+        # 真机一拖窗口就「未响应」。连子进程放 DbMessageSource 的后台线程里，连上之前 UIA
+        # 顶着，连不上每分钟再试。也不再拖慢网关启动。
         source = DbMessageSource(
-            attach=build_reader,
+            attach=build_worker_reader,
             store=store,
             ui_source=ui_source,
             watchlist=watchlist,

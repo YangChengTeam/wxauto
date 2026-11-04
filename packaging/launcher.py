@@ -14,7 +14,13 @@ from __future__ import annotations
 
 import sys
 
-from wxclient.ui.__main__ import main
-
 if __name__ == "__main__":
+    # 本地库子进程（`wxclient.wechat_db.worker`）：同一个 exe 带 `--db-worker` 起。
+    # **在 import 界面之前分流**——它不要窗口、不要单实例锁、不要启动动画。
+    if "--db-worker" in sys.argv[1:]:
+        from wxclient.wechat_db.worker import serve
+
+        sys.exit(serve())
+    from wxclient.ui.__main__ import main
+
     sys.exit(main())
