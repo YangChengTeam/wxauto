@@ -184,7 +184,8 @@ its cadence and every gate are unchanged — only *how a round discovers new mes
 - **It fails safe**: no key / unsupported WeChat version / no account dir whose keys match the running WeChat → `build_reader`
   returns `None`. All DB work (key scan, decrypt, queries) runs in a **separate worker process**
   (`wechat_db/worker.py`, same exe with `--db-worker`); in-process it starved the Tk thread of the GIL and the window
-  hung on drag (0.1.131). Keys never leave the worker. Until the worker connects, the UIA loop stands in on its built-in cadence while `DbMessageSource` keeps re-attaching in a
+  hung on drag (0.1.131). Keys never leave the worker. Each worker call times out after 15s; a stuck worker is
+  killed and re-attached in the background (0.1.133). UIA window enumeration skips the client's own windows. Until the worker connects, the UIA loop stands in on its built-in cadence while `DbMessageSource` keeps re-attaching in a
   background thread every 60s and switches to the DB as soon as it connects (0.1.130 — one slow key scan must
   not leave a whole session on window polling). There is **no switch** to turn the
   DB path off (0.1.128 removed `use_local_db`, `prefilter_by_session_list` and the polling-only UI fields:
