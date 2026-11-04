@@ -1713,8 +1713,9 @@ class MainWindow:
             # 这儿的闸留着，是不让「探测线程首次 import」这条路上出现任何不排队的加载。
             with HEAVY_IMPORT_LOCK:
                 from wxclient.uia_probe import probe_wechat_uia
+                from wxclient.uia_probe.constants import PERIODIC_PROBE_MAX_NODES
 
-            probe = probe_wechat_uia()
+            probe = probe_wechat_uia(max_nodes=PERIODIC_PROBE_MAX_NODES)
             self._report_probe(probe, None)
             if probe.get("logged_in"):
                 status = ("已登录", theme.GREEN)

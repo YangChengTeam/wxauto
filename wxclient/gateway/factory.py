@@ -158,13 +158,28 @@ def build_gateway(
     #: 缩回托盘。探测本身要跟重型 import 串行（Windows 加载器锁，见 heavy_import.py），
     #: 探不出来就当「还没探到微信」处理，宁可说做不了也不要假装能做。
     #: 138：本机登录的是哪个微信（`accountRef`，和状态上报给业务端的同一个值）。按进程打开的账号目录算，
-    #: 不碰界面；但要枚举进程打开的文件，保活每轮、每条开场指令都问一遍不划算，缓存一分钟。
-    #: 认不出 = 空串（不猜）：开场协调随之报做不了，回到原来的流程。
-    account_cache: dict[str, Any] = {"ref": "", "at": 0.0}
+    #: 不碰界面；但要枚举微信进程的全部句柄（真机 2 秒多，期间整个客户端跟着卡），所以**同一批微信
+    #: 进程只认一次**（同 `ui/uia_status._account`）：换号 / 重启微信进程号就变，自然重认。
+    #: 认不出 = 空串（不猜）：开场协调随之报做不了，回到原来的流程；认不出的结果 5 分钟后再试。
+    account_cache: dict[str, Any] = {"ref": "", "at": 0.0, "pids": ()}
+
+    def _wechat_pids() -> tuple[int, ...]:
+        try:
+            import psutil
+
+            return tuple(sorted(
+                p.pid for p in psutil.process_iter(["name"])
+                if (p.info.get("name") or "").lower() in ("weixin.exe", "wechat.exe")
+            ))
+        except Exception:  # noqa: BLE001
+            return ()
 
     def current_account_ref() -> str:
         now = time.monotonic()
-        if account_cache["at"] and now - account_cache["at"] < 60:
+        pids = _wechat_pids()
+        if account_cache["at"] and pids == account_cache["pids"] and (
+            account_cache["ref"] or now - account_cache["at"] < 300
+        ):
             return account_cache["ref"]
         try:
             with HEAVY_IMPORT_LOCK:
@@ -173,14 +188,15 @@ def build_gateway(
         except Exception as exc:  # noqa: BLE001 —— 认不出就当认不出，不影响别的
             _wechat.warning("认微信账号失败", error=str(exc))
             account = None
-        account_cache.update(ref=account.account_ref if account else "", at=now)
+        account_cache.update(ref=account.account_ref if account else "", at=now, pids=pids)
         return account_cache["ref"]
 
     def current_capabilities() -> dict[str, Capability]:
         try:
             with HEAVY_IMPORT_LOCK:
                 from wxclient.uia_probe import probe_wechat_uia
-            uia = probe_wechat_uia()
+                from wxclient.uia_probe.constants import PERIODIC_PROBE_MAX_NODES
+            uia = probe_wechat_uia(max_nodes=PERIODIC_PROBE_MAX_NODES)
         except Exception as exc:  # noqa: BLE001 —— 探测失败 = 不知道 = 按做不了报
             _wechat.warning("能力探测时 UIA 探测失败", error=str(exc))
             uia = None
