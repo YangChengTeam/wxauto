@@ -474,3 +474,44 @@ class FirstAttachWaitTests(unittest.IsolatedAsyncioTestCase):
             await source.fetch(ACCOUNT)
             self.assertEqual(ui.polls, 0)
             self.assertEqual(source.fixed_poll_interval_seconds, 3.0)
+
+
+class ObserveOutsideHoursTests(_Base):
+    """工作时间窗外只看不收：有变化照样打日志，但不推游标、不出消息、不开窗。"""
+
+    async def test_窗外打日志_不推游标(self) -> None:
+        from structlog.testing import capture_logs
+
+        self.store.set_db_cursor(ACCOUNT, NAME, 5)
+        self.reader.set_session(5)
+        self.source._reader = self.reader
+        await self.source.observe()                          # 建基线
+        self.reader.set_session(6)
+        self.reader.set_rows([_row(6, "晚上好")])
+        with capture_logs() as logs:
+            await self.source.observe()
+        self.assertEqual([e["内容"] for e in logs if e["event"] == "本地库读到新消息"], ["晚上好"])
+        self.assertEqual(self.store.db_cursor(ACCOUNT, NAME), 5)   # 游标没动，进窗后照常收
+        self.assertEqual(self.ui.calls, [])
+        out = await self.fetch()
+        self.assertEqual([m.text for m in out], ["晚上好"])
+
+    async def test_InboundLoop窗外调observe(self) -> None:
+        from wxclient.gateway.inbound import InboundLoop
+
+        seen = []
+
+        class _Src:
+            async def observe(self):
+                seen.append(1)
+
+            async def fetch(self, account_id):
+                raise AssertionError("窗外不该 fetch")
+
+        async def handler(*_a, **_k):
+            return None
+
+        loop = InboundLoop(accounts=[ACCOUNT], source=_Src(), store=self.store, handler=handler,
+                           is_active=lambda _now: False)
+        self.assertEqual(await loop.tick(), 0)
+        self.assertEqual(seen, [1])

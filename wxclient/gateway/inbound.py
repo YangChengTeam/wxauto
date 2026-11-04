@@ -381,6 +381,14 @@ class InboundLoop:
             ):
                 self._quiet_round_logged_at = now
                 _log.info("开始新一轮轮询：不在工作时间窗，这一轮不读微信（工作时间窗在配置中心改）")
+            # 本地库监听窗外也看：读库微信看不见，库里有变化照样打日志（用户 2026-11-04：「只要读取到
+            # 数据变化就显示打印到日志」）。只看不收——不推游标、不入缓冲、不开窗，回复仍等进窗。
+            observe = getattr(self._source, "observe", None)
+            if callable(observe):
+                try:
+                    await observe()
+                except Exception as exc:  # noqa: BLE001 - 旁观失败不影响窗外静默
+                    _log.warning("窗外看本地库失败", error=str(exc)[:160])
             return 0
         self._quiet_round_logged_at = None
         if self._sleeping:

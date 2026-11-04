@@ -158,6 +158,21 @@ class DbMessageSource:
             return await self._ui.fetch(account_id)
         return await self._fetch_db(account_id)
 
+    async def observe(self) -> None:
+        """工作时间窗外只看不收：库里有变化照样打「本地库读到新消息」，但不推游标、不出消息、
+        不开窗（`InboundLoop.tick` 窗外调它）。还没连上就只在后台连，不让 UIA 顶。"""
+        if self._reader is not None and getattr(self._reader, "alive", True) is False:
+            self._reader = None
+            self._seen_sessions = None
+        if self._reader is None:
+            self._ensure_attaching()
+            return
+        sessions = self._reader.sessions()
+        previous = self._seen_sessions
+        self._seen_sessions = {name: value[0] for name, value in sessions.items()}
+        if previous is not None:
+            self._log_new_messages(previous, sessions, self._watchlist.watched())
+
     async def _fetch_db(self, account_id: str) -> list[InboundMessage]:
         self._watchlist.warn_if_idle()
         listed = self._watchlist.watched()
