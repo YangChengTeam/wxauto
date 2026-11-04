@@ -122,12 +122,14 @@ class DbMessageSource:
     def _stranger_activity(self, listed: Sequence[str], sessions: dict) -> bool:
         """名单外的单聊有没有「新来的红点」：未读 > 0，且这个会话是新冒出来的或 local_id 涨了。
 
-        首轮没有基线：只要名单外单聊挂着红点就扫一次。读不到未读数就不扫（不拿 UIA 兜底
-        轮询——入站发现新消息只靠本地库）。
+        首轮只建基线、不扫：启动时就挂着的红点多半是放了很久的服务号/企业微信（真机
+        2026-11-04：招行、微信团队、一个 @openim，各挂着几条），为它们开一次窗就是一次
+        拉前台。读不到未读数也不扫——入站发现新消息只靠本地库，不拿 UIA 兜底轮询。
         """
-        previous = self._seen_sessions or {}
-        first = self._seen_sessions is None
+        previous = self._seen_sessions
         self._seen_sessions = {name: value[0] for name, value in sessions.items()}
+        if previous is None:
+            return False
         try:
             unread = self._reader.unread_counts()
         except Exception as exc:  # noqa: BLE001
@@ -135,7 +137,7 @@ class DbMessageSource:
             return False
         listed_users = {self._resolve(peer_id, sessions) for peer_id in listed}
         return any(
-            first or sessions.get(name, (0, None))[0] > previous.get(name, 0)
+            sessions.get(name, (0, None))[0] > previous.get(name, 0)
             for name in unread
             if name not in listed_users and _is_direct_chat(name)
         )

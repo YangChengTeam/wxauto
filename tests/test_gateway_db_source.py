@@ -249,12 +249,12 @@ class StrangerScanTests(_Base):
             await self.fetch()
         self.assertEqual(self.ui.stranger_scans, 0)
 
-    async def test_首轮有名单外红点扫一次_之后不再动不扫(self) -> None:
+    async def test_启动时就挂着的红点只建基线_不扫(self) -> None:
         self.reader._sessions["wxid_other"] = (10, "text")
         self.reader.unread = {"wxid_other": 1}
         for _ in range(3):
             await self.fetch()
-        self.assertEqual(self.ui.stranger_scans, 1)
+        self.assertEqual(self.ui.stranger_scans, 0)
 
     async def test_名单外单聊来新消息挂红点才扫(self) -> None:
         self.reader._sessions["wxid_other"] = (10, "text")
