@@ -71,3 +71,25 @@ class WorkerAttachFailTests(unittest.TestCase):
         self.addCleanup(process.kill)
         self.assertIn(b'"ok": false', process.stdout.readline())
         self.assertEqual(process.wait(timeout=10), 1)
+
+
+class WorkerTimeoutTests(unittest.TestCase):
+    """子进程卡住不回：父进程等到超时就杀掉它并报错，绝不无限等（网关事件循环会跟着停）。"""
+
+    def test_不回应就超时并结束子进程(self) -> None:
+        from unittest import mock
+
+        from wxclient.wechat_db import worker
+
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(30)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        self.addCleanup(process.kill)
+        process.stdout.readline()
+        reader = WorkerReader(process)
+        with mock.patch.object(worker, "CALL_TIMEOUT_SECONDS", 0.3):
+            with self.assertRaises(RuntimeError):
+                reader.sessions()
+        process.wait(timeout=10)
+        self.assertFalse(reader.alive)

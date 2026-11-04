@@ -350,7 +350,7 @@ class NewMessageLogTests(_Base):
         self.reader._rows["wxid_other"] = [_row(10, "老消息")]
         self.assertEqual(await self._logged(), [])
 
-    async def test_名单内外和群的新消息都打_公众号不打(self) -> None:
+    async def test_名单内外_群_公众号的新消息都打(self) -> None:
         await self.fetch()
         self.reader.set_session(6)
         self.reader.set_rows([_row(6, "在吗")])
@@ -363,13 +363,24 @@ class NewMessageLogTests(_Base):
         self.reader._sessions["gh_abc"] = (8, "text")
         self.reader._rows["gh_abc"] = [_row(8, "推文")]
         logged = await self._logged()
-        got = [(e["会话"], e["名单内"], e["发送方"], e["类型"], e["内容"]) for e in logged]
+        got = [(e["会话"], e["会话类型"], e["名单内"], e["发送方"], e["类型"], e["内容"]) for e in logged]
         self.assertEqual(got, [
-            (NAME, "是", "对方", "文字", "在吗"),
-            ("李四", "否", "自己", "文字", "你好"),
-            ("李四", "否", "对方", "图片", "[图片]"),
-            ("123@chatroom", "否", "王五", "文字", "大家好"),
+            (NAME, "单聊", "是", "对方", "文字", "在吗"),
+            ("李四", "单聊", "否", "自己", "文字", "你好"),
+            ("李四", "单聊", "否", "对方", "图片", "[图片]"),
+            ("123@chatroom", "群聊", "否", "王五", "文字", "大家好"),
+            ("gh_abc", "公众号", "否", "对方", "文字", "推文"),
         ])
+
+    async def test_涨了但切不出消息_也打一条会话有变化(self) -> None:
+        from structlog.testing import capture_logs
+
+        await self.fetch()
+        self.reader._sessions["wxid_other"] = (11, None)   # 比如撤回 / 系统提示：new_messages 切不出
+        with capture_logs() as logs:
+            await self.fetch()
+        changed = [e for e in logs if e["event"] == "本地库会话有变化"]
+        self.assertEqual([(e["会话"], e["最新一条类型"]) for e in changed], [("李四", "其他")])
 
 
 class AttachLaterTests(unittest.IsolatedAsyncioTestCase):

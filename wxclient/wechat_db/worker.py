@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -40,6 +41,10 @@ _METHODS = frozenset({
 #: 等子进程连上本地库最多多久（秒）。它在自己进程里扫钥，单跑几秒；留足余量。
 ATTACH_TIMEOUT_SECONDS = 180.0
 
+#: 单次查询最多等多久（秒）。一次解密最大的消息库真机 0.4 秒；超了就当子进程卡死，杀掉重起，
+#: 绝不让网关的事件循环（连带 AI 端心跳）跟着等下去。
+CALL_TIMEOUT_SECONDS = 15.0
+
 
 # ───────────────────────────── 子进程这一侧 ─────────────────────────────
 
@@ -48,11 +53,13 @@ def serve() -> int:
     proto_in = sys.stdin.buffer if sys.stdin else os.fdopen(0, "rb")
     proto_out = sys.stdout.buffer if sys.stdout else os.fdopen(1, "wb")
     # 协议独占 stdout：日志（structlog 默认打 stdout）全改去 stderr，别把协议行搅乱。
-    # stderr 固定 UTF-8：管道默认走系统代码页（GBK），父进程按 UTF-8 解出来全是乱码。
-    if sys.stderr:
-        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    # 日志按 JSON（ensure_ascii）一行一条：管道上只有 ASCII，什么代码页都不会乱码（0.1.131 真机
+    # 走 GBK 解成了一串 �）；父进程解开再按自己的格式打进实时日志。
     sys.stdout = sys.stderr if sys.stderr else open(os.devnull, "w", encoding="utf-8")
-    structlog.configure(logger_factory=structlog.PrintLoggerFactory(sys.stdout))
+    structlog.configure(
+        processors=[structlog.processors.add_log_level, structlog.processors.JSONRenderer(ensure_ascii=True)],
+        logger_factory=structlog.PrintLoggerFactory(sys.stdout),
+    )
 
     def send(payload: dict) -> None:
         proto_out.write(json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n")
@@ -95,6 +102,18 @@ class WorkerReader:
     def __init__(self, process: subprocess.Popen) -> None:
         self._process = process
         self._lock = threading.Lock()
+        # 回包由专门的线程读进队列，调用方带超时等：管道读没有超时，直接 readline 一卡就是永远。
+        self._replies: queue.Queue[bytes] = queue.Queue()
+        threading.Thread(target=self._pump, name="wx-db-worker-out", daemon=True).start()
+
+    def _pump(self) -> None:
+        for line in self._process.stdout:
+            self._replies.put(line)
+        self._replies.put(b"")  # EOF：子进程没了
+
+    @property
+    def alive(self) -> bool:
+        return self._process.poll() is None
 
     def _call(self, method: str, *args: Any) -> Any:
         with self._lock:
@@ -103,7 +122,11 @@ class WorkerReader:
             line = json.dumps({"m": method, "a": list(args)}, ensure_ascii=False).encode("utf-8") + b"\n"
             self._process.stdin.write(line)
             self._process.stdin.flush()
-            reply = self._process.stdout.readline()
+            try:
+                reply = self._replies.get(timeout=CALL_TIMEOUT_SECONDS)
+            except queue.Empty:
+                self._process.kill()
+                raise RuntimeError(f"本地库子进程 {CALL_TIMEOUT_SECONDS:g} 秒没回应，已结束它，稍后重连") from None
         if not reply:
             raise RuntimeError("本地库子进程没有回应")
         payload = json.loads(reply)
@@ -142,11 +165,23 @@ class WorkerReader:
 
 
 def _forward_stderr(process: subprocess.Popen) -> None:
-    """子进程的日志（扫钥计数等）转进客户端日志，排障看得见。只有计数，不含密钥和正文。"""
+    """子进程的日志（扫钥计数等）转进客户端日志，排障看得见。只有计数，不含密钥和正文。
+
+    子进程按 JSON 一行一条打（见 `serve`）；解不开的（比如解释器崩溃的 traceback）原样转。
+    """
     for raw in process.stderr:
         text = raw.decode("utf-8", "replace").strip()
-        if text:
-            _log.info("本地库子进程", 输出=text[-300:])
+        if not text:
+            continue
+        try:
+            record = json.loads(text)
+        except ValueError:
+            _log.info("本地库子进程输出", 内容=text[-300:])
+            continue
+        event = str(record.pop("event", ""))
+        level = str(record.pop("level", "info"))
+        record.pop("timestamp", None)
+        (_log.warning if level in ("warning", "error", "critical") else _log.info)(f"本地库子进程：{event}", **record)
 
 
 def build_worker_reader() -> WorkerReader | None:

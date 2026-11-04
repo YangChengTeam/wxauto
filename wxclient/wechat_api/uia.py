@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 import re
 import sys
@@ -4459,7 +4460,17 @@ def _win32_top_windows(visible_only: bool = True) -> tuple[list[Any], str | None
     win32gui, info_mod, wrap_mod = mods
     handles: list[int] = []
     try:
+        own_pid = os.getpid()
+        try:
+            process_of = __import__("win32process").GetWindowThreadProcessId
+        except Exception:  # noqa: BLE001 - 没装 pywin32（测试替身）就不过滤
+            process_of = None
+
         def _collect(hwnd: int, _: Any) -> bool:
+            # 跳过本进程自己的窗口（客户端界面）：后台线程对它们做 UIA 要等界面线程应答，
+            # 界面正在被拖动/忙时两边互等，客户端就「未响应」（真机 2026-11-04）。微信不在本进程。
+            if process_of is not None and process_of(hwnd)[1] == own_pid:
+                return True
             if not visible_only or win32gui.IsWindowVisible(hwnd):
                 handles.append(hwnd)
             return True

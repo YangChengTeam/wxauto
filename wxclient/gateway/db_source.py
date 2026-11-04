@@ -141,6 +141,11 @@ class DbMessageSource:
         self._attach_task = asyncio.get_running_loop().create_task(keep_trying())
 
     async def fetch(self, account_id: str) -> list[InboundMessage]:
+        if self._reader is not None and getattr(self._reader, "alive", True) is False:
+            # 子进程卡死被杀 / 自己退了：丢掉它，后台重连，期间 UIA 顶着；连回来重建基线。
+            _local.warning("本地库子进程没了，暂由 UIA 顶着，后台重连")
+            self._reader = None
+            self._seen_sessions = None
         if self._reader is None and self._attach_task is None and self._attach is not None:
             self._ensure_attaching()
             try:
@@ -203,38 +208,49 @@ class DbMessageSource:
         return collected
 
     def _log_new_messages(self, previous: dict[str, int], sessions: dict, listed: Sequence[str]) -> None:
-        """这一轮库里涨了的会话，逐条打「本地库读到新消息」：谁、什么类型、内容摘要（同 UIA 的
-        `preview`，截 40 字）。只打日志，不决定回不回——那是名单和下游的事。公众号/系统号不打。"""
+        """这一轮库里有变化的会话**全部**打进日志（用户 2026-11-04：「只要读取到数据变化就显示打印到日志」）。
+
+        逐条打「本地库读到新消息」：会话、会话类型（单聊/群聊/公众号/系统）、名单内否、发送方、
+        消息类型、内容摘要（同 UIA 的 `preview`，截 40 字）。涨了但切不出可读消息的（撤回、系统提示、
+        通话等）打一条「本地库会话有变化」。只打日志，不决定回不回——那是名单和下游的事。
+        一个会话出错不影响别的会话。
+        """
         try:
             listed_users = {self._resolve(peer_id, sessions): peer_id for peer_id in listed}
-            for name, (local_id, _type) in sessions.items():
-                before = previous.get(name)
-                if before is not None and local_id <= before:
-                    continue
-                if not (_is_direct_chat(name) or name.endswith("@chatroom")):
-                    continue
+        except Exception:  # noqa: BLE001
+            listed_users = {}
+        for name, (local_id, newest_type) in sessions.items():
+            before = previous.get(name)
+            if before is not None and local_id <= before:
+                continue
+            kind = _chat_kind(name)
+            try:
                 if before is None:  # 新冒出来的会话：只看最后几条，别把整段历史打出来
                     before = max(local_id - LOG_MESSAGES_PER_SESSION, 0)
                 rows = self._reader.new_messages(name, before)
-                chat = listed_users.get(name) or self._reader.display_name(name)
-                group = name.endswith("@chatroom")
+                chat = listed_users.get(name) or self._reader.display_name(name) or name
+                common = {"会话": chat, "会话类型": kind, "名单内": "是" if name in listed_users else "否"}
+                if not rows:
+                    _local.info("本地库会话有变化", **common, 最新一条类型=_TYPE_LABELS.get(newest_type, "其他"),
+                                local_id=local_id)
+                    continue
                 for row in rows[-LOG_MESSAGES_PER_SESSION:]:
                     who = "自己" if row["is_self"] else (
-                        self._reader.display_name(row["sender_username"]) if group and row["sender_username"] else "对方"
+                        self._reader.display_name(row["sender_username"])
+                        if kind == "群聊" and row["sender_username"] else "对方"
                     )
+                    label = _TYPE_LABELS.get(row["message_type"], row["message_type"])
                     _local.info(
                         "本地库读到新消息",
-                        会话=chat,
-                        名单内="是" if name in listed_users else "否",
-                        群聊="是" if group else "否",
+                        **common,
                         发送方=who,
-                        类型=_TYPE_LABELS.get(row["message_type"], row["message_type"]),
-                        内容=preview(row) if row["message_type"] == "text" else f"[{_TYPE_LABELS.get(row['message_type'], '消息')}]",
+                        类型=label,
+                        内容=preview(row) if row["message_type"] == "text" else f"[{label}]",
                     )
                 if len(rows) > LOG_MESSAGES_PER_SESSION:
                     _local.info("本地库这个会话一次来了很多条，日志只打最后几条", 会话=chat, 共=len(rows))
-        except Exception as exc:  # noqa: BLE001 —— 打日志失败不能拖垮这一轮
-            _local.warning("本地库新消息日志没打出来", error=str(exc))
+            except Exception as exc:  # noqa: BLE001 —— 打日志失败不能拖垮这一轮
+                _local.warning("本地库会话有变化，但没读出内容", 会话=name, 会话类型=kind, error=str(exc)[:160])
 
     def _stranger_activity(self, previous: dict[str, int] | None, listed: Sequence[str], sessions: dict) -> bool:
         """名单外的单聊有没有「新来的红点」：未读 > 0，且这个会话是新冒出来的或 local_id 涨了。
@@ -397,6 +413,14 @@ def _first_seen_tail(rows: list[dict]) -> list[dict]:
             break
     tail.reverse()
     return tail
+
+
+def _chat_kind(username: str) -> str:
+    if username.endswith("@chatroom"):
+        return "群聊"
+    if username.startswith(("gh_", "brandsessionholder", "brandservicesessionholder")):
+        return "公众号"
+    return "单聊" if _is_direct_chat(username) else "系统"
 
 
 def _is_direct_chat(username: str) -> bool:
