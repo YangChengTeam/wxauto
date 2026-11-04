@@ -162,6 +162,28 @@ There is no "callback on new message". So `gateway` must run its own long-lived 
 
 This long-lived polling loop is **settled architecture**. It is not the "scheduled job" that is forbidden.
 
+**Since 0.1.121 the loop finds new messages from the local WeChat database instead of opening chat
+windows to poll** (`wxclient/wechat_db/` + `gateway/db_source.py`, user ruling 2026-11-03). The loop,
+its cadence and every gate are unchanged — only *how a round discovers new messages* changed:
+
+- **Text** is read straight from the decrypted DB, cursored by `local_id` (monotonic, so none of the
+  text-signature drift the UIA path fights). Self vs. peer comes from `Name2Id`, so the "gateway's own
+  reply read back as a new inbound" problem does not exist on this path.
+- **Voice / image / file / video** carry no transcript or attachment bytes in the DB, so the whole peer
+  for that round is handed back to `QueueMessageSource.read_peer` (UIA) — voice transcription, attachment
+  save and not-found→add-friend all stay on the one tested path. A peer is DB-owned or UIA-owned, never
+  both in the same round; the `local_id` cursor baselines forward across the handoff.
+- **First contact / name mismatch / unlisted red-dot strangers** stay on UIA (first-seen tail, add-friend,
+  the §10 stranger window).
+- **The DB access is read-only** (see §5.1/§5.3): `ReadProcessMemory` on `Weixin.exe` for the key, page-HMAC
+  verify + AES decrypt into an **in-memory** SQLite image. No key or chat text is ever written to disk or a log.
+- **It fails safe**: no key / unsupported WeChat version / more than one logged-in account → `build_reader`
+  returns `None` and the gateway runs the UIA loop exactly as before (`GatewaySettings.use_local_db` also
+  turns it off). Debounce, work-hours window, send-rate limits and jitter are untouched.
+
+The UIA `watch_chats` / `get_unread_messages` path remains the fallback and is still the only way media and
+strangers are read; do not delete it.
+
 ---
 
 ## 5. Red lines (a violation is a defect)
@@ -215,6 +237,13 @@ This long-lived polling loop is **settled architecture**. It is not the "schedul
 - **The MVP supports a single WeChat account in a single Windows session.**
 - **No DLL injection, no process spoofing, no screen-reader flag tampering**, and no other scheme that works
   around WeChat's restrictions.
+- **Reading the local database is read-only and allowed** (0.1.121, user ruling 2026-11-03): the key is read
+  from `Weixin.exe` with `ReadProcessMemory`, the database is decrypted into memory and opened `query_only`
+  with a deny-by-default authorizer. This is *reading state the user already owns*, the same thing the 映身
+  desktop app ships. It is **not** an exception to the line above: no code is written into WeChat, no handle
+  or window is spoofed, nothing is injected, and no accessibility flag is touched. The key and any decrypted
+  bytes stay in memory and never reach disk or a log. Writing to, or tampering with, any WeChat database is
+  still forbidden.
 
 ### 5.4 UIA
 
