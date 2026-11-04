@@ -136,6 +136,11 @@ DB 只换「怎么**发现**新消息」。产出同一种 `InboundMessage`，�
 ## 6. 配置与回退
 
 - 0.1.128 起**没有开关**：入站一律走本地库监听（`use_local_db` / `prefilter_by_session_list` 删了）。
+- **本地库读取在独立子进程**（0.1.131，`wechat_db/worker.py`）：扫钥、解密、查询全在子进程里，客户端只经
+  stdin/stdout 一问一答拿查询结果；**密钥不出子进程**。冻结包是同一个 exe 带 `--db-worker`（`packaging/launcher.py`
+  在 import 界面前分流），源码跑是 `python -m wxclient.wechat_db.worker`。起因：同进程跑和界面抢 GIL——真机
+  2026-11-04 单跑扫钥 4 秒，同进程挂 tk 窗口 22 秒、界面一卡 0.6 秒，真客户端里卡 9 秒、拖窗口即「未响应」被
+  Windows 关掉（AppHangB1）。父进程退出子进程读到 EOF 自退。
 - **扫钥在后台、连不上就重试**（0.1.130）：网关启动不再同步扫钥；`DbMessageSource` 在后台线程里连本地库，
   连上之前由 UIA 按它自己的节拍顶着，没连上每 `ATTACH_RETRY_SECONDS`（60 秒）再试，连上即切本地库
   （日志「本地库已连上，入站切到本地库监听」）。切过来的第一轮把名单里的游标直接基线到最新，不重放 UIA 读过的。
