@@ -68,6 +68,8 @@ class DbMessageSource:
         self._read_unread = bool(read_unread_strangers)
         self._round = 0
         self._paused_peers: set[str] = set()
+        # 上一轮各会话最后一条的 local_id；名单外单聊涨了才去 UIA 扫红点（None = 还没建基线）。
+        self._seen_sessions: dict[str, int] | None = None
 
     # MessageSource 里 runner 会装的两个回调，直接透传给 UIA 替身（查无此人 / 读不到要去加好友）。
     def set_unreachable_handler(self, handler) -> None:
@@ -107,13 +109,31 @@ class DbMessageSource:
         for peer_id in watched:
             collected.extend(await self._fetch_watched(account_id, peer_id, sessions))
 
-        # 名单外挂红点的单聊仍走 UIA 的窄路（名单只认同步，这里不接管）。
-        if self._read_unread:
+        # 名单外挂红点的单聊仍走 UIA 的窄路（名单只认同步，这里不接管）。但只在本地库看到
+        # 名单外单聊真有新动静时才开：每轮都扫就是每轮把微信拉到前台，省掉开窗等于白省
+        # （真机 2026-11-04：5 秒一轮「汇总未读消息」+「已把微信窗口拉回前台」）。
+        if self._read_unread and self._stranger_activity(listed, sessions):
             try:
                 collected.extend(await self._ui.read_unread_strangers(account_id, listed))
             except Exception as exc:  # noqa: BLE001
                 _local.warning("名单外红点扫描失败，这一轮跳过", error=str(exc))
         return collected
+
+    def _stranger_activity(self, listed: Sequence[str], sessions: dict) -> bool:
+        """名单外的单聊这轮有没有新消息（新会话或 local_id 涨了）。首轮建基线并照扫一次。
+
+        自己在名单外会话里发的也会让 local_id 涨，那顶多多扫一次、扫不出红点，不漏人。
+        """
+        previous = self._seen_sessions
+        self._seen_sessions = {name: value[0] for name, value in sessions.items()}
+        if previous is None:
+            return True
+        listed_users = {self._resolve(peer_id, sessions) for peer_id in listed}
+        return any(
+            local_id > previous.get(name, 0)
+            for name, (local_id, _type) in sessions.items()
+            if name not in listed_users and _is_direct_chat(name)
+        )
 
     def _drop_handed_off(
         self, account_id: str, watched: Sequence[str], sessions: dict
@@ -215,9 +235,18 @@ class DbMessageSource:
             "读完这个会话（本地库）",
             会话=peer_id,
             新消息=len(inbound),
-            最近一条=(ready[-1]["text"] or "")[:40],
+            字数=sum(len(row["text"] or "") for row in ready),  # 正文不进日志（AGENTS §5.3）
         )
         return inbound
+
+
+def _is_direct_chat(username: str) -> bool:
+    """单聊才可能是候选人：群、公众号、文件传输助手、折叠群入口这些都不算。"""
+    return not (
+        username.endswith("@chatroom")
+        or username.startswith(("gh_", "@"))
+        or username in {"filehelper", "weixin", "notifymessage", "fmessage", "medianote", "floatbottle"}
+    )
 
 
 def _hold_trailing_voice(rows: list[dict]) -> tuple[list[dict], int]:

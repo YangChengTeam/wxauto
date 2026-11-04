@@ -53,12 +53,14 @@ class _FakeUi:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.returns: list[InboundMessage] = []
+        self.stranger_scans = 0
 
     async def read_peer(self, account_id, peer_id, *, unread=None):
         self.calls.append(peer_id)
         return list(self.returns)
 
     async def read_unread_strangers(self, account_id, listed):
+        self.stranger_scans += 1
         return []
 
     def set_unreachable_handler(self, handler):
@@ -201,3 +203,40 @@ class TakeoverTests(_Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StrangerScanTests(_Base):
+    """名单外红点仍走 UIA，但只在本地库看到名单外单聊有新动静时才扫（每扫一次就拉一次前台）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.source._read_unread = True
+        self.store.set_db_cursor(ACCOUNT, NAME, 5)
+        self.reader.set_session(5)
+
+    async def test_首轮扫一次_之后没动静不扫(self) -> None:
+        self.reader._sessions["wxid_other"] = (10, "text")
+        await self.fetch()
+        await self.fetch()
+        await self.fetch()
+        self.assertEqual(self.ui.stranger_scans, 1)
+
+    async def test_名单外单聊来新消息才扫(self) -> None:
+        self.reader._sessions["wxid_other"] = (10, "text")
+        await self.fetch()
+        self.reader._sessions["wxid_other"] = (11, "text")
+        await self.fetch()
+        self.reader._sessions["wxid_new"] = (1, "text")  # 新冒出来的会话也算
+        await self.fetch()
+        self.assertEqual(self.ui.stranger_scans, 3)
+
+    async def test_名单内或群和公众号的动静不触发扫描(self) -> None:
+        self.reader._sessions["123@chatroom"] = (1, "text")
+        self.reader._sessions["gh_abc"] = (1, "text")
+        await self.fetch()
+        self.reader.set_session(6)
+        self.reader.set_rows([_row(6, "在吗")])
+        self.reader._sessions["123@chatroom"] = (2, "text")
+        self.reader._sessions["gh_abc"] = (2, "text")
+        await self.fetch()
+        self.assertEqual(self.ui.stranger_scans, 1)
