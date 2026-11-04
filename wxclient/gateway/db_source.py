@@ -84,6 +84,7 @@ class DbMessageSource:
         # 本地库连上之前 UIA 已经替它跑过几轮：连上后第一轮把名单里各会话的游标直接基线到
         # 最新，不走首见切尾部——那几条 UIA 已经读过、可能也回过了，再出一遍就是重复回复。
         self._ui_rounds_before_attach = False
+        self._wake = None  # InboundLoop.wake：连上本地库时叫醒，不用等 UIA 那一觉睡完
         self._store = store
         # UIA 替身：首次读、含媒体那一轮、名字对不上、名单外红点都委给它。
         self._ui = ui_source
@@ -117,6 +118,9 @@ class DbMessageSource:
         还没连上（暂由 UIA 顶着）就返回 None，走 UIA 的节拍——别让开窗轮询跟着 3 秒一轮。"""
         return DB_POLL_INTERVAL_SECONDS if self._reader is not None else None
 
+    def set_wake(self, wake) -> None:
+        self._wake = wake
+
     def _ensure_attaching(self) -> None:
         """后台一直试着连本地库，连上为止（每 `ATTACH_RETRY_SECONDS` 一次，扫钥在线程里跑）。"""
         if self._attach is None or (self._attach_task is not None and not self._attach_task.done()):
@@ -134,6 +138,8 @@ class DbMessageSource:
                 if reader is not None:
                     self._reader = reader
                     _local.info("本地库已连上，入站切到本地库监听", 第几次=attempt)
+                    if self._wake is not None:
+                        self._wake()
                     return
                 _local.info("本地库还没连上，暂由 UIA 轮询顶着，稍后再试", 第几次=attempt, 秒后重试=ATTACH_RETRY_SECONDS)
                 await asyncio.sleep(ATTACH_RETRY_SECONDS)

@@ -515,3 +515,43 @@ class ObserveOutsideHoursTests(_Base):
                            is_active=lambda _now: False)
         self.assertEqual(await loop.tick(), 0)
         self.assertEqual(seen, [1])
+
+
+class WakeOnAttachTests(unittest.IsolatedAsyncioTestCase):
+    """本地库后台连上时叫醒入站循环：不用睡完 UIA 那一觉（真机 180 秒）才开始看库。"""
+
+    async def test_连上就叫醒(self) -> None:
+        from wxclient.gateway.inbound import InboundLoop
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = GatewayStore(Path(tmp) / "gateway.db")
+            reader, ui = _FakeReader(), _FakeUi()
+            gate = {"ready": False}
+            source = DbMessageSource(attach=lambda: reader if gate["ready"] else None, store=store,
+                                     ui_source=ui, clock=lambda: AT, read_unread_strangers=False)
+            observed = []
+            real = source.observe
+
+            async def observe():
+                observed.append(source._reader is not None)
+                await real()
+
+            source.observe = observe
+
+            async def handler(*_a, **_k):
+                return None
+
+            loop = InboundLoop(accounts=[ACCOUNT], source=source, store=store, handler=handler,
+                               poll_interval_seconds=180.0, is_active=lambda _now: False)
+            from unittest import mock
+
+            from wxclient.gateway import db_source
+
+            with mock.patch.object(db_source, "ATTACH_RETRY_SECONDS", 0.01):
+                task = asyncio.create_task(loop.run())
+                await asyncio.sleep(0.05)                    # 第一趟：没连上，开始 180 秒那一觉
+                gate["ready"] = True
+                await asyncio.sleep(0.2)                     # 后台连上 → 叫醒 → 再跑一趟
+                loop.stop()
+                await asyncio.wait_for(task, 2)
+            self.assertIn(True, observed, "连上之后应当马上看一趟库，而不是睡满 180 秒")

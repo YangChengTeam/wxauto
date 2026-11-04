@@ -356,6 +356,17 @@ class InboundLoop:
         （2026-08-18 审计 P0-8）。"""
         self._quiet_notice: dict[PeerKey, tuple[str, int]] = {}
         self._stopped = asyncio.Event()
+        # 叫醒正在睡的这一觉（不改节拍，只是提前跑下一趟）：本地库后台连上时用——不然连上之后
+        # 还要睡完 UIA 那一觉（真机 180 秒）才开始看库。
+        self._wake: asyncio.Event | None = None
+        setter = getattr(source, "set_wake", None)
+        if callable(setter):
+            setter(self.wake)
+
+    def wake(self) -> None:
+        """提前结束当前这一觉（线程安全：只在事件循环里调）。"""
+        if self._wake is not None:
+            self._wake.set()
 
     # ────────────────────────── 单步 ──────────────────────────
 
@@ -722,10 +733,13 @@ class InboundLoop:
             # 记下这一觉睡到几点：界面拿它做「下次读消息」的倒计时。**记的是真实那一觉**
             # （含抖动、含快慢档），不是配置里那个数——照配置算的倒计时会一直和现实差几十秒。
             self._next_poll_at = self._clock() + timedelta(seconds=delay)
+            self._wake = asyncio.Event()
+            stop, wake = asyncio.ensure_future(self._stopped.wait()), asyncio.ensure_future(self._wake.wait())
             try:
-                await asyncio.wait_for(self._stopped.wait(), timeout=delay)
-            except TimeoutError:
-                continue
+                await asyncio.wait({stop, wake}, timeout=delay, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                for waiter in (stop, wake):
+                    waiter.cancel()
         self._next_poll_at = None
         await self.drain()
 
