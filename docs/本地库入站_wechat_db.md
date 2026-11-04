@@ -52,7 +52,7 @@
    GatewayRunner.handle_turn → AI 端(WS) → 卡片 → 出站发送
 ```
 
-**选哪条**在 `gateway/factory.py`：`GatewaySettings.use_local_db` 开着（默认）且
+**选哪条**在 `gateway/factory.py`：
 `wechat_db.build_reader()` 扫到密钥、认出当前登录的那个账号目录（换过号留下的旧目录按活跃度排后、密钥对不上自动跳过）→ DB 路线；否则 `build_reader()` 返回 `None`，
 **自动回退** UIA 路线，行为与 0.1.120 完全一致。**任何一步失败都安全回退，不拦启动。**
 
@@ -132,9 +132,14 @@ DB 只换「怎么**发现**新消息」。产出同一种 `InboundMessage`，�
 
 ## 6. 配置与回退
 
-- `GatewaySettings.use_local_db`（默认 `True`）：关掉＝永远走 UIA 轮询（0.1.120 及以前）。
+- 0.1.128 起**没有开关**：入站一律走本地库监听（`use_local_db` / `prefilter_by_session_list` 删了）。
+- **节拍**：固定 `db_source.DB_POLL_INTERVAL_SECONDS`（3 秒，带抖动）看一次库，不走快慢档、不吃 AI 端下发的
+  `wechat.pacing`。读库微信看不见，30/180 秒地板是给开窗轮询定的。配置中心「读消息间隔」、极速页「正聊着的
+  时长 / 每轮读几个会话 / 正聊着每轮几个」随之删除，老文件里的键启动时清掉（`settings_store._RETIRED_KEYS`）。
+- **委回 UIA 也按动静**：归 UIA 的会话（含媒体）只在库里 local_id 涨了才再开窗，停在一张图片上不会每 3 秒开一次。
 - 回退触发：非 Windows / 扫不到密钥（微信没登录、版本不支持）/ 所有账号目录都对不上当前微信 →
-  `build_reader()` 返回 `None` 并记一条 `info`，走 UIA。
+  `build_reader()` 返回 `None` 并记一条 `info`，走 UIA，节拍用 `GatewaySettings` 里的代码默认值
+  （空闲 180 秒 / 聊着 30 秒 / 热窗 600 秒，界面上不再能改）。
 
 ---
 
@@ -234,7 +239,7 @@ gateway/
   db_source.py 新：DbMessageSource（归属判定、委回、游标），实现 MessageSource
   wechat_io.py 老 UIA 源；新增 read_peer / read_unread_strangers 两个公开口给委回
   factory.py   选源：DB 优先，扫不到回退 UIA
-  config.py    use_local_db 开关（默认开）
+  config.py    （0.1.128 删了 use_local_db 开关：没有不走本地库的选项）
   sessions.py  gateway_db_cursors 表 + db_cursor / set_db_cursor
   inbound.py   InboundLoop（节拍、去抖、派发）——没动
   autofriend.py / friendcheck.py / friends.py   加好友三条链路（§7，暂未 DB 化）

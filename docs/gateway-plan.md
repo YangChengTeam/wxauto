@@ -180,7 +180,7 @@ WXCLIENT_GATEWAY_BUSINESS_API_URL      https://<business-host>
                                        换票凭证 = 登录签发的客户端 Token（DPAPI 保存，不进配置）
 WXCLIENT_GATEWAY_LOCAL_TICKET_FILE     联调用本地票据文件（与上面一项互斥，生产留空）
 WXCLIENT_GATEWAY_TASK_TYPE             默认 wechat_reply
-WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS 读消息间隔，默认 180，下限 30（配置中心填低了保存时拒绝，不再悄悄抬）
+WXCLIENT_GATEWAY_POLL_INTERVAL_SECONDS 读消息间隔，默认 180，下限 30。0.1.128 起只管本地库读不了时的 UIA 回退，配置中心那格已删（入站固定 3 秒看一次本地库）
 WXCLIENT_GATEWAY_FRIEND_CHECK_INTERVAL_SECONDS  查新好友间隔，默认 900，下限 300（同上，保存时拒绝），0=不查
 WXCLIENT_GATEWAY_DEBOUNCE_SECONDS      去抖窗口
 WXCLIENT_GATEWAY_TURN_TIMEOUT_SECONDS  一轮上限，默认 180
