@@ -113,6 +113,8 @@ class ReaderTests(unittest.TestCase):
         self.fx = _Fixture()
         self.addCleanup(self.fx.cleanup)
         self.reader = self.fx.reader()
+        # 先关连接再删临时目录：Windows 不让删打开着的库文件（后注册的 cleanup 先跑）。
+        self.addCleanup(self.reader.close)
 
     def test_sessions_报出最后一条的_local_id_和类型(self) -> None:
         self.fx.add_message(5, "在吗")
