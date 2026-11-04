@@ -178,7 +178,9 @@ its cadence and every gate are unchanged — only *how a round discovers new mes
   (not-found→add-friend). **Unlisted strangers** go to the §10 UIA window only when `session.db` shows an
   unlisted 1:1 chat with `unread_count > 0` whose `local_id` moved — never as a per-round sweep.
 - **The DB access is read-only** (see §5.1/§5.3): `ReadProcessMemory` on `Weixin.exe` for the key, page-HMAC
-  verify + AES decrypt into an **in-memory** SQLite image. No key or chat text is ever written to disk or a log.
+  verify + AES decrypt into an **in-memory** SQLite image. No key or decrypted DB image is ever written to disk or a log. Every new DB message (listed or not; groups
+  included, official accounts not) is logged as 「本地库读到新消息」 with a 40-char `wechat_io.preview`, the same
+  rule as the UIA path — logging never decides whether to reply; the watchlist does (user 2026-11-04).
 - **It fails safe**: no key / unsupported WeChat version / no account dir whose keys match the running WeChat → `build_reader`
   returns `None` and the gateway runs the UIA loop on its built-in defaults. There is **no switch** to turn the
   DB path off (0.1.128 removed `use_local_db`, `prefilter_by_session_list` and the polling-only UI fields:
