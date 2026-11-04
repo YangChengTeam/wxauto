@@ -81,8 +81,9 @@ excludes = [
     # 只服务语音消息（本仓一处都不调），已改成用到时再 import，所以这三块一起砍。
     # ⚠️ 哪天要做语音消息，先把 utils.py 那两行改回顶层 import，再删这三个名字。
     "numpy", "soundfile", "sounddevice",
-    # cryptography（_rust.pyd 9.2MB）：TLS 走标准库 ssl，全仓无一处 import。
-    "cryptography",
+    # ⚠️ cryptography / zstandard **不能**再进这张表：0.1.121 起本地库入站要用——
+    #   cryptography 解库（AES），zstandard 解群聊/长文本的 compress_content。0.1.123 真机
+    #   装上就报 No module named 'cryptography'，网关整个起不来（2026-11-04）。
     # HTTP/3 全家桶：httpx 用的是 h11/httpcore 那条路，aioquic 没人 import。
     "aioquic", "pylsqpack",
     # ★ 这里**曾经**砍掉 Pythonwin / win32ui / win32uiole（6.7MB），理由是「本仓只用
@@ -93,8 +94,8 @@ excludes = [
     #   import，看不见依赖自己的。加名字前必须打一个包、装上、真跑一遍（`build.py`
     #   现在会自动做这件事，见它的自检那一步）。
     # 打包机 env 里装着、被顺手收进来的：类型检查器、另一套 HTTP 栈、.NET 桥、
-    # httpx 的可选压缩后端（缺了它只是不宣告 br/zstd，功能不受影响）。
-    "mypy", "aiohttp", "pythonnet", "clr", "zstandard", "brotli", "bcrypt",
+    # httpx 的可选压缩后端（缺了它只是不宣告 br，功能不受影响）。
+    "mypy", "aiohttp", "pythonnet", "clr", "brotli", "bcrypt",
 ]
 
 # 模块级 excludes 管不到的：包本身要留，只是里面某个大插件从来用不上。

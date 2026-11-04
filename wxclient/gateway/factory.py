@@ -18,7 +18,6 @@ import structlog
 from wxclient.config import load_settings
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
-from wxclient.wechat_db import build_reader
 
 from .. import logrole, tuning
 from .agent_files import AgentFileUploader, http_base_from_ws
@@ -275,6 +274,12 @@ def build_gateway(
     # Windows / 账号目录都对不上当前微信时 `build_reader` 返回 None，自动回退到上面那条 UIA 轮询（AGENTS.md §4.3）。
     source = ui_source
     if gateway_settings.use_local_db:
+        try:
+            # 用到时才 import：wechat_db 顶层要 cryptography，包里缺了也只回退 UIA，不拦启动。
+            from wxclient.wechat_db import build_reader
+        except ImportError as exc:
+            _log.info("本地库入站不可用，回退到 UIA 轮询", 原因=str(exc)[:160])
+            build_reader = lambda: None  # noqa: E731
         reader = build_reader()
         if reader is not None:
             source = DbMessageSource(

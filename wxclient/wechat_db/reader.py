@@ -298,8 +298,8 @@ class WeChatDbReader:
                         record["message_content"]
                     )
                     text = _strip_group_prefix(text)
-                    if not text.strip():
-                        continue
+                # 文本解不出正文（如 zstd 解压失败）也交 UIA 读，别把候选人的话悄悄丢掉。
+                needs_ui_read = raw_type != _TEXT_TYPE or not text.strip()
                 rows.append(
                     {
                         "local_id": int(record["local_id"]),
@@ -309,7 +309,7 @@ class WeChatDbReader:
                         "is_self": is_self,
                         "sender_username": sender,
                         "message_type": message_type,
-                        "needs_ui_read": raw_type != _TEXT_TYPE,
+                        "needs_ui_read": needs_ui_read,
                     }
                 )
         rows.sort(key=lambda row: (row["create_time"], row["sort_seq"], row["local_id"]))

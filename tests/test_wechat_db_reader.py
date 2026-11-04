@@ -154,6 +154,12 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual([r["message_type"] for r in rows], ["voice", "image"])
         self.assertTrue(all(r["needs_ui_read"] for r in rows))
 
+    def test_new_messages_文本解不出正文交UIA不丢(self) -> None:
+        self.fx.add_message(1, "")  # 如 zstd 解压失败：宁可开窗读，也别悄悄吞掉
+        self.fx.add_message(2, "你好啊")
+        rows = self.reader.new_messages(PEER, 0)
+        self.assertEqual([(r["text"], r["needs_ui_read"]) for r in rows], [("", True), ("你好啊", False)])
+
     def test_new_messages_系统消息被跳过(self) -> None:
         self.fx.add_message(1, "你已添加了张三", local_type=10000)
         self.fx.add_message(2, "你好啊")
