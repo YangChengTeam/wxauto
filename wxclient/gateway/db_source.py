@@ -36,7 +36,7 @@ from .. import logrole
 from .inbound import InboundMessage
 from .sessions import HUMAN_TAKEOVER, GatewayStore
 from .watchlist import Watchlist
-from .wechat_io import FIRST_SEEN_TAIL, QueueMessageSource, to_inbound
+from .wechat_io import FIRST_SEEN_TAIL, QueueMessageSource, preview, to_inbound
 
 _log = structlog.get_logger(__name__)
 _local = _log.bind(**{logrole.ROLE_KEY: logrole.LOCAL})
@@ -44,6 +44,11 @@ _local = _log.bind(**{logrole.ROLE_KEY: logrole.LOCAL})
 #: 多久看一次本地库（秒）。读库微信看不见，不受开窗轮询的 30/180 秒地板管；界面上的「读消息
 #: 间隔」0.1.128 起删了。库没变时 `sessions()` 复用上次的连接，一轮只是 stat 几个文件。
 DB_POLL_INTERVAL_SECONDS = 3.0
+
+#: 一个会话一轮最多往日志里打几条新消息（突然冒出一大段时别把日志刷爆）。
+LOG_MESSAGES_PER_SESSION = 10
+
+_TYPE_LABELS = {"text": "文字", "image": "图片", "voice": "语音", "video": "视频", "emoji": "表情", "file": "文件/链接"}
 
 #: `gateway_db_cursors` 里的哨兵：这个会话当前归 UIA 读（有未消化的语音/图片/文件等），
 #: 本地库这一侧先不碰它，每轮委回 UIA；等它最后一条又变回文本、UIA 也追平了，再交回本地库。
@@ -115,6 +120,13 @@ class DbMessageSource:
             人工接管=len(listed) - len(watched),
         )
 
+        # 库里每个会话的新消息都先打进日志，不管在不在名单（用户 2026-11-04：「读到数据库的新消息
+        # 把日志打出来，回复不回复是监听名单的事」）。首轮只建基线，不把历史倒进日志。
+        previous = self._seen_sessions
+        self._seen_sessions = {name: value[0] for name, value in sessions.items()}
+        if previous is not None:
+            self._log_new_messages(previous, sessions, listed)
+
         collected: list[InboundMessage] = []
         for peer_id in watched:
             collected.extend(await self._fetch_watched(account_id, peer_id, sessions))
@@ -122,22 +134,54 @@ class DbMessageSource:
         # 名单外挂红点的单聊仍走 UIA 的窄路（名单只认同步，这里不接管）。但只在本地库看到
         # 名单外单聊真挂着红点、且是新来的时才开：每轮都扫就是每轮把微信拉到前台，省掉开窗
         # 等于白省（真机 2026-11-04：5 秒一轮「汇总未读消息」+「已把微信窗口拉回前台」）。
-        if self._read_unread and self._stranger_activity(listed, sessions):
+        if self._read_unread and self._stranger_activity(previous, listed, sessions):
             try:
                 collected.extend(await self._ui.read_unread_strangers(account_id, listed))
             except Exception as exc:  # noqa: BLE001
                 _local.warning("名单外红点扫描失败，这一轮跳过", error=str(exc))
         return collected
 
-    def _stranger_activity(self, listed: Sequence[str], sessions: dict) -> bool:
+    def _log_new_messages(self, previous: dict[str, int], sessions: dict, listed: Sequence[str]) -> None:
+        """这一轮库里涨了的会话，逐条打「本地库读到新消息」：谁、什么类型、内容摘要（同 UIA 的
+        `preview`，截 40 字）。只打日志，不决定回不回——那是名单和下游的事。公众号/系统号不打。"""
+        try:
+            listed_users = {self._resolve(peer_id, sessions): peer_id for peer_id in listed}
+            for name, (local_id, _type) in sessions.items():
+                before = previous.get(name)
+                if before is not None and local_id <= before:
+                    continue
+                if not (_is_direct_chat(name) or name.endswith("@chatroom")):
+                    continue
+                if before is None:  # 新冒出来的会话：只看最后几条，别把整段历史打出来
+                    before = max(local_id - LOG_MESSAGES_PER_SESSION, 0)
+                rows = self._reader.new_messages(name, before)
+                chat = listed_users.get(name) or self._reader.display_name(name)
+                group = name.endswith("@chatroom")
+                for row in rows[-LOG_MESSAGES_PER_SESSION:]:
+                    who = "自己" if row["is_self"] else (
+                        self._reader.display_name(row["sender_username"]) if group and row["sender_username"] else "对方"
+                    )
+                    _local.info(
+                        "本地库读到新消息",
+                        会话=chat,
+                        名单内="是" if name in listed_users else "否",
+                        群聊="是" if group else "否",
+                        发送方=who,
+                        类型=_TYPE_LABELS.get(row["message_type"], row["message_type"]),
+                        内容=preview(row) if row["message_type"] == "text" else f"[{_TYPE_LABELS.get(row['message_type'], '消息')}]",
+                    )
+                if len(rows) > LOG_MESSAGES_PER_SESSION:
+                    _local.info("本地库这个会话一次来了很多条，日志只打最后几条", 会话=chat, 共=len(rows))
+        except Exception as exc:  # noqa: BLE001 —— 打日志失败不能拖垮这一轮
+            _local.warning("本地库新消息日志没打出来", error=str(exc))
+
+    def _stranger_activity(self, previous: dict[str, int] | None, listed: Sequence[str], sessions: dict) -> bool:
         """名单外的单聊有没有「新来的红点」：未读 > 0，且这个会话是新冒出来的或 local_id 涨了。
 
         首轮只建基线、不扫：启动时就挂着的红点多半是放了很久的服务号/企业微信（真机
         2026-11-04：招行、微信团队、一个 @openim，各挂着几条），为它们开一次窗就是一次
         拉前台。读不到未读数也不扫——入站发现新消息只靠本地库，不拿 UIA 兜底轮询。
         """
-        previous = self._seen_sessions
-        self._seen_sessions = {name: value[0] for name, value in sessions.items()}
         if previous is None:
             return False
         try:
@@ -273,7 +317,7 @@ class DbMessageSource:
             会话=peer_id,
             首见=first_seen,
             新消息=len(inbound),
-            字数=sum(len(row["text"] or "") for row in ready),  # 正文不进日志（AGENTS §5.3）
+            字数=sum(len(row["text"] or "") for row in ready),  # 逐条内容已在「本地库读到新消息」里
         )
         return inbound
 

@@ -50,6 +50,9 @@ class _FakeReader:
     def resolve_username(self, name: str) -> str | None:
         return USER if name == NAME else None
 
+    def display_name(self, username: str) -> str:
+        return {USER: NAME, "wxid_other": "李四", "wxid_mem": "王五"}.get(username, username)
+
     def new_messages(self, username: str, after: int) -> list[dict]:
         return [r for r in self._rows.get(username, []) if r["local_id"] > after]
 
@@ -317,3 +320,47 @@ class StrangerScanTests(_Base):
         self.reader.set_rows([_row(6, "在吗")])
         await self.fetch()
         self.assertEqual(self.ui.stranger_scans, 0)
+
+
+class NewMessageLogTests(_Base):
+    """用户 2026-11-04：库里读到的新消息都打日志，不管在不在名单；回不回是名单的事。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.store.set_db_cursor(ACCOUNT, NAME, 5)
+        self.reader.set_session(5)
+        self.reader._sessions["wxid_other"] = (10, "text")
+        self.reader._sessions["123@chatroom"] = (3, "text")
+        self.reader._sessions["gh_abc"] = (7, "text")
+
+    async def _logged(self) -> list[dict]:
+        from structlog.testing import capture_logs
+
+        with capture_logs() as logs:
+            await self.fetch()
+        return [e for e in logs if e["event"] == "本地库读到新消息"]
+
+    async def test_首轮只建基线_不打历史(self) -> None:
+        self.reader._rows["wxid_other"] = [_row(10, "老消息")]
+        self.assertEqual(await self._logged(), [])
+
+    async def test_名单内外和群的新消息都打_公众号不打(self) -> None:
+        await self.fetch()
+        self.reader.set_session(6)
+        self.reader.set_rows([_row(6, "在吗")])
+        self.reader._sessions["wxid_other"] = (12, "image")
+        self.reader._rows["wxid_other"] = [_row(11, "你好", is_self=True), _row(12, "", message_type="image")]
+        self.reader._sessions["123@chatroom"] = (4, "text")
+        member = _row(4, "大家好")
+        member["sender_username"] = "wxid_mem"
+        self.reader._rows["123@chatroom"] = [member]
+        self.reader._sessions["gh_abc"] = (8, "text")
+        self.reader._rows["gh_abc"] = [_row(8, "推文")]
+        logged = await self._logged()
+        got = [(e["会话"], e["名单内"], e["发送方"], e["类型"], e["内容"]) for e in logged]
+        self.assertEqual(got, [
+            (NAME, "是", "对方", "文字", "在吗"),
+            ("李四", "否", "自己", "文字", "你好"),
+            ("李四", "否", "对方", "图片", "[图片]"),
+            ("123@chatroom", "否", "王五", "文字", "大家好"),
+        ])

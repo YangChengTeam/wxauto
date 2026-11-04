@@ -8,7 +8,8 @@
 - 会话名 ↔ username 怎么对（``resolve_username`` / ``display_name``，走 contact.db 的
   remark / nick_name —— 网关一向按微信里显示的那个名字寻址）。
 
-★ **只读、不写盘、不进日志**：密钥和聊天正文绝不落盘、绝不写进日志，日志只有计数。
+★ **只读、不写盘**：密钥和解密出的库镜像绝不落盘、绝不进日志。这一层的日志只有计数；
+  聊天内容只由网关按 UIA 同一口径打摘要（`wechat_io.preview`，截 40 字，用户 2026-11-04 要的）。
   开连接默认用 `crypto.decrypt_database_bytes` 解到内存里的 SQLite 镜像；测试注入
   ``open_connection`` 直接开一个明文 fixture，不碰解密，也就能在 Linux 上跑。
 
