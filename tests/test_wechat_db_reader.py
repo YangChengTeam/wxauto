@@ -182,3 +182,41 @@ class ReaderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BuildReaderTests(unittest.TestCase):
+    """换过号的机器上留着旧账号目录：不能因此整条回退 UIA，要挑密钥对得上的那个。"""
+
+    def test_旧账号对不上就试下一个(self) -> None:
+        from unittest import mock
+
+        from wxclient.wechat_db import reader as module
+
+        tried: list[str] = []
+
+        def attach(self: WeChatDbReader) -> None:
+            tried.append(self._storage.parent.name)
+            if self._storage.parent.name != "wxid_now":
+                raise ValueError("当前登录微信与本地库不匹配")
+
+        storages = [Path("x/wxid_old/db_storage"), Path("x/wxid_now/db_storage")]
+        with mock.patch.object(module, "locate_storages", return_value=storages), mock.patch.object(
+            WeChatDbReader, "attach", attach
+        ):
+            reader = module.build_reader()
+        self.assertIsNotNone(reader)
+        self.assertEqual(reader._storage.parent.name, "wxid_now")
+        self.assertEqual(tried, ["wxid_old", "wxid_now"])
+
+    def test_全都对不上回退None(self) -> None:
+        from unittest import mock
+
+        from wxclient.wechat_db import reader as module
+
+        def attach(self: WeChatDbReader) -> None:
+            raise ValueError("不匹配")
+
+        with mock.patch.object(module, "locate_storages", return_value=[Path("x/a/db_storage")]), mock.patch.object(
+            WeChatDbReader, "attach", attach
+        ):
+            self.assertIsNone(module.build_reader())

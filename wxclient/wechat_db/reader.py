@@ -12,7 +12,7 @@
   开连接默认用 `crypto.decrypt_database_bytes` 解到内存里的 SQLite 镜像；测试注入
   ``open_connection`` 直接开一个明文 fixture，不碰解密，也就能在 Linux 上跑。
 
-真机上微信没登录 / 版本不对 / 多账号时 `attach` 抛错，上层据此回退到 UIA 轮询
+真机上微信没登录 / 版本不对 / 本地库与当前登录账号对不上时 `attach` 抛错，上层据此回退到 UIA 轮询
 （AGENTS.md §4.3）。
 """
 
@@ -316,12 +316,13 @@ class WeChatDbReader:
         return rows
 
 
-def locate_storage() -> Path:
-    """定位本机当前登录账号的 ``db_storage`` 目录（Windows，微信 4.x）。
+def locate_storages() -> list[Path]:
+    """列出本机各账号的 ``db_storage`` 目录（Windows，微信 4.x），最近活跃的排前面。
 
     走微信自己写的配置：``%APPDATA%\\Tencent\\xwechat\\config\\*.ini`` 里存着数据根，
-    根下 ``xwechat_files\\<account>\\db_storage``。0 个或多个账号都抛错——MVP 只支持
-    单账号（AGENTS.md §5.3），多账号交回 UIA 由它精确处理。
+    根下 ``xwechat_files\\<account>\\db_storage``。换过号的机器上旧账号目录还留着
+    （真机 2026-11-04 就是一旧一新两个），所以不能要求「正好一个」：按 session.db
+    （含 -wal）最近写入时间排序，由 `build_reader` 挨个 attach，密钥对得上的才是当前登录的。
     """
     if os.name != "nt":
         raise ValueError("本地库读取只在 Windows 上可用")
@@ -331,21 +332,39 @@ def locate_storage() -> Path:
     with open(configs[0], encoding="utf-8", errors="ignore") as handle:
         root = Path(handle.read().strip())
     base = root / "xwechat_files"
-    accounts = [p for p in base.iterdir() if (p / "db_storage").is_dir()] if base.is_dir() else []
-    if len(accounts) != 1:
-        raise ValueError(f"期望正好一个已登录账号，实际 {len(accounts)} 个")
-    return accounts[0] / "db_storage"
+    storages = [p / "db_storage" for p in base.iterdir() if (p / "db_storage").is_dir()] if base.is_dir() else []
+    if not storages:
+        raise ValueError("未找到已登录账号的本地库")
+    return sorted(storages, key=_last_write, reverse=True)
 
 
 def build_reader() -> WeChatDbReader | None:
-    """定位 + 扫钥 + 认账号，成了返回可用的 reader，任何一步失败返回 None（上层回退 UIA）。"""
+    """定位 + 扫钥 + 认账号，成了返回可用的 reader，任何一步失败返回 None（上层回退 UIA）。
+
+    多个账号目录时从最近活跃的试起；attach 会核对 session.db 的密钥是否出自正在运行的
+    微信，旧账号对不上就抛错、换下一个，全都对不上才回退。
+    """
     try:
-        reader = WeChatDbReader(locate_storage())
-        reader.attach()
-        return reader
+        storages = locate_storages()
     except Exception as exc:  # noqa: BLE001 —— 失败就回退 UIA 轮询，不让它拦住启动
         _log.info("本地库入站不可用，回退到 UIA 轮询", 原因=str(exc)[:160])
         return None
+    reason = ""
+    for storage in storages:
+        try:
+            reader = WeChatDbReader(storage)
+            reader.attach()
+            return reader
+        except Exception as exc:  # noqa: BLE001
+            reason = str(exc)[:160]
+    _log.info("本地库入站不可用，回退到 UIA 轮询", 原因=reason, 账号目录=len(storages))
+    return None
+
+
+def _last_write(storage: Path) -> int:
+    """账号目录的活跃度：session.db 及其 -wal 里较新的 mtime；读不到算 0。"""
+    session = storage / "session" / "session.db"
+    return max(_file_version(session)[0::2])
 
 
 def _file_version(path: Path) -> tuple:

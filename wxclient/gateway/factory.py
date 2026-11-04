@@ -272,7 +272,7 @@ def build_gateway(
         ),
     )
     # 入站优先走本地库（`wechat_db`）：省掉「为了看有没有新消息而开窗」。扫不到密钥 / 非
-    # Windows / 多账号时 `build_reader` 返回 None，自动回退到上面那条 UIA 轮询（AGENTS.md §4.3）。
+    # Windows / 账号目录都对不上当前微信时 `build_reader` 返回 None，自动回退到上面那条 UIA 轮询（AGENTS.md §4.3）。
     source = ui_source
     if gateway_settings.use_local_db:
         reader = build_reader()
