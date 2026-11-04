@@ -244,6 +244,17 @@ class WeChatDbReader:
             out[row["username"]] = (int(row["local_id"] or 0), _TYPE_NAMES.get(raw_type))
         return out
 
+    def unread_counts(self) -> dict[str, int]:
+        """{username: 未读数}，只列未读 > 0 的会话（微信自己维护的红点数）。"""
+        path = self._storage / "session" / "session.db"
+        columns = {row["name"] for row in self._query(path, "PRAGMA table_info(SessionTable)")}
+        if "unread_count" not in columns:
+            return {}
+        rows = self._query(
+            path, "SELECT username, unread_count FROM SessionTable WHERE is_hidden=0 AND unread_count>0"
+        )
+        return {row["username"]: int(row["unread_count"]) for row in rows}
+
     # ── 取新消息 ─────────────────────────────────────────────
 
     def _tables_for(self, username: str) -> list[tuple[Path, str]]:

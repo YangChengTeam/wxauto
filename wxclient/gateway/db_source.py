@@ -36,7 +36,7 @@ from .. import logrole
 from .inbound import InboundMessage
 from .sessions import HUMAN_TAKEOVER, GatewayStore
 from .watchlist import Watchlist
-from .wechat_io import QueueMessageSource, to_inbound
+from .wechat_io import FIRST_SEEN_TAIL, QueueMessageSource, to_inbound
 
 _log = structlog.get_logger(__name__)
 _local = _log.bind(**{logrole.ROLE_KEY: logrole.LOCAL})
@@ -110,8 +110,8 @@ class DbMessageSource:
             collected.extend(await self._fetch_watched(account_id, peer_id, sessions))
 
         # 名单外挂红点的单聊仍走 UIA 的窄路（名单只认同步，这里不接管）。但只在本地库看到
-        # 名单外单聊真有新动静时才开：每轮都扫就是每轮把微信拉到前台，省掉开窗等于白省
-        # （真机 2026-11-04：5 秒一轮「汇总未读消息」+「已把微信窗口拉回前台」）。
+        # 名单外单聊真挂着红点、且是新来的时才开：每轮都扫就是每轮把微信拉到前台，省掉开窗
+        # 等于白省（真机 2026-11-04：5 秒一轮「汇总未读消息」+「已把微信窗口拉回前台」）。
         if self._read_unread and self._stranger_activity(listed, sessions):
             try:
                 collected.extend(await self._ui.read_unread_strangers(account_id, listed))
@@ -120,18 +120,23 @@ class DbMessageSource:
         return collected
 
     def _stranger_activity(self, listed: Sequence[str], sessions: dict) -> bool:
-        """名单外的单聊这轮有没有新消息（新会话或 local_id 涨了）。首轮建基线并照扫一次。
+        """名单外的单聊有没有「新来的红点」：未读 > 0，且这个会话是新冒出来的或 local_id 涨了。
 
-        自己在名单外会话里发的也会让 local_id 涨，那顶多多扫一次、扫不出红点，不漏人。
+        首轮没有基线：只要名单外单聊挂着红点就扫一次。读不到未读数就不扫（不拿 UIA 兜底
+        轮询——入站发现新消息只靠本地库）。
         """
-        previous = self._seen_sessions
+        previous = self._seen_sessions or {}
+        first = self._seen_sessions is None
         self._seen_sessions = {name: value[0] for name, value in sessions.items()}
-        if previous is None:
-            return True
+        try:
+            unread = self._reader.unread_counts()
+        except Exception as exc:  # noqa: BLE001
+            _local.warning("读本地库未读数失败，这一轮不扫名单外红点", error=str(exc))
+            return False
         listed_users = {self._resolve(peer_id, sessions) for peer_id in listed}
         return any(
-            local_id > previous.get(name, 0)
-            for name, (local_id, _type) in sessions.items()
+            first or sessions.get(name, (0, None))[0] > previous.get(name, 0)
+            for name in unread
             if name not in listed_users and _is_direct_chat(name)
         )
 
@@ -185,12 +190,21 @@ class DbMessageSource:
 
         session_max, _newest = sessions[username]
 
-        # 第一次见这个会话：交 UIA 走「首见只接尾部今天、对方发的」，再把本地库游标
-        # 基线到最新，往后归本地库。
+        # 第一次见这个会话：同 UIA 的 `first_seen_fresh`，只接尾部连续、今天、对方发的
+        # （最多 FIRST_SEEN_TAIL 条），直接从库里切，不开窗；这几条里有媒体才交 UIA。
+        # 之后游标基线到最新，往后归本地库。
         if cursor is None:
-            results = await self._ui.read_peer(account_id, peer_id)
+            try:
+                tail = _first_seen_tail(self._reader.new_messages(username, max(session_max - 50, 0)))
+            except Exception as exc:  # noqa: BLE001 —— 读不了交 UIA 兜底
+                _local.warning("读本地库消息失败，这个会话交 UIA", 会话=peer_id, error=str(exc))
+                tail = None
+            if tail is None or any(row["needs_ui_read"] for row in tail):
+                results = await self._ui.read_peer(account_id, peer_id)
+                self._store.set_db_cursor(account_id, peer_id, session_max)
+                return results
             self._store.set_db_cursor(account_id, peer_id, session_max)
-            return results
+            return self._emit_text(account_id, peer_id, tail, first_seen=True)
 
         if session_max <= cursor:
             return []  # 没新消息
@@ -218,6 +232,12 @@ class DbMessageSource:
             return await self._ui.read_peer(account_id, peer_id)
 
         # 全是文本：直接从库里出，游标推到这批最后一条 local_id。
+        self._store.set_db_cursor(account_id, peer_id, ready[-1]["local_id"])
+        return self._emit_text(account_id, peer_id, ready)
+
+    def _emit_text(
+        self, account_id: str, peer_id: str, ready: list[dict], *, first_seen: bool = False
+    ) -> list[InboundMessage]:
         now = self._clock()
         inbound: list[InboundMessage] = []
         for row in ready:
@@ -230,22 +250,39 @@ class DbMessageSource:
             inbound.append(
                 to_inbound(account_id, peer_id, raw, seq=row["local_id"], at=now)
             )
-        self._store.set_db_cursor(account_id, peer_id, ready[-1]["local_id"])
         _local.info(
             "读完这个会话（本地库）",
             会话=peer_id,
+            首见=first_seen,
             新消息=len(inbound),
             字数=sum(len(row["text"] or "") for row in ready),  # 正文不进日志（AGENTS §5.3）
         )
         return inbound
 
 
+def _first_seen_tail(rows: list[dict]) -> list[dict]:
+    """首见只接的那几条：倒着数，遇到自己发的 / 不是今天的就停，最多 FIRST_SEEN_TAIL 条。"""
+    today = datetime.now().date()
+    tail: list[dict] = []
+    for row in reversed(rows):
+        if row["is_self"]:
+            break
+        if row["create_time"] and datetime.fromtimestamp(row["create_time"]).date() != today:
+            break
+        tail.append(row)
+        if len(tail) >= FIRST_SEEN_TAIL:
+            break
+    tail.reverse()
+    return tail
+
+
 def _is_direct_chat(username: str) -> bool:
     """单聊才可能是候选人：群、公众号、文件传输助手、折叠群入口这些都不算。"""
     return not (
         username.endswith("@chatroom")
-        or username.startswith(("gh_", "@"))
-        or username in {"filehelper", "weixin", "notifymessage", "fmessage", "medianote", "floatbottle"}
+        or username.startswith(("gh_", "@", "brandsessionholder", "brandservicesessionholder"))
+        or username
+        in {"filehelper", "weixin", "notifymessage", "fmessage", "medianote", "floatbottle", "mphelper"}
     )
 
 

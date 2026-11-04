@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,6 +33,7 @@ class _FakeReader:
     def __init__(self) -> None:
         self._sessions: dict[str, tuple[int, str | None]] = {}
         self._rows: dict[str, list[dict]] = {}
+        self.unread: dict[str, int] = {}
 
     def set_session(self, local_id: int, message_type: str = "text") -> None:
         self._sessions[USER] = (local_id, message_type)
@@ -41,6 +43,9 @@ class _FakeReader:
 
     def sessions(self) -> dict[str, tuple[int, str | None]]:
         return dict(self._sessions)
+
+    def unread_counts(self) -> dict[str, int]:
+        return dict(self.unread)
 
     def resolve_username(self, name: str) -> str | None:
         return USER if name == NAME else None
@@ -76,10 +81,12 @@ class _FakeUi:
         pass
 
 
-def _row(local_id: int, text: str, *, message_type: str = "text", is_self: bool = False) -> dict:
+def _row(
+    local_id: int, text: str, *, message_type: str = "text", is_self: bool = False, at: int | None = None
+) -> dict:
     return {
         "local_id": local_id,
-        "create_time": 1_700_000_000 + local_id,
+        "create_time": at if at is not None else 1_700_000_000 + local_id,
         "sort_seq": local_id,
         "text": text,
         "is_self": is_self,
@@ -112,12 +119,34 @@ class _Base(unittest.IsolatedAsyncioTestCase):
 
 
 class TextTests(_Base):
-    async def test_首次见委回UIA_并把游标基线到最新(self) -> None:
+    async def test_首次见从库里只接尾部今天对方发的_不开窗(self) -> None:
+        now = int(time.time())
         self.reader.set_session(5)
-        self.ui.returns = [_ui_msg("你好啊")]
+        self.reader.set_rows([
+            _row(2, "上个月的", at=now - 40 * 86400),
+            _row(3, "我回过了", is_self=True, at=now - 60),
+            _row(4, "在吗", at=now - 30),
+            _row(5, "还招人吗", at=now),
+        ])
         out = await self.fetch()
-        self.assertEqual(self.ui.calls, [NAME])             # 首见交 UIA
-        self.assertEqual([m.text for m in out], ["你好啊"])
+        self.assertEqual(self.ui.calls, [])                 # 首见也不开窗
+        self.assertEqual([m.text for m in out], ["在吗", "还招人吗"])
+        self.assertEqual(self.store.db_cursor(ACCOUNT, NAME), 5)
+
+    async def test_首次见历史都不是今天_一条不接只建基线(self) -> None:
+        self.reader.set_session(5)
+        self.reader.set_rows([_row(5, "老消息", at=int(time.time()) - 3 * 86400)])
+        self.assertEqual(await self.fetch(), [])
+        self.assertEqual(self.ui.calls, [])
+        self.assertEqual(self.store.db_cursor(ACCOUNT, NAME), 5)
+
+    async def test_首次见尾部有媒体才委回UIA(self) -> None:
+        self.reader.set_session(5)
+        self.reader.set_rows([_row(5, "", message_type="image", at=int(time.time()))])
+        self.ui.returns = [_ui_msg("[图片]")]
+        out = await self.fetch()
+        self.assertEqual(self.ui.calls, [NAME])
+        self.assertEqual([m.text for m in out], ["[图片]"])
         self.assertEqual(self.store.db_cursor(ACCOUNT, NAME), 5)
 
     async def test_文本新消息直接从库里出_不碰UIA(self) -> None:
@@ -206,7 +235,7 @@ if __name__ == "__main__":
 
 
 class StrangerScanTests(_Base):
-    """名单外红点仍走 UIA，但只在本地库看到名单外单聊有新动静时才扫（每扫一次就拉一次前台）。"""
+    """名单外红点仍走 UIA，但只在本地库看到名单外单聊新挂上红点时才扫（每扫一次就拉一次前台）。"""
 
     def setUp(self) -> None:
         super().setUp()
@@ -214,29 +243,37 @@ class StrangerScanTests(_Base):
         self.store.set_db_cursor(ACCOUNT, NAME, 5)
         self.reader.set_session(5)
 
-    async def test_首轮扫一次_之后没动静不扫(self) -> None:
+    async def test_没有红点就从不扫_首轮也不扫(self) -> None:
         self.reader._sessions["wxid_other"] = (10, "text")
-        await self.fetch()
-        await self.fetch()
-        await self.fetch()
+        for _ in range(3):
+            await self.fetch()
+        self.assertEqual(self.ui.stranger_scans, 0)
+
+    async def test_首轮有名单外红点扫一次_之后不再动不扫(self) -> None:
+        self.reader._sessions["wxid_other"] = (10, "text")
+        self.reader.unread = {"wxid_other": 1}
+        for _ in range(3):
+            await self.fetch()
         self.assertEqual(self.ui.stranger_scans, 1)
 
-    async def test_名单外单聊来新消息才扫(self) -> None:
+    async def test_名单外单聊来新消息挂红点才扫(self) -> None:
         self.reader._sessions["wxid_other"] = (10, "text")
         await self.fetch()
-        self.reader._sessions["wxid_other"] = (11, "text")
+        self.reader._sessions["wxid_other"] = (11, "text")  # 自己发的：涨了但没红点
+        await self.fetch()
+        self.reader._sessions["wxid_other"] = (12, "text")
+        self.reader.unread = {"wxid_other": 1}
         await self.fetch()
         self.reader._sessions["wxid_new"] = (1, "text")  # 新冒出来的会话也算
+        self.reader.unread["wxid_new"] = 1
         await self.fetch()
-        self.assertEqual(self.ui.stranger_scans, 3)
+        self.assertEqual(self.ui.stranger_scans, 2)
 
-    async def test_名单内或群和公众号的动静不触发扫描(self) -> None:
+    async def test_名单内或群和公众号的红点不触发扫描(self) -> None:
         self.reader._sessions["123@chatroom"] = (1, "text")
         self.reader._sessions["gh_abc"] = (1, "text")
-        await self.fetch()
+        self.reader.unread = {"123@chatroom": 3, "gh_abc": 5, USER: 1, "brandsessionholder": 2}
         self.reader.set_session(6)
         self.reader.set_rows([_row(6, "在吗")])
-        self.reader._sessions["123@chatroom"] = (2, "text")
-        self.reader._sessions["gh_abc"] = (2, "text")
         await self.fetch()
-        self.assertEqual(self.ui.stranger_scans, 1)
+        self.assertEqual(self.ui.stranger_scans, 0)
