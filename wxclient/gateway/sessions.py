@@ -59,6 +59,16 @@ CREATE TABLE IF NOT EXISTS gateway_peer_kinds (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (account_id, peer_id)
 );
+-- 本地库入站（`wechat_db` 路线）的游标：会话读到的最大 ``local_id``。
+-- 跟 `gateway_cursors`（UIA 那条链路的文本签名游标）各管各的——local_id 稳定自增，
+-- 不会像文本签名那样漂，所以单独一张表、单独一套语义。
+CREATE TABLE IF NOT EXISTS gateway_db_cursors (
+  account_id     TEXT NOT NULL,
+  peer_id        TEXT NOT NULL,
+  last_local_id  INTEGER NOT NULL DEFAULT 0,
+  updated_at     TEXT NOT NULL,
+  PRIMARY KEY (account_id, peer_id)
+);
 CREATE TABLE IF NOT EXISTS gateway_commands (
   account_id TEXT NOT NULL,
   command_id TEXT NOT NULL,
@@ -1044,6 +1054,31 @@ class GatewayStore:
                   updated_at=excluded.updated_at
                 """,
                 (account_id, peer_id, signature, seq, _utcnow().isoformat()),
+            )
+            conn.commit()
+
+    # ── 本地库入站游标（`wechat_db` 路线，按 local_id）──
+
+    def db_cursor(self, account_id: str, peer_id: str) -> int | None:
+        """这个会话本地库读到的最大 ``local_id``；``None`` = 还没读过（第一次接入）。"""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                "SELECT last_local_id FROM gateway_db_cursors WHERE account_id=? AND peer_id=?",
+                (account_id, peer_id),
+            ).fetchone()
+        return int(row[0]) if row else None
+
+    def set_db_cursor(self, account_id: str, peer_id: str, last_local_id: int) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """
+                INSERT INTO gateway_db_cursors (account_id, peer_id, last_local_id, updated_at)
+                VALUES (?,?,?,?)
+                ON CONFLICT(account_id, peer_id) DO UPDATE SET
+                  last_local_id=excluded.last_local_id,
+                  updated_at=excluded.updated_at
+                """,
+                (account_id, peer_id, int(last_local_id), _utcnow().isoformat()),
             )
             conn.commit()
 

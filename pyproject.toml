@@ -35,6 +35,8 @@ dependencies = [
   "SQLAlchemy>=2.0",
   "httpx>=0.27",
   "websockets>=13",
+  # 本地库入站（wxclient/wechat_db/）：群消息正文是 zstd 压的，解它要用。
+  "zstandard>=0.22",
 ]
 
 [tool.setuptools.dynamic]

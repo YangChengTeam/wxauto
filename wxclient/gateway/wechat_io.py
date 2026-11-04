@@ -1027,6 +1027,21 @@ class QueueMessageSource:
         )
         return tail
 
+    async def read_peer(
+        self, account_id: str, peer_id: str, *, unread: int | None = None
+    ) -> list[InboundMessage]:
+        """公开版 `_fetch_peer`：本地库入站（`db_source`）把「首次读 / 含媒体的那一轮 /
+        名字对不上」的会话委回这条 UIA 链路时用，走的还是同一套首见、语音转写、
+        附件另存、查无此人计数逻辑，不另起一套。"""
+        return await self._fetch_peer(account_id, peer_id, unread=unread)
+
+    async def read_unread_strangers(self, account_id: str, listed: Sequence[str]) -> list[InboundMessage]:
+        """公开版名单外红点扫描：本地库入站不接管这条窄路，仍交 UIA 原样处理。"""
+        out: list[InboundMessage] = []
+        for peer_id, unread in await self._unread_strangers(account_id, listed):
+            out.extend(await self._fetch_peer(account_id, peer_id, unread=unread))
+        return out
+
     async def _fetch_peer(
         self, account_id: str, peer_id: str, *, unread: int | None = None
     ) -> list[InboundMessage]:
