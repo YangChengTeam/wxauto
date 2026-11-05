@@ -256,6 +256,11 @@ class GatewaySettings(BaseSettings):
 
     active_hours: str = "09:00-21:00"
 
+    human_idle_seconds: float = 5.0
+    """有人在用这台电脑（鼠标 / 键盘有真人动静）时微信自动操作暂停，停手多少秒后自动恢复。
+    `0` = 不暂停。只管动微信界面的任务，读本地库不受影响。见 `wxclient.human_activity`
+    （用户 2026-11-05：「鼠标人为滚动就暂停，多少秒没动自动恢复」，照映身的逻辑做）。"""
+
     allow_insecure_transport: bool = False
     """允许 ``http://`` / ``ws://`` 明文。默认拒绝——Bearer 凭证不得明文过网。"""
 

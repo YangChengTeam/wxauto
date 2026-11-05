@@ -18,6 +18,7 @@ from typing import Any
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from wxclient import human_activity
 from wxclient.config import Settings
 from wxclient.queue import OperationWorker, Task, TaskStatus, TaskStore, TaskType
 from wxclient.wechat_api import WeChatApi
@@ -103,8 +104,17 @@ class WeChatRuntime:
         return await asyncio.to_thread(self.wait_for_task, task.id, timeout)
 
     def wait_for_task(self, task_id: str, timeout_seconds: float) -> dict[str, Any]:
-        deadline = time.monotonic() + max(0.1, timeout_seconds)
-        while time.monotonic() < deadline:
+        last = time.monotonic()
+        deadline = last + max(0.1, timeout_seconds)
+        while True:
+            now = time.monotonic()
+            if human_activity.busy():
+                # 有人在用电脑、任务被压着没做：这段不算等待时间，否则人一用久，回复就被记成
+                # 「没确认发出」，而任务稍后照样会执行（`wxclient.human_activity`）。
+                deadline += now - last
+            last = now
+            if now >= deadline:
+                break
             task = self.store.get(task_id)
             if task is None:
                 raise ValueError(f"Unknown task: {task_id}")

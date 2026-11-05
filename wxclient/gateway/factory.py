@@ -15,6 +15,7 @@ from typing import Any
 
 import structlog
 
+from wxclient import human_activity
 from wxclient.config import load_settings
 from wxclient.heavy_import import HEAVY_IMPORT_LOCK
 from wxclient.runtime import REAL_ACTION_CONFIRMATION, RuntimeSettings, WeChatRuntime
@@ -115,6 +116,8 @@ def build_gateway(
     runtime_settings = RuntimeSettings(allow_real_actions=allow_real_actions)
     runtime_settings.validate_for_start()
     runtime = WeChatRuntime(wechat_settings, runtime_settings)
+    # 有人在用电脑时微信 UI 操作停手（队列取任务前问它）；钩子在独立子进程里，装不上照常干活。
+    human_activity.start(gateway_settings.human_idle_seconds)
 
     database_path = Path(gateway_db) if gateway_db else wechat_settings.data_dir / "gateway.db"
     store = GatewayStore(database_path)

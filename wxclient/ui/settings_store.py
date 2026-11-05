@@ -139,6 +139,9 @@ FIELDS: tuple[Field, ...] = (
           section="sched", unit="小时", default="72"),
     Field("WXCLIENT_GATEWAY_ACTIVE_HOURS", "工作时间窗", "全天：00:00-24:00",
           section="sched", default="09:00-21:00"),
+    # 用户 2026-11-05：有人用鼠标就暂停，停手几秒自动恢复（`wxclient.human_activity`）。
+    Field("WXCLIENT_GATEWAY_HUMAN_IDLE_SECONDS", "有人操作时暂停",
+          "停手几秒后恢复；0=不暂停", section="sched", unit="秒", default="5"),
     # 用户 2026-09-15：私聊那档（20/时）也要能在配置中心改。原来界面上只有总闸一格，
     # 标题却叫「每小时发送上限」——专员把它调高，私聊照样被 20 那档拦住，而两边都
     # 「没配错」。总闸改名「发送总上限」，私聊档单独一格，两个数各管各的：

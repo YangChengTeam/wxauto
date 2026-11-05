@@ -13,7 +13,7 @@ from typing import Any, ClassVar
 
 import structlog
 
-from wxclient import tuning
+from wxclient import human_activity, tuning
 from wxclient.heavy_import import import_wechat_driver
 from wxclient.uia_probe import probe_wechat_uia
 from wxclient.uia_probe.constants import (
@@ -4169,9 +4169,10 @@ def _human_pause(what: str) -> None:
     """按 `_PAUSES` / `_MOMENTS_PAUSES` 里那一档随机停一会儿。表里没有的名字不停（不静默乱猜一个值）。"""
     span = _PAUSES.get(what) or _MOMENTS_PAUSES.get(what)
     scale = tuning.PAUSE_SCALE  # 极速模式可改；平时 1，0＝不停
-    if span is None or scale <= 0:
-        return
-    time.sleep(random.uniform(*span) * scale)
+    if span is not None and scale > 0:
+        time.sleep(random.uniform(*span) * scale)
+    # 两步之间有人动了鼠标键盘：等他停手再走下一步（`wxclient.human_activity`）。
+    human_activity.wait_idle()
 
 
 def _type_like_human(edit: Any, text: str) -> None:

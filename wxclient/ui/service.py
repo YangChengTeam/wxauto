@@ -493,6 +493,9 @@ class GatewayService:
             except Exception as exc:  # noqa: BLE001 - 收尾失败不掩盖真正的退出原因
                 _log.warning("网关收尾异常", error=str(exc))
             gateway.runtime.stop()
+            from wxclient import human_activity  # 只在收尾用；网关那边已经 import 过
+
+            human_activity.stop()
             loop.close()
             self._ready.set()
             with self._lock:

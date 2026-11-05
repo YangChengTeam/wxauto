@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import structlog
 
+from wxclient import human_activity
 from wxclient.wechat_api import WeChatApi, WeChatApiError, WeChatApiUnavailableError
 from wxclient.wechat_api.errors import CONTACT_NOT_FOUND_CODE, is_contact_not_found
 
@@ -14,6 +15,9 @@ from .models import Task, TaskType, is_real_write
 from .store import TaskStore
 
 logger = structlog.get_logger(__name__)
+
+#: 有人在用电脑时，取到的任务放回队列后隔多久再取（秒）。不算一次重试。
+HUMAN_BUSY_RETRY_SECONDS = 0.5
 
 
 @dataclass(frozen=True)
@@ -105,6 +109,10 @@ class OperationWorker:
             return False
         task = self.store.claim_next(self.worker_id, self.lease_seconds)
         if task is None:
+            return False
+        if human_activity.busy():
+            # 有人在用鼠标键盘：任务原样放回、不算一次尝试，停手够久再做（`wxclient.human_activity`）。
+            self.store.yield_task(task.id, self.worker_id, task.payload, HUMAN_BUSY_RETRY_SECONDS)
             return False
         self._busy = True
         task_logger = logger.bind(task_id=task.id, task_type=task.type.value)

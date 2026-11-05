@@ -21,6 +21,11 @@ if __name__ == "__main__":
         from wxclient.wechat_db.worker import serve
 
         sys.exit(serve())
+    # 鼠标键盘监听子进程（`wxclient.human_activity`）：同上，只装钩子、报动静。
+    if "--input-watch" in sys.argv[1:]:
+        from wxclient.human_activity import serve as watch
+
+        sys.exit(watch())
     from wxclient.ui.__main__ import main
 
     sys.exit(main())
