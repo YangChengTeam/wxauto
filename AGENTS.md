@@ -295,6 +295,17 @@ Every line here was learned on a real machine. Read the reason before changing o
   (`_PAUSES` / `_type_like_human` in `wechat_api/uia.py`). A full `set_text` plus a zero-delay click is a
   six-second run with zero variance, and that by itself is a signature. Pauses are always drawn from a random
   range — a fixed 2.0 seconds is as much a machine as a fixed 0.0 seconds, only slower.
+- **When a person is using the computer, WeChat UI automation stops** (user 2026-11-05, ported from 映身
+  `human_activity.py`). Real mouse/keyboard input (low-level hooks; input flagged `INJECTED`, i.e. our own
+  pywinauto clicks, does not count) pauses the queue: `queue.worker` puts a claimed task back
+  (`yield_task`, no attempt spent) while `human_activity.busy()`, and `_human_pause` waits between steps.
+  It resumes once input has stopped for `human_idle_seconds` (config 「有人操作时暂停」, default 5, 0 = off).
+  While a task is held back, `runtime.wait_for_task` stops its countdown — otherwise a long session at the
+  keyboard turns a reply into "not confirmed" that still goes out later. ★ **The hooks live in a child
+  process** (`--input-watch`), never in the client: a low-level hook callback runs for every mouse move
+  system-wide, and in a process whose GIL is contended it lags the whole machine's mouse. If the hooks
+  cannot be installed the client logs a warning and carries on unpaused. Reading the local DB is not UI
+  work and is never paused.
 - **A candidate under human takeover is not even read** (user ruling 2026-08-28). It is filtered in
   `wechat_io.QueueMessageSource._drop_handed_off`; the write-side gate (`guard._takeover_denial`) stays as a
   second path. The earlier position was "reading must continue, otherwise the backend cannot cancel its
