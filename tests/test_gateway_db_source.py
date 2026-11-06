@@ -11,7 +11,7 @@ import asyncio
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from wxclient.gateway import GatewayStore
@@ -35,6 +35,7 @@ class _FakeReader:
         self._sessions: dict[str, tuple[int, str | None]] = {}
         self._rows: dict[str, list[dict]] = {}
         self.unread: dict[str, int] = {}
+        self.friends: set[str] = set()
 
     def set_session(self, local_id: int, message_type: str = "text") -> None:
         self._sessions[USER] = (local_id, message_type)
@@ -56,6 +57,9 @@ class _FakeReader:
 
     def new_messages(self, username: str, after: int) -> list[dict]:
         return [r for r in self._rows.get(username, []) if r["local_id"] > after]
+
+    def friend_names(self, names: list[str]) -> list[str]:
+        return [name for name in names if name in self.friends]
 
 
 class _FakeUi:
@@ -326,6 +330,65 @@ class StrangerScanTests(_Base):
         self.reader.set_rows([_row(6, "在吗")])
         await self.fetch()
         self.assertEqual(self.ui.stranger_scans, 0)
+
+
+class PendingFriendTests(_Base):
+    """申请过、等通过的人，本地联系人表里已经是好友 → 交 runner 上报（周彪 2026-11-06 现场）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.now = AT
+        self.source._clock = lambda: self.now
+        self.store.set_db_cursor(ACCOUNT, NAME, 5)
+        self.reader.set_session(5)
+        self.reader.friends = set()
+        self.reported: list[tuple[str, str]] = []
+
+        async def on_accepted(account_id, name):
+            self.reported.append((account_id, name))
+
+        self.source.set_friend_accepted_handler(on_accepted)
+        self.store.note_friend_request(ACCOUNT, "13800000001", "李四-仓库工")
+        self.store.note_friend_request(ACCOUNT, "13800000002", "王五-普工")
+
+    async def test_离线时通过的_开机第一轮就报(self) -> None:
+        self.reader.friends = {"李四-仓库工"}
+        await self.fetch()
+        self.assertEqual(self.reported, [(ACCOUNT, "李四-仓库工")])
+
+    async def test_还没通过的不报_一分钟内不重查(self) -> None:
+        await self.fetch()
+        self.reader.friends = {"王五-普工"}
+        self.now = AT + timedelta(seconds=30)
+        await self.fetch()
+        self.assertEqual(self.reported, [])
+        self.now = AT + timedelta(seconds=61)
+        await self.fetch()
+        self.assertEqual(self.reported, [(ACCOUNT, "王五-普工")])
+
+    async def test_台账空或没装上报口就不查库(self) -> None:
+        def boom(_names):
+            raise AssertionError("不该查库")
+
+        self.reader.friend_names = boom
+        self.store.drop_friend_request(ACCOUNT, "13800000001")
+        self.store.drop_friend_request(ACCOUNT, "13800000002")
+        await self.fetch()
+        self.source.set_friend_accepted_handler(None)
+        self.store.note_friend_request(ACCOUNT, "13800000003", "赵六")
+        self.now = AT + timedelta(seconds=120)
+        await self.fetch()
+        self.assertEqual(self.reported, [])
+
+    async def test_查库出错不拖垮这一轮(self) -> None:
+        def boom(_names):
+            raise RuntimeError("contact.db 读不了")
+
+        self.reader.friend_names = boom
+        self.reader.set_session(6)
+        self.reader.set_rows([_row(6, "在吗")])
+        messages = await self.fetch()
+        self.assertEqual([m.text for m in messages], ["在吗"])
 
 
 class NewMessageLogTests(_Base):

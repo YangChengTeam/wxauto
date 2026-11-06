@@ -54,6 +54,10 @@ ATTACH_RETRY_SECONDS = 60.0
 #: 顶一轮「汇总未读消息」——那一轮要开窗、拉前台、跑一分钟（真机 2026-11-04 22:04）。
 FIRST_ATTACH_WAIT_SECONDS = 30.0
 
+#: 多久对一次「申请过、等通过」的台账和本地联系人表（秒）。只查库、不动微信；报不出去
+#: （后端不可达）时下一趟再报，间隔别太密，免得一个人每 3 秒喊一次上报失败。
+FRIEND_CHECK_INTERVAL_SECONDS = 60.0
+
 #: 一个会话一轮最多往日志里打几条新消息（突然冒出一大段时别把日志刷爆）。
 LOG_MESSAGES_PER_SESSION = 10
 
@@ -98,6 +102,9 @@ class DbMessageSource:
         # 归 UIA 的会话上次委回时库里最后一条的 local_id：没涨就不再开窗（3 秒一轮，
         # 不能为一个停在图片上的会话每轮开一次窗）。只在内存里，重启后至多多委回一次。
         self._ui_owned_seen: dict[str, int] = {}
+        # async (account_id, session_name)：本地库认出「申请过的人已经是好友」时交给 runner 上报。
+        self._on_friend_accepted = None
+        self._friend_checked_at: datetime | None = None
 
     # MessageSource 里 runner 会装的两个回调，直接透传给 UIA 替身（查无此人 / 读不到要去加好友）。
     def set_unreachable_handler(self, handler) -> None:
@@ -105,6 +112,9 @@ class DbMessageSource:
 
     def set_not_found_handler(self, handler) -> None:
         self._ui.set_not_found_handler(handler)
+
+    def set_friend_accepted_handler(self, handler) -> None:
+        self._on_friend_accepted = handler
 
     def set_hot_window(self, seconds: float) -> None:
         self._ui.set_hot_window(seconds)
@@ -214,6 +224,8 @@ class DbMessageSource:
         if previous is not None:
             self._log_new_messages(previous, sessions, listed)
 
+        await self._check_pending_friends(account_id)
+
         collected: list[InboundMessage] = []
         for peer_id in watched:
             collected.extend(await self._fetch_watched(account_id, peer_id, sessions))
@@ -272,6 +284,38 @@ class DbMessageSource:
                     _local.info("本地库这个会话一次来了很多条，日志只打最后几条", 会话=chat, 共=len(rows))
             except Exception as exc:  # noqa: BLE001 —— 打日志失败不能拖垮这一轮
                 _local.warning("本地库会话有变化，但没读出内容", 会话=name, 会话类型=kind, error=str(exc)[:160])
+
+    async def _check_pending_friends(self, account_id: str) -> None:
+        """台账里等通过的人，本地联系人表里已经是好友了 → 交给 runner 当场上报 accepted。
+
+        补的洞（周彪 2026-11-06）：对方在客户端关着时通过了申请，开机后他那条消息算基线、
+        名单外红点不扫，「收到他的消息 = 他通过了」那条路就不会走；搜索复查又是 15 分钟
+        才查一个人、只在期限内。业务端那边他一直是 requested，进不了监听，首次触达也发不出。
+        contact 表是微信自己写的，查它不动微信，所以每分钟把台账整本对一遍。
+        """
+        if self._on_friend_accepted is None:
+            return
+        now = self._clock()
+        if self._friend_checked_at is not None and (
+            now - self._friend_checked_at
+        ).total_seconds() < FRIEND_CHECK_INTERVAL_SECONDS:
+            return
+        self._friend_checked_at = now
+        try:
+            pending = self._store.pending_friend_names(account_id)
+            accepted = self._reader.friend_names(pending) if pending else []
+        except Exception as exc:  # noqa: BLE001 —— 查不了就等下一趟，搜索复查那条还在
+            _local.warning("本地库对好友台账失败，下一趟再对", error=str(exc)[:160])
+            return
+        if accepted:
+            _local.info("本地库看到申请过的人已经是好友了，上报通过", 人数=len(accepted))
+        for name in accepted:
+            try:
+                result = self._on_friend_accepted(account_id, name)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:  # noqa: BLE001 —— 一个人报不出去不拖累别人
+                _local.warning("申请过的人已是好友，但上报出错，下一趟再报", error=str(exc)[:160])
 
     def _stranger_activity(self, previous: dict[str, int] | None, listed: Sequence[str], sessions: dict) -> bool:
         """名单外的单聊有没有「新来的红点」：未读 > 0，且这个会话是新冒出来的或 local_id 涨了。

@@ -65,8 +65,11 @@ class _Fixture:
 
     def _build_contact(self) -> None:
         conn = self._conn(self.storage / "contact" / "contact.db")
-        conn.execute("CREATE TABLE contact (username TEXT, remark TEXT, nick_name TEXT)")
-        conn.execute("INSERT INTO contact VALUES (?,?,?)", (PEER, "张三", "小张"))
+        conn.execute(
+            "CREATE TABLE contact (username TEXT, remark TEXT, nick_name TEXT,"
+            " local_type INTEGER DEFAULT 1, delete_flag INTEGER DEFAULT 0)"
+        )
+        conn.execute("INSERT INTO contact (username, remark, nick_name) VALUES (?,?,?)", (PEER, "张三", "小张"))
         conn.commit()
         conn.close()
 
@@ -125,10 +128,29 @@ class ReaderTests(unittest.TestCase):
 
     def test_resolve_username_撞名返回None(self) -> None:
         conn = sqlite3.connect(self.fx.storage / "contact" / "contact.db")
-        conn.execute("INSERT INTO contact VALUES ('wxid_other','张三','别人')")
+        conn.execute("INSERT INTO contact (username, remark, nick_name) VALUES ('wxid_other','张三','别人')")
         conn.commit()
         conn.close()
         self.assertIsNone(self.reader.resolve_username("张三"))
+
+    def _add_contact(self, username: str, remark: str, local_type: int, delete_flag: int = 0) -> None:
+        conn = sqlite3.connect(self.fx.storage / "contact" / "contact.db")
+        conn.execute(
+            "INSERT INTO contact (username, remark, nick_name, local_type, delete_flag) VALUES (?,?,?,?,?)",
+            (username, remark, "昵称", local_type, delete_flag),
+        )
+        conn.commit()
+        conn.close()
+
+    def test_friend_names_只认已是好友的备注名(self) -> None:
+        self._add_contact("wxid_wait", "李四-仓库工", 3)      # 申请还没通过：备注落在陌生人行上
+        self._add_contact("wxid_gone", "王五-普工", 1, 1)     # 删了
+        names = ["李四-仓库工", "张三", "王五-普工", "查无此人"]
+        self.assertEqual(self.reader.friend_names(names), ["张三"])
+
+    def test_friend_names_撞名不算(self) -> None:
+        self._add_contact("wxid_other", "张三", 1)
+        self.assertEqual(self.reader.friend_names(["张三"]), [])
 
     def test_display_name_备注优先(self) -> None:
         self.assertEqual(self.reader.display_name(PEER), "张三")

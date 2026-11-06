@@ -365,6 +365,9 @@ class GatewayRunner:
         # 092 管「在名单里却不是好友」，093 管「是好友了却不在名单里」。
         if friend_checker is not None:
             friend_checker.on_accepted = self._on_friend_accepted
+        # 本地库那条判据（`DbMessageSource`）：contact 表里他已经是好友 → 同一条上报路。
+        if hasattr(source, "set_friend_accepted_handler"):
+            source.set_friend_accepted_handler(self._on_friend_accepted)
         # 2026-09-12 自动通过别人发来的好友申请：通过之后先临时纳入监听（他发的第一句才读得到），
         # 认得出号的照旧报给业务端。
         if friend_watcher is not None:

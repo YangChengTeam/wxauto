@@ -218,6 +218,30 @@ class WeChatDbReader:
         usernames = {row["username"] for row in rows}
         return next(iter(usernames)) if len(usernames) == 1 else None
 
+    def friend_names(self, display_names: Sequence[str]) -> list[str]:
+        """这几个显示名里，**已经是好友**的那些（按传入顺序）。
+
+        给「申请发出去了、等对方通过」那本台账用：对方通过之后微信把他写进 contact 表、
+        ``local_type`` 变成 1（真机 2026-11-06：好友 297 行全是 1，群成员/陌生人是 3）。
+        备注名在通过前就可能已经落在 ``local_type=3`` 的行上（真机见过 2 行），所以只认
+        备注名不够，必须连 ``local_type`` 一起看。对不上、撞名（歧义）、已删除都不算——
+        宁可漏报交给 UIA 复查，也不把还没通过的人报成通过。
+        """
+        found: list[str] = []
+        for name in display_names:
+            rows = self._query(
+                self._contact_db(),
+                "SELECT username, local_type, delete_flag FROM contact "
+                "WHERE remark=? OR (COALESCE(remark,'')='' AND nick_name=?)",
+                (name, name),
+            )
+            if len({row["username"] for row in rows}) != 1:
+                continue
+            row = rows[0]
+            if int(row["local_type"] or 0) == 1 and not int(row["delete_flag"] or 0):
+                found.append(name)
+        return found
+
     def sessions(self) -> dict[str, tuple[int, str | None]]:
         """{username: (最后一条消息的 local_id, 最后一条的 message_type)}。
 

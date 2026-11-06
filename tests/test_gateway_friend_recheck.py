@@ -396,6 +396,36 @@ class TestLandsThroughRunner(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(number, NUMBER)
 
 
+    async def test_本地库认出已是好友_走同一条上报路(self) -> None:
+        """周彪 2026-11-06：对方在客户端关着时通过，开机后本地库对 contact 表认出来就报。"""
+
+        class _DbSource(_SilentSource):
+            handler = None
+
+            def set_friend_accepted_handler(self, handler) -> None:
+                self.handler = handler
+
+        self.store.note_friend_request(ACCOUNT, NUMBER, NAME)
+        source = _DbSource()
+        GatewayRunner(
+            settings=GatewaySettings(ai_ws_url="ws://127.0.0.1:1/ws", local_ticket_file=self.tickets),
+            ticket_provider=LocalFileTicketProvider(self.tickets),
+            store=self.store,
+            source=source,
+            sink=_SilentSink(),
+            accounts=[ACCOUNT],
+            watchlist=self.watchlist,
+            contacts=self.contacts,
+            clock=lambda: self.now,
+        )
+        self.assertIsNotNone(source.handler)
+        await source.handler(ACCOUNT, NAME)
+        self.assertEqual([(r["status"], r["number"], r["remark"]) for r in self.contacts.reported],
+                         [("accepted", NUMBER, NAME)])
+        self.assertEqual(self.store.pending_friend_request(ACCOUNT, NAME), "")
+        self.assertEqual(self.watchlist.watched(), [])  # 进不进名单仍等业务端同步
+
+
 if __name__ == "__main__":
     unittest.main()
 

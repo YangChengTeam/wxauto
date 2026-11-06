@@ -35,7 +35,7 @@ WORKER_FLAG = "--db-worker"
 #: 子进程可被调用的只读查询（白名单：管道那头不能随便调别的方法）。
 _METHODS = frozenset({
     "sessions", "unread_counts", "new_messages", "session_cursor",
-    "resolve_username", "display_name", "poll_changes",
+    "resolve_username", "display_name", "poll_changes", "friend_names",
 })
 
 #: 等子进程连上本地库最多多久（秒）。它在自己进程里扫钥，单跑几秒；留足余量。
@@ -151,6 +151,9 @@ class WorkerReader:
 
     def display_name(self, username: str) -> str:
         return str(self._call("display_name", username))
+
+    def friend_names(self, display_names: list[str]) -> list[str]:
+        return [str(name) for name in self._call("friend_names", list(display_names))]
 
     def poll_changes(self) -> bool:
         return bool(self._call("poll_changes"))

@@ -772,6 +772,21 @@ class GatewayStore:
             ).fetchone()
         return (str(row[0]), str(row[1]).strip()) if row else ("", "")
 
+    def pending_friend_names(self, account_id: str) -> list[str]:
+        """台账里所有还在等通过的会话名（去重、去空）。
+
+        给本地库那条判据用（`DbMessageSource`）：查 contact 表不动微信，所以一次全看，
+        不像搜索复查那样一趟一个、也不受「查多久」期限限制。
+        """
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """SELECT DISTINCT TRIM(session_name) FROM gateway_friend_checks
+                    WHERE account_id = ? AND TRIM(session_name) <> ''
+                 ORDER BY 1""",
+                (account_id,),
+            ).fetchall()
+        return [str(row[0]) for row in rows]
+
     def note_friend_check(self, account_id: str, number: str, at: str) -> None:
         """记下「这一趟真去微信里查过他了」。查成功查失败都记。
 
