@@ -306,6 +306,13 @@ Every line here was learned on a real machine. Read the reason before changing o
   system-wide, and in a process whose GIL is contended it lags the whole machine's mouse. If the hooks
   cannot be installed the client logs a warning and carries on unpaused. Reading the local DB is not UI
   work and is never paused.
+- **"They accepted our friend request" is also read from the local DB** (0.1.138, field case 2026-11-06:
+  accepted while the client was off → never reported → stuck at `requested`, no first message). Once a
+  minute `DbMessageSource._check_pending_friends` checks the whole local ledger (`gateway_friend_checks`)
+  against `contact.db` and hands hits to `runner._on_friend_accepted`, the same report path as the search
+  re-check. ★ **A friend is `local_type = 1` and not deleted** — a remark alone proves nothing: on the real
+  machine remarks also sit on `local_type = 3` (not-a-friend) rows. Ambiguous names are skipped and left to
+  the search re-check. Joining the watchlist still waits for the business sync.
 - **A candidate under human takeover is not even read** (user ruling 2026-08-28). It is filtered in
   `wechat_io.QueueMessageSource._drop_handed_off`; the write-side gate (`guard._takeover_denial`) stays as a
   second path. The earlier position was "reading must continue, otherwise the backend cannot cancel its
