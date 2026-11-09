@@ -258,6 +258,11 @@ CREATE TABLE IF NOT EXISTS gateway_relationships (
   announced       INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (account_id, peer_id)
 );
+-- 本机零散的单值（目前只有 install_id：这份本地库第一次建起来时随机生成，UIA 消息 id 带上它）。
+CREATE TABLE IF NOT EXISTS gateway_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 """
 
 
@@ -1019,6 +1024,21 @@ class GatewayStore:
                 (account_id, peer_id),
             ).fetchone()
         return bool(row and row[0])
+
+    def install_id(self) -> str:
+        """这份本地库的安装号（8 位十六进制，第一次取时生成，之后不变）。
+
+        UIA 读到的消息 id 是 ``会话#安装号.序号``：序号是本机自己数的，重装 / 删了本地库会从 1 再数，
+        AI 端却永久记着每个消息 id——不带安装号，新装的「张三#1」就撞上旧的「张三#1」。
+        """
+        if getattr(self, "_install_id", None):
+            return self._install_id
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO gateway_meta (key, value) VALUES ('install_id', ?)", (uuid4().hex[:8],)
+            )
+            self._install_id = str(conn.execute("SELECT value FROM gateway_meta WHERE key='install_id'").fetchone()[0])
+        return self._install_id
 
     def get_cursor(self, account_id: str, peer_id: str) -> tuple[str | None, int]:
         with closing(self._connect()) as conn:

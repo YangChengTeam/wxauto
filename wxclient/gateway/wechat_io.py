@@ -586,11 +586,13 @@ def to_inbound(
     at: datetime | None = None,
     attachment: dict[str, Any] | None = None,
     first_contact: bool = False,
+    msg_id: str | None = None,
+    sent_at: datetime | None = None,
 ) -> InboundMessage:
     return InboundMessage(
         account_id=account_id,
         peer_id=peer_id,
-        msg_id=f"{peer_id}#{seq}",
+        msg_id=msg_id or f"{peer_id}#{seq}",
         text=attachment_text(raw, attachment),
         at=at or datetime.now(timezone.utc),
         from_self=is_self_message(raw),
@@ -602,6 +604,7 @@ def to_inbound(
         raw_text=str(raw.get("text") or ""),
         first_contact=first_contact,
         system_tip=is_system_tip(raw),
+        sent_at=sent_at,
     )
 
 
@@ -1148,6 +1151,9 @@ class QueueMessageSource:
             )
 
         now = self._clock()
+        # 消息 id 带上本机安装号：序号是本机自己数的，重装 / 清了本地数据会从 1 再数，而 AI 端把
+        # 消息 id 永久记着——同一个 id 换了正文就是冲突、整轮被拒（生产 2026-11-09）。
+        install = self._store.install_id()
         inbound: list[InboundMessage] = []
         for offset, raw in enumerate(fresh):
             if not str(raw.get("text") or "").strip():
@@ -1164,7 +1170,7 @@ class QueueMessageSource:
             inbound.append(
                 to_inbound(
                     account_id, peer_id, raw, seq=seq + offset + 1, at=now, attachment=attachment,
-                    first_contact=stranger,
+                    first_contact=stranger, msg_id=f"{peer_id}#{install}.{seq + offset + 1}",
                 )
             )
         return inbound

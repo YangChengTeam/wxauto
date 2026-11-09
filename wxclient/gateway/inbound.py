@@ -86,6 +86,12 @@ class InboundMessage:
     first_contact: bool = False
     """True = 这个会话**不在监听名单里**，是看到红点数才去读的（`wechat_io._unread_strangers`，
     用户 2026-09-28）。这一轮要带 `first_contact` 给 AI 端：判不出在找工作就一条都不发（spec 090）。"""
+    sent_at: datetime | None = None
+    """这条在微信里**真实的发送时刻**（本地库的 ``create_time``）；UIA 读不出带日期的时刻，留 None。
+
+    上报 AI 端 / 业务端的 ``occurred_at`` 优先用它：AI 端按「消息 ID + 正文 + 时刻」登记事件，同一条
+    消息重读一遍（重连、重装后首见）要报出一模一样的值，不然同一个 ID 两种时刻就是冲突，整轮被拒
+    （生产 2026-11-09「failed to prepare turn state」）。``at`` 仍是读到的时刻，去抖等本机节拍用它。"""
     system_tip: bool = False
     """True = 微信自己插在聊天里的**系统提示行**（居中灰字，「你已添加了 XX，现在可以开始聊天了」这类，
     控件类型 `mmui::ChatItemView` 且不是时间分隔行）。不是谁说的话，发送协调（138）时按 `system` 来源报，
@@ -111,6 +117,7 @@ def message_to_row(message: InboundMessage) -> dict:
         "raw_text": message.raw_text,
         "first_contact": message.first_contact,
         "system_tip": message.system_tip,
+        "sent_at": message.sent_at.isoformat() if message.sent_at else "",
     }
 
 
@@ -137,7 +144,15 @@ def message_from_row(account_id: str, peer_id: str, row: dict) -> InboundMessage
         raw_text=str(row.get("raw_text") or ""),
         first_contact=bool(row.get("first_contact")),
         system_tip=bool(row.get("system_tip")),
+        sent_at=_parse_time(row.get("sent_at")),
     )
+
+
+def _parse_time(value: object) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value)) if value else None
+    except ValueError:
+        return None
 
 
 class MessageSource(Protocol):

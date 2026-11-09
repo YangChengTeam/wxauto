@@ -81,7 +81,7 @@ def build_delivery_context(
             "message_id": wire_message_id(message.account_id, message.peer_id, message.msg_id),
             "source_kind": kind,
             "text": message.text[:MAX_TEXT],
-            "occurred_at": wire_time(message.at),
+            "occurred_at": wire_time(message.sent_at or message.at),
         })
     if relationship is not None:
         relationship_id, established_at = relationship

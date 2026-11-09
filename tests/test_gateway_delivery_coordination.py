@@ -338,3 +338,31 @@ class RunnerTurnTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("工资多少", send["text"])
             finally:
                 await runner.stop()
+
+
+class StableEventIdentityTests(unittest.TestCase):
+    """AI 端按「消息 id + 正文 + 时刻」永久登记事件：同一个 id 换了正文或时刻就整轮被拒
+    （生产 2026-11-09「failed to prepare turn state」）。本机报出去的 id / 时刻必须稳。"""
+
+    def test_有真实发送时刻就报它_不报读到的时刻(self) -> None:
+        sent = datetime(2026, 11, 9, 2, 30, tzinfo=timezone.utc)
+        read = to_inbound(ACCOUNT, PEER, {"text": "在吗"}, seq=7, at=WORKDAY, msg_id=f"{PEER}#db7", sent_at=sent)
+        again = to_inbound(ACCOUNT, PEER, {"text": "在吗"}, seq=7, at=WORKDAY + timedelta(days=3),
+                           msg_id=f"{PEER}#db7", sent_at=sent)
+        first, second = (build_delivery_context([m])["messages"][0] for m in (read, again))
+        self.assertEqual(first, second)                      # 隔几天重读：id、正文、时刻一字不差
+        self.assertEqual(first["occurred_at"], "2026-11-09T02:30:00.000Z")
+
+    def test_sent_at落盘后读回不丢(self) -> None:
+        sent = datetime(2026, 11, 9, 2, 30, tzinfo=timezone.utc)
+        message = to_inbound(ACCOUNT, PEER, {"text": "在吗"}, seq=7, at=WORKDAY, sent_at=sent)
+        self.assertEqual(message_from_row(ACCOUNT, PEER, message_to_row(message)).sent_at, sent)
+        old_row = {k: v for k, v in message_to_row(message).items() if k != "sent_at"}
+        self.assertIsNone(message_from_row(ACCOUNT, PEER, old_row).sent_at)  # 升级前排着队的老行
+
+    def test_安装号生成一次_之后不变_新库换一个(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first = GatewayStore(Path(tmp) / "a.db").install_id()
+            self.assertRegex(first, r"^[0-9a-f]{8}$")
+            self.assertEqual(GatewayStore(Path(tmp) / "a.db").install_id(), first)  # 重启照旧
+            self.assertNotEqual(GatewayStore(Path(tmp) / "b.db").install_id(), first)  # 重装（新库）换号

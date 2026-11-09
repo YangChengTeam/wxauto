@@ -185,7 +185,9 @@ its cadence and every gate are unchanged — only *how a round discovers new mes
   returns `None`. All DB work (key scan, decrypt, queries) runs in a **separate worker process**
   (`wechat_db/worker.py`, same exe with `--db-worker`); in-process it starved the Tk thread of the GIL and the window
   hung on drag (0.1.131). Keys never leave the worker. Each worker call times out after 15s; a stuck worker is
-  killed and re-attached in the background (0.1.133). UIA window enumeration skips the client's own windows.
+  killed and re-attached in the background (0.1.133). A worker that is alive but whose `sessions()` read fails
+  `DB_FAIL_RECONNECT_ROUNDS` (3) rounds in a row (WeChat restarted / re-logged in, old keys stale) is treated
+  the same: closed, re-attached in the background, UIA stands in meanwhile; one failed round alone does nothing. UIA window enumeration skips the client's own windows.
   Periodic WeChat probes (UI every 15s, keepalive every 30s) count at most `PERIODIC_PROBE_MAX_NODES` (120) UIA
   nodes, not 5000 — every node is a cross-process call WeChat's UI thread must answer, and dragging WeChat's window
   froze both (0.1.134). The account lookup (walks all WeChat handles, ~2s) is cached per WeChat PID set. Until the worker connects, the UIA loop stands in on its built-in cadence while `DbMessageSource` keeps re-attaching in a

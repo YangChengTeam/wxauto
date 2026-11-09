@@ -663,10 +663,9 @@ class GatewayRunner:
                 # 微信 UI 读不到稳定的消息 ID（见 `wechat_io` 模块说明），拿本机那个
                 # 单调序号派生一个稳定 ID；哈希掉是因为它里面带着对方的备注名。
                 message_id=local_message_id(account_id, message.msg_id),
-                # `at` 是**读到**这条的时刻。微信自己标的「18:28」没有日期，还原不成可信的
-                # 时间点，所以宁可用读到的时刻，也不去猜一个更好看的（契约要真实发生时间，
-                # 这是本机能给出的最接近的真话）。
-                occurred_at=message.at,
+                # 本地库读到的有真实发送时刻（`sent_at`）就用它；UIA 读的只有「18:28」没有日期，
+                # 还原不成可信的时间点，宁可用读到的时刻（`at`），也不去猜一个更好看的。
+                occurred_at=message.sent_at or message.at,
                 content=message.text,
                 message_type=message.message_type,
                 source="inbound_poll",

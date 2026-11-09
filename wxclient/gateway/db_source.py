@@ -54,6 +54,12 @@ ATTACH_RETRY_SECONDS = 60.0
 #: 顶一轮「汇总未读消息」——那一轮要开窗、拉前台、跑一分钟（真机 2026-11-04 22:04）。
 FIRST_ATTACH_WAIT_SECONDS = 30.0
 
+#: 子进程还活着、但会话表连续几轮读不出来，就当这条连接失效：结束子进程、后台重连，期间 UIA 顶着。
+#: 偶发一轮失败（解密时库正好在写，「Database changed during snapshot」）下一轮自己就好，不值得
+#: 重扫一次钥；连着几轮都不行（微信重启 / 重新登录后库文件和密钥都换了），守着旧连接只会每 3 秒
+#: 空手一轮，入站整个停摆。
+DB_FAIL_RECONNECT_ROUNDS = 3
+
 #: 多久对一次「申请过、等通过」的台账和本地联系人表（秒）。只查库、不动微信；报不出去
 #: （后端不可达）时下一趟再报，间隔别太密，免得一个人每 3 秒喊一次上报失败。
 FRIEND_CHECK_INTERVAL_SECONDS = 60.0
@@ -88,6 +94,8 @@ class DbMessageSource:
         # 本地库连上之前 UIA 已经替它跑过几轮：连上后第一轮把名单里各会话的游标直接基线到
         # 最新，不走首见切尾部——那几条 UIA 已经读过、可能也回过了，再出一遍就是重复回复。
         self._ui_rounds_before_attach = False
+        # 会话表连续读失败的轮数，到 `DB_FAIL_RECONNECT_ROUNDS` 就丢掉连接重连。
+        self._db_failures = 0
         self._wake = None  # InboundLoop.wake：连上本地库时叫醒，不用等 UIA 那一觉睡完
         self._store = store
         # UIA 替身：首次读、含媒体那一轮、名字对不上、名单外红点都委给它。
@@ -156,12 +164,39 @@ class DbMessageSource:
 
         self._attach_task = asyncio.get_running_loop().create_task(keep_trying())
 
+    async def _drop_reader(self) -> None:
+        """丢掉当前连接（子进程一并结束），后台重连；连回来重建基线。"""
+        reader, self._reader = self._reader, None
+        self._seen_sessions = None
+        self._db_failures = 0
+        close = getattr(reader, "close", None)
+        if callable(close):
+            try:
+                await asyncio.to_thread(close)  # 等子进程退出最多几秒，别卡事件循环
+            except Exception as exc:  # noqa: BLE001 —— 关不干净也照样重连
+                _local.info("结束本地库子进程时出错，照样重连", error=str(exc)[:160])
+        self._ensure_attaching()
+
+    async def _read_sessions(self) -> dict | None:
+        """读会话表；读不出来返回 None。连续 `DB_FAIL_RECONNECT_ROUNDS` 轮读不出来就丢掉连接重连。"""
+        try:
+            sessions = self._reader.sessions()
+        except Exception as exc:  # noqa: BLE001 —— 本地库这一趟读不了就这轮空手，别拖垮循环
+            self._db_failures += 1
+            _local.warning("读本地微信库会话表失败", error=str(exc)[:300], 连续失败=self._db_failures)
+            if self._db_failures >= DB_FAIL_RECONNECT_ROUNDS:
+                _local.warning("本地库连续读不出来，当连接失效：结束子进程、后台重连，暂由 UIA 顶着",
+                               连续失败=self._db_failures)
+                await self._drop_reader()
+            return None
+        self._db_failures = 0
+        return sessions
+
     async def fetch(self, account_id: str) -> list[InboundMessage]:
         if self._reader is not None and getattr(self._reader, "alive", True) is False:
             # 子进程卡死被杀 / 自己退了：丢掉它，后台重连，期间 UIA 顶着；连回来重建基线。
             _local.warning("本地库子进程没了，暂由 UIA 顶着，后台重连")
-            self._reader = None
-            self._seen_sessions = None
+            await self._drop_reader()
         if self._reader is None and self._attach_task is None and self._attach is not None:
             self._ensure_attaching()
             try:
@@ -178,12 +213,13 @@ class DbMessageSource:
         """工作时间窗外只看不收：库里有变化照样打「本地库读到新消息」，但不推游标、不出消息、
         不开窗（`InboundLoop.tick` 窗外调它）。还没连上就只在后台连，不让 UIA 顶。"""
         if self._reader is not None and getattr(self._reader, "alive", True) is False:
-            self._reader = None
-            self._seen_sessions = None
+            await self._drop_reader()
         if self._reader is None:
             self._ensure_attaching()
             return
-        sessions = self._reader.sessions()
+        sessions = await self._read_sessions()
+        if sessions is None:
+            return
         previous = self._seen_sessions
         self._seen_sessions = {name: value[0] for name, value in sessions.items()}
         if previous is not None:
@@ -195,10 +231,11 @@ class DbMessageSource:
         self._round += 1
 
         # session.db 一解就知道每个会话最后一条的 local_id 和类型，不用挨个开消息分片。
-        try:
-            sessions = self._reader.sessions()
-        except Exception as exc:  # noqa: BLE001 —— 本地库这一趟读不了就这轮空手，别拖垮循环
-            _local.warning("读本地微信库会话表失败，这一轮不出新消息", error=str(exc))
+        sessions = await self._read_sessions()
+        if sessions is None:
+            if self._reader is None:  # 刚判失效丢掉了：这一轮就由 UIA 顶上，不空等
+                self._ui_rounds_before_attach = True
+                return await self._ui.fetch(account_id)
             return []
 
         if self._ui_rounds_before_attach:
@@ -452,7 +489,13 @@ class DbMessageSource:
                 "timestamp_text": _clock_text(row["create_time"]),
             }
             inbound.append(
-                to_inbound(account_id, peer_id, raw, seq=row["local_id"], at=now)
+                # id 用微信自己的 local_id（加 db 前缀，和 UIA 的本机序号分开），时刻用库里的发送时刻：
+                # 同一条消息不管哪次读、重装没重装，报给 AI 端的 id / 正文 / 时刻都一样，
+                # AI 端当同一条认，不会冲突（生产 2026-11-09「failed to prepare turn state」）。
+                to_inbound(
+                    account_id, peer_id, raw, seq=row["local_id"], at=now,
+                    msg_id=f"{peer_id}#db{row['local_id']}", sent_at=_sent_at(row["create_time"]),
+                )
             )
         _local.info(
             "读完这个会话（本地库）",
@@ -508,6 +551,13 @@ def _hold_trailing_voice(rows: list[dict]) -> tuple[list[dict], int]:
     while cut > 0 and rows[cut - 1]["message_type"] == "voice":
         cut -= 1
     return rows[:cut], len(rows) - cut
+
+
+def _sent_at(create_time: int) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(int(create_time), timezone.utc) if create_time else None
+    except (ValueError, OSError, OverflowError):
+        return None
 
 
 def _clock_text(create_time: int) -> str:

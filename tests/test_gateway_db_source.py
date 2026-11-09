@@ -169,7 +169,12 @@ class TextTests(_Base):
         out = await self.fetch()
         self.assertEqual(self.ui.calls, [])                 # 没委回 UIA
         self.assertEqual([m.text for m in out], ["在吗", "你好啊"])
-        self.assertEqual([m.msg_id for m in out], [f"{NAME}#3", f"{NAME}#4"])
+        # id 用库里的 local_id（db 前缀，和 UIA 的本机序号分开），时刻用库里的发送时刻：同一条重读报出来一模一样。
+        self.assertEqual([m.msg_id for m in out], [f"{NAME}#db3", f"{NAME}#db4"])
+        self.assertEqual(
+            [m.sent_at for m in out],
+            [datetime.fromtimestamp(1_700_000_003, timezone.utc), datetime.fromtimestamp(1_700_000_004, timezone.utc)],
+        )
         self.assertEqual(self.store.db_cursor(ACCOUNT, NAME), 4)
 
     async def test_没有新消息返回空(self) -> None:
@@ -618,3 +623,81 @@ class WakeOnAttachTests(unittest.IsolatedAsyncioTestCase):
                 loop.stop()
                 await asyncio.wait_for(task, 2)
             self.assertIn(True, observed, "连上之后应当马上看一趟库，而不是睡满 180 秒")
+
+
+class StaleReaderReconnectTests(unittest.IsolatedAsyncioTestCase):
+    """子进程还活着、但库连着几轮读不出来（微信重启 / 重新登录后旧密钥对不上）：当连接失效，
+    结束子进程、后台重连，期间 UIA 顶着；偶发一轮失败不动它。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store = GatewayStore(Path(self._tmp.name) / "gateway.db")
+        self.stale = _FakeReader()
+        self.stale.closed = 0
+        self.stale.broken = True
+
+        def sessions():
+            if self.stale.broken:
+                raise RuntimeError("ValueError: Database page authentication failed")
+            return {}
+
+        def close():
+            self.stale.closed += 1
+
+        self.stale.sessions = sessions
+        self.stale.close = close
+        self.fresh = _FakeReader()
+        self.fresh.set_session(5)
+        self.ui = _FakeUi()
+        self.attempts = 0
+        watchlist = Watchlist()
+        watchlist.apply_backend({"only": [NAME]})
+
+        def attach():
+            self.attempts += 1
+            return self.fresh
+
+        self.source = DbMessageSource(
+            reader=self.stale, attach=attach, store=self.store, ui_source=self.ui, watchlist=watchlist,
+            clock=lambda: AT, read_unread_strangers=False,
+        )
+
+    async def test_偶发一轮失败_不重连(self) -> None:
+        self.assertEqual(await self.source.fetch(ACCOUNT), [])
+        self.stale.broken = False
+        await self.source.fetch(ACCOUNT)
+        self.stale.broken = True
+        await self.source.fetch(ACCOUNT)                     # 成功一轮清零，这又是第一次
+        await self.source.fetch(ACCOUNT)
+        self.assertIs(self.source._reader, self.stale)
+        self.assertEqual((self.stale.closed, self.attempts, self.ui.polls), (0, 0, 0))
+
+    async def test_连续失败到阈值_结束子进程重连_这一轮UIA顶上(self) -> None:
+        from wxclient.gateway import db_source
+
+        for _ in range(db_source.DB_FAIL_RECONNECT_ROUNDS - 1):
+            self.assertEqual(await self.source.fetch(ACCOUNT), [])
+        self.assertEqual(self.ui.polls, 0)
+        self.ui.returns = [_ui_msg("你好")]
+        out = await self.source.fetch(ACCOUNT)
+        self.assertEqual([m.text for m in out], ["你好"])
+        self.assertEqual(self.ui.polls, 1)
+        self.assertEqual(self.stale.closed, 1)
+        await self.source._attach_task
+        self.assertIs(self.source._reader, self.fresh)
+        self.assertEqual(self.attempts, 1)
+        self.ui.returns = []
+        self.assertEqual(await self.source.fetch(ACCOUNT), [])  # 新连接：名单游标直接基线，不重放
+        self.assertEqual(self.ui.polls, 1)
+        self.assertEqual(self.store.db_cursor(ACCOUNT, NAME), 5)
+
+    async def test_窗外observe连续失败也重连_不抛(self) -> None:
+        from wxclient.gateway import db_source
+
+        for _ in range(db_source.DB_FAIL_RECONNECT_ROUNDS):
+            await self.source.observe()
+        self.assertEqual(self.stale.closed, 1)
+        await self.source._attach_task
+        self.assertIs(self.source._reader, self.fresh)
+        self.assertEqual(self.ui.polls, 0)                   # 窗外只连，不让 UIA 顶

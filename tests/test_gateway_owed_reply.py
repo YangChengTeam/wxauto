@@ -162,3 +162,23 @@ class HandBackKeepsSeqTests(_Base):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class InstallScopedIdTests(unittest.IsolatedAsyncioTestCase):
+    """UIA 的序号是本机数的，重装（新本地库）会从 1 再数；AI 端却永久记着每个消息 id，
+    同一个 id 换了正文就整轮被拒（生产 2026-11-09）。id 带上本机安装号，新装的不会撞旧的。"""
+
+    async def test_消息id带安装号_重装后同序号也不撞(self) -> None:
+        ids = []
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("old.db", "reinstalled.db"):
+                store = GatewayStore(Path(tmp) / name)
+                runtime = _Runtime()
+                runtime.messages = [_peer("你好啊")]
+                watchlist = Watchlist()
+                watchlist.apply_backend({"only": [PEER]})
+                source = QueueMessageSource(runtime=runtime, store=store, watchlist=watchlist)
+                (message,) = await source.fetch(ACCOUNT)
+                self.assertEqual(message.msg_id, f"{PEER}#{store.install_id()}.1")
+                ids.append(message.msg_id)
+        self.assertNotEqual(ids[0], ids[1])
