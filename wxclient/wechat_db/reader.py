@@ -34,6 +34,12 @@ from . import crypto
 
 _log = structlog.get_logger(__name__)
 
+#: 同 `uia_probe.constants.WECHAT_PROCESS_NAMES`；不从那边导，免得读库子进程把 UIA 那串带进来。
+_WECHAT_PROCESS_NAMES = ("weixin.exe", "wechat.exe")
+
+#: 微信打开着的库文件路径 → 它所在的 ``db_storage`` 目录。
+_OPEN_DB = re.compile(r"^(.+?[\\/]db_storage)[\\/].+\.db(?:-wal|-shm)?$", re.IGNORECASE)
+
 #: 一条消息 `local_type` 的低 32 位才是真类型；高位是 sub_type（真机上见过
 #: 25769803825 = (6<<32)|49 这种复合值）。
 _TYPE_MASK = 0xFFFFFFFF
@@ -355,23 +361,91 @@ class WeChatDbReader:
 def locate_storages() -> list[Path]:
     """列出本机各账号的 ``db_storage`` 目录（Windows，微信 4.x），最近活跃的排前面。
 
-    走微信自己写的配置：``%APPDATA%\\Tencent\\xwechat\\config\\*.ini`` 里存着数据根，
-    根下 ``xwechat_files\\<account>\\db_storage``。换过号的机器上旧账号目录还留着
-    （真机 2026-11-04 就是一旧一新两个），所以不能要求「正好一个」：按 session.db
-    （含 -wal）最近写入时间排序，由 `build_reader` 挨个 attach，密钥对得上的才是当前登录的。
+    先问正在跑的微信：它打开着的 ``db_storage`` 库文件就是当前登录账号的，数据目录挪到
+    哪个盘都一样（`_open_storages`）。问不出来再猜（`_guessed_bases`）：微信自己写的
+    ``%APPDATA%\\Tencent\\xwechat\\config\\*.ini`` 里存着数据根，根下
+    ``xwechat_files\\<account>\\db_storage``；以及默认的「文档」目录。
+
+    换过号的机器上旧账号目录还留着（真机 2026-11-04 就是一旧一新两个），所以不能要求
+    「正好一个」：微信开着的排最前，其余按 session.db（含 -wal）最近写入时间排序，由
+    `build_reader` 挨个 attach，密钥对得上的才是当前登录的。
     """
     if os.name != "nt":
         raise ValueError("本地库读取只在 Windows 上可用")
-    configs = glob.glob(os.path.expandvars(r"%APPDATA%\Tencent\xwechat\config\*.ini"))
-    if not configs:
-        raise ValueError("未找到微信配置，请先登录电脑版微信")
-    with open(configs[0], encoding="utf-8", errors="ignore") as handle:
-        root = Path(handle.read().strip())
-    base = root / "xwechat_files"
-    storages = [p / "db_storage" for p in base.iterdir() if (p / "db_storage").is_dir()] if base.is_dir() else []
+    bases = _guessed_bases()
+    storages = _rank_storages(_open_storages(), bases)
     if not storages:
+        if not bases:
+            raise ValueError("未找到微信数据目录，请先登录电脑版微信")
         raise ValueError("未找到已登录账号的本地库")
-    return sorted(storages, key=_last_write, reverse=True)
+    return storages
+
+
+def _open_storages() -> list[Path]:
+    """正在运行的微信进程打开着的 ``db_storage`` 目录；问不出来给空（由调用方接着猜）。
+
+    只看文件句柄的路径，不读内容。问不出来的正常情形同 `uia_probe.account.probe_account`：
+    微信没在跑、进程属于别的用户、系统不让枚举已打开文件。
+    """
+    try:
+        import psutil
+
+        procs = list(psutil.process_iter(["name"]))
+    except Exception:  # noqa: BLE001 —— 探测失败不该拦住后面的猜
+        return []
+    found: dict[str, Path] = {}
+    for proc in procs:
+        try:
+            if (proc.info.get("name") or "").lower() not in _WECHAT_PROCESS_NAMES:
+                continue
+            paths = [handle.path for handle in proc.open_files()]
+        except Exception as exc:  # noqa: BLE001 —— 权限 / 进程刚退出
+            _log.debug("枚举微信打开的文件失败", error=str(exc)[:80])
+            continue
+        for path in paths:
+            hit = _OPEN_DB.match(path or "")
+            if hit and Path(hit.group(1)).is_dir():
+                found.setdefault(os.path.normcase(hit.group(1)), Path(hit.group(1)))
+    return list(found.values())
+
+
+def _guessed_bases() -> list[Path]:
+    """可能装着各账号目录的 ``xwechat_files``：每份微信配置里的数据根 + 默认「文档」目录。
+
+    以前只读第一份 ini：那份是空的、或指着已经不用的旧位置时，后面对的那份就没人看了。
+    """
+    roots: list[Path] = []
+    for config in sorted(glob.glob(os.path.expandvars(r"%APPDATA%\Tencent\xwechat\config\*.ini"))):
+        try:
+            with open(config, encoding="utf-8", errors="ignore") as handle:
+                text = handle.read(4096).strip().lstrip("﻿")
+        except OSError:
+            continue
+        if text and Path(text).is_absolute():
+            roots.append(Path(text))
+    roots.append(Path.home() / "Documents")
+    bases: dict[str, Path] = {}
+    for root in roots:
+        base = root / "xwechat_files"
+        if base.is_dir():
+            bases.setdefault(os.path.normcase(str(base)), base)
+    return list(bases.values())
+
+
+def _rank_storages(opened: Sequence[Path], bases: Sequence[Path]) -> list[Path]:
+    """微信开着的排最前，其余按最近活跃；同一个目录只留一份。"""
+    seen: dict[str, Path] = {}
+    for storage in sorted(opened, key=_last_write, reverse=True):
+        seen.setdefault(os.path.normcase(str(storage)), storage)
+    guessed: list[Path] = []
+    for base in bases:
+        try:
+            guessed.extend(p / "db_storage" for p in base.iterdir() if (p / "db_storage").is_dir())
+        except OSError:
+            continue
+    for storage in sorted(guessed, key=_last_write, reverse=True):
+        seen.setdefault(os.path.normcase(str(storage)), storage)
+    return list(seen.values())
 
 
 def build_reader() -> WeChatDbReader | None:

@@ -250,3 +250,94 @@ class BuildReaderTests(unittest.TestCase):
             WeChatDbReader, "attach", attach
         ):
             self.assertIsNone(module.build_reader())
+
+
+class LocateStoragesTests(unittest.TestCase):
+    """数据目录挪了盘、配置读不到的机器：先问正在跑的微信打开着哪些库，问不出来再猜。"""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name).resolve()
+
+    def _account(self, base: Path, name: str, mtime: int = 0) -> Path:
+        storage = base / name / "db_storage"
+        (storage / "session").mkdir(parents=True)
+        if mtime:
+            session = storage / "session" / "session.db"
+            session.touch()
+            import os
+
+            os.utime(session, (mtime, mtime))
+        return storage
+
+    @staticmethod
+    def _psutil(processes: list[tuple[str, object]]):
+        from types import SimpleNamespace
+
+        def proc(name: str, files: object):
+            def open_files():
+                if isinstance(files, Exception):
+                    raise files
+                return [SimpleNamespace(path=str(p)) for p in files]
+
+            return SimpleNamespace(info={"name": name}, open_files=open_files)
+
+        return SimpleNamespace(process_iter=lambda attrs=None: [proc(n, f) for n, f in processes])
+
+    def test_微信开着的库文件指出挪了盘的账号目录(self) -> None:
+        from unittest import mock
+
+        from wxclient.wechat_db import reader as module
+
+        mine = self._account(self.tmp / "D" / "xwechat_files", "wxid_now_ab12")
+        other = self._account(self.tmp / "E" / "xwechat_files", "wxid_other")
+        fake = self._psutil([
+            ("explorer.exe", [other / "session" / "session.db"]),
+            ("Weixin.exe", [mine / "message" / "message_0.db", mine / "session" / "session.db-wal",
+                            self.tmp / "log.txt", self.tmp / "gone" / "db_storage" / "x" / "x.db"]),
+        ])
+        with mock.patch.dict("sys.modules", {"psutil": fake}):
+            self.assertEqual(module._open_storages(), [mine])
+
+    def test_问不出来就给空不往上炸(self) -> None:
+        from unittest import mock
+
+        from wxclient.wechat_db import reader as module
+
+        denied = self._psutil([("Weixin.exe", PermissionError("denied"))])
+        with mock.patch.dict("sys.modules", {"psutil": denied}):
+            self.assertEqual(module._open_storages(), [])
+        with mock.patch.dict("sys.modules", {"psutil": None}):
+            self.assertEqual(module._open_storages(), [])
+
+    def test_每份配置都看_空的和指着没有的位置的跳过_默认文档目录兜底(self) -> None:
+        from unittest import mock
+
+        from wxclient.wechat_db import reader as module
+
+        moved = self.tmp / "D"
+        (moved / "xwechat_files").mkdir(parents=True)
+        home = self.tmp / "home"
+        (home / "Documents" / "xwechat_files").mkdir(parents=True)
+        configs = self.tmp / "config"
+        configs.mkdir()
+        (configs / "a.ini").write_text("", encoding="utf-8")
+        (configs / "b.ini").write_text(str(self.tmp / "nowhere"), encoding="utf-8")
+        (configs / "c.ini").write_text("﻿" + str(moved) + "\n", encoding="utf-8")
+        with mock.patch.object(module.glob, "glob", return_value=[str(p) for p in sorted(configs.iterdir())]), \
+                mock.patch.object(module.Path, "home", return_value=home):
+            self.assertEqual(
+                module._guessed_bases(), [moved / "xwechat_files", home / "Documents" / "xwechat_files"]
+            )
+
+    def test_微信开着的排最前_其余按最近活跃_不重复(self) -> None:
+        from wxclient.wechat_db import reader as module
+
+        base = self.tmp / "xwechat_files"
+        old = self._account(base, "wxid_old", mtime=3000)
+        now = self._account(base, "wxid_now", mtime=1000)
+        mid = self._account(base, "wxid_mid", mtime=2000)
+        (base / "all_users").mkdir()
+        self.assertEqual(module._rank_storages([now], [base]), [now, old, mid])
+        self.assertEqual(module._rank_storages([], [base, self.tmp / "missing"]), [old, mid, now])
