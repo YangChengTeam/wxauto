@@ -2409,6 +2409,29 @@ class UpdateBadgeTests(unittest.TestCase):
     def _badge(self) -> str:
         return str(self.window._update_item.cget("text")) if self.window._update_item.winfo_manager() else ""
 
+    def test_the_periodic_check_keeps_going_whoever_else_is_checking(self) -> None:
+        later: list = []
+        self.window._later = lambda ms, fn: later.append(fn)
+
+        # 后台那次还没回来，人点了「检查更新」：回来的仍算后台那次，要接着排下一趟。
+        self.window._update_manual = True
+        self.window._check_finished(None, None, False)
+        self.assertEqual(later, [self.window._auto_check])
+
+        # 定时那趟撞上正在查（被挡下）/ 正在下载：这一趟不查，但下一趟照排。
+        del later[:]
+        self.updater.check_async = lambda done: False
+        self.window._auto_check()
+        self.window._update_state = "downloading"
+        self.window._auto_check()
+        self.assertEqual(later, [self.window._auto_check] * 2)
+
+        # 人点的被挡下不排定时（那条线归后台那次管）。
+        del later[:]
+        self.window._update_state = "idle"
+        self.window.check_updates(manual=True)
+        self.assertEqual(later, [])
+
     def test_nothing_shows_until_there_is_a_newer_version(self) -> None:
         self.assertEqual(self._badge(), "")
 

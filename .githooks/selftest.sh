@@ -37,7 +37,7 @@ expect_block "改代码没升版本号"     'printf "\nX_PROBE = 1\n" >> wxclien
 
 echo "不该被拦的："
 expect_pass "纯文档改动"            'echo "# x" >> docs/gateway-plan.md; git add docs/gateway-plan.md'
-expect_pass "改代码且升了版本"      'printf "\nX_PROBE = 1\n" >> wxclient/runtime.py; v=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+" wxclient/__init__.py|head -1); sed -i "s/$v/9.9.9/" wxclient/__init__.py; git add wxclient/runtime.py wxclient/__init__.py'
+expect_pass "改代码且升了版本"      'printf "\nX_PROBE = 1\n" >> wxclient/runtime.py; v=$(grep -oE "[0-9]+\.[0-9]+\.[0-9]+" wxclient/__init__.py|head -1); sed -i.bak "s/$v/9.9.9/" wxclient/__init__.py; rm -f wxclient/__init__.py.bak; git add wxclient/runtime.py wxclient/__init__.py'
 expect_pass "wxclient 纯注释改动"   'printf "\n# 一条注释\n" >> wxclient/runtime.py; git add wxclient/runtime.py'
 expect_pass ".env.example"          'echo "K=" > .env.example; git add .env.example'
 

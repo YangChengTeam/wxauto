@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import beijing_time  # noqa: F401 —— 时间窗按本机时间比，用例按北京时间写
 from structlog.testing import capture_logs
 
 from wxclient.gateway import (
@@ -37,20 +38,25 @@ from wxclient.gateway.guard import (
     ACTION_MESSAGE,
     ACTION_MOMENTS,
 )
-from wxclient.gateway.inbound import FOLLOW_UP_DEFER, PENDING_MAX_AGE_HOURS, PENDING_MAX_ATTEMPTS, message_to_row
+from wxclient.gateway.inbound import (
+    FOLLOW_UP_DEFER,
+    PENDING_MAX_AGE_HOURS,
+    PENDING_MAX_ATTEMPTS,
+    message_to_row,
+)
 from wxclient.gateway.outbound import AUTO_TAKEOVER_REASON
 from wxclient.gateway.sessions import HUMAN_TAKEOVER
 from wxclient.gateway.wechat_io import (
     FIRST_SEEN_TAIL,
     MAX_PEERS_PER_POLL,
     MAX_PEERS_PER_QUICK_POLL,
-    preview_keys,
-    preview_matches,
-    row_time,
     QueueMessageSource,
     latest_cursor,
     legacy_message_signature,
     message_signature,
+    preview_keys,
+    preview_matches,
+    row_time,
     split_new_messages,
 )
 from wxclient.queue import TaskType

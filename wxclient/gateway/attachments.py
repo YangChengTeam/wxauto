@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import base64
 import mimetypes
-import shutil
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -208,9 +207,6 @@ class AttachmentFetcher:
         if removed:
             _log.info("清掉过期附件", 文件数=removed, 保留小时=RETENTION_HOURS)
         return removed
-
-    def drop_all(self) -> None:
-        shutil.rmtree(self._root, ignore_errors=True)
 
 
 class _suppress_oserror:

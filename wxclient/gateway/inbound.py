@@ -774,6 +774,12 @@ class InboundLoop:
             return None  # 窗外一个微信动作都不做，倒计时到点了也不会读，别给个会骗人的数
         return max(0.0, (self._next_poll_at - now).total_seconds())
 
+    async def close_source(self) -> None:
+        """服务停下时让消息源收口（本地库监听要结束它的读库子进程）；没有可收的就什么都不做。"""
+        close = getattr(self._source, "close", None)
+        if callable(close):
+            await close()
+
     def stop(self) -> None:
         self._stopped.set()
 

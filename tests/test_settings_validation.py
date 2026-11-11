@@ -210,7 +210,7 @@ class DemoModeTests(unittest.TestCase):
             self.assertEqual(validate(back), {}, "关闭极速前先恢复普通模式合法值")
 
     def test_ui_floor_matches_the_gateway_floor(self) -> None:
-        from wxclient.gateway.config import DEMO_FRIEND_FLOOR_SECONDS, DEMO_MIN_SECONDS
+        from wxclient.gateway.config import DEMO_FRIEND_FLOOR_SECONDS
 
         self.assertEqual(settings_store.DEMO_FRIEND_FLOOR_SECONDS, DEMO_FRIEND_FLOOR_SECONDS)
 

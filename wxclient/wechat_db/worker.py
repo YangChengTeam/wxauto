@@ -55,7 +55,8 @@ def serve() -> int:
     # 协议独占 stdout：日志（structlog 默认打 stdout）全改去 stderr，别把协议行搅乱。
     # 日志按 JSON（ensure_ascii）一行一条：管道上只有 ASCII，什么代码页都不会乱码（0.1.131 真机
     # 走 GBK 解成了一串 �）；父进程解开再按自己的格式打进实时日志。
-    sys.stdout = sys.stderr if sys.stderr else open(os.devnull, "w", encoding="utf-8")
+    # 进程级的 stdout 替身，活到子进程退出为止，没有可以收的地方。
+    sys.stdout = sys.stderr if sys.stderr else open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
     structlog.configure(
         processors=[structlog.processors.add_log_level, structlog.processors.JSONRenderer(ensure_ascii=True)],
         logger_factory=structlog.PrintLoggerFactory(sys.stdout),
@@ -125,7 +126,7 @@ class WorkerReader:
             try:
                 reply = self._replies.get(timeout=CALL_TIMEOUT_SECONDS)
             except queue.Empty:
-                self._process.kill()
+                _reap(self._process)
                 raise RuntimeError(f"本地库子进程 {CALL_TIMEOUT_SECONDS:g} 秒没回应，已结束它，稍后重连") from None
         if not reply:
             raise RuntimeError("本地库子进程没有回应")
@@ -164,7 +165,16 @@ class WorkerReader:
                 self._process.stdin.close()
             self._process.wait(timeout=5)
         except Exception:  # noqa: BLE001
-            self._process.kill()
+            _reap(self._process)
+
+
+def _reap(process: subprocess.Popen) -> None:
+    """结束子进程并等它退出：只 kill 不 wait，进程句柄和三根管道就一直挂着。"""
+    try:
+        process.kill()
+        process.wait(timeout=5)
+    except Exception as exc:  # noqa: BLE001 —— 收不干净也不该拦住调用方
+        _log.info("结束本地库子进程时出错", error=str(exc)[:160])
 
 
 def _forward_stderr(process: subprocess.Popen) -> None:
@@ -213,7 +223,7 @@ def build_worker_reader() -> WorkerReader | None:
     waiter.join(ATTACH_TIMEOUT_SECONDS)
     if not ready.get("ok"):
         _log.info("本地库入站不可用，回退到 UIA 轮询", 原因=str(ready.get("error") or "子进程超时没连上")[:160])
-        process.kill()
+        _reap(process)
         return None
     _log.info("已连上本地微信库（子进程）", pid=process.pid)
     return WorkerReader(process)

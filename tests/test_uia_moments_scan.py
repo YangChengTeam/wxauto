@@ -10,7 +10,8 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from tests.test_uia_moments_like import OLDER, TIMESTAMP, _Item, _LikeButton, _List
+from test_uia_moments_like import OLDER, TIMESTAMP, _Item, _LikeButton, _List
+
 from wxclient.wechat_api.uia import UiaWeChatDriver, _parse_post_text
 
 IMAGES = re.compile(r"\s包含(\d+)张图片\s")

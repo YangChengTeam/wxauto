@@ -48,6 +48,12 @@ def parse_schedule_at(raw: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.astimezone()
 
 
+def _instant(due_at: str) -> datetime:
+    """库里那串 ``due_at`` 的时刻。老行可能带着时区偏移，所以按时刻比、不比字符串。"""
+    parsed = datetime.fromisoformat(due_at)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
 class ScheduleLoop:
     """定时指令的常驻循环。
 
@@ -90,7 +96,7 @@ class ScheduleLoop:
         for account_id in self._accounts:
             for row in self._store.due_scheduled_commands(account_id, now):
                 self._store.drop_scheduled_command(row["command_id"])
-                if row["due_at"] < cutoff.isoformat():
+                if _instant(row["due_at"]) < cutoff:
                     # 迟太久就别做了——但必须说出来，静悄悄吞掉一条排期跟丢消息一样坏。
                     _log.warning(
                         "定时指令迟到太久，已放弃",

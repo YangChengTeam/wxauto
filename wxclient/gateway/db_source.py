@@ -164,6 +164,24 @@ class DbMessageSource:
 
         self._attach_task = asyncio.get_running_loop().create_task(keep_trying())
 
+    async def close(self) -> None:
+        """服务停下时收口：不再重连，把读库子进程结束掉。
+
+        不收的话每次「退出登录 → 再登录」都留下一个读库子进程（握着密钥和解密后的库镜像），
+        直到整个客户端退出才散。
+        """
+        task, self._attach_task = self._attach_task, None
+        self._attach = None  # 之后的 `_ensure_attaching` 一律不再起
+        if task is not None and not task.done():
+            task.cancel()
+        reader, self._reader = self._reader, None
+        close = getattr(reader, "close", None)
+        if callable(close):
+            try:
+                await asyncio.to_thread(close)
+            except Exception as exc:  # noqa: BLE001 —— 关不干净也不拦退出
+                _local.info("结束本地库子进程时出错", error=str(exc)[:160])
+
     async def _drop_reader(self) -> None:
         """丢掉当前连接（子进程一并结束），后台重连；连回来重建基线。"""
         reader, self._reader = self._reader, None

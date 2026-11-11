@@ -357,14 +357,15 @@ class LoginPage(tk.Frame):
     def _start(self, email: str, password: str, *, replace: bool) -> None:
         self._set_busy(True)
         self._show_error("")
-        threading.Thread(target=self._work, args=(email, password, replace),
+        # tk 变量在 tk 线程里读好再交给后台线程（`_work` 一律不碰控件）。
+        threading.Thread(target=self._work, args=(email, password, replace, bool(self._remember.get())),
                          name="wx-ui-login", daemon=True).start()
 
-    def _work(self, email: str, password: str, replace: bool) -> None:
+    def _work(self, email: str, password: str, replace: bool, remember: bool) -> None:
         """后台线程：登录。**这里一律不碰控件**，结果 after 回 tk 线程。"""
         try:
             identity = self._auth.login(email, password, replace_existing=replace,
-                                        remember=self._remember.get())
+                                        remember=remember)
         except AuthError as exc:
             # 先把话取出来再进 lambda：except 块一结束 Python 就把 exc 删了，
             # 闭包里再去读它拿到的是 NameError（ruff F821 当场抓到过）。

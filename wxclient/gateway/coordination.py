@@ -100,7 +100,3 @@ def build_delivery_context(
     while len(rows) > first + 1 and sum(len(row["text"]) for row in rows) > MAX_BATCH_TEXT:
         del rows[first]
     return {"messages": rows}
-
-
-def has_user_text(context: dict[str, Any]) -> bool:
-    return any(row.get("source_kind") == "user" for row in context.get("messages") or [])

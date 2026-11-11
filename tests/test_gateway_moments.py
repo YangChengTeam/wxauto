@@ -12,6 +12,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import beijing_time  # noqa: F401 —— 时间窗按本机时间比，用例按北京时间写
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from wxclient.gateway import GatewayStore
@@ -29,10 +31,11 @@ POSTS = (
 
 
 class _Runtime:
-    def __init__(self, result=None, status="succeeded", boom=False):
+    def __init__(self, result=None, status="succeeded", boom=False, timed_out=False):
         self._result = result
         self._status = status
         self._boom = boom
+        self._timed_out = timed_out
         self.calls: list[tuple] = []
 
     async def submit(self, task_type, payload, *, confirmation=""):
@@ -45,6 +48,8 @@ class _Runtime:
                 "dry_run": False, "posts": list(POSTS), "liked": min(2, int(payload.get("like_limit", 0))),
                 "already_liked": 0, "scanned": 3, "first_key": "张三今天招工", "stopped": "older",
             }
+        if self._timed_out:  # `WeChatRuntime.wait_for_task` 超时的形状：状态还没终结 + timed_out
+            return {"status": "running", "result": None, "timed_out": True}
         return {"status": self._status, "result": result}
 
 
@@ -179,6 +184,13 @@ class MomentsWatcherTests(unittest.IsolatedAsyncioTestCase):
         posts = await self.watcher(runtime, on_new_posts=boom).tick()
         self.assertEqual(len(posts), 3)
         self.assertEqual(self.store.moment_cursor(ACCOUNT), "张三今天招工")
+
+    async def test_等超时_可能已经点了几下_占住的额度不还(self) -> None:
+        posts = await self.watcher(_Runtime(timed_out=True)).tick()
+        self.assertEqual(posts, [])
+        used = self.store.sends_since(ACCOUNT, self.now - timedelta(days=1), action=ACTION_MOMENTS_LIKE)
+        self.assertGreater(used, 0, "超时不等于没点：宁多记不少记")
+        self.assertEqual(self.store.moment_cursor(ACCOUNT), "", "没结论不前移游标")
 
 
 if __name__ == "__main__":

@@ -692,6 +692,14 @@ class StaleReaderReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.ui.polls, 1)
         self.assertEqual(self.store.db_cursor(ACCOUNT, NAME), 5)
 
+    async def test_服务停下时结束读库子进程_之后不再重连(self) -> None:
+        await self.source.close()
+        self.assertEqual(self.stale.closed, 1)
+        self.assertIsNone(self.source._reader)
+        self.source._ensure_attaching()
+        self.assertIsNone(self.source._attach_task)
+        self.assertEqual(self.attempts, 0)
+
     async def test_窗外observe连续失败也重连_不抛(self) -> None:
         from wxclient.gateway import db_source
 

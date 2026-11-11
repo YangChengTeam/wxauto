@@ -1865,6 +1865,7 @@ class GatewayRunner:
             _ai.warning("退出时还有未收口的轮次，已放弃", turns=abandoned)
         await self._drain_message_events()
         await self._pool.close_all()
+        await self.loop.close_source()
 
     async def _drain_message_events(self) -> None:
         """退出前把发件箱再清一次（有上限）。

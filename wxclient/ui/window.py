@@ -1389,6 +1389,8 @@ class MainWindow:
             self._later(CHECK_INTERVAL_SECONDS * 1000, self._auto_check)
             return
         if self._update_state in ("downloading", "installing"):
+            # 这一趟不查，但定时这条线不能断：下载要是失败了，之后还得有人接着查。
+            self._later(CHECK_INTERVAL_SECONDS * 1000, self._auto_check)
             return
         self.check_updates(manual=False)
 
@@ -1404,18 +1406,26 @@ class MainWindow:
         if manual:
             self._note_update("正在检查更新…", theme.TEXT_MUTED)
 
+        # 这一次查是谁发起的跟着这次请求走：后台那次还没回来时人点了「检查更新」，回来的仍是
+        # 后台那次——按「人点的」处理就没人再排下一趟，定时检查从此停掉。
         def done(release: Release | None, error: UpdateError | None) -> None:
-            self._hop(lambda: self._check_finished(release, error))
+            self._hop(lambda: self._check_finished(release, error, manual))
 
         if not self._updater.check_async(done):
-            return  # 后台已经在查了，等它回来
+            # 已经有一次在查了，等它回来。定时那趟被挡下时要自己排下一趟——回来的那次若是人点的，不会替它排。
+            if not manual:
+                self._later(CHECK_INTERVAL_SECONDS * 1000, self._auto_check)
+            return
         if self._update_state == "idle":
             self._update_state = "checking"
 
-    def _check_finished(self, release: Release | None, error: UpdateError | None) -> None:
+    def _check_finished(
+        self, release: Release | None, error: UpdateError | None, manual: bool | None = None,
+    ) -> None:
         if self._destroyed:
             return
-        manual = self._update_manual
+        if manual is None:
+            manual = self._update_manual
         if error is not None:
             if self._update_state == "checking":
                 self._update_state = "idle"

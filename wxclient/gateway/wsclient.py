@@ -284,15 +284,6 @@ class AgentWsClient:
         """
         return await self._request("wechat.watchlist.sync", {})
 
-    async def remove_watchlist(self, names: list[str]) -> dict[str, Any]:
-        """把这几个会话移出自动回复名单。返回 AI 端说的 ``{removed, watching, blocked}``。
-
-        **删除必须发生在 AI 端**：名单的权威在那儿，推一次覆盖一次——本机删掉只能撑到
-        下一次推送，删了立刻又回来。这里等回应（`_request`），因为界面要照实话回复
-        「删掉了没有」，而不是发完就说成了。
-        """
-        return await self._request("wechat.watchlist.remove", {"names": names})
-
     # ────────────────────────── 内部 ──────────────────────────
 
     async def ping(self) -> None:

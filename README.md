@@ -10,7 +10,7 @@ Windows 微信自动化网关，服务于劳小智招聘业务：把入站微信
 - 确定性守门：频次上限、工作时间窗、候选人级人工接管（AI 端判对方拒绝 / 不再找工作时提案接管；本机拉黑 2026-10-09 已拆）
 - 发送消息、加好友、监听会话、读取可见消息、发布朋友圈
 - 只读探测微信 UIA 可用性
-- 桌面端：登录 → 拉参数 → 托盘常驻 + 实时日志 + 配置中心
+- 桌面端：登录 → 托盘常驻 + 实时日志 + 配置中心（参数都在本机配置中心里，后端不下发）
 - SQLite 任务记录、同类待执行任务去重、单 worker 串行操作微信
 - 真实动作三重确认（`--allow-real-actions` + `dry_run=false` + 确认短语）
 
@@ -205,8 +205,9 @@ Windows runner 还按 **2 倍**分钟计费。所以触发面只开了这一个�
 包大小约 **68 MB**，双击到窗口出来 **4.5 秒**（2026-08-14 真机实测那版是 61.8 MB /
 1702 文件；2026-08-13 那版是 125.8 MB / 12.3 秒）。砍的都是「一处都没 import」的整块：
 OpenCV 138MB（`pyautogui → pyscreeze` 拖进来，只有模糊图像匹配 `confidence=` 才用得上，
-本仓找元素走 UIA 控件树）、numpy+openblas 28MB、cryptography 9.2MB、PIL 的 AVIF 编解码器
+本仓找元素走 UIA 控件树）、numpy+openblas 28MB、PIL 的 AVIF 编解码器
 7.8MB、aioquic 全家 4.6MB，逐条理由写在 spec 的 `excludes` 里。
+（cryptography 曾在这张表里，0.1.121 起本地库入站要用它解库，已放回包里——别再砍。）
 **要做图像匹配就得先把 `cv2` 那行删掉；要做语音消息就得先把 `numpy/soundfile/sounddevice`
 那行删掉**（对应地，`third_party/pywechat` 里那两处音频 import 已改成用到时再 import）。
 
@@ -257,6 +258,7 @@ wxclient/
   queue/        # SQLite 任务与单消费者 worker
   wechat_api/   # pyweixin 二次封装
   uia_probe/    # 只读 UIA 状态探测
+  wechat_db/    # 只读读取微信本地库（入站监听的主路径，在子进程里跑）
   config/       # Windows 微信运行参数
 ```
 

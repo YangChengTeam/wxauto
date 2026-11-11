@@ -1217,17 +1217,6 @@ class GatewayStore:
             int(version), int(mode_version), trigger_id, now, reported_at,
         )
 
-    def mark_candidate_mode_reported(
-        self, account_id: str, session_name: str, at: str | None = None,
-    ) -> None:
-        """回报成功了。只动 `reported_at`——状态本身不许在这里被改写。"""
-        with closing(self._connect()) as conn:
-            conn.execute(
-                "UPDATE gateway_candidate_mode SET reported_at=? WHERE account_id=? AND session_name=?",
-                (at or _utcnow().isoformat(), account_id, session_name),
-            )
-            conn.commit()
-
     # ────────────────────────── 旧黑名单（只剩迁移）──────────────────────────
     #
     # ★ 本机拉黑 2026-10-09 整个拆掉（用户：「不应该有拉黑的情况」）。原来 AI 端判对方拒绝 →
@@ -1396,27 +1385,35 @@ class GatewayStore:
                 (
                     command_id, account_id,
                     json.dumps(payload, ensure_ascii=False),
-                    due_at.isoformat(), (at or _utcnow()).isoformat(),
+                    due_at.astimezone(timezone.utc).isoformat(), (at or _utcnow()).isoformat(),
                 ),
             )
             conn.commit()
 
     def due_scheduled_commands(self, account_id: str, now: datetime) -> list[dict]:
-        """已经到点的那些，最早的排前面。"""
+        """已经到点的那些，最早的排前面。
+
+        按**时刻**比，不比字符串：`schedule_at` 带着对方给的时区偏移（东八区的 09:00+08:00），
+        跟 UTC 的「现在」比字符串会晚整整一个偏移量才到点。新行存的已是 UTC，这里解析后再比
+        是为了老行（带偏移存下的）也对。表里只有还没到点的那几条，全取出来比不贵。
+        """
         with closing(self._connect()) as conn:
             rows = conn.execute(
-                "SELECT command_id, payload, due_at FROM gateway_scheduled_commands "
-                "WHERE account_id=? AND due_at<=? ORDER BY due_at",
-                (account_id, now.isoformat()),
+                "SELECT command_id, payload, due_at FROM gateway_scheduled_commands WHERE account_id=?",
+                (account_id,),
             ).fetchall()
-        out = []
+        due = []
         for row in rows:
             try:
                 payload = json.loads(row[1])
+                at = datetime.fromisoformat(row[2])
             except ValueError:
                 continue
-            out.append({"command_id": row[0], "payload": payload, "due_at": row[2]})
-        return out
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            if at <= now:
+                due.append((at, {"command_id": row[0], "payload": payload, "due_at": row[2]}))
+        return [item for _, item in sorted(due, key=lambda pair: pair[0])]
 
     def drop_scheduled_command(self, command_id: str) -> None:
         with closing(self._connect()) as conn:

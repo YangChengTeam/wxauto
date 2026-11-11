@@ -39,6 +39,7 @@ _TASK_LABELS = {
     "watch_chats": "监听多个会话",
     "read_chat_sessions": "读取会话列表",
     "read_chat_history": "读取聊天记录",
+    "save_message_attachment": "保存消息附件",
     "read_visible_messages": "读取可见消息",
     "post_moments": "发布朋友圈",
     "read_recent_moments": "读取最近朋友圈",
@@ -47,7 +48,7 @@ _TASK_LABELS = {
     "scan_moments": "朋友圈巡看",
 }
 
-#: 日志目录里留多少天。半个月足够回溯一次「上周三那单怎么回事」，又不会把盘吃掉。
+#: 日志目录里留多少天。一个月足够回溯一次「上周三那单怎么回事」，又不会把盘吃掉。
 KEEP_DAYS = 30
 
 

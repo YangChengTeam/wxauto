@@ -86,6 +86,7 @@ wxclient/
   queue/        # [FROZEN] SQLite tasks + single-consumer worker
   wechat_api/   # [FROZEN] pyweixin wrapper
   uia_probe/    # [FROZEN] read-only UIA state probing
+  wechat_db/    # read-only local database reader (the primary inbound path, §4.3), runs in a child process
   config/       # WeChat runtime parameters
 third_party/pywechat/pyweixin/   # vendored; the package that actually drives WeChat
 docs/gateway-plan.md             # gateway implementation checklist
@@ -402,7 +403,8 @@ document — do not invent fields locally.**
 - There is exactly one parameter file, `gateway.env` (the client endpoints push no configuration; the old
   `gateway.remote.env` layer is gone). **The UI contains not a single credential**, and the WeChat ID is no
   longer transcribed by hand — accounting uses the `agent.id` returned by login.
-- "Remember my email" remembers the email only, never the password.
+- "记住登录状态" remembers the email **and the password** (user ruling 2026-08-15), both protected with
+  DPAPI like the token — see the header of `wxclient/ui/token_store.py`. Never in a plaintext config or a log.
 - **Nothing starts before login**: the service starts in `__main__.start_service()` and nowhere else.
 - **"Log out" is "stop the service", and there is only this one** (stop the gateway + revoke the server
   session + return to the login page). The window sidebar and the tray menu must agree; the tray menu is

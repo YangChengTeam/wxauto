@@ -223,6 +223,12 @@ class AddFriendReturnsTheNameTests(unittest.TestCase):
         patcher = mock.patch("wxclient.tuning.PROFILE_WAIT_SECONDS", 0.05)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # 拟人停顿、等窗口的 sleep 同理：照真等的话这一个类要跑一分半（整套用例的八成时间）。
+        from wxclient.wechat_api import uia
+
+        sleeper = mock.patch.object(uia.time, "sleep")
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
 
     def _driver(self, profile_exists: bool = True, add_button_exists: bool = True,
                 send_button_exists: bool = False, profile_text: str | None = None,

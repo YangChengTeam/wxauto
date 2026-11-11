@@ -163,15 +163,15 @@ class MomentsWatcher:
             _log.warning("moments.poll.failed", account=account_id, error=str(exc)[:160])
             return []
         status = str((raw or {}).get("status") or "succeeded")
-        if status != "succeeded":
+        if status != "succeeded" or (raw or {}).get("timed_out"):
             # 超时：微信那边可能已经点了几下，按占住的算，宁多记不少记；其余全额还回。
-            if status == "timed_out":
+            if (raw or {}).get("timed_out"):
                 reservation.settle(reservation.granted)
             else:
                 reservation.release()
             _log.warning(
                 "moments.poll.failed", account=account_id,
-                error=str((raw or {}).get("error") or status)[:160],
+                error=str((raw or {}).get("last_error") or status)[:160],
             )
             return []
 

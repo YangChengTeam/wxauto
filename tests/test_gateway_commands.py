@@ -9,11 +9,12 @@ import base64
 import json
 import tempfile
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, ClassVar
 
+import beijing_time  # noqa: F401 —— 时间窗按本机时间比，用例按北京时间写
 from structlog.testing import capture_logs
 
 from wxclient.gateway import CommandExecutor, GatewayStore, OutboundGuard
@@ -979,6 +980,24 @@ class ScheduleLoopTests(unittest.IsolatedAsyncioTestCase):
         self._schedule(WORKDAY + timedelta(hours=2))
         self.assertEqual(await self._loop().tick(), 0)
         self.assertEqual(self.fired, [])
+        self.assertEqual(self.store.count_scheduled_commands(), 1)
+
+    async def test_due_is_compared_as_an_instant_not_as_a_string(self) -> None:
+        # 对方给的是东八区的时刻，本机的「现在」是 UTC：比字符串的话 13:55+08:00 > 06:00+00:00，
+        # 要晚八小时才到点。老行（带偏移存下的）同样要认。
+        self.now = WORKDAY.astimezone(timezone.utc)
+        self._schedule(WORKDAY - timedelta(minutes=5))
+        with closing(self.store._connect()) as conn:
+            conn.execute(
+                "INSERT INTO gateway_scheduled_commands (command_id, account_id, payload, due_at, created_at) "
+                "VALUES (?,?,?,?,?)",
+                ("legacy", ACCOUNT, json.dumps({"command_id": "legacy", "op": "send_message",
+                                               "args": {"to": "王建国", "text": "老行"}}),
+                 (WORKDAY - timedelta(minutes=10)).isoformat(), self.now.isoformat()),
+            )
+        self._schedule(WORKDAY + timedelta(minutes=5), "later")
+        self.assertEqual(await self._loop().tick(), 2)
+        self.assertEqual([p["args"]["text"] for p in self.fired], ["老行", "提醒您明天面试"])
         self.assertEqual(self.store.count_scheduled_commands(), 1)
 
     async def test_due_fires_once_and_is_cleared(self) -> None:
