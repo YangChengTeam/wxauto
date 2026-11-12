@@ -84,8 +84,9 @@ class InboundMessage:
     """这条在微信里**读到的原始文字**（图片气泡就是「图片」两个字，不是 ``text`` 里的占位句）。
     只为下一次从微信读回同一条时认得出来（`GatewayStore.recent_raw_keys`），不喂给 AI 端。"""
     first_contact: bool = False
-    """True = 这个会话**不在监听名单里**，是看到红点数才去读的（`wechat_io._unread_strangers`，
-    用户 2026-09-28）。这一轮要带 `first_contact` 给 AI 端：判不出在找工作就一条都不发（spec 090）。"""
+    """这一轮带 `first_contact` 给 AI 端（spec 090 的陌生人首次接触口径）。原来由「名单外挂红点的
+    单聊」那条窄路置位；那条路 2026-11-12 整条拆掉（名单外一概静默），本机现在不会再置它。字段留着
+    是因为落盘的待处理批次和 AI 端协议里都有这一项。"""
     sent_at: datetime | None = None
     """这条在微信里**真实的发送时刻**（本地库的 ``create_time``）；UIA 读不出带日期的时刻，留 None。
 

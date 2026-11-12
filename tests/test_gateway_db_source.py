@@ -124,7 +124,6 @@ class _Base(unittest.IsolatedAsyncioTestCase):
             ui_source=self.ui,
             watchlist=watchlist,
             clock=lambda: AT,
-            read_unread_strangers=False,
         )
 
     async def fetch(self) -> list[InboundMessage]:
@@ -292,49 +291,34 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class StrangerScanTests(_Base):
-    """名单外红点仍走 UIA，但只在本地库看到名单外单聊新挂上红点时才扫（每扫一次就拉一次前台）。"""
+class UnlistedSilenceTests(_Base):
+    """名单外的会话一概静默（用户 2026-11-12：「在库中才进行回复，其它进行静默」）：
+    库里看到它有新消息、挂着红点，也不读、不开窗、不交给 UIA。"""
 
     def setUp(self) -> None:
         super().setUp()
-        self.source._read_unread = True
         self.store.set_db_cursor(ACCOUNT, NAME, 5)
         self.reader.set_session(5)
 
-    async def test_没有红点就从不扫_首轮也不扫(self) -> None:
+    async def test_名单外单聊来新消息挂红点_不读不开窗(self) -> None:
         self.reader._sessions["wxid_other"] = (10, "text")
-        for _ in range(3):
-            await self.fetch()
-        self.assertEqual(self.ui.stranger_scans, 0)
-
-    async def test_启动时就挂着的红点只建基线_不扫(self) -> None:
-        self.reader._sessions["wxid_other"] = (10, "text")
-        self.reader.unread = {"wxid_other": 1}
-        for _ in range(3):
-            await self.fetch()
-        self.assertEqual(self.ui.stranger_scans, 0)
-
-    async def test_名单外单聊来新消息挂红点才扫(self) -> None:
-        self.reader._sessions["wxid_other"] = (10, "text")
-        await self.fetch()
-        self.reader._sessions["wxid_other"] = (11, "text")  # 自己发的：涨了但没红点
         await self.fetch()
         self.reader._sessions["wxid_other"] = (12, "text")
-        self.reader.unread = {"wxid_other": 1}
-        await self.fetch()
-        self.reader._sessions["wxid_new"] = (1, "text")  # 新冒出来的会话也算
+        self.reader.unread = {"wxid_other": 2}
+        self.reader._sessions["wxid_new"] = (1, "text")  # 新冒出来的会话同样不理
         self.reader.unread["wxid_new"] = 1
-        await self.fetch()
-        self.assertEqual(self.ui.stranger_scans, 2)
+        self.assertEqual(await self.fetch(), [])
+        self.assertEqual((self.ui.polls, self.ui.stranger_scans), (0, 0))
+        self.assertFalse(hasattr(self.source, "_stranger_activity"))
 
-    async def test_名单内或群和公众号的红点不触发扫描(self) -> None:
-        self.reader._sessions["123@chatroom"] = (1, "text")
-        self.reader._sessions["gh_abc"] = (1, "text")
-        self.reader.unread = {"123@chatroom": 3, "gh_abc": 5, USER: 1, "brandsessionholder": 2}
+    async def test_名单里的照常读(self) -> None:
+        self.reader._sessions["wxid_other"] = (10, "text")
+        self.reader.unread = {"wxid_other": 3}
         self.reader.set_session(6)
         self.reader.set_rows([_row(6, "在吗")])
-        await self.fetch()
-        self.assertEqual(self.ui.stranger_scans, 0)
+        got = await self.fetch()
+        self.assertEqual([m.text for m in got], ["在吗"])
+        self.assertEqual({m.peer_id for m in got}, {NAME})
 
 
 class PendingFriendTests(_Base):
@@ -471,7 +455,7 @@ class AttachLaterTests(unittest.IsolatedAsyncioTestCase):
 
         self.source = DbMessageSource(
             attach=attach, store=self.store, ui_source=self.ui, watchlist=watchlist,
-            clock=lambda: AT, read_unread_strangers=False,
+            clock=lambda: AT,
         )
 
     async def _settle(self) -> None:
@@ -538,7 +522,7 @@ class FirstAttachWaitTests(unittest.IsolatedAsyncioTestCase):
             watchlist = Watchlist()
             watchlist.apply_backend({"only": [NAME]})
             source = DbMessageSource(attach=attach, store=store, ui_source=ui, watchlist=watchlist,
-                                     clock=lambda: AT, read_unread_strangers=False)
+                                     clock=lambda: AT)
             await source.fetch(ACCOUNT)
             self.assertEqual(ui.polls, 0)
             self.assertEqual(source.fixed_poll_interval_seconds, 3.0)
@@ -596,7 +580,7 @@ class WakeOnAttachTests(unittest.IsolatedAsyncioTestCase):
             reader, ui = _FakeReader(), _FakeUi()
             gate = {"ready": False}
             source = DbMessageSource(attach=lambda: reader if gate["ready"] else None, store=store,
-                                     ui_source=ui, clock=lambda: AT, read_unread_strangers=False)
+                                     ui_source=ui, clock=lambda: AT)
             observed = []
             real = source.observe
 
@@ -660,7 +644,7 @@ class StaleReaderReconnectTests(unittest.IsolatedAsyncioTestCase):
 
         self.source = DbMessageSource(
             reader=self.stale, attach=attach, store=self.store, ui_source=self.ui, watchlist=watchlist,
-            clock=lambda: AT, read_unread_strangers=False,
+            clock=lambda: AT,
         )
 
     async def test_偶发一轮失败_不重连(self) -> None:

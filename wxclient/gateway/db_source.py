@@ -16,8 +16,8 @@
   **这个会话这一轮整段委回 UIA**（`QueueMessageSource.read_peer`）——语音转写、附件
   另存、查无此人计数都照 UIA 那套走。委回时 `local_id` 游标基线前移，两条链路不会
   同时对同一条消息出手。
-- **首次接入 / 名字对不上 / 名单外红点**：一律交 UIA（首见只认尾部今天、对方发的那几条；
-  名字对不上触发加好友；红点扫描是名单外的窄路）。
+- **首次接入 / 名字对不上**：一律交 UIA（首见只认尾部今天、对方发的那几条；名字对不上触发加好友）。
+- **名单外的会话**：库里看到有新消息只打日志，不读、不开窗、不回（用户 2026-11-12）。
 
 ## 待真机验收
 
@@ -86,7 +86,6 @@ class DbMessageSource:
         ui_source: QueueMessageSource,
         watchlist: Watchlist | None = None,
         clock=None,
-        read_unread_strangers: bool = True,
     ) -> None:
         self._reader = reader
         self._attach = attach
@@ -98,14 +97,13 @@ class DbMessageSource:
         self._db_failures = 0
         self._wake = None  # InboundLoop.wake：连上本地库时叫醒，不用等 UIA 那一觉睡完
         self._store = store
-        # UIA 替身：首次读、含媒体那一轮、名字对不上、名单外红点都委给它。
+        # UIA 替身：首次读、含媒体那一轮、名字对不上都委给它。
         self._ui = ui_source
         self._watchlist = watchlist or Watchlist()
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._read_unread = bool(read_unread_strangers)
         self._round = 0
         self._paused_peers: set[str] = set()
-        # 上一轮各会话最后一条的 local_id；名单外单聊涨了才去 UIA 扫红点（None = 还没建基线）。
+        # 上一轮各会话最后一条的 local_id，只用来打「读到新消息」的日志（None = 还没建基线）。
         self._seen_sessions: dict[str, int] | None = None
         # 归 UIA 的会话上次委回时库里最后一条的 local_id：没涨就不再开窗（3 秒一轮，
         # 不能为一个停在图片上的会话每轮开一次窗）。只在内存里，重启后至多多委回一次。
@@ -285,14 +283,8 @@ class DbMessageSource:
         for peer_id in watched:
             collected.extend(await self._fetch_watched(account_id, peer_id, sessions))
 
-        # 名单外挂红点的单聊仍走 UIA 的窄路（名单只认同步，这里不接管）。但只在本地库看到
-        # 名单外单聊真挂着红点、且是新来的时才开：每轮都扫就是每轮把微信拉到前台，省掉开窗
-        # 等于白省（真机 2026-11-04：5 秒一轮「汇总未读消息」+「已把微信窗口拉回前台」）。
-        if self._read_unread and self._stranger_activity(previous, listed, sessions):
-            try:
-                collected.extend(await self._ui.read_unread_strangers(account_id, listed))
-            except Exception as exc:  # noqa: BLE001
-                _local.warning("名单外红点扫描失败，这一轮跳过", error=str(exc))
+        # ★ 名单外的会话到此为止：库里看到它有新消息只打一条日志（上面 `_log_new_messages`），
+        #   不读、不开窗、不回（用户 2026-11-12：「在库中才进行回复，其它进行静默」）。
         return collected
 
     def _log_new_messages(self, previous: dict[str, int], sessions: dict, listed: Sequence[str]) -> None:
@@ -344,7 +336,7 @@ class DbMessageSource:
         """台账里等通过的人，本地联系人表里已经是好友了 → 交给 runner 当场上报 accepted。
 
         补的洞（周彪 2026-11-06）：对方在客户端关着时通过了申请，开机后他那条消息算基线、
-        名单外红点不扫，「收到他的消息 = 他通过了」那条路就不会走；搜索复查又是 15 分钟
+        名单外的会话又一概不读，「收到他的消息 = 他通过了」那条路走不到；搜索复查又是 15 分钟
         才查一个人、只在期限内。业务端那边他一直是 requested，进不了监听，首次触达也发不出。
         contact 表是微信自己写的，查它不动微信，所以每分钟把台账整本对一遍。
         """
@@ -371,27 +363,6 @@ class DbMessageSource:
                     await result
             except Exception as exc:  # noqa: BLE001 —— 一个人报不出去不拖累别人
                 _local.warning("申请过的人已是好友，但上报出错，下一趟再报", error=str(exc)[:160])
-
-    def _stranger_activity(self, previous: dict[str, int] | None, listed: Sequence[str], sessions: dict) -> bool:
-        """名单外的单聊有没有「新来的红点」：未读 > 0，且这个会话是新冒出来的或 local_id 涨了。
-
-        首轮只建基线、不扫：启动时就挂着的红点多半是放了很久的服务号/企业微信（真机
-        2026-11-04：招行、微信团队、一个 @openim，各挂着几条），为它们开一次窗就是一次
-        拉前台。读不到未读数也不扫——入站发现新消息只靠本地库，不拿 UIA 兜底轮询。
-        """
-        if previous is None:
-            return False
-        try:
-            unread = self._reader.unread_counts()
-        except Exception as exc:  # noqa: BLE001
-            _local.warning("读本地库未读数失败，这一轮不扫名单外红点", error=str(exc))
-            return False
-        listed_users = {self._resolve(peer_id, sessions) for peer_id in listed}
-        return any(
-            sessions.get(name, (0, None))[0] > previous.get(name, 0)
-            for name in unread
-            if name not in listed_users and _is_direct_chat(name)
-        )
 
     def _drop_handed_off(
         self, account_id: str, watched: Sequence[str], sessions: dict

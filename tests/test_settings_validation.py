@@ -303,22 +303,19 @@ class SpeedKnobTableTests(unittest.TestCase):
 
     def test_apply_on_then_off_restores_the_originals(self) -> None:
         from wxclient import tuning
-        from wxclient.gateway import runner, schedule, wechat_io
+        from wxclient.gateway import runner, schedule
 
         on = {tuning.TOGGLE_KEY: "1",
-              "WXCLIENT_GATEWAY_DEMO_MAX_UNREAD_STRANGERS_PER_POLL": "15",
               "WXCLIENT_GATEWAY_DEMO_CONTACTS_SYNC_INTERVAL_SECONDS": "7",
               "WXCLIENT_GATEWAY_DEMO_PAUSE_SCALE": "0"}
         try:
             changed = tuning.apply(on)
-            self.assertEqual(wechat_io.MAX_UNREAD_STRANGERS_PER_POLL, 15)
             self.assertEqual(runner.CONTACTS_SYNC_INTERVAL_SECONDS, 7.0)
             self.assertEqual(tuning.PAUSE_SCALE, 0.0)
             self.assertEqual(schedule.CHECK_INTERVAL_SECONDS, 5.0, "没填的用极速默认值")
-            self.assertIn("MAX_UNREAD_STRANGERS_PER_POLL", changed)
+            self.assertIn("CONTACTS_SYNC_INTERVAL_SECONDS", changed)
         finally:
             self.assertEqual(tuning.apply({}), {})
-        self.assertEqual(wechat_io.MAX_UNREAD_STRANGERS_PER_POLL, 3)
         self.assertEqual(runner.CONTACTS_SYNC_INTERVAL_SECONDS, 120.0)
         self.assertEqual(tuning.PAUSE_SCALE, 1.0)
         self.assertEqual(schedule.CHECK_INTERVAL_SECONDS, 30.0)

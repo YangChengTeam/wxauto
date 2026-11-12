@@ -89,7 +89,7 @@
    这一步就知道「谁有新动静」，**不用开窗、不用解各个消息分片**。
 2. 名单里**人工接管中**的会话这轮不读，顺手把它们的 `local_id` 游标推到最新（交回分身时不回放老师打的那串）。
 3. 对每个要读的会话，按 §4.2 判定归属、产出 `InboundMessage`。
-4. 名单外挂红点的陌生人仍交 UIA 的窄路扫（`QueueMessageSource.read_unread_strangers`）。但**只在 session.db 显示名单外单聊挂着红点（`unread_count > 0`）且是新来的（新会话或 local_id 涨了）时才扫**，首轮只建基线不扫（启动时就挂着的多是服务号、企业微信的陈年红点）；群、公众号、文件传输助手不算。每扫一次就会把微信拉到前台，每轮都扫等于没省（0.1.125）。
+4. 名单外的会话一概静默：库里看到它有新消息只打一条日志，不读、不开窗、不回（用户 2026-11-12；原来「名单外挂红点的单聊交 UIA 开窗读」那条窄路 0.1.142 整条拆掉）。
 
 ### 4.2 一个会话这一轮归谁（核心：同一时刻只归一条链路，不重不漏）
 
@@ -256,7 +256,7 @@ wxclient/wechat_db/              ← 新：本地库只读
   reader.py    会话变化探测 / local_id 取新消息 / 名字映射 / locate_storages+attach+build_reader(回退)
 gateway/
   db_source.py 新：DbMessageSource（归属判定、委回、游标），实现 MessageSource
-  wechat_io.py 老 UIA 源；新增 read_peer / read_unread_strangers 两个公开口给委回
+  wechat_io.py 老 UIA 源；新增 read_peer 这个公开口给委回
   factory.py   选源：DB 优先，扫不到回退 UIA
   config.py    （0.1.128 删了 use_local_db 开关：没有不走本地库的选项）
   sessions.py  gateway_db_cursors 表 + db_cursor / set_db_cursor

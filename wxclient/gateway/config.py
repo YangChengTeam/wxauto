@@ -158,11 +158,6 @@ class GatewaySettings(BaseSettings):
     到期不是「判定他不会通过」，只是**别让他一直占住每轮那一个名额**——名额被占住，
     后面新申请的人就一直排不上。"""
 
-    read_unread_strangers: bool = True
-    """全量巡检那一轮顺带看一眼红点数：**不在名单里**、挂着红点的单聊开窗读，交 AI 端判断是不是
-    来找工作的（用户 2026-09-28）。群、服务号/公众号、人工接管中的一律不读；
-    每轮最多开 ``wechat_io.MAX_UNREAD_STRANGERS_PER_POLL`` 个。**不往名单里加人**（名单只认同步）。
-    **默认开**，关掉＝名单外的消息一概不看（0.1.89 及以前的行为）。"""
 
     debounce_seconds: float = 3.0
 

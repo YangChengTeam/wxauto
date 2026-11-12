@@ -52,8 +52,6 @@ KNOBS: tuple[Knob, ...] = (
          "3", "1", "settings:debounce_seconds", minimum=0),
     # 「正聊着的时长 / 每轮读几个会话 / 正聊着每轮几个」0.1.128 删了：入站改本地库监听，
     # 不再按名单开窗轮询，这三格只管 UIA 开窗那条路（`settings_store._RETIRED_KEYS` 清老键）。
-    Knob("MAX_UNREAD_STRANGERS_PER_POLL", "每轮看几个陌生人", "名单外有红点的单聊", "个", "demo_wait",
-         "3", "8", "wxclient.gateway.wechat_io:MAX_UNREAD_STRANGERS_PER_POLL", kind="int"),
     Knob("AUTO_ACCEPT_LIMIT", "一趟通过几个申请", "自动通过好友申请", "个", "demo_wait",
          "5", "20", "wxclient.gateway.friends:AUTO_ACCEPT_LIMIT", kind="int"),
     Knob("PAUSE_SCALE", "操作停顿倍率", "加好友/朋友圈每步停顿；0=不停", "倍",

@@ -176,8 +176,8 @@ its cadence and every gate are unchanged — only *how a round discovers new mes
   both in the same round; the `local_id` cursor baselines forward across the handoff.
 - **First contact is read from the DB too** (same rule as `first_seen_fresh`: trailing, today's, peer-sent,
   at most `FIRST_SEEN_TAIL`); only a media row in that tail hands it to UIA. **Name mismatch** stays on UIA
-  (not-found→add-friend). **Unlisted strangers** go to the §10 UIA window only when `session.db` shows an
-  unlisted 1:1 chat with `unread_count > 0` whose `local_id` moved — never as a per-round sweep.
+  (not-found→add-friend). **Unlisted chats are never read** (§10): a change in `session.db` for a chat that is
+  not on the watchlist is logged and nothing else happens.
 - **The DB access is read-only** (see §5.1/§5.3): `ReadProcessMemory` on `Weixin.exe` for the key, page-HMAC
   verify + AES decrypt into an **in-memory** SQLite image. No key or decrypted DB image is ever written to disk or a log. Every new DB message (listed or not; groups
   included, official accounts not) is logged as 「本地库读到新消息」 with a 40-char `wechat_io.preview`, the same
@@ -479,16 +479,15 @@ Nothing on this machine adds to it.** User ruling 2026-09-24: 「监听逻辑是
   rows (the friend-request ledger) are never touched by it.
 - Auto-accepting friend requests (110) still accepts and reports `accepted` to the backend; it does not add
   anyone to the watchlist.
-- **Reading an unlisted chat that shows a red-dot count is allowed; admitting it is not** (user ruling
-  2026-09-28, 0.1.90, `wechat_io._unread_strangers`, switch `read_unread_strangers`). On a full sweep round only,
-  `get_unread_messages` (no window opened) lists sessions with a badge; unlisted one-to-one chats are opened —
-  at most `MAX_UNREAD_STRANGERS_PER_POLL` — and at most that many trailing messages go to the AI service with
-  `first_contact`, which stays silent unless the peer is job-seeking (spec 090). Excluded without opening:
-  anything on the list or in local `never`, under human takeover, a known group,
-  `SYSTEM_SESSION_NAMES` (service/official accounts, WeChat feature entries). A group found on opening is
-  remembered and dropped. **Nobody enters the watchlist this way**, and an unlisted read failure never feeds
-  the unreachable / not-found strike counters (those add friends and remove list entries). Known cost the user
-  accepted: opening the chat clears the recruiter's red dot, including for peers the AI then ignores.
+- **A chat that is not on the watchlist is silent — not read, not opened, not answered** (user ruling
+  2026-11-12: 「要根据数据库中的消息变化名单比对我们本地的名单库，如果在库中才进行回复，其它进行静默」).
+  The inbound path is: a message change in the local database → is that session in the local watchlist? →
+  only then read and dispatch. The "unlisted chat with a red-dot count gets opened and handed to the AI with
+  `first_contact`" window (0.1.90, user ruling 2026-09-28) was **removed in 0.1.142**: with an empty list every
+  incoming message set off a red-dot sweep that opened up to three badge sessions, and when a badge name did
+  not match the session list the vendored opener typed it into WeChat's search box (user report 2026-11-12).
+  **Do not bring it back** — someone new who must be answered gets written into contacts by the business
+  backend and arrives through sync. The `first_contact` field stays in the protocol but nothing here sets it.
 
 ---
 
