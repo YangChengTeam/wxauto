@@ -4871,9 +4871,10 @@ def _window_has_group_count_label(window: Any) -> bool:
     for node in descendants:
         auto_id = str(_element_info_value(node, "automation_id") or "")
         text = str(_safe_call(getattr(node, "window_text", None)) or "").strip()
+        # 只认微信自己标群人数的那个控件。原来还有一条「窗口里任何一行长得像 xxx(12) 的字都算」，
+        # 会被聊天内容命中：对方发一句「我想报名(2)」，这个单聊就被判成群——多行消息的第一行被
+        # 当成发送人丢掉，这个人还被记成群。
         if auto_id.endswith("current_chat_count_label") and re.fullmatch(r"\(\d+\)", text):
-            return True
-        if re.fullmatch(r".+\(\d+\)", text) and "current_chat_name_label" not in auto_id:
             return True
     return False
 

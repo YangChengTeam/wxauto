@@ -436,6 +436,11 @@ def _render_event(event: str, payload: dict[str, Any]) -> str:
         return f"微信任务执行器已启动，轮询间隔 {payload.get('poll_interval')} 秒"
     if event == "worker.stopped":
         return "微信任务执行器已停止"
+    if event == "worker.loop_error":
+        return (
+            f"微信任务执行器出了意外，{payload.get('retry_in')} 秒后接着跑"
+            f"（连续第 {payload.get('failures')} 次）：{payload.get('error')}"
+        )
     if event == "task.running":
         return f"微信任务开始执行：{task_type} #{task_id}"
     if event == "task.succeeded":

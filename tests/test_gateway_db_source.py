@@ -206,6 +206,31 @@ class TextTests(_Base):
         self.assertEqual(self.ui.calls, [NAME])
         self.assertEqual(out, [])
 
+    async def test_读不了的会话按开窗节拍读_不是三秒开一次窗(self) -> None:
+        """备注对不上唯一账号 / 会话行不在：每一轮都开窗就是三四秒切一次微信窗口。"""
+        from datetime import timedelta
+
+        self.store.set_db_cursor(ACCOUNT, NAME, 0)
+        self.reader._sessions = {}
+        now = {"at": AT}
+        self.source._clock = lambda: now["at"]
+
+        for _ in range(60):                     # 三分钟、每 3 秒一轮，一直读不到东西
+            await self.fetch()
+            now["at"] += timedelta(seconds=3)
+        self.assertEqual(len(self.ui.calls), 1, "平时 180 秒才开一次窗")
+
+        await self.fetch()                      # 第 180 秒：到点再开一次，这回读到了他的话
+        self.assertEqual(len(self.ui.calls), 2)
+        self.ui.returns = [object()]            # type: ignore[list-item]
+        now["at"] += timedelta(seconds=180)
+        await self.fetch()
+        self.assertEqual(len(self.ui.calls), 3)
+        for _ in range(20):                     # 刚读到过东西：接下来一分钟按 30 秒一次
+            now["at"] += timedelta(seconds=3)
+            await self.fetch()
+        self.assertEqual(len(self.ui.calls), 5)
+
 
 class MediaTests(_Base):
     async def test_含媒体整段委回UIA_并标UI持有(self) -> None:

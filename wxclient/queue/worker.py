@@ -26,6 +26,11 @@ class TaskContinuation:
     delay_seconds: float = 0.1
 
 
+#: 执行循环出意外之后隔多久再跑：1 秒起、每次翻倍、封顶 30 秒；跑成一轮就清零。
+LOOP_ERROR_BASE_SECONDS = 1.0
+LOOP_ERROR_MAX_SECONDS = 30.0
+
+
 class OperationWorker:
     """The single consumer allowed to operate the WeChat UI."""
 
@@ -84,9 +89,25 @@ class OperationWorker:
 
     def run_forever(self) -> None:
         logger.info("worker.started", poll_interval=self.poll_interval)
+        failures = 0
         try:
             while not self._stop.is_set():
-                if not self.run_once():
+                try:
+                    worked = self.run_once()
+                    failures = 0
+                except Exception as exc:  # noqa: BLE001 —— 一次意外不该让唯一的执行线程就此消失
+                    # 任务库被锁、读写出错之类：原来异常直接窜出去，线程无声结束（只剩一条「已停止」），
+                    # 之后的任务没人做，要等下一次有人提交才会被重新拉起；要是正好卡在「消息已发出、
+                    # 结果还没记上」，那条任务会一直挂到租约过期、被记成结果未知。记下来，缓一缓接着跑。
+                    failures += 1
+                    wait = min(LOOP_ERROR_BASE_SECONDS * (2 ** (failures - 1)), LOOP_ERROR_MAX_SECONDS)
+                    logger.error(
+                        "worker.loop_error", error=f"{type(exc).__name__}: {exc}"[:200],
+                        failures=failures, retry_in=wait,
+                    )
+                    self._stop.wait(wait)
+                    continue
+                if not worked:
                     self._stop.wait(self.poll_interval)
         finally:
             self.store.release_worker(self.worker_id)

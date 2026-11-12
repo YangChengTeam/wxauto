@@ -388,6 +388,44 @@ class TaskStoreTests(unittest.TestCase):
 
         self.assertEqual(claimed.id, search.id)  # type: ignore[union-attr]
 
+    def test_an_unexpected_error_does_not_kill_the_only_worker_thread(self) -> None:
+        """任务库被锁之类的意外：记下来、缓一缓接着跑，不能让执行线程无声消失。"""
+        from unittest import mock
+
+        from wxclient.queue import worker as worker_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp) / "tasks.db")
+            api = _FakeApi()
+            worker = OperationWorker(store, api, poll_interval=0.01)  # type: ignore[arg-type]
+            real_claim = store.claim_next
+            boom = {"left": 2}
+
+            def flaky_claim(*args, **kwargs):
+                if boom["left"]:
+                    boom["left"] -= 1
+                    raise RuntimeError("database is locked")
+                return real_claim(*args, **kwargs)
+
+            task = store.create_task(
+                TaskType.SCAN_MESSAGES, {"friend": "chat-a", "duration": "1s", "dry_run": True}, "default",
+            )
+            with mock.patch.object(store, "claim_next", flaky_claim), \
+                    mock.patch.object(worker_module, "LOOP_ERROR_BASE_SECONDS", 0.01):
+                worker.start()
+                try:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        current = store.get(task.id)
+                        if current is not None and current.status == TaskStatus.SUCCEEDED:
+                            break
+                        time.sleep(0.02)
+                    self.assertTrue(worker.running, "出过两次意外之后线程还活着")
+                    self.assertEqual(store.get(task.id).status, TaskStatus.SUCCEEDED)  # type: ignore[union-attr]
+                    self.assertEqual(boom["left"], 0)
+                finally:
+                    worker.stop()
+
     def test_worker_completes_a_serialized_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TaskStore(Path(tmp) / "tasks.db")

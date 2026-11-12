@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import structlog
 
@@ -45,6 +45,15 @@ _local = _log.bind(**{logrole.ROLE_KEY: logrole.LOCAL})
 #: 多久看一次本地库（秒）。读库微信看不见，不受开窗轮询的 30/180 秒地板管；界面上的「读消息
 #: 间隔」0.1.128 起删了。库没变时 `sessions()` 复用上次的连接，一轮只是 stat 几个文件。
 DB_POLL_INTERVAL_SECONDS = 3.0
+
+#: 名单里的会话本地库读不了（备注在联系人库里对不上唯一账号、会话行不在、读库出错）而改走开窗
+#: 读时，同一个会话最短隔多久才再开一次窗（秒）。跟开窗轮询原来的节拍一致：平时 180 秒一次，
+#: 刚读到过东西的 10 分钟里 30 秒一次（`pacing.MIN_READ_INTERVAL_SECONDS` 那条地板）。
+#: ★ 原来没有这道闸：这类会话每一轮（三四秒）都开一次窗——重名的备注读得成功，所以会一直这么
+#:   开下去，微信窗口被不停拉到前台、切会话，正是风控最敏感的形态。
+UI_FALLBACK_IDLE_SECONDS = 180.0
+UI_FALLBACK_ACTIVE_SECONDS = 30.0
+UI_FALLBACK_HOT_SECONDS = 600.0
 
 #: 本地库没连上时多久再试一次（秒）。扫钥在客户端里偶尔会被别的启动线程拖过时限（真机
 #: 2026-11-04 21:32：单跑 4 秒，客户端里超了 60 秒），一次失败不能整场都退回 UIA。
@@ -103,6 +112,9 @@ class DbMessageSource:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._round = 0
         self._paused_peers: set[str] = set()
+        # 改走开窗读的会话：上次开窗的时刻、「刚读到过东西」到什么时候为止（见 `_read_via_ui`）。
+        self._ui_fallback_at: dict[str, datetime] = {}
+        self._ui_fallback_hot_until: dict[str, datetime] = {}
         # 上一轮各会话最后一条的 local_id，只用来打「读到新消息」的日志（None = 还没建基线）。
         self._seen_sessions: dict[str, int] | None = None
         # 归 UIA 的会话上次委回时库里最后一条的 local_id：没涨就不再开窗（3 秒一轮，
@@ -414,8 +426,8 @@ class DbMessageSource:
 
         username = self._resolve(peer_id, sessions)
         if username is None or username not in sessions:
-            # 名字对不上 / 会话不在表里：交 UIA（它会走查无此人→加好友那套）。
-            return await self._ui.read_peer(account_id, peer_id)
+            # 名字对不上 / 会话不在表里：交 UIA（它会走查无此人→加好友那套），按开窗的节拍来。
+            return await self._read_via_ui(account_id, peer_id)
 
         session_max, _newest = sessions[username]
 
@@ -442,7 +454,7 @@ class DbMessageSource:
             rows = self._reader.new_messages(username, cursor)
         except Exception as exc:  # noqa: BLE001 —— 单会话读失败交 UIA 兜底，别炸整轮
             _local.warning("读本地库消息失败，这个会话交 UIA", 会话=peer_id, error=str(exc))
-            return await self._ui.read_peer(account_id, peer_id)
+            return await self._read_via_ui(account_id, peer_id)
         if not rows:
             return []
 
@@ -464,6 +476,20 @@ class DbMessageSource:
         # 全是文本：直接从库里出，游标推到这批最后一条 local_id。
         self._store.set_db_cursor(account_id, peer_id, ready[-1]["local_id"])
         return self._emit_text(account_id, peer_id, ready)
+
+    async def _read_via_ui(self, account_id: str, peer_id: str) -> list[InboundMessage]:
+        """本地库读不了的会话改走开窗读，但按开窗的节拍来，不跟着本地库三四秒一轮。"""
+        now = self._clock()
+        last = self._ui_fallback_at.get(peer_id)
+        hot = self._ui_fallback_hot_until.get(peer_id)
+        interval = UI_FALLBACK_ACTIVE_SECONDS if hot is not None and now < hot else UI_FALLBACK_IDLE_SECONDS
+        if last is not None and (now - last).total_seconds() < interval:
+            return []
+        self._ui_fallback_at[peer_id] = now
+        results = await self._ui.read_peer(account_id, peer_id)
+        if results:
+            self._ui_fallback_hot_until[peer_id] = now + timedelta(seconds=UI_FALLBACK_HOT_SECONDS)
+        return results
 
     def _emit_text(
         self, account_id: str, peer_id: str, ready: list[dict], *, first_seen: bool = False
