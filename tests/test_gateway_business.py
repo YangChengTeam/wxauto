@@ -42,6 +42,7 @@ from wxclient.gateway.inbound import (
     FOLLOW_UP_DEFER,
     PENDING_MAX_AGE_HOURS,
     PENDING_MAX_ATTEMPTS,
+    PENDING_RETRY_BASE_SECONDS,
     message_to_row,
 )
 from wxclient.gateway.outbound import AUTO_TAKEOVER_REASON
@@ -841,7 +842,11 @@ class PendingInboundTests(StoreTestCase):
 
         online = True                            # AI 端恢复
         self._now = T0 + timedelta(seconds=20)
-        await loop.tick()                        # 重投
+        await loop.tick()                        # 刚失败过，还在退避里：这一趟不投
+        await loop.drain()
+        self.assertEqual(delivered, [], "失败后不是下一趟立刻重投（本地库监听三四秒一轮）")
+        self._now = T0 + timedelta(seconds=10 + PENDING_RETRY_BASE_SECONDS)
+        await loop.tick()                        # 退避到点 → 重投
         await loop.drain()
         self.assertEqual(len(delivered), 1)
         self.assertIn("还招人吗", delivered[0])

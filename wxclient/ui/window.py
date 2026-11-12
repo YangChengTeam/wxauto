@@ -1171,7 +1171,8 @@ class MainWindow:
         # 2026-08-15 踩过反面：设了却没有「完事」的回调，于是人都退回登录页了，
         # 侧栏还在转圈说「正在停止服务，请稍候」。
         self.set_busy(LOGOUT_BUSY_TEXT)
-        if self.service.state in {ServiceState.RUNNING, ServiceState.STARTING}:
+        # 重启走到「已停、还没起」那一刻状态是 STOPPED：也要喊一声停，让重启那条线程别再往下起。
+        if self.service.state in {ServiceState.RUNNING, ServiceState.STARTING} or self.service.restarting:
             self.service.stop_async()
         self._await_logout(revoked, time.monotonic() + LOGOUT_TIMEOUT_SECONDS)
 

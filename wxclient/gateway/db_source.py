@@ -477,6 +477,12 @@ class DbMessageSource:
                 "message_type": "text",
                 "timestamp_text": _clock_text(row["create_time"]),
             }
+            # 自己发的这条，是不是网关替分身发出去的那句（出站台账认亲，认一次销一条）。认上了标
+            # `gateway_echo`，AI 端按「分身说的」算；不标的话每一句回复三秒后读回来都成了「专员本人
+            # 插话」，下一轮带着 operator_intervened 去——AI 会以为有人接手而收声（同 UIA 那条链路的
+            # `_claim_own_echoes`，2026-09-19）。库里 is_self 是准的，所以只认自己发的，不碰对方的话。
+            if row["is_self"] and self._store.claim_sent_echo(account_id, peer_id, str(row["text"] or "")):
+                raw["gateway_echo"] = True
             inbound.append(
                 # id 用微信自己的 local_id（加 db 前缀，和 UIA 的本机序号分开），时刻用库里的发送时刻：
                 # 同一条消息不管哪次读、重装没重装，报给 AI 端的 id / 正文 / 时刻都一样，

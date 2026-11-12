@@ -145,6 +145,23 @@ class TextTests(_Base):
         self.assertEqual([m.text for m in out], ["在吗", "还招人吗"])
         self.assertEqual(self.store.db_cursor(ACCOUNT, NAME), 5)
 
+    async def test_网关替分身发出去的话读回来标成分身_不算专员插话(self) -> None:
+        self.store.set_db_cursor(ACCOUNT, NAME, 5)
+        self.store.remember_sent_text(ACCOUNT, NAME, "包吃住的，月薪六千")
+        self.reader.set_session(8)
+        self.reader.set_rows([
+            _row(6, "包吃住的，月薪六千", is_self=True),   # 网关发出去的那句
+            _row(7, "稍等我问下领导", is_self=True),       # 招聘老师自己在微信里打的
+            _row(8, "包吃住的，月薪六千"),                 # 对方原样复读：是他说的，不能被吞
+        ])
+        out = await self.fetch()
+        self.assertEqual(
+            [(m.text, m.from_self, m.from_gateway) for m in out],
+            [("包吃住的，月薪六千", True, True), ("稍等我问下领导", True, False),
+             ("包吃住的，月薪六千", False, False)],
+        )
+        self.assertFalse(self.store.claim_sent_echo(ACCOUNT, NAME, "包吃住的，月薪六千"), "认一次销一条")
+
     async def test_首次见历史都不是今天_一条不接只建基线(self) -> None:
         self.reader.set_session(5)
         self.reader.set_rows([_row(5, "老消息", at=int(time.time()) - 3 * 86400)])

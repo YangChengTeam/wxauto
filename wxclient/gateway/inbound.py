@@ -41,8 +41,20 @@ QUIET_ROUND_LOG_SECONDS = 60.0
 _SELF_CONTEXT_LIMIT = 10
 
 #: 待处理批次最多重投几次。AI 端长时间不可用时不该无限重试同一批，但也不能几分钟就放弃：
-#: 轮询间隔是分钟级，20 次差不多覆盖一两个小时的中断。
+#: 配合下面的退避，20 次覆盖两个多小时的中断。
 PENDING_MAX_ATTEMPTS = 20
+
+#: 失败后隔多久再投：第 1 次失败等 30 秒，之后每次翻倍，封顶 10 分钟（30/60/120/240/480/600…）。
+#: ★ 原来没有这一档，靠「轮询间隔是分钟级」自然拉开——入站改成本地库监听后一轮只有三四秒，
+#:   失败的批次下一轮立刻重投，20 次一分钟出头就用完：AI 端或换票抖一下，候选人那几句话就被
+#:   当成「重投多次仍失败」永久放弃了，每次重投还各换一张票。
+PENDING_RETRY_BASE_SECONDS = 30.0
+PENDING_RETRY_MAX_SECONDS = 600.0
+
+
+def pending_retry_delay(attempts: int) -> float:
+    """第 ``attempts`` 次失败之后等多少秒再投。"""
+    return min(PENDING_RETRY_BASE_SECONDS * (2 ** max(attempts - 1, 0)), PENDING_RETRY_MAX_SECONDS)
 
 #: 待处理批次的保鲜期。队列是**短期**的（需求文档 §2.4）——隔了一天再回过去更奇怪。
 #: 取 24h 是为了覆盖「晚上快下班时收到、失败了、第二天进工作时间窗才补上」这条真实路径。
@@ -366,6 +378,8 @@ class InboundLoop:
         self._next_poll_at: datetime | None = None  # 下一趟读消息的时刻，给界面倒计时用
         self._inflight: dict[PeerKey, asyncio.Task[None]] = {}
         self._pending_loaded: set[str] = set()
+        #: 失败过的批次最早什么时候再投（`pending_retry_delay`）。只在内存里：重启后立刻补投一次无妨。
+        self._pending_retry_at: dict[str, datetime] = {}
         self._inflight_batches: set[str] = set()
         """正在被某一轮处理的批次。**必须单独记**：它此刻既不在缓冲里、也还没销账，
         `_reload_pending` 看不见它就会把同一批再装载一次 → 候选人收到两条一样的回复
@@ -582,6 +596,7 @@ class InboundLoop:
             for batch_id in batch_ids or ():
                 self._store.drop_pending_inbound(batch_id)
                 self._pending_loaded.discard(batch_id)
+                self._pending_retry_at.pop(batch_id, None)
         finally:
             self._inflight_batches.difference_update(batch_ids or ())
 
@@ -595,9 +610,14 @@ class InboundLoop:
         去消耗一段本来就该等的时间，等额度回来时批次已经被放弃了。
         """
         attempts = 0
+        wait = 0.0
         if follow_up == FOLLOW_UP_RETRY:
             for batch_id in batch_ids or ():
                 attempts = max(attempts, self._store.bump_pending_attempts(batch_id))
+            wait = pending_retry_delay(attempts)
+            retry_at = self._clock() + timedelta(seconds=wait)
+            for batch_id in batch_ids or ():
+                self._pending_retry_at[batch_id] = retry_at
         self._pending_loaded.difference_update(batch_ids or ())
         _ai.warning(
             "这一轮没把话说出去，本批留在待处理队列等重投",
@@ -605,6 +625,7 @@ class InboundLoop:
             原因=why or follow_up,
             计入失败=(follow_up == FOLLOW_UP_RETRY),
             已重试=attempts,
+            秒后再投=round(wait),
         )
 
     # ────────────────────────── 欠账重投（070）──────────────────────────
@@ -625,6 +646,7 @@ class InboundLoop:
         cutoff = now - timedelta(hours=PENDING_MAX_AGE_HOURS)
         for row in self._store.purge_pending_inbound_before(cutoff):
             self._pending_loaded.discard(row["batch_id"])
+            self._pending_retry_at.pop(row["batch_id"], None)
             _local.warning(
                 "待处理消息超过保鲜期，已丢弃（这时候再回过去反而更奇怪）",
                 account=row["account_id"],
@@ -641,6 +663,7 @@ class InboundLoop:
                 continue
             if row["attempts"] >= PENDING_MAX_ATTEMPTS:
                 self._store.drop_pending_inbound(batch_id)
+                self._pending_retry_at.pop(batch_id, None)
                 _local.warning(
                     "待处理消息重投多次仍失败，已放弃",
                     account=row["account_id"],
@@ -648,6 +671,9 @@ class InboundLoop:
                     已重试=row["attempts"],
                 )
                 continue
+            retry_at = self._pending_retry_at.get(batch_id)
+            if retry_at is not None and now < retry_at:
+                continue  # 刚失败过，还在退避里
             account_id, peer_id = row["account_id"], row["peer_id"]
             messages = [message_from_row(account_id, peer_id, item) for item in row["payload"]]
             if not messages:

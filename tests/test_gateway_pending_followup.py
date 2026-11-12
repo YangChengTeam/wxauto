@@ -43,6 +43,7 @@ from wxclient.gateway.inbound import (
     FOLLOW_UP_DEFER,
     FOLLOW_UP_RETRY,
     PENDING_MAX_ATTEMPTS,
+    PENDING_RETRY_MAX_SECONDS,
     InboundMessage,
 )
 from wxclient.gateway.outbound import DeliveryResult
@@ -163,8 +164,32 @@ class GuardDenialKeepsTheBatchTests(FollowUpLoopTestCase):
         loop = self._loop(FakeSource([[msg("在吗", msg_id="m1")]] + [[]] * 20), handler, now=T0)
         for _ in range(PENDING_MAX_ATTEMPTS + 2):
             await self._dispatch_once(loop)
+            self._now += timedelta(seconds=PENDING_RETRY_MAX_SECONDS)   # 等过退避再投下一次
         self.assertEqual(self._pending(), [], "重试到上限要放弃")
         self.assertLessEqual(calls, PENDING_MAX_ATTEMPTS + 1)
+
+    async def test_retry_backs_off_instead_of_burning_the_budget_in_a_minute(self) -> None:
+        """入站三四秒一轮：失败的批次不能下一轮就重投，否则 20 次一分钟出头就用完、消息被永久放弃。"""
+        from wxclient.gateway.inbound import pending_retry_delay
+
+        self.assertEqual([pending_retry_delay(n) for n in (1, 2, 3, 4, 5, 6, 20)],
+                         [30.0, 60.0, 120.0, 240.0, 480.0, 600.0, 600.0])
+        calls = 0
+
+        async def handler(_a: str, _p: str, _t: str, _m) -> DeliveryResult:
+            nonlocal calls
+            calls += 1
+            return DeliveryResult(skipped_reason="AI 端没结果", follow_up=FOLLOW_UP_RETRY)
+
+        loop = self._loop(FakeSource([[msg("在吗", msg_id="m1")]] + [[]] * 80), handler, now=T0)
+        await self._dispatch_once(loop)
+        self.assertEqual(calls, 1)
+        for _ in range(30):                       # 接下来两分钟、每 4 秒一轮
+            self._now += timedelta(seconds=4)
+            await loop.tick()
+            await loop.drain()
+        self.assertEqual(calls, 3, "两分钟里只再投两次（30 秒后、再过 60 秒后）")
+        self.assertEqual(len(self._pending()), 1, "还欠着，没被放弃")
 
 
 class TakeoverDefersInsteadOfSettlingTests(GuardDenialKeepsTheBatchTests):

@@ -114,6 +114,9 @@ class GatewayService:
         self._stop_requested = False
         self._running_since: float | None = None
         self._restarting = False
+        #: 正在跑「停 → 起」的那条线程，以及重启途中有没有别人喊了停（退出登录）。见 `stop` / `restart_async`。
+        self._restart_owner: threading.Thread | None = None
+        self._restart_aborted = False
         # ★ 状态快照 + 专职轮询线程：界面读快照，真正去问网关（可能查库、可能等锁）的
         #   活全在这条线程上。它卡多久都只卡自己，主线程照旧每秒重绘。
         self._command_listener: Callable[[dict], None] | None = None
@@ -150,6 +153,11 @@ class GatewayService:
         with self._lock:
             if self._state in {ServiceState.STARTING, ServiceState.RUNNING}:
                 return
+            if self._thread is not None and self._thread.is_alive():
+                # 上一个实例停机超时、线程还活着：这时再起一个，就是两个网关同时操作同一个微信；
+                # 旧线程收尾时还会把新实例的状态盖成「已停止」。宁可这次不起，等它停干净再点。
+                _log.warning("上一个网关实例还没停下来，这次不启动", 状态=self._state.value)
+                return
             self._set_state(ServiceState.STARTING, None)
             self._ready.clear()
             self._stop_requested = False
@@ -158,6 +166,10 @@ class GatewayService:
 
     def stop(self, timeout: float = 15.0) -> None:
         with self._lock:
+            if self._restarting and threading.current_thread() is not self._restart_owner:
+                # 重启走到一半（已停、还没起）时别人喊了停——典型是退出登录。记下来，
+                # 重启那条线程看到就不再往下起，否则人都退出去了网关又自己跑起来。
+                self._restart_aborted = True
             thread, loop = self._thread, self._loop
             if thread is None or not thread.is_alive():
                 self._set_state(ServiceState.STOPPED, None)
@@ -202,16 +214,29 @@ class GatewayService:
                 _log.info("已经在重启了，忽略这次请求")
                 return None
             self._restarting = True
+            self._restart_aborted = False
 
         def work() -> None:
             try:
+                with self._lock:
+                    self._restart_owner = threading.current_thread()
                 self.stop(timeout=timeout)
+                with self._lock:
+                    still_running = self._thread is not None and self._thread.is_alive()
+                    aborted = self._restart_aborted
+                if still_running:
+                    _log.error("旧的网关实例没在限时内停下来，这次不重启；等它停止后再点一次", 等了秒=timeout)
+                    return
+                if aborted:
+                    _log.info("重启途中收到停止请求（如退出登录），不再启动")
+                    return
                 if before_start is not None:
                     before_start()
                 self.start()
             finally:
                 with self._lock:
                     self._restarting = False
+                    self._restart_owner = None
 
         return self._in_background("wx-gateway-restart", work, on_done)
 

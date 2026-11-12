@@ -381,6 +381,69 @@ class GatewayServiceTests(unittest.TestCase):
 
         service.stop(timeout=5)
 
+    def _slow_stopping_service(self, hold: threading.Event, builds: list[int]) -> GatewayService:
+        """收尾要等 ``hold`` 放行才结束的网关：模拟「停机超时、旧线程还活着」。"""
+        started = threading.Event()
+
+        class SlowRunner(_FakeRunner):
+            async def stop(self) -> None:
+                hold.wait(timeout=10)
+                await super().stop()
+
+        def builder() -> _FakeGateway:
+            builds.append(1)
+            started.clear()
+            gateway = _FakeGateway(started)
+            gateway.runner = SlowRunner(started)
+            return gateway
+
+        return GatewayService(builder)
+
+    def test_restart_does_not_start_a_second_gateway_when_the_old_one_is_still_stopping(self) -> None:
+        """★ 停机超时后不能再起一个：两个网关会同时操作同一个微信。"""
+        hold, builds = threading.Event(), []
+        service = self._slow_stopping_service(hold, builds)
+        service.start()
+        self.assertTrue(service.wait_ready(timeout=5))
+
+        applied: list[str] = []
+        done = threading.Event()
+        service.restart_async(before_start=lambda: applied.append("params"), on_done=done.set, timeout=0.3)
+        self.assertTrue(done.wait(timeout=10))
+        self.assertEqual((len(builds), applied), (1, []), "旧实例没停干净：不灌新参数、不起新实例")
+        self.assertFalse(service.restarting)
+
+        service.start()                       # 手动再点启动同样不许
+        self.assertEqual(len(builds), 1)
+
+        hold.set()                            # 旧实例终于停下来
+        service.stop(timeout=5)
+        self.assertIs(service.state, ServiceState.STOPPED)
+        service.start()                       # 停干净之后才起得来
+        self.assertTrue(service.wait_ready(timeout=5))
+        self.assertEqual(len(builds), 2)
+        service.stop(timeout=5)
+
+    def test_a_stop_during_restart_cancels_the_start(self) -> None:
+        """★ 重启走到一半时退出登录：不能人都退出去了，网关又自己跑起来。"""
+        hold, builds = threading.Event(), []
+        service = self._slow_stopping_service(hold, builds)
+        service.start()
+        self.assertTrue(service.wait_ready(timeout=5))
+
+        done = threading.Event()
+        service.restart_async(on_done=done.set, timeout=5)
+        deadline = time.monotonic() + 5
+        while service.state is not ServiceState.STOPPING and time.monotonic() < deadline:
+            time.sleep(0.01)
+        stopper = service.stop_async(timeout=5)   # 退出登录喊的那一声停
+        time.sleep(0.05)
+        hold.set()
+        self.assertTrue(done.wait(timeout=10))
+        stopper.join(timeout=10)
+        self.assertEqual(len(builds), 1, "被喊停的重启不再往下起")
+        self.assertIs(service.state, ServiceState.STOPPED)
+
     def test_stop_before_start_is_harmless(self) -> None:
         service = GatewayService(lambda: _FakeGateway(threading.Event()))
 
