@@ -31,7 +31,6 @@ from .attachments import (
     collect_attachments,
     to_inline,
 )
-from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
 from .candidates import CandidateDirectory
 from .capabilities import CAPABILITIES_OP, Capability, capabilities_frame
@@ -253,7 +252,6 @@ class GatewayRunner:
         capabilities: Callable[[], dict[str, Capability]] | None = None,
         account_ref: Callable[[], str] | None = None,
         candidate_mode: CandidateModeClient | None = None,
-        auto_friend: AutoFriendWatcher | None = None,
         friend_checker: PendingFriendWatcher | None = None,
         moments_watcher: MomentsWatcher | None = None,
         file_uploader: AgentFileUploader | None = None,
@@ -271,7 +269,6 @@ class GatewayRunner:
         self._watchlist = watchlist
         self._friends = friend_watcher
         self._commands = command_executor
-        self._auto_friend = auto_friend
         self._friend_checker = friend_checker
         # 本机朋友圈巡看（用户 2026-09-08）：新动态点赞在它自己手上；评论要 AI 端写，
         # 由它回调这里自触发一轮（`_comment_new_moments`）。
@@ -352,13 +349,9 @@ class GatewayRunner:
             clock=self._clock,
             on_peer_messages=self._note_inbound_messages,
         )
-        # 092：名单里连续几轮读不到的那个会话，交给 AutoFriendWatcher 去判「是不是压根还不是好友」。
-        # 到这一步才装：它要用 `CommandExecutor` 和 `_report_contact`，两个都比 source 晚。
-        if auto_friend is not None and hasattr(source, "set_unreachable_handler"):
-            auto_friend.on_added = self._report_contact
-            source.set_unreachable_handler(auto_friend.on_unreachable)
-        # 连续几轮都「查无此人」→ 移出监听名单（用户 2026-09-24）。跟 092 各装各的：
-        # 自动补加好友关着的机器上也得生效。
+        # 连续几轮都「查无此人」→ 移出监听名单（用户 2026-09-24）。
+        # ★ 092「读不到就本机自己补加好友」0.1.145 已拆（用户 2026-11-12）：它拿会话名（多半是
+        #   对方昵称）当备注，又被当成验证语发出去，而业务端的 label 本机拿不到。加好友只认业务端下发。
         if hasattr(source, "set_not_found_handler"):
             source.set_not_found_handler(self._on_contact_not_found)
         # 093：反过来的那半边——已申请、还没通过的人，隔一阵复查一次是不是通过了。
@@ -1428,14 +1421,14 @@ class GatewayRunner:
         （`GET /client/contacts`，用户 2026-08-20：不新增接口）。所以这个按钮 =
         「立刻跑一轮会话名同步，再照它重算名单」，返回 ``{watching, blocked}`` 给界面报数。
 
-        **并存期的回退**（design §6）：派生出来是空的（后端还没数据 / 没登录 / 这一下没拉到）时，
-        照旧请 AI 端重推那条老路。移交途中不能有「点了同步却什么也不会发生」的窗口——
-        那正是这个按钮存在的理由（专员说不准屏幕上这份新不新）。
+        没配业务端地址时（只剩开发环境）才请 AI 端重推那条老路（design §6 并存期的回退）。
         """
         if self._contacts is not None and self._contacts.configured:
             # 全量：业务端已经不让盯的人要在这一下里消失，不能等增量（它永远不会带回删掉的行）。
-            complete = await self._sync_contacts_once(full=True)
-            if self._watchlist is not None and (complete or self._watchlist.watched()):
+            await self._sync_contacts_once(full=True)
+            # ★ 业务端配着就只报本机名单：AI 端的推送已不采用（`adopt_backend_authority`），
+            #   再去请 AI 端重推只会拿回它那份老名单的人数，界面报的数和屏幕上的名单对不上。
+            if self._watchlist is not None:
                 return {
                     "watching": len(self._watchlist.watched()),
                     "blocked": len(self._watchlist.scope.never),

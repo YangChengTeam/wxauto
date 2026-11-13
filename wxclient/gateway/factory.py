@@ -24,7 +24,6 @@ from .. import logrole, tuning
 from .agent_files import AgentFileUploader, http_base_from_ws
 from .agent_sessions import AgentSessionEraser
 from .attachments import AttachmentFetcher
-from .autofriend import AutoFriendWatcher
 from .candidate_mode import CandidateModeClient
 from .candidates import CandidateDirectory
 from .capabilities import Capability, probe_capabilities
@@ -138,7 +137,7 @@ def build_gateway(
                 only=frozenset(saved.get("only") or ()),
                 never=frozenset(saved.get("never") or ()),
                 received=True,
-                origin="上次 AI 端推送（本地留存）",
+                origin="上次同步（本地留存）",
             )
         )
     # 演示模式关抖动、换地板（`GatewaySettings._apply_demo_mode`）；平时这两样就是 pacing 的常量。
@@ -219,6 +218,9 @@ def build_gateway(
         gateway_settings.business_api_url,
         client_token or (lambda: ""),
     )
+    if contacts.configured:
+        # 名单权威在业务端：AI 端登记时那条老推送不许在每次启动时把旧名单装回来。
+        watchlist.adopt_backend_authority()
     # 候选人回写（api2 §9）。同一个 Client Token、同一条「没登录就躺平」的规矩。
     candidates = CandidateDirectory(
         gateway_settings.business_api_url,
@@ -339,15 +341,6 @@ def build_gateway(
         session_eraser=AgentSessionEraser(
             base_url=http_base_from_ws(gateway_settings.ai_ws_url),
             ticket_provider=ticket_provider,
-        ),
-        # 092：名单里还不是好友的人自动补加。加好友本身仍走 `command_executor`——
-        # 能力闸、频控闸、时间窗、幂等一道不绕。
-        auto_friend=AutoFriendWatcher(
-            store=store,
-            runtime=runtime,
-            commands=command_executor,
-            enabled=gateway_settings.auto_add_friend,
-            min_interval_seconds=gateway_settings.friend_floor_seconds,
         ),
         # 2026-09-12：别人发来的申请默认自动通过（`auto_accept_friend`），走 `command_executor`——
         # 能力闸、加好友配额、时间窗、幂等一道不绕；dry-run 机器只数不点。

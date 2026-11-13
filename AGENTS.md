@@ -338,6 +338,11 @@ Every line here was learned on a real machine. Read the reason before changing o
 - ★ When a `remark` (the candidate's label) is present, it is also what gets typed into the box under
   「发送添加朋友申请」, replacing `greetings` (user, 2026-09-24; `CommandExecutor` in `gateway/commands.py`).
   No remark → the greeting rules of 092 still apply.
+- ★ **This machine never starts a friend request on its own** (user ruling 2026-11-12, 0.1.145). The 092
+  "watched but unreadable → search contacts → add friend" path (`autofriend.py`) was removed: it passed the
+  session name (usually the peer's nickname) as `remark`, which the rule above then sent as the request
+  text, and the business label never reaches this machine. Every `add_friend` comes from the business
+  backend with its label. **Do not bring a local add path back.**
 - Failing to read the nickname is not a failure (`name` becomes `null`, logged as `friend.add.fallback`).
   But **a number that cannot be found raises an error**, no longer silently returning success — otherwise the
   AI service waits forever on a request that was never sent.
@@ -477,6 +482,13 @@ Nothing on this machine adds to it.** User ruling 2026-09-24: 「监听逻辑是
   and only if every page arrived, delete local `accepted` rows the backend no longer returns. Incremental sync
   never brings a deleted row back, which is why a stopped plan's people used to linger. Local `requested`
   rows (the friend-request ledger) are never touched by it.
+- ★ **With the business API configured, the legacy AI push (`ev: wechat.watchlist`) is ignored from start-up**
+  (`Watchlist.adopt_backend_authority`, called in `factory.py`; 0.1.145). The "backend has spoken" flag used to
+  live only in memory, so every login re-applied the AI service's old outreach list (field case 2026-11-12:
+  36 on login, 0 after 「同步名单」, 36 again on the next login), and none of those names resolved in the local
+  DB, so each one was opened through WeChat's search box.
+- **A watched name the local DB resolves but has no session row for is not opened** — no session row means no
+  message to read (0.1.145). Only a name the DB cannot resolve (absent / ambiguous) still falls back to UIA.
 - Auto-accepting friend requests (110) still accepts and reports `accepted` to the backend; it does not add
   anyone to the watchlist.
 - **A chat that is not on the watchlist is silent — not read, not opened, not answered** (user ruling

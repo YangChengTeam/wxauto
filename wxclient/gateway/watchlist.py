@@ -188,6 +188,18 @@ class Watchlist:
             return False
         return self._merge(data, "AI 端推送", "监听列表推送格式不对，忽略")
 
+    def adopt_backend_authority(self) -> None:
+        """从这一刻起名单只认业务端同步，AI 端那条老推送一律不采用（装配时调一次）。
+
+        ★ 0.1.145 现场：每次登录名单显示 36 个，点「同步名单」清空，下次登录又是 36。
+          「后端接管了」只记在内存里（`_backend_seen`），重启清零；登录时同步还没派生出东西，
+          AI 端一登记就把它那份老名单（069 时代 outreach 自动收录的）推下来，于是又装回去——
+          而名单里那些名字本地库对不上，每个都按开窗节拍去微信搜索框里搜一遍。
+          业务端同步配着（生产上总是配着）就说明权威已经移交（0.1.120「名单只以业务端同步为准」），
+          不必等它第一次说话。
+        """
+        self._backend_seen = True
+
     def apply_backend(self, data: dict) -> bool:
         """吃下业务后端同步来的一份名单（spec 085 之后的权威来源）。
 

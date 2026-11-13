@@ -36,6 +36,8 @@ class _FakeReader:
         self._rows: dict[str, list[dict]] = {}
         self.unread: dict[str, int] = {}
         self.friends: set[str] = set()
+        #: 联系人库里对不上这个名字（没有 / 撞名）。
+        self.unresolvable = False
 
     def set_session(self, local_id: int, message_type: str = "text") -> None:
         self._sessions[USER] = (local_id, message_type)
@@ -50,7 +52,7 @@ class _FakeReader:
         return dict(self.unread)
 
     def resolve_username(self, name: str) -> str | None:
-        return USER if name == NAME else None
+        return USER if name == NAME and not self.unresolvable else None
 
     def display_name(self, username: str) -> str:
         return {USER: NAME, "wxid_other": "李四", "wxid_mem": "王五"}.get(username, username)
@@ -80,9 +82,6 @@ class _FakeUi:
     async def read_unread_strangers(self, account_id, listed):
         self.stranger_scans += 1
         return []
-
-    def set_unreachable_handler(self, handler):
-        pass
 
     def set_not_found_handler(self, handler):
         pass
@@ -201,17 +200,25 @@ class TextTests(_Base):
 
     async def test_名字对不上交UIA(self) -> None:
         self.store.set_db_cursor(ACCOUNT, NAME, 0)
-        self.reader._sessions = {}          # resolve 得到 username 但不在会话表
+        self.reader.unresolvable = True
         out = await self.fetch()
         self.assertEqual(self.ui.calls, [NAME])
         self.assertEqual(out, [])
+
+    async def test_x_认得出但还没会话行_不开窗不搜索(self) -> None:
+        """★ 用户 2026-11-12「还是有乱搜索」：名单里还没聊过的好友，会话表里没有他，
+        原来也交 UIA，开窗要在搜索框里打他的名字，每 180 秒搜一遍。没会话行 = 没消息可读。"""
+        self.store.set_db_cursor(ACCOUNT, NAME, 0)
+        self.reader._sessions = {}
+        self.assertEqual(await self.fetch(), [])
+        self.assertEqual(self.ui.calls, [], "没有会话就没东西可读，不许去搜索框里搜他")
 
     async def test_读不了的会话按开窗节拍读_不是三秒开一次窗(self) -> None:
         """备注对不上唯一账号 / 会话行不在：每一轮都开窗就是三四秒切一次微信窗口。"""
         from datetime import timedelta
 
         self.store.set_db_cursor(ACCOUNT, NAME, 0)
-        self.reader._sessions = {}
+        self.reader.unresolvable = True
         now = {"at": AT}
         self.source._clock = lambda: now["at"]
 

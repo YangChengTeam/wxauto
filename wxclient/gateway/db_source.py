@@ -124,10 +124,7 @@ class DbMessageSource:
         self._on_friend_accepted = None
         self._friend_checked_at: datetime | None = None
 
-    # MessageSource 里 runner 会装的两个回调，直接透传给 UIA 替身（查无此人 / 读不到要去加好友）。
-    def set_unreachable_handler(self, handler) -> None:
-        self._ui.set_unreachable_handler(handler)
-
+    # runner 装的「查无此人」回调，直接透传给 UIA 替身。
     def set_not_found_handler(self, handler) -> None:
         self._ui.set_not_found_handler(handler)
 
@@ -425,9 +422,14 @@ class DbMessageSource:
             return results
 
         username = self._resolve(peer_id, sessions)
-        if username is None or username not in sessions:
-            # 名字对不上 / 会话不在表里：交 UIA（它会走查无此人→加好友那套），按开窗的节拍来。
+        if username is None:
+            # 名字对不上（联系人库里没有 / 撞名）：交 UIA（它会走查无此人→加好友那套），按开窗的节拍来。
             return await self._read_via_ui(account_id, peer_id)
+        if username not in sessions:
+            # 认得出是谁、只是还没有会话行 = 和他一条消息都没有，没什么可读的。
+            # ★ 原来这里也交 UIA：开窗读要在微信搜索框里打他的名字，名单里还没聊过的好友
+            #   每 180 秒被搜一遍（用户 2026-11-12「还是有乱搜索」）。他一来消息会话行就有了。
+            return []
 
         session_max, _newest = sessions[username]
 

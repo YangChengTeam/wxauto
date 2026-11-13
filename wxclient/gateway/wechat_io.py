@@ -590,7 +590,6 @@ class QueueMessageSource:
         watchlist: Watchlist | None = None,
         history_limit: int = 20,
         clock=None,
-        on_unreachable=None,
         attachment_fetcher=None,
         hot_window_seconds: float = 600.0,
         prefilter_by_session_list: bool = True,
@@ -617,10 +616,7 @@ class QueueMessageSource:
         self._prefilter = bool(prefilter_by_session_list)
         self._allow_real = bool(allow_real_actions)
         self._confirmation = confirmation
-        # 092：连续 UNREACHABLE_STRIKES 轮读不到时喊一声。**只是「读不到」，不是「不是好友」**
-        # ——判定留给回调那边（`autofriend.py`），这里一行都不管策略。
-        self._on_unreachable = on_unreachable
-        # 会话名 → 连续读不到了几轮（092：从 set 改成计数）
+        # 会话名 → 连续读不到了几轮（只用来在「刚读不到 / 又能读了」时各说一句）
         self._unreachable: dict[str, int] = {}
         # 会话名 → 连续几轮都是「查无此人」（队列回的 reason_code = CONTACT_NOT_FOUND）。
         # 跟上面那个分开数：那个任何读失败都算（微信卡了、窗口打不开），这个只认「搜不到这个名字」。
@@ -844,14 +840,6 @@ class QueueMessageSource:
         )
         return due
 
-    def set_unreachable_handler(self, handler) -> None:
-        """装上「连续几轮读不到就喊一声」的回调（092）。
-
-        构造时装不上：喊话的对象（`AutoFriendWatcher`）要用到 `CommandExecutor`，
-        而那个是 runner 拼起来的，比本对象晚。所以留一个装配口，别让 runner 戳私有属性。
-        """
-        self._on_unreachable = handler
-
     def set_not_found_handler(self, handler) -> None:
         """装上「连续几轮都查无此人就喊一声」的回调：``async (account_id, peer_id) -> None``。"""
         self._on_not_found = handler
@@ -970,11 +958,6 @@ class QueueMessageSource:
             # 真正有用的信息（第一次是什么时候、为什么）反而被埋掉。
             if strikes == 1:
                 _log.warning("名单里的这个会话读不到，先跳过", 会话=peer_id, 原因=reason[:120])
-            # 092：连续几轮都读不到才喊。**喊的是「读不到」，不是「不是好友」**——
-            # 这条分支任何读失败都会走（名字差一个字、微信卡了、窗口打不开），
-            # 拿它直接去加好友就是误加。到底是不是好友由回调那边再确定性判一次。
-            if strikes == UNREACHABLE_STRIKES and self._on_unreachable is not None:
-                await self._on_unreachable(account_id, peer_id, reason)
             await self._count_not_found(account_id, peer_id, history)
             return []
         self._not_found.pop(peer_id, None)

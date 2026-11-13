@@ -161,6 +161,21 @@ class CoexistenceTests(unittest.TestCase):
         self.assertFalse(wl.apply_push({"only": ["别人"]}), "但已经接管了")
         self.assertEqual(wl.watched(), ["张三"])
 
+    def test_x_业务端配着_重启后AI推送也不作数(self) -> None:
+        """★ 用户 2026-11-12：每次登录名单 36 个，同步后没了，下次登录又是 36。
+        「接管了」只在内存里，重启清零，AI 端一登记就把它那份老名单推回来。"""
+        saved: list[WatchScope] = []
+        old = [f"老名单{i}" for i in range(36)]
+        wl = Watchlist(persist=saved.append)
+        wl.apply_push({"only": old})               # 登录时 AI 端推来的老名单
+        wl.apply_backend({"only": []})            # 点「同步名单」：业务端明说没人
+
+        restarted = Watchlist()                    # 重新登录 = 新进程装配
+        restarted.apply_scope(saved[-1])
+        restarted.adopt_backend_authority()        # factory：业务端同步配着
+        self.assertFalse(restarted.apply_push({"only": old}))
+        self.assertEqual(restarted.watched(), [], "★ 老名单不许在登录时装回来")
+
     def test_后端给的形状不对_不算接管也不动名单(self) -> None:
         wl = Watchlist()
         wl.apply_push({"only": ["张三"]})
