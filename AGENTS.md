@@ -314,8 +314,12 @@ Every line here was learned on a real machine. Read the reason before changing o
   minute `DbMessageSource._check_pending_friends` checks the whole local ledger (`gateway_friend_checks`)
   against `contact.db` and hands hits to `runner._on_friend_accepted`, the same report path as the search
   re-check. ★ **A friend is `local_type = 1` and not deleted** — a remark alone proves nothing: on the real
-  machine remarks also sit on `local_type = 3` (not-a-friend) rows. Ambiguous names are skipped and left to
-  the search re-check. Joining the watchlist still waits for the business sync.
+  machine remarks also sit on `local_type = 3` (not-a-friend) rows. Ambiguous names are skipped.
+  ★ **While the DB is connected the search re-check (`friendcheck.PendingFriendWatcher`) does not run at
+  all** (user ruling 2026-11-13, 0.1.146: the list was empty yet the search box kept searching names one by
+  one). It only searches while the DB is not connected or is re-attaching. An ambiguous name is not handed
+  to search either — search misjudges same-name contacts just the same; it is recognized later by its first
+  inbound message or a successful backend send. Joining the watchlist still waits for the business sync.
 - **A candidate under human takeover is not even read** (user ruling 2026-08-28). It is filtered in
   `wechat_io.QueueMessageSource._drop_handed_off`; the write-side gate (`guard._takeover_denial`) stays as a
   second path. The earlier position was "reading must continue, otherwise the backend cannot cancel its

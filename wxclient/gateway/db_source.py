@@ -143,6 +143,11 @@ class DbMessageSource:
         还没连上（暂由 UIA 顶着）就返回 None，走 UIA 的节拍——别让开窗轮询跟着 3 秒一轮。"""
         return DB_POLL_INTERVAL_SECONDS if self._reader is not None else None
 
+    @property
+    def db_connected(self) -> bool:
+        """本地库此刻连着没有。搜索复查（`friendcheck.PendingFriendWatcher`）认这个：连着就不搜人。"""
+        return self._reader is not None
+
     def set_wake(self, wake) -> None:
         self._wake = wake
 
@@ -360,7 +365,7 @@ class DbMessageSource:
         try:
             pending = self._store.pending_friend_names(account_id)
             accepted = self._reader.friend_names(pending) if pending else []
-        except Exception as exc:  # noqa: BLE001 —— 查不了就等下一趟，搜索复查那条还在
+        except Exception as exc:  # noqa: BLE001 —— 查不了就等下一趟（连着库时搜索复查是停的，只能靠下一趟）
             _local.warning("本地库对好友台账失败，下一趟再对", error=str(exc)[:160])
             return
         if accepted:

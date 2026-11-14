@@ -23,6 +23,7 @@ from wxclient.gateway import (
     LocalFileTicketProvider,
 )
 from wxclient.gateway.friendcheck import DEFAULT_DEADLINE_HOURS, PendingFriendWatcher
+from wxclient.gateway.guard import READ_FRIENDS_ACTION
 from wxclient.gateway.watchlist import Watchlist
 from wxclient.queue import TaskType
 
@@ -250,6 +251,44 @@ class TestPacing(_Base):
         runtime = _Runtime({"exact_count": 1})
         self.assertEqual(await self.watcher(runtime, interval_seconds=0).tick(), [])
         self.assertEqual(runtime.calls, [])
+
+
+class TestDefersToLocalDb(_Base):
+    """★ 用户 2026-11-13：名单清空了还在一个个搜人。本地库连着就由它判通过，搜索复查整趟不跑。"""
+
+    async def test_本地库连着就不动搜索框(self) -> None:
+        self.requested()
+        runtime = _Runtime({"exact_count": 1})
+        self.assertEqual(await self.watcher(runtime, db_connected=lambda: True).tick(), [])
+        self.assertEqual(runtime.calls, [])
+        self.assertEqual(self.accepted, [])
+
+    async def test_本地库连着也不占查好友那本账(self) -> None:
+        """跳过的一趟不能占住共享节拍，否则 AI 端下发的查好友申请被白白挡住。"""
+        self.requested()
+        await self.watcher(db_connected=lambda: True).tick()
+        self.assertIsNone(self.store.seconds_since_read(ACCOUNT, READ_FRIENDS_ACTION, self.now))
+
+    async def test_本地库没连上就退回搜索(self) -> None:
+        self.requested()
+        runtime = _Runtime({"exact_count": 1})
+        self.assertEqual(await self.watcher(runtime, db_connected=lambda: False).tick(), [NAME])
+        self.assertEqual(len(runtime.calls), 1)
+
+    async def test_断线重连期间退回搜索_连回来又停(self) -> None:
+        self.requested()
+        connected = [True]
+        runtime = _Runtime()
+        watcher = self.watcher(runtime, db_connected=lambda: connected[0])
+        await watcher.tick()
+        self.assertEqual(runtime.calls, [])
+        connected[0] = False
+        await watcher.tick()
+        self.assertEqual(len(runtime.calls), 1)
+        connected[0] = True
+        self.now += timedelta(hours=1)  # 过了节拍闸，确认停掉的是本地库那道判断而不是闸
+        await watcher.tick()
+        self.assertEqual(len(runtime.calls), 1)
 
 
 class TestOnlyOnePerTick(_Base):

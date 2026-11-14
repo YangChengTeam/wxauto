@@ -364,6 +364,8 @@ def build_gateway(
             # 让路和占闸都按「加好友最小间隔」来，和加好友自己守的是同一个数。
             friend_interval_seconds=gateway_settings.friend_interval_seconds,
             active_hours=gateway_settings.active_hours,
+            # 本地库连着就由它判通过、不动搜索框；没连上（或断线重连期间）才退回搜索复查。
+            db_connected=(lambda: source.db_connected) if isinstance(source, DbMessageSource) else None,
         ),
         # 用户 2026-09-08：本机自己巡看朋友圈，只碰新动态。**默认关**（间隔 0）。
         moments_watcher=MomentsWatcher(

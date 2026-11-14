@@ -87,6 +87,7 @@ class PendingFriendWatcher:
         friend_interval_seconds: float = MIN_FRIEND_INTERVAL_SECONDS,
         active_hours: str = "",
         on_accepted: Callable[[str, str], object] | None = None,
+        db_connected: Callable[[], bool] | None = None,
         clock: Callable[[], datetime] | None = None,
         rng: random.Random | None = None,
     ) -> None:
@@ -108,6 +109,12 @@ class PendingFriendWatcher:
         #: async (account_id, session_name) -> None：确认通过之后怎么落地。
         #: runner 拼好之后再装（上报和名单派生都在它手上）。
         self.on_accepted = on_accepted
+        #: () -> bool：本地库此刻连着没有（`DbMessageSource.db_connected`）。连着就整趟不搜——
+        #: 「他通过了没有」由本地库每分钟对 contact 表判（`DbMessageSource._check_pending_friends`），
+        #: 不动微信。★ 用户 2026-11-13：名单清空了还在一个个搜人，就是这条和本地库那条两头一起跑。
+        #: 撞名的人本地库判不出，搜索也一样判不准（见模块注释 ③），所以不留给搜索兜底。
+        self._db_connected = db_connected
+        self._deferring_to_db = False
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._rng = rng
         self._stopped = asyncio.Event()
@@ -127,6 +134,14 @@ class PendingFriendWatcher:
         self.pending_wait_seconds = 0.0
         if not self.enabled or not self._within_active_hours():
             return []
+        if self._db_connected is not None and self._db_connected():
+            if not self._deferring_to_db:
+                self._deferring_to_db = True
+                _log.info("本地库已连上，好友通过改由本地库判，搜索复查暂停")
+            return []
+        if self._deferring_to_db:
+            self._deferring_to_db = False
+            _log.info("本地库断开了，好友通过退回搜索复查")
         accepted: list[str] = []
         waits: list[float] = []
         for account_id in self._accounts:
